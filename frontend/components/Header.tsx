@@ -4,6 +4,7 @@ import { useState, useEffect, useRef } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useCompany } from '../contexts/CompanyContext';
+import { useView } from '../contexts/ViewContext';
 import NotificationPanel from './NotificationPanel';
 import apiClient from '../lib/apiClient';
 
@@ -13,6 +14,7 @@ interface UnreadCount {
 
 export default function Header() {
   const { companies, activeCompany, setActiveCompanyId, loading } = useCompany();
+  const { mode, orgId, setSingleCompany, setPortfolio, setGroup } = useView();
   const router = useRouter();
   const [showSwitcher, setShowSwitcher] = useState(false);
   const [showNotif, setShowNotif] = useState(false);
@@ -61,6 +63,18 @@ export default function Header() {
     router.push('/login');
   };
 
+  const activeOrgId = activeCompany?.organization_id ?? orgId ?? null;
+  const modeTitle = mode === 'portfolio'
+    ? 'Toan bo doanh nghiep'
+    : mode === 'group'
+      ? 'Hop nhat theo nhom'
+      : (activeCompany?.name ?? 'Chon cong ty');
+  const modeSubtitle = mode === 'single'
+    ? (activeCompany?.tax_code ?? '—')
+    : mode === 'group'
+      ? `Organization: ${activeOrgId ?? 'Chua xac dinh'}`
+      : `${companies.length} cong ty trong danh muc`;
+
   return (
     <header className="fixed top-0 left-0 right-0 z-40 bg-white border-b border-gray-100 shadow-sm">
       <div className="max-w-2xl mx-auto flex items-center justify-between px-4 h-14">
@@ -72,17 +86,28 @@ export default function Header() {
             disabled={loading}
           >
             <div className="w-7 h-7 rounded-lg bg-primary-600 flex items-center justify-center text-white text-xs font-bold flex-shrink-0">
-              {activeCompany?.name?.[0]?.toUpperCase() ?? '?'}
+              {mode === 'portfolio' ? 'P' : mode === 'group' ? 'G' : (activeCompany?.name?.[0]?.toUpperCase() ?? '?')}
             </div>
             <div className="min-w-0">
               <div className="text-sm font-semibold text-gray-900 truncate leading-tight">
-                {activeCompany?.name ?? 'Chọn công ty'}
+                {modeTitle}
               </div>
               <div className="text-xs text-gray-400 leading-tight">
-                {activeCompany?.tax_code ?? '—'}
+                {modeSubtitle}
               </div>
             </div>
-            {companies.length > 1 && (
+            <span
+              className={`text-[10px] px-1.5 py-0.5 rounded-full font-semibold uppercase ${
+                mode === 'single'
+                  ? 'bg-blue-50 text-blue-700'
+                  : mode === 'group'
+                    ? 'bg-emerald-50 text-emerald-700'
+                    : 'bg-amber-50 text-amber-700'
+              }`}
+            >
+              {mode}
+            </span>
+            {companies.length > 0 && (
               <svg
                 className={`w-4 h-4 text-gray-400 flex-shrink-0 transition-transform ${showSwitcher ? 'rotate-180' : ''}`}
                 fill="none"
@@ -94,15 +119,60 @@ export default function Header() {
             )}
           </button>
 
-          {showSwitcher && companies.length > 1 && (
+          {showSwitcher && companies.length > 0 && (
             <div className="absolute top-full left-0 mt-1 w-72 bg-white rounded-xl shadow-lg border border-gray-100 overflow-hidden z-50">
+              <div className="border-b border-gray-100 p-2 space-y-1.5">
+                <p className="px-2 text-[11px] font-semibold uppercase tracking-wide text-gray-500">Che do xem</p>
+                <button
+                  onClick={() => {
+                    if (!activeCompany?.id) return;
+                    setSingleCompany(activeCompany.id);
+                    setShowSwitcher(false);
+                    router.push('/dashboard');
+                  }}
+                  className={`w-full px-3 py-2 rounded-lg text-left text-sm font-medium transition-colors ${
+                    mode === 'single' ? 'bg-blue-50 text-blue-700' : 'hover:bg-gray-50 text-gray-700'
+                  }`}
+                >
+                  Don vi don le
+                </button>
+                <button
+                  onClick={() => {
+                    setPortfolio();
+                    setShowSwitcher(false);
+                    router.push('/portfolio');
+                  }}
+                  className={`w-full px-3 py-2 rounded-lg text-left text-sm font-medium transition-colors ${
+                    mode === 'portfolio' ? 'bg-amber-50 text-amber-700' : 'hover:bg-gray-50 text-gray-700'
+                  }`}
+                >
+                  Danh muc toan bo
+                </button>
+                <button
+                  onClick={() => {
+                    if (!activeOrgId) return;
+                    setGroup(activeOrgId);
+                    setShowSwitcher(false);
+                    router.push(`/group/${activeOrgId}`);
+                  }}
+                  disabled={!activeOrgId}
+                  className={`w-full px-3 py-2 rounded-lg text-left text-sm font-medium transition-colors ${
+                    mode === 'group' ? 'bg-emerald-50 text-emerald-700' : 'hover:bg-gray-50 text-gray-700'
+                  } disabled:bg-gray-100 disabled:text-gray-400`}
+                >
+                  Hop nhat theo nhom
+                </button>
+              </div>
               <div className="p-2">
+                <p className="px-2 pb-1 text-[11px] font-semibold uppercase tracking-wide text-gray-500">Cong ty</p>
                 {companies.map((c) => (
                   <button
                     key={c.id}
                     onClick={() => {
                       setActiveCompanyId(c.id);
+                      setSingleCompany(c.id);
                       setShowSwitcher(false);
+                      router.push('/dashboard');
                     }}
                     className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-left transition-colors ${
                       c.id === activeCompany?.id

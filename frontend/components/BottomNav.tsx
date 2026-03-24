@@ -2,6 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import { useView } from '../contexts/ViewContext';
 
 const navItems = [
   {
@@ -62,16 +63,28 @@ const navItems = [
 
 export default function BottomNav() {
   const pathname = usePathname();
+  const { mode, orgId } = useView();
+
+  const homeHref = mode === 'portfolio'
+    ? '/portfolio'
+    : mode === 'group' && orgId
+      ? `/group/${orgId}`
+      : '/dashboard';
 
   return (
     <nav className="fixed bottom-0 inset-x-0 bg-white border-t border-gray-200 z-40 pb-safe">
       <div className="flex justify-around items-center h-16 max-w-lg mx-auto">
         {navItems.map((item) => {
-          const active = pathname?.startsWith(item.href) ?? false;
+          const href = item.href === '/dashboard' ? homeHref : item.href;
+          const active = pathname
+            ? (href.startsWith('/group/')
+                ? pathname.startsWith('/group/')
+                : pathname.startsWith(href))
+            : false;
           return (
             <Link
               key={item.href}
-              href={item.href}
+              href={href}
               className="flex flex-col items-center gap-1 flex-1 py-2"
             >
               {item.icon(active)}

@@ -1,4 +1,5 @@
 import axios, { AxiosInstance, AxiosResponse } from 'axios';
+import type { ViewMode } from 'shared';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 
@@ -12,6 +13,29 @@ let _activeCompanyId: string | null = null;
 export const setApiCompanyId = (id: string | null): void => { _activeCompanyId = id; };
 export const getApiCompanyId = (): string | null => _activeCompanyId;
 
+interface ApiViewContext {
+  mode: ViewMode;
+  orgId?: string | null;
+  companyId?: string | null;
+}
+
+let _viewContext: ApiViewContext = { mode: 'single', orgId: null, companyId: null };
+
+export const setApiViewContext = (ctx: ApiViewContext): void => {
+  _viewContext = {
+    mode: ctx.mode,
+    orgId: ctx.orgId ?? null,
+    companyId: ctx.companyId ?? null,
+  };
+
+  // Backward compatibility for endpoints that still rely on X-Company-Id.
+  if (_viewContext.mode === 'single') {
+    _activeCompanyId = _viewContext.companyId ?? _activeCompanyId;
+  }
+};
+
+export const getApiViewContext = (): ApiViewContext => _viewContext;
+
 export const apiClient: AxiosInstance = axios.create({
   baseURL: `${API_URL}/api`,
   withCredentials: true, // send HTTP-only refresh token cookie
@@ -23,8 +47,19 @@ apiClient.interceptors.request.use((config) => {
   if (_accessToken) {
     config.headers.Authorization = `Bearer ${_accessToken}`;
   }
-  if (_activeCompanyId) {
-    config.headers['X-Company-Id'] = _activeCompanyId;
+
+  config.headers['X-View-Mode'] = _viewContext.mode;
+
+  if (_viewContext.orgId) {
+    config.headers['X-Organization-Id'] = _viewContext.orgId;
+  }
+
+  const singleCompanyId = _viewContext.mode === 'single'
+    ? (_viewContext.companyId ?? _activeCompanyId)
+    : _activeCompanyId;
+
+  if (singleCompanyId) {
+    config.headers['X-Company-Id'] = singleCompanyId;
   }
   return config;
 });

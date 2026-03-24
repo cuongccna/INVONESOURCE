@@ -11,6 +11,13 @@ export type SubmissionMethod = 'manual' | 'tvan' | 'gdt_api';
 export type SubmissionStatus = 'draft' | 'ready' | 'submitted' | 'accepted' | 'rejected';
 
 export type CompanyType = 'private' | 'jsc' | 'partnership' | 'household' | 'other';
+export type ViewMode = 'portfolio' | 'group' | 'single';
+
+export interface ViewContextState {
+  mode: ViewMode;
+  orgId?: string;
+  companyId?: string;
+}
 
 export interface Company {
   id: string;

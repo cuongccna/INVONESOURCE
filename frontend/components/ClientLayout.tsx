@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import axios from 'axios';
 import { setAccessToken } from '../lib/apiClient';
 import { CompanyProvider } from '../contexts/CompanyContext';
+import { ViewProvider } from '../contexts/ViewContext';
 import Header from './Header';
 import BottomNav from './BottomNav';
 
@@ -46,11 +47,13 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
 
   return (
     <CompanyProvider>
-      <div className="min-h-screen bg-gray-50">
-        <Header />
-        <main className="pb-20 pt-14 safe-bottom">{children}</main>
-        <BottomNav />
-      </div>
+      <ViewProvider>
+        <div className="min-h-screen bg-gray-50">
+          <Header />
+          <main className="pb-20 pt-14 safe-bottom">{children}</main>
+          <BottomNav />
+        </div>
+      </ViewProvider>
     </CompanyProvider>
   );
 }

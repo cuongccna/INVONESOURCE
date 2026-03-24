@@ -17,7 +17,24 @@ const companySchema = z.object({
   email: z.string().email().optional().or(z.literal('')).default(''),
   company_type: z.enum(['private', 'jsc', 'partnership', 'household', 'other']).default('private'),
   fiscal_year_start: z.coerce.number().int().min(1).max(12).default(1),
+  organization_id: z.string().uuid().optional().nullable(),
+  parent_id: z.string().uuid().optional().nullable(),
+  level: z.coerce.number().int().min(1).max(20).optional(),
+  entity_type: z.enum(['company', 'branch', 'representative_office', 'project']).optional(),
+  is_consolidated: z.boolean().optional(),
 });
+
+type CompanyTreeNode = {
+  id: string;
+  name: string;
+  tax_code: string;
+  level: number;
+  entity_type: string;
+  organization_id: string | null;
+  parent_id: string | null;
+  is_consolidated: boolean;
+  children: CompanyTreeNode[];
+};
 
 // GET /api/companies — list companies for the current user
 router.get('/', async (req: Request, res: Response, next: NextFunction) => {
@@ -25,6 +42,7 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
     const { rows } = await pool.query(
       `SELECT c.id, c.name, c.tax_code, c.address, c.phone, c.email,
               c.company_type, c.fiscal_year_start, c.onboarded, c.created_at,
+              c.organization_id, c.parent_id, c.level, c.entity_type, c.is_consolidated,
               uc.role
        FROM companies c
        JOIN user_companies uc ON uc.company_id = c.id AND uc.user_id = $1
@@ -38,22 +56,124 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
   }
 });
 
+// GET /api/companies/tree?organizationId=... — nested hierarchy for current user
+router.get('/tree', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const organizationId = req.query.organizationId as string | undefined;
+    if (organizationId && !z.string().uuid().safeParse(organizationId).success) {
+      throw new ValidationError('organizationId không hợp lệ');
+    }
+
+    const params: unknown[] = [req.user!.userId];
+    const organizationFilter = organizationId ? ` AND c.organization_id = $${params.push(organizationId)}` : '';
+
+    const { rows } = await pool.query<{
+      id: string;
+      name: string;
+      tax_code: string;
+      level: number;
+      entity_type: string;
+      organization_id: string | null;
+      parent_id: string | null;
+      is_consolidated: boolean;
+    }>(
+      `SELECT c.id, c.name, c.tax_code,
+              COALESCE(c.level, 1) AS level,
+              COALESCE(c.entity_type::text, 'company') AS entity_type,
+              c.organization_id, c.parent_id, COALESCE(c.is_consolidated, false) AS is_consolidated
+       FROM companies c
+       JOIN user_companies uc ON uc.company_id = c.id AND uc.user_id = $1
+       WHERE c.deleted_at IS NULL${organizationFilter}
+       ORDER BY c.level ASC, c.name ASC`,
+      params
+    );
+
+    const nodeMap = new Map<string, CompanyTreeNode>();
+    for (const r of rows) {
+      nodeMap.set(r.id, {
+        id: r.id,
+        name: r.name,
+        tax_code: r.tax_code,
+        level: Number(r.level ?? 1),
+        entity_type: r.entity_type,
+        organization_id: r.organization_id,
+        parent_id: r.parent_id,
+        is_consolidated: Boolean(r.is_consolidated),
+        children: [],
+      });
+    }
+
+    const roots: CompanyTreeNode[] = [];
+    for (const node of nodeMap.values()) {
+      const parent = node.parent_id ? nodeMap.get(node.parent_id) : undefined;
+      if (parent) {
+        parent.children.push(node);
+      } else {
+        roots.push(node);
+      }
+    }
+
+    const sortTree = (nodes: CompanyTreeNode[]) => {
+      nodes.sort((a, b) => a.level - b.level || a.name.localeCompare(b.name, 'vi'));
+      nodes.forEach((n) => sortTree(n.children));
+    };
+    sortTree(roots);
+
+    sendSuccess(res, roots);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // POST /api/companies — create new company (user becomes OWNER)
 router.post('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const parsed = companySchema.safeParse(req.body);
     if (!parsed.success) throw new ValidationError(parsed.error.issues[0]?.message ?? 'Invalid input');
 
-    const { name, tax_code, address, phone, email, company_type, fiscal_year_start } = parsed.data;
+    const {
+      name,
+      tax_code,
+      address,
+      phone,
+      email,
+      company_type,
+      fiscal_year_start,
+      organization_id,
+      parent_id,
+      level,
+      entity_type,
+      is_consolidated,
+    } = parsed.data;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
       const id = uuidv4();
       const { rows } = await client.query(
-        `INSERT INTO companies (id, name, tax_code, address, phone, email, company_type, fiscal_year_start, onboarded)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false)
-         RETURNING id, name, tax_code, address, phone, email, company_type, fiscal_year_start, onboarded, created_at`,
-        [id, name, tax_code, address, phone, email || null, company_type, fiscal_year_start]
+        `INSERT INTO companies (
+           id, name, tax_code, address, phone, email,
+           company_type, fiscal_year_start, onboarded,
+           organization_id, parent_id, level, entity_type, is_consolidated
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, $9, $10, $11, $12, $13)
+         RETURNING id, name, tax_code, address, phone, email,
+                   company_type, fiscal_year_start, onboarded, created_at,
+                   organization_id, parent_id, level, entity_type, is_consolidated`,
+        [
+          id,
+          name,
+          tax_code,
+          address,
+          phone,
+          email || null,
+          company_type,
+          fiscal_year_start,
+          organization_id ?? null,
+          parent_id ?? null,
+          level ?? 1,
+          entity_type ?? 'company',
+          is_consolidated ?? false,
+        ]
       );
       await client.query(
         `INSERT INTO user_companies (user_id, company_id, role) VALUES ($1, $2, 'OWNER')`,
@@ -78,6 +198,7 @@ router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
     const { rows } = await pool.query(
       `SELECT c.id, c.name, c.tax_code, c.address, c.phone, c.email,
               c.company_type, c.fiscal_year_start, c.onboarded, c.created_at, c.updated_at,
+              c.organization_id, c.parent_id, c.level, c.entity_type, c.is_consolidated,
               uc.role
        FROM companies c
        JOIN user_companies uc ON uc.company_id = c.id AND uc.user_id = $2
@@ -106,14 +227,46 @@ router.put('/:id', async (req: Request, res: Response, next: NextFunction) => {
     const parsed = companySchema.safeParse(req.body);
     if (!parsed.success) throw new ValidationError(parsed.error.issues[0]?.message ?? 'Invalid input');
 
-    const { name, tax_code, address, phone, email, company_type, fiscal_year_start } = parsed.data;
+    const {
+      name,
+      tax_code,
+      address,
+      phone,
+      email,
+      company_type,
+      fiscal_year_start,
+      organization_id,
+      parent_id,
+      level,
+      entity_type,
+      is_consolidated,
+    } = parsed.data;
     const { rows } = await pool.query(
       `UPDATE companies
        SET name=$1, tax_code=$2, address=$3, phone=$4, email=$5,
-           company_type=$6, fiscal_year_start=$7, updated_at=NOW()
-       WHERE id=$8 AND deleted_at IS NULL
-       RETURNING id, name, tax_code, address, phone, email, company_type, fiscal_year_start, onboarded`,
-      [name, tax_code, address, phone, email || null, company_type, fiscal_year_start, req.params.id]
+           company_type=$6, fiscal_year_start=$7,
+           organization_id=$8, parent_id=$9, level=$10,
+           entity_type=$11, is_consolidated=$12,
+           updated_at=NOW()
+       WHERE id=$13 AND deleted_at IS NULL
+       RETURNING id, name, tax_code, address, phone, email,
+                 company_type, fiscal_year_start, onboarded,
+                 organization_id, parent_id, level, entity_type, is_consolidated`,
+      [
+        name,
+        tax_code,
+        address,
+        phone,
+        email || null,
+        company_type,
+        fiscal_year_start,
+        organization_id ?? null,
+        parent_id ?? null,
+        level ?? 1,
+        entity_type ?? 'company',
+        is_consolidated ?? false,
+        req.params.id,
+      ]
     );
     if (!rows[0]) throw new NotFoundError('Company not found');
     sendSuccess(res, rows[0]);

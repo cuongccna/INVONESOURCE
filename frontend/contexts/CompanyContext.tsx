@@ -15,6 +15,11 @@ export interface CompanyInfo {
   name: string;
   tax_code: string;
   address: string;
+  organization_id?: string | null;
+  parent_id?: string | null;
+  level?: number;
+  entity_type?: 'company' | 'subsidiary' | 'branch';
+  is_consolidated?: boolean;
   company_type: string;
   fiscal_year_start: number;
   onboarded: boolean;
