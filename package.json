@@ -1,0 +1,27 @@
+{
+  "name": "invone-platform",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "backend",
+    "frontend",
+    "shared"
+  ],
+  "scripts": {
+    "dev:backend": "npm run dev --workspace=backend",
+    "dev:frontend": "npm run dev --workspace=frontend",
+    "dev:all": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "build:backend": "npm run build --workspace=backend",
+    "build:frontend": "npm run build --workspace=frontend",
+    "db:migrate": "npm run db:migrate --workspace=backend",
+    "db:seed": "npm run db:seed --workspace=backend",
+    "db:reset": "npm run db:reset --workspace=backend",
+    "test": "npm run test --workspace=backend",
+    "test:watch": "npm run test:watch --workspace=backend",
+    "test:coverage": "npm run test:coverage --workspace=backend",
+    "type-check": "npm run type-check --workspace=backend && npm run type-check --workspace=frontend"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "HĐĐT - Hóa Đơn Điện Tử",
+  "short_name": "HĐĐT",
+  "description": "Nền tảng quản lý hóa đơn điện tử và kê khai thuế GTGT",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#ffffff",
+  "theme_color": "#2563eb",
+  "icons": [
+    {
+      "src": "/icons/icon-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["finance", "business"],
+  "lang": "vi",
+  "dir": "ltr"
+}

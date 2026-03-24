@@ -1,0 +1,14 @@
+# Git ignore — HĐĐT Platform
+.env
+*.env.local
+node_modules/
+dist/
+.next/
+coverage/
+*.log
+*.pem
+.DS_Store
+Thumbs.db
+uploads/
+pdf_storage/
+.env.example

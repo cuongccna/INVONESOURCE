@@ -1,0 +1,405 @@
+'use client';
+
+import { useEffect, useState, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
+import apiClient from '../../../../lib/apiClient';
+import { useCompany } from '../../../../contexts/CompanyContext';
+import BackButton from '../../../../components/BackButton';
+
+interface Company {
+  id: string;
+  name: string;
+  tax_code: string;
+  address: string;
+  phone: string;
+  email: string;
+  company_type: 'private' | 'jsc' | 'partnership' | 'household' | 'other';
+  fiscal_year_start: number;
+  onboarded: boolean;
+  role: string;
+  created_at: string;
+}
+
+const COMPANY_TYPE_LABELS: Record<string, string> = {
+  private: 'TNHH / Tư nhân',
+  jsc: 'Cổ phần',
+  partnership: 'Hợp danh',
+  household: 'Hộ kinh doanh',
+  other: 'Khác',
+};
+
+const MONTHS = [
+  'Tháng 1', 'Tháng 2', 'Tháng 3', 'Tháng 4',
+  'Tháng 5', 'Tháng 6', 'Tháng 7', 'Tháng 8',
+  'Tháng 9', 'Tháng 10', 'Tháng 11', 'Tháng 12',
+];
+
+type CompanyFormData = {
+  name: string;
+  tax_code: string;
+  address: string;
+  phone: string;
+  email: string;
+  company_type: 'private' | 'jsc' | 'partnership' | 'household' | 'other';
+  fiscal_year_start: number;
+};
+
+const EMPTY_FORM: CompanyFormData = {
+  name: '',
+  tax_code: '',
+  address: '',
+  phone: '',
+  email: '',
+  company_type: 'private',
+  fiscal_year_start: 1,
+};
+
+export default function CompaniesSettingsPage() {
+  const [companies, setCompanies] = useState<Company[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showModal, setShowModal] = useState(false);
+  const [editTarget, setEditTarget] = useState<Company | null>(null);
+  const [form, setForm] = useState<CompanyFormData>(EMPTY_FORM);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+  const [deleteTarget, setDeleteTarget] = useState<Company | null>(null);
+  const { setActiveCompanyId, activeCompanyId, refreshCompanies } = useCompany();
+  const router = useRouter();
+
+  const loadCompanies = useCallback(async () => {
+    try {
+      const res = await apiClient.get<{ data: Company[] }>('/companies');
+      setCompanies(res.data.data);
+    } catch {
+      setError('Không thể tải danh sách công ty');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadCompanies();
+  }, [loadCompanies]);
+
+  const openCreate = () => {
+    setEditTarget(null);
+    setForm(EMPTY_FORM);
+    setError('');
+    setShowModal(true);
+  };
+
+  const openEdit = (c: Company) => {
+    setEditTarget(c);
+    setForm({
+      name: c.name,
+      tax_code: c.tax_code,
+      address: c.address ?? '',
+      phone: c.phone ?? '',
+      email: c.email ?? '',
+      company_type: c.company_type,
+      fiscal_year_start: c.fiscal_year_start,
+    });
+    setError('');
+    setShowModal(true);
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setSubmitting(true);
+    try {
+      if (editTarget) {
+        await apiClient.put(`/companies/${editTarget.id}`, form);
+      } else {
+        const res = await apiClient.post<{ data: Company }>('/companies', form);
+        // New company: go to onboarding
+        const newId = res.data?.data?.id;
+        if (newId) {
+          await refreshCompanies();
+          setActiveCompanyId(newId);
+          router.push('/onboarding');
+          return;
+        }
+      }
+      await loadCompanies();
+      await refreshCompanies();
+      setShowModal(false);
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { error?: { message?: string } } } })?.response?.data?.error
+          ?.message ?? 'Có lỗi xảy ra';
+      setError(msg);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
+    try {
+      await apiClient.delete(`/companies/${deleteTarget.id}`);
+      await loadCompanies();
+      await refreshCompanies();
+      setDeleteTarget(null);
+    } catch {
+      // silent
+    }
+  };
+
+  const handleSwitch = (id: string) => {
+    setActiveCompanyId(id);
+    router.push('/dashboard');
+  };
+
+  return (
+    <div className="max-w-2xl mx-auto px-4 py-6">
+      <BackButton fallbackHref="/dashboard" className="mb-4" />
+      <div className="flex items-center justify-between mb-6">
+        <h1 className="text-xl font-bold text-gray-900">Quản lý công ty</h1>
+        <button
+          onClick={openCreate}
+          className="flex items-center gap-1.5 bg-primary-600 text-white text-sm px-4 py-2 rounded-lg hover:bg-primary-700 transition-colors"
+        >
+          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+          </svg>
+          Thêm công ty
+        </button>
+      </div>
+
+      {loading ? (
+        <div className="flex justify-center py-16">
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600" />
+        </div>
+      ) : companies.length === 0 ? (
+        <div className="text-center py-16 text-gray-400">
+          <p className="text-4xl mb-3">🏢</p>
+          <p>Bạn chưa có công ty nào</p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {companies.map((c) => (
+            <div
+              key={c.id}
+              className={`bg-white rounded-xl border p-4 ${
+                c.id === activeCompanyId ? 'border-primary-300 ring-1 ring-primary-200' : 'border-gray-100'
+              }`}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="w-10 h-10 rounded-xl bg-primary-600 flex items-center justify-center text-white font-bold text-sm flex-shrink-0">
+                    {c.name[0]?.toUpperCase()}
+                  </div>
+                  <div className="min-w-0">
+                    <p className="font-semibold text-gray-900 text-sm">{c.name}</p>
+                    <p className="text-xs text-gray-500">MST: {c.tax_code}</p>
+                    <div className="flex items-center gap-2 mt-1 flex-wrap">
+                      <span className="text-xs bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full">
+                        {COMPANY_TYPE_LABELS[c.company_type] ?? c.company_type}
+                      </span>
+                      <span className={`text-xs px-2 py-0.5 rounded-full ${
+                        c.role === 'OWNER'
+                          ? 'bg-amber-100 text-amber-700'
+                          : c.role === 'ADMIN'
+                          ? 'bg-blue-100 text-blue-700'
+                          : 'bg-gray-100 text-gray-600'
+                      }`}>
+                        {c.role}
+                      </span>
+                      {!c.onboarded && (
+                        <span className="text-xs bg-orange-100 text-orange-600 px-2 py-0.5 rounded-full">
+                          Chưa cài đặt
+                        </span>
+                      )}
+                      {c.id === activeCompanyId && (
+                        <span className="text-xs bg-primary-100 text-primary-700 px-2 py-0.5 rounded-full font-medium">
+                          Đang chọn
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-1 flex-shrink-0">
+                  {c.id !== activeCompanyId && (
+                    <button
+                      onClick={() => handleSwitch(c.id)}
+                      className="text-xs text-primary-600 hover:bg-primary-50 px-2.5 py-1.5 rounded-lg transition-colors"
+                    >
+                      Chọn
+                    </button>
+                  )}
+                  {['OWNER', 'ADMIN'].includes(c.role) && (
+                    <button
+                      onClick={() => openEdit(c)}
+                      className="p-1.5 text-gray-400 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
+                    >
+                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                      </svg>
+                    </button>
+                  )}
+                  {c.role === 'OWNER' && (
+                    <button
+                      onClick={() => setDeleteTarget(c)}
+                      className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                    >
+                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                      </svg>
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Create / Edit modal */}
+      {showModal && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 px-4">
+          <div className="bg-white w-full max-w-md rounded-2xl shadow-xl">
+            <form onSubmit={(e) => void handleSubmit(e)}>
+              <div className="p-5 border-b border-gray-100">
+                <h2 className="text-lg font-semibold text-gray-900">
+                  {editTarget ? 'Sửa thông tin công ty' : 'Thêm công ty mới'}
+                </h2>
+              </div>
+
+              <div className="p-5 space-y-4">
+                {error && (
+                  <div className="bg-red-50 text-red-600 text-sm px-3 py-2 rounded-lg">{error}</div>
+                )}
+
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Tên công ty *</label>
+                  <input
+                    required
+                    value={form.name}
+                    onChange={(e) => setForm({ ...form, name: e.target.value })}
+                    className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-300"
+                    placeholder="Công ty TNHH ABC"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Mã số thuế *</label>
+                  <input
+                    required
+                    value={form.tax_code}
+                    onChange={(e) => setForm({ ...form, tax_code: e.target.value })}
+                    className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary-300"
+                    placeholder="0123456789"
+                  />
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 mb-1">Loại hình DN</label>
+                    <select
+                      value={form.company_type}
+                      onChange={(e) => setForm({ ...form, company_type: e.target.value as typeof form.company_type })}
+                      className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-300"
+                    >
+                      {Object.entries(COMPANY_TYPE_LABELS).map(([k, v]) => (
+                        <option key={k} value={k}>{v}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 mb-1">Tháng đầu năm TK</label>
+                    <select
+                      value={form.fiscal_year_start}
+                      onChange={(e) => setForm({ ...form, fiscal_year_start: Number(e.target.value) })}
+                      className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-300"
+                    >
+                      {MONTHS.map((m, i) => (
+                        <option key={i + 1} value={i + 1}>{m}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Địa chỉ</label>
+                  <input
+                    value={form.address}
+                    onChange={(e) => setForm({ ...form, address: e.target.value })}
+                    className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-300"
+                    placeholder="Số nhà, đường, quận/huyện, tỉnh/thành"
+                  />
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 mb-1">Điện thoại</label>
+                    <input
+                      value={form.phone}
+                      onChange={(e) => setForm({ ...form, phone: e.target.value })}
+                      className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-300"
+                      placeholder="0901234567"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 mb-1">Email</label>
+                    <input
+                      type="email"
+                      value={form.email}
+                      onChange={(e) => setForm({ ...form, email: e.target.value })}
+                      className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-300"
+                      placeholder="ketoan@congty.vn"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="p-5 border-t border-gray-100 flex gap-3">
+                <button
+                  type="button"
+                  onClick={() => setShowModal(false)}
+                  className="flex-1 border border-gray-200 text-gray-600 py-2.5 rounded-xl text-sm font-medium hover:bg-gray-50 transition-colors"
+                >
+                  Huỷ
+                </button>
+                <button
+                  type="submit"
+                  disabled={submitting}
+                  className="flex-1 bg-primary-600 text-white py-2.5 rounded-xl text-sm font-medium hover:bg-primary-700 disabled:opacity-60 transition-colors"
+                >
+                  {submitting ? 'Đang lưu...' : editTarget ? 'Lưu thay đổi' : 'Thêm công ty'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Delete confirm modal */}
+      {deleteTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+          <div className="bg-white rounded-2xl shadow-xl max-w-sm w-full p-6">
+            <h3 className="text-lg font-semibold text-gray-900 mb-2">Xoá công ty?</h3>
+            <p className="text-sm text-gray-500 mb-5">
+              Công ty <strong>{deleteTarget.name}</strong> sẽ bị ẩn khỏi hệ thống. Dữ liệu hóa đơn không bị xóa.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setDeleteTarget(null)}
+                className="flex-1 border border-gray-200 py-2.5 rounded-xl text-sm font-medium text-gray-600 hover:bg-gray-50 transition-colors"
+              >
+                Hủy
+              </button>
+              <button
+                onClick={() => void handleDelete()}
+                className="flex-1 bg-red-600 text-white py-2.5 rounded-xl text-sm font-medium hover:bg-red-700 transition-colors"
+              >
+                Xoá
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
