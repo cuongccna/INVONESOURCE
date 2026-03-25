@@ -1,20 +1,31 @@
 import { RequestHandler } from 'express';
 import { pool } from '../db/pool';
 import { ForbiddenError } from '../utils/AppError';
-import type { UserRole } from './auth';
+import type { UserRole, ViewMode } from './auth';
 
 /**
- * requireCompany middleware — multi-company support.
+ * requireCompany middleware — multi-company + view-mode support.
  *
- * Reads the optional `X-Company-Id` request header. If it differs from the
- * company embedded in the JWT, the user's access to that company is verified
- * and req.user.companyId + req.user.role are updated for this request.
+ * 1. Reads `X-View-Mode` header (single | group | portfolio). Defaults to 'single'.
+ * 2. Reads `X-Organization-Id` header for group view.
+ * 3. Reads `X-Company-Id` header and verifies access (single mode).
  *
  * Must run AFTER authenticate (req.user must already be set).
- * Safe to skip if no X-Company-Id header is sent.
  */
 export const requireCompany: RequestHandler = async (req, _res, next) => {
   if (!req.user) return next();
+
+  // Parse view-mode headers (safe defaults)
+  const rawMode = (req.headers['x-view-mode'] as string | undefined) ?? 'single';
+  const viewMode: ViewMode = (['single', 'group', 'portfolio'] as const).includes(rawMode as ViewMode)
+    ? (rawMode as ViewMode)
+    : 'single';
+
+  req.user.viewMode = viewMode;
+  req.user.organizationId = (req.headers['x-organization-id'] as string | undefined) ?? null;
+
+  // For group/portfolio we skip per-company RBAC; data services enforce user ownership
+  if (viewMode !== 'single') return next();
 
   const headerCompanyId = req.headers['x-company-id'] as string | undefined;
   if (!headerCompanyId || headerCompanyId === req.user.companyId) return next();

@@ -8,7 +8,7 @@ const genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
  * GeminiOCRService — extracts invoice data from scanned images using Gemini 1.5 Flash
  */
 export class GeminiOCRService {
-  private model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+  private model = genAI.getGenerativeModel({ model: env.GEMINI_MODEL });
 
   async extractInvoiceFromImage(
     imageBuffer: Buffer,

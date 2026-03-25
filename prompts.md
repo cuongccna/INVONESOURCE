@@ -2346,3 +2346,660 @@ Each rule: toggle on/off, edit threshold, add item exclusion list
 
 Store rules in: audit_rule_configs(company_id, rule_id, threshold, severity, enabled, exclusions, updated_at)
 ```
+
+---
+
+## GROUP 26 — UI COMPLETION: FIX EXISTING BUGS
+
+### P26.1 — Fix ESG carbon calculation (currently showing 336,900 tCO2e — WRONG)
+```
+[Respond in Vietnamese]
+The ESG Carbon Estimate widget on /dashboard is showing 336,900 tCO2e which is
+completely wrong. This is because it's multiplying raw VND amounts without correct
+emission factors.
+
+Fix /backend/src/services/EsgEstimationService.ts:
+
+Correct formula: carbon_estimate_kgCO2e = (spend_VND / 1,000,000) × emission_factor
+Unit: tCO2e = kgCO2e / 1000
+
+This prompt supersedes any earlier rough wording that implied factors were applied
+directly on raw VND amounts.
+
+Correct emission factors (kgCO2e per 1 MILLION VND spent):
+  'Năng lượng & Nhiên liệu'    : 0.85
+  'Vận tải & Logistics'        : 0.62
+  'Vật tư sản xuất'            : 0.45
+  'Dịch vụ'                    : 0.12
+  'Văn phòng phẩm'             : 0.18
+  'Xây dựng & Bất động sản'    : 0.38
+  'Thực phẩm & F&B'            : 0.28
+  'Khác'                        : 0.20  ← default
+
+Example:
+  spend_VND = 700,000,000
+  factor = 0.20 kgCO2e / 1,000,000 VND
+  carbon_estimate_kgCO2e = (700,000,000 / 1,000,000) × 0.20 = 140 kgCO2e
+  carbon_estimate_tCO2e = 140 / 1000 = 0.14 tCO2e
+
+The correct total for a typical 700M VND input invoice month should be roughly 0.1–0.3 tCO2e
+with the factors above, not hundreds of thousands of tCO2e.
+
+Also fix the UI display:
+- Show "tCO2e" not "336.900 tCO2e" (remove absurd number)
+- Add disclaimer text: "Ước tính sơ bộ theo phương pháp chi tiêu (Scope 3)"
+- Show breakdown: top 3 categories with their carbon contribution
+- If total < 1 tCO2e, show in kgCO2e instead
+```
+
+### P26.2 — Fix sync log warnings (showing 5 MISA warnings 23h ago with no detail)
+```
+[Respond in Vietnamese]
+The dashboard shows 5 MISA sync warning icons (⚠) all showing "23h trước" with no
+explanation. This is unhelpful. Fix the sync log display:
+
+1. Backend: GET /api/sync/recent?companyId=&limit=5
+   Return sync_logs with:
+   - status: 'success' | 'warning' | 'error'
+   - records_fetched count
+   - error_detail (if any)
+   - duration_seconds
+   
+   A sync is 'warning' only if: records_fetched > 0 BUT errors_count > 0
+   A sync is 'error' if: records_fetched = 0 AND errors_count > 0
+   A sync is 'success' if: errors_count = 0
+
+2. Frontend: Fix the "Đồng Bộ Gần Đây" section on dashboard:
+   Show meaningful status text instead of just the icon:
+   ✅ MISA — "Đồng bộ 156 hóa đơn" — 23h trước
+   ⚠️ Viettel — "Lấy được 45 HĐ, bỏ qua 2 lỗi" — 2h trước  
+   🔴 BKAV — "Thất bại: Token hết hạn" — 5h trước [Xác thực lại]
+
+3. If all syncs show the same timestamp (23h trước × 5): this indicates the cron job
+   is not running correctly. Add a "Đồng bộ thủ công" button that triggers all active
+   connectors immediately.
+```
+
+### P26.3 — Fix AI Anomaly Detection (currently empty — "Nhấn Phân tích" state)
+```
+[Respond in Vietnamese]
+The "Phát Hiện Bất Thường AI" widget on dashboard shows empty state.
+Fix it to show real results automatically, not require manual button press.
+
+Changes needed:
+
+1. Backend: Run anomaly detection automatically after each sync.
+   POST /api/ai/anomalies/run should be called by the SyncWorker after completion.
+   Results saved to price_anomalies table.
+
+2. Backend: GET /api/ai/anomalies/summary?companyId=
+   Return: { critical: N, warning: N, topItems: [{itemName, deviation, sellerName}] }
+
+3. Frontend widget: Replace empty state with live data:
+   If anomalies exist:
+     "🔴 2 bất thường nghiêm trọng | ⚠️ 5 cần xem xét"
+     Show top 2 anomalies inline:
+       "Giấy in A4 — NCC Văn Phòng XYZ: tăng 30% so với tháng trước"
+       "Bao bì loại B — NCC Vật Tư ABC: cao hơn 25% so với giá thị trường"
+     [Xem tất cả →] link to /audit/anomalies
+   
+   If no anomalies: show "✅ Không phát hiện bất thường trong kỳ này"
+   
+   Remove the manual "Phân tích" button — make this automatic.
+   Show "Cập nhật lúc: [last_sync_time]" timestamp.
+```
+
+---
+
+## GROUP 27 — NAVIGATION: ADD ALL MISSING MODULES
+
+### P27.1 — Add new navigation items (CRM, Vendors, Audit, Cashflow)
+```
+[Respond in Vietnamese]
+The bottom navigation currently shows: Tổng Quan | Hóa Đơn | Tờ Khai | Đối Soát | AI | Báo Cáo
+
+The following completely built modules have NO navigation entry and are unreachable:
+- /crm/customers (RFM, customer list)
+- /crm/repurchase (predictive repurchase)
+- /crm/aging (debt collection)
+- /vendors (vendor management)
+- /vendors/price-alerts (price tracking)
+- /products/profitability (product analysis)
+- /cashflow (cash flow projection)
+- /audit/anomalies (AI auditor / fraud detection)
+- /reports/trends (trend analysis)
+- /reports/monthly (monthly summary)
+- /portfolio/alerts (multi-company alert center)
+
+Fix: Replace the bottom nav (max 5 tabs on mobile) and add a "More" menu:
+
+Bottom nav (5 tabs):
+  Tổng Quan (/dashboard)
+  Hóa Đơn (/invoices)
+  Tờ Khai (/declarations)
+  AI & Báo Cáo → opens a drawer/modal with all sub-pages
+  Cài Đặt (/settings)
+
+"AI & Báo Cáo" drawer sections:
+  📊 Phân Tích:
+    Báo cáo xu hướng (/reports/trends)
+    Báo cáo tháng (/reports/monthly)
+    So sánh công ty (/compare)
+  
+  👥 Khách Hàng (CRM):
+    Danh sách & RFM (/crm/customers)
+    Dự đoán mua lại (/crm/repurchase)
+    Báo cáo nợ (/crm/aging)
+  
+  🏭 Nhà Cung Cấp:
+    Tổng quan NCC (/vendors)
+    Cảnh báo giá (/vendors/price-alerts)
+  
+  📦 Sản Phẩm:
+    Lợi nhuận sản phẩm (/products/profitability)
+  
+  💰 Dòng Tiền:
+    Dự báo 90 ngày (/cashflow)
+  
+  🔍 Kiểm Toán AI:
+    Phát hiện bất thường (/audit/anomalies)
+    Cấu hình quy tắc (/settings/audit-rules)
+  
+  🏢 Đa Công Ty:
+    Danh mục tổng (/portfolio)
+    Cảnh báo hệ thống (/portfolio/alerts)
+
+Desktop sidebar: add all the above as grouped navigation items.
+```
+
+### P27.2 — Dashboard quick actions update
+```
+[Respond in Vietnamese]
+The "Thao Tác Nhanh" section on dashboard currently shows:
+  Xem Hóa Đơn | Tờ Khai | Kết Nối nhà mạng | Trợ Lý AI
+
+Update to show context-aware quick actions based on what needs attention:
+
+Dynamic quick actions (show the most relevant 4 based on current state):
+  ALWAYS show:
+    📄 Xem Hóa Đơn → /invoices
+    🤖 Trợ Lý AI → /ai
+  
+  CONDITIONAL (show if condition is true):
+    🔴 [N] Bất thường giá → /audit/anomalies  (if anomalies > 0)
+    📅 Nộp tờ khai (còn N ngày) → /declarations  (if deadline < 10 days)
+    💰 [N] Hóa đơn đến hạn → /crm/aging  (if overdue > 0)
+    📈 Dự đoán mua lại → /crm/repurchase  (if predictions available)
+    ⚠️ Lỗi kết nối → /settings/connectors  (if circuit breaker open)
+    🏭 [N] Giá NCC tăng → /vendors/price-alerts  (if price alerts > 0)
+
+Each action card: icon + label + count badge if applicable
+Fetch: GET /api/dashboard/quick-actions?companyId= returns the relevant actions to show
+```
+
+---
+
+## GROUP 28 — CRM PAGES: COMPLETE UI
+
+### P28.1 — Build /crm/customers page (full implementation)
+```
+[Respond in Vietnamese]
+Create the complete /crm/customers page. This page must fetch REAL data from the API.
+
+Backend prerequisites (create if missing):
+  GET /api/crm/rfm?companyId=&segment=&page=&pageSize=20
+  GET /api/crm/rfm/summary?companyId=
+  POST /api/crm/rfm/recalculate (trigger BullMQ job)
+  
+  If no RFM data exists yet: run calculateRfm() synchronously for the first request
+  and return results (may take a few seconds — show loading state).
+
+Full page layout:
+
+1. Page header: "Khách Hàng" + period context + "Tính lại RFM" button
+
+2. Summary cards row (horizontal scroll on mobile):
+  [Tổng KH: 24] [Champions: 3 (45% DT)] [At Risk: 5 (23% DT)] [Mới T3: 2]
+  
+3. Segment filter tabs (horizontal scroll):
+  Tất cả | Champions | Loyal | At Risk | Big Spender | New | Lost
+  Each tab shows count badge
+
+4. Customer list (mobile: cards, desktop: table):
+  Each customer card:
+    Avatar circle with initials (from company name)
+    Tên công ty (bold) + MST (muted)
+    RFM Score: [R:4 F:3 M:5] displayed as colored pills
+    Segment badge (color-coded)
+    Lần mua cuối: X ngày trước
+    Tổng DT 12T: [amount]
+    Số đơn: [count]
+  
+5. Customer detail (tap card → slide panel from bottom on mobile, right on desktop):
+  Section: Thông tin
+    Tên, MST, địa chỉ từ dữ liệu HĐ
+    Segment badge + RFM explanation
+  Section: Lịch sử mua hàng
+    Last 5 invoices: date + amount + items count + VAT
+    "Xem tất cả hóa đơn" link → /invoices?buyerTaxCode=X
+  Section: Phân tích AI (Gemini)
+    Load on demand: "Phân tích" button → call Gemini with customer data
+    Show: pattern summary, churn risk, recommendation
+
+6. FAB button (bottom right): "Tính lại RFM" → POST /api/crm/rfm/recalculate → show progress toast
+```
+
+### P28.2 — Build /crm/repurchase page (predictive pipeline)
+```
+[Respond in Vietnamese]
+Create the complete /crm/repurchase page — sales opportunity pipeline.
+
+Backend prerequisites:
+  GET /api/crm/repurchase?companyId=&daysRange=7  (7|14|30)
+  GET /api/crm/repurchase/stats?companyId=  (summary stats)
+  PATCH /api/crm/repurchase/:id/action  (mark as actioned)
+  
+  If no prediction data: show onboarding message:
+  "Cần ít nhất 3 lần mua hàng từ cùng 1 khách để dự đoán.
+   Hệ thống đang phân tích dữ liệu của bạn..."
+
+Page layout:
+
+Header:
+  "Dự Đoán Mua Lại" + "Cập nhật: [last_run_time]"
+  Summary: "12 cơ hội trong 30 ngày tới | Độ chính xác: 78%"
+
+Timeline tabs: Tuần này (7 ngày) | 2 tuần | Tháng này (30 ngày)
+
+Opportunity cards (sorted by urgency):
+  Each card:
+    [URGENCY INDICATOR: red circle if ≤3 days, orange 4-7, blue 8+]
+    Tên khách hàng (bold)
+    Sản phẩm: [item_name]
+    Dự kiến: [predicted_date] (còn X ngày)
+    Trung bình: [avg_quantity] [unit] / [avg_interval] ngày
+    Confidence: [Cao ✓ | Trung bình ~]
+    [Đã liên hệ ✓] toggle  |  [Ghi chú] button
+
+"Khách hàng im lặng" section (collapsed by default, expand with count):
+  Customers whose predicted date has passed > 14 days
+  Each: name + product + "[N] ngày quá hạn" (red text) + [Gọi ngay] button
+
+Empty state (no predictions yet): 
+  Illustration + "Hệ thống cần thêm dữ liệu để dự đoán. Khi có đủ 3 lần mua,
+  dự đoán sẽ xuất hiện tự động."
+```
+
+### P28.3 — Build /crm/aging page (debt collection)
+```
+[Respond in Vietnamese]
+Create the complete /crm/aging page — accounts receivable aging report.
+
+Backend prerequisites:
+  GET /api/crm/aging?companyId=  → aging buckets + customer breakdown
+  PATCH /api/invoices/:id/mark-paid  → mark invoice as paid
+  POST /api/crm/aging/send-reminder/:customerId  → create reminder notification
+  
+  Aging buckets: current (not due) | 1-30 | 31-60 | 61-90 | 90+ days overdue
+
+Page layout:
+
+Header summary bar (4 colored cards):
+  Chưa đến hạn: [amount] (gray)
+  Trễ 1-30 ngày: [amount] (yellow)
+  Trễ 31-60 ngày: [amount] (orange)
+  Trễ >60 ngày: [amount] (red)
+  
+  Total bar: "Tổng công nợ chưa thu: [sum] từ [N] khách hàng"
+
+Important note for Vietnamese context:
+  Most invoices don't track payment dates yet.
+  Show banner: "Đánh dấu hóa đơn đã thanh toán để báo cáo chính xác hơn"
+  Provide bulk-mark-paid option
+
+Customer aging table:
+  Columns: Khách hàng | MST | Chưa hạn | 1-30 ngày | 31-60 | 61-90 | 90+ | Tổng nợ | Hành động
+  Row colors: all-gray → yellow → orange → red based on worst bucket
+  Hành động: [Nhắc nợ] (creates notification) | [Xem HĐ] | [Đánh dấu đã thu]
+  Expandable row: shows individual invoices with their amounts and due dates
+
+"Nhắc nợ tự động" section at bottom:
+  Toggle: "Tự động nhắc khi HĐ đến hạn 1 ngày trước"
+  Toggle: "Nhắc qua Telegram" (if Telegram configured)
+  "Cài đặt nhắc nhở" → /settings/notifications
+```
+
+---
+
+## GROUP 29 — VENDOR & PRODUCT PAGES: COMPLETE UI
+
+### P29.1 — Build /vendors page (vendor overview)
+```
+[Respond in Vietnamese]
+Create the complete /vendors page — vendor management overview.
+
+Backend: GET /api/vendors?companyId=&sortBy=spend&page=1
+  Aggregate from input invoices: per seller_tax_code
+  Return: seller_name, tax_code, total_spend_12m, invoice_count, last_invoice_date,
+          avg_invoice_value, spend_pct_of_total, has_price_alert (boolean),
+          price_trend: 'up'|'down'|'stable'|'new'
+
+Page layout:
+
+Header KPIs (4 cards):
+  NCC hoạt động (3 tháng): [count]
+  Tổng chi tiêu tháng này: [amount]
+  Có cảnh báo giá: [count] (orange if > 0)
+  NCC chiếm tỉ trọng cao nhất: [name] ([pct]%)
+
+Vendor list (mobile: cards, desktop: table):
+  Each vendor card/row:
+    Avatar circle with initials
+    Tên NCC (bold) + MST (muted)
+    Tổng chi tiêu: [amount 12 tháng]
+    Số HĐ: [count] | Trung bình: [avg/invoice]
+    Tỉ trọng: [pct]% with mini progress bar
+    Xu hướng: ↑ red (price up) | ↓ green (price down) | → stable | NEW badge
+    Risk badge: Cao (>30%) | Trung bình (10-30%) | Thấp (<10%) concentration
+    [Xem chi tiết] → vendor detail slide panel
+
+"Cảnh báo giá" section (if any):
+  "⚠️ [N] mặt hàng có biến động giá đáng chú ý → Xem chi tiết"
+  Link to /vendors/price-alerts
+
+"NCC mới tháng này" section:
+  List vendors appearing for the first time — highlight for review
+  [Xác nhận đối tác] button
+
+Sort/filter: by spend, invoice count, risk level, price trend
+```
+
+### P29.2 — Build /vendors/price-alerts page
+```
+[Respond in Vietnamese]
+Create the complete /vendors/price-alerts page.
+
+Backend: GET /api/vendors/price-alerts?companyId=&severity=&acknowledged=false
+  Return price_anomalies records with AI explanation
+
+Page layout:
+
+Header: "Cảnh Báo Biến Động Giá" + filter toggles
+
+Filter bar: Nghiêm trọng | Cần xem xét | Thông tin | Đã xử lý
+
+Alert cards (sorted by severity then pct_deviation):
+  Each card has left border color: red=critical, orange=warning, blue=info
+  
+  Card content:
+    [SEVERITY BADGE] [ANOMALY TYPE: "Tăng giá đột biến" | "Cao hơn NCC khác" | "NCC mới" | "Chia nhỏ HĐ"]
+    Tên mặt hàng: [item_name] (bold, large)
+    Nhà cung cấp: [seller_name]
+    Giá hiện tại: [unit_price] → Giá bình quân: [baseline_price] (+ pct_deviation in red/green)
+    Ngày phát hiện: [created_at] | HĐ số: [invoice_number]
+    
+    AI Giải Thích box (light blue background):
+      "[ai_explanation text]"
+      "Đề xuất: [action]"
+    
+    Action buttons row:
+      [Xem hóa đơn] [Đánh dấu OK] [Báo lên quản lý]
+
+Price history modal (when clicking item name):
+  Line chart: unit_price over last 12 months for this item+vendor
+  Show baseline (dotted line), actual prices (solid), flag anomaly points (red dots)
+
+Summary at top: "Phát hiện ~[total_overcharge] triệu đồng chi phí bất thường tiềm tàng"
+```
+
+### P29.3 — Build /products/profitability page
+```
+[Respond in Vietnamese]
+Create the complete /products/profitability page.
+
+Backend: GET /api/products/profitability?companyId=&month=&year=
+  Requires invoice_line_items data to exist.
+  If no line_items extracted yet: show "Đang trích xuất chi tiết hàng hóa..." with progress.
+
+Page layout:
+
+Header: "Lợi Nhuận Sản Phẩm" + period selector
+
+Section 1 — 80/20 insight banner:
+  "20% sản phẩm hàng đầu đóng góp [pct]% doanh thu và [pct]% lợi nhuận"
+  Mini Pareto chart (bar + cumulative line)
+
+Section 2 — Product table (sortable):
+  Columns: Sản phẩm | Doanh thu | Giá vốn | Lợi nhuận gộp | Margin% | Phân loại
+  
+  Classification badges (BCG-style):
+    ⭐ Star: top margin + growing → "Đầu tư thêm" (green)
+    🐄 Cash Cow: high revenue, stable → "Duy trì" (blue)  
+    ❓ Question: high revenue, low margin → "Xem lại giá" (orange)
+    🐕 Dog: low both → "Cân nhắc dừng" (red)
+  
+  Margin% column: green if >30%, yellow 10-30%, red <10%
+  Sort: default by gross_profit DESC
+
+Section 3 — "Hàng Ngủ Đông" alert box (if any):
+  Red/orange banner: "5 mặt hàng đã nhập nhưng chưa bán trong 90 ngày"
+  List: item_name | last_purchase_date | estimated_value
+  "Cảnh báo: tổng giá trị tồn ước tính [X] triệu"
+
+If no line_item data available:
+  Empty state: "Tính năng này cần dữ liệu chi tiết hàng hóa từ hóa đơn XML.
+  Hệ thống đang trích xuất tự động. Quay lại sau lần đồng bộ tiếp theo."
+```
+
+---
+
+## GROUP 30 — CASHFLOW & AUDIT PAGES: COMPLETE UI
+
+### P30.1 — Build /cashflow page (90-day projection)
+```
+[Respond in Vietnamese]
+Create the complete /cashflow page.
+
+Backend: GET /api/cashflow/projection?companyId=&days=90
+  Calculate from unpaid invoices (payment_date IS NULL):
+    AR (incoming): output invoices grouped by payment_due_date
+    AP (outgoing): input invoices grouped by payment_due_date
+    Tax: ct41 amount due on 20th of next month
+  
+  If no payment_due_date set: default = invoice_date + 30 days
+  Return: daily buckets for next 90 days, running balance, summary
+
+Page layout:
+
+Header: "Dự Báo Dòng Tiền" + "90 ngày tới" label
+
+Important banner (if no payment tracking data):
+  "💡 Để dự báo chính xác hơn: đánh dấu hóa đơn đã thanh toán [Hướng dẫn]"
+
+Section 1 — Summary cards:
+  Thu dự kiến 30 ngày: [AR amount] (green)
+  Chi dự kiến 30 ngày: [AP amount] (red)
+  Thuế phải nộp: [tax amount + date] (orange)
+  Dòng tiền ròng 30 ngày: [net] (green if positive, red if negative)
+
+Section 2 — Waterfall chart (Recharts ComposedChart):
+  Bar per week: net cashflow (green=positive, red=negative)
+  Line: cumulative balance
+  X-axis: weekly dates for 12 weeks
+  Hover: shows AR + AP + tax breakdown for that week
+  Red zone: when cumulative balance goes negative (shaded background)
+
+Section 3 — Critical dates list:
+  "Ngày cần chú ý" — dates where large flows occur
+  Each: date + type (Thu tiền/Trả tiền/Thuế) + amount + who
+  Sorted by absolute amount DESC
+  Red highlight for negative-balance dates
+
+Section 4 — Overdue receivables:
+  AR invoices where payment_due_date < today AND payment_date IS NULL
+  Table: Khách hàng | Số HĐ | Hạn | Quá hạn | Số tiền | [Nhắc nợ]
+  
+  "Đánh dấu đã thu" button: opens date picker → sets payment_date
+```
+
+### P30.2 — Build /audit/anomalies page (AI Auditor — the killer feature)
+```
+[Respond in Vietnamese]
+Create the complete /audit/anomalies page. This is the highest-value page in the app.
+Make it look professional and trustworthy — this is what justifies the subscription.
+
+Backend: 
+  GET /api/audit/anomalies?companyId=&severity=&acknowledged=false&page=1
+  GET /api/audit/summary?companyId=  → counts + total_overcharge_estimate
+  PATCH /api/audit/anomalies/:id/acknowledge  (with optional note)
+  POST /api/audit/anomalies/:id/escalate  → creates CRITICAL notification to OWNER
+
+Page layout:
+
+Header: 
+  Shield icon + "Kiểm Toán AI" title
+  Sub: "Giám sát 24/7 | Cập nhật sau mỗi lần đồng bộ"
+
+Alert banner (if critical items exist — RED background):
+  "🚨 Phát hiện [N] bất thường nghiêm trọng — ước tính [X] triệu đồng chi phí bất thường"
+  [Xem ngay] button scrolls to critical items
+
+Severity filter tabs: Tất cả | 🔴 Nghiêm trọng ([N]) | ⚠️ Cần xem ([N]) | ℹ️ Thông tin ([N]) | ✅ Đã xử lý
+
+Anomaly cards:
+  Left border: 4px red=critical, orange=warning, blue=info
+  
+  Card header:
+    [SEVERITY BADGE] [TYPE BADGE: "Tăng giá đột biến" / "NCC mới giao dịch lớn" / "Chia nhỏ HĐ" / "Chênh lệch NCC"]
+    Mặt hàng: [item_name] (18px bold)
+    [seller_name] — [invoice_date] — HĐ #[invoice_number]
+  
+  Price comparison row (visual):
+    Giá bình quân: [baseline]đ  →→→  Giá này: [unit_price]đ  [+X% ▲] (red)
+  
+  AI Explanation card (light background, distinct style):
+    Robot icon + "Phân tích AI"
+    "[ai_explanation — written in simple Vietnamese for business owner]"
+    "Đề xuất hành động: [action]"
+  
+  Action buttons:
+    [Xem hóa đơn gốc] → navigate to invoice
+    [Đánh dấu OK - Đã kiểm tra] → acknowledge modal with note field
+    [🔔 Báo cáo lên Giám đốc] → POST escalate → sends push + Telegram to OWNER
+
+Vendor Risk Table (below anomaly list):
+  "Nhà cung cấp cần theo dõi"
+  Columns: NCC | Số lần bất thường (3T) | Tổng tiền chênh | Mức độ tin cậy
+  Trust score badges: Cao (green) | Trung bình (yellow) | Thấp (red)
+
+Empty state (no anomalies):
+  Green checkmark illustration
+  "✅ Không phát hiện bất thường trong kỳ này"
+  "Hệ thống kiểm tra liên tục sau mỗi lần đồng bộ hóa đơn"
+```
+
+### P30.3 — Build /reports/trends page (trend analysis)
+```
+[Respond in Vietnamese]
+Create the complete /reports/trends page.
+
+Backend: GET /api/reports/trends?companyId=&months=12
+  Return monthly aggregates: revenue, cost, vat, invoice_count, avg_invoice_value
+  Plus: top_customers (top 5 by revenue), top_suppliers (top 5 by spend)
+  Plus: seasonality insight (which months are above/below average)
+
+Page layout:
+
+Header: "Phân Tích Xu Hướng" + period selector (3T / 6T / 12T / 24T)
+Export button: "Tải báo cáo" (browser print)
+
+Section 1 — Revenue trend (Recharts AreaChart):
+  12 months area chart: revenue (blue fill) + cost (gray fill)
+  Moving average line (3-month, dashed)
+  Highlight bars: months > average (darker shade)
+  Seasonal labels: auto-detect top 3 months → show "Cao điểm" badge on X-axis
+  Y-axis: format as "Trđ" (triệu đồng)
+
+Section 2 — VAT trend (Recharts BarChart grouped):
+  Grouped bars: VAT đầu ra (blue) | VAT đầu vào (green) | Phải nộp (red)
+  6 months
+
+Section 3 — Two columns:
+  Left: Top 5 khách hàng (by revenue) — horizontal bar chart
+    Each bar: customer name (truncated) + revenue amount
+    Click bar → /crm/customers filtered to that customer
+  
+  Right: Top 5 nhà cung cấp (by spend) — same structure
+    Click → /vendors filtered to that vendor
+
+Section 4 — Invoice health trend:
+  Stacked bar: Hợp lệ (green) | Chờ xác thực (yellow) | Không hợp lệ (red) per month
+  Shows GDT compliance improvement/degradation over time
+
+Section 5 — AI Seasonal Insight (Gemini — load on page open, cache result):
+  Card with robot icon: "Phân tích Gemini AI"
+  "[Natural language seasonal insight in Vietnamese]"
+  "Gợi ý: [actionable recommendation]"
+  Fallback: "Đang phân tích dữ liệu..." loading state
+```
+
+### P30.4 — Build /reports/monthly/[year]/[month] page (month-end printable report)
+```
+[Respond in Vietnamese]
+Create the complete /reports/monthly/[year]/[month] page.
+
+Backend: GET /api/reports/monthly/:year/:month?companyId=
+  Return:
+  - company info: name, tax_code, address
+  - output summary by VAT rate (0/5/8/10): subtotal, vat, total
+  - input summary by VAT rate (0/5/8/10): subtotal, vat, total
+  - VAT reconciliation lines: ct22, ct23, ct24, ct25, ct40a, ct41, ct43
+  - notable items: pending_gdt_count, invalid_invoice_count, anomaly_count
+  - generated_at timestamp
+
+Page layout:
+
+Header:
+  Company name + MST
+  Title: "Báo Cáo Tài Chính Tháng [MM/YYYY]"
+  Generated time: [dd/MM/yyyy HH:mm]
+  Actions: [In báo cáo] [Tải Excel] [Tạo tờ khai]
+
+Section 1 — Revenue summary table:
+  Columns: Thuế suất | Doanh số chưa thuế | Thuế GTGT | Tổng doanh thu
+  Rows: 0% | 5% | 8% | 10% | TỔNG CỘNG
+  Bold total row, VND formatting, print-friendly borders
+
+Section 2 — Purchase summary table:
+  Same structure for input invoices
+  Highlight deductible VAT subtotal row
+
+Section 3 — VAT reconciliation panel:
+  [22] Tổng VAT đầu vào
+  [23] VAT đầu vào đủ điều kiện khấu trừ
+  [24] VAT còn được khấu trừ kỳ trước chuyển sang
+  [25] Tổng VAT được khấu trừ
+  [40a] Tổng VAT đầu ra
+  [41] VAT phải nộp kỳ này
+  [43] VAT còn được khấu trừ chuyển kỳ sau
+
+  Color rules:
+    ct41 > 0 → red/orange emphasis
+    ct43 > 0 → green emphasis
+
+Section 4 — Notable items / alerts:
+  - HĐ chưa xác thực GDT: [count] → link to filtered invoice list
+  - HĐ không hợp lệ: [count]
+  - Bất thường AI: [count] → link /audit/anomalies
+  - Gợi ý ngắn: "Cần kiểm tra trước khi nộp tờ khai" if any warning count > 0
+
+Section 5 — Print optimization:
+  A4 portrait layout
+  Hide navigation/header/footer app chrome in print mode
+  Keep tables on page where possible, avoid row breaking
+
+If the API has no monthly data yet:
+  Show empty state with CTA:
+  "Chưa có đủ dữ liệu để lập báo cáo tháng này" + [Đồng bộ ngay]
+```
+

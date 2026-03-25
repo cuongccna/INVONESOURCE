@@ -17,6 +17,20 @@ import aiRouter from './routes/ai';
 import dashboardRouter from './routes/dashboard';
 import companiesRouter from './routes/companies';
 import notificationsRouter from './routes/notifications';
+import portfolioRouter from './routes/portfolio';
+import groupRouter from './routes/group';
+import organizationsRouter from './routes/organizations';
+import compareRouter from './routes/compare';
+import crmRouter from './routes/crm';
+import vendorsRouter from './routes/vendors';
+import productsRouter from './routes/products';
+import forecastRouter from './routes/forecast';
+import cashflowRouter from './routes/cashflow';
+import telegramRouter from './routes/telegram';
+import esgRouter from './routes/esg';
+import repurchaseRouter from './routes/repurchase';
+import auditRouter from './routes/audit';
+import insightsRouter from './routes/insights';
 import { registry } from './connectors/ConnectorRegistry';
 import { MisaConnector } from './connectors/MisaConnector';
 import { ViettelConnector } from './connectors/ViettelConnector';
@@ -25,13 +39,36 @@ import { GdtIntermediaryConnector } from './connectors/GdtIntermediaryConnector'
 import { scheduleSyncCron } from './jobs/SyncWorker';
 import { gdtValidateWorker } from './jobs/GdtValidatorWorker';
 import { scheduleTaxDeadlineReminder } from './jobs/TaxDeadlineReminderJob';
+import { scheduleRepurchaseAlertJob } from './jobs/RepurchaseAlertJob';
 
 const app = express();
+
+const fallbackOrigins = ['http://localhost:3000', 'http://127.0.0.1:3000'];
+const configuredOrigins = [
+  ...(env.FRONTEND_URL ? [env.FRONTEND_URL] : []),
+  ...(env.FRONTEND_URLS
+    ? env.FRONTEND_URLS.split(',').map((o) => o.trim()).filter(Boolean)
+    : []),
+  ...fallbackOrigins,
+];
+const allowOriginSet = new Set(configuredOrigins);
 
 // ─── Security middleware ────────────────────────────────────────────────────
 app.use(helmet());
 app.use(cors({
-  origin: env.FRONTEND_URL ?? 'http://localhost:3000',
+  origin(origin, callback) {
+    // Allow server-to-server and non-browser requests (no Origin header)
+    if (!origin) return callback(null, true);
+
+    if (allowOriginSet.has(origin)) return callback(null, true);
+
+    // Convenience for LAN testing in development
+    if (env.NODE_ENV === 'development' && /^http:\/\/192\.168\.[0-9]{1,3}\.[0-9]{1,3}:3000$/.test(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error(`CORS blocked origin: ${origin}`));
+  },
   credentials: true,
 }));
 app.use(express.json({ limit: '10mb' }));
@@ -50,7 +87,21 @@ app.use('/api/reports', reportsRouter);
 app.use('/api/declarations', declarationsRouter);
 app.use('/api/ai', aiRouter);
 app.use('/api/dashboard', dashboardRouter);
+app.use('/api/portfolio', portfolioRouter);
+app.use('/api/group', groupRouter);
+app.use('/api/organizations', organizationsRouter);
+app.use('/api/crm', crmRouter);
+app.use('/api/vendors', vendorsRouter);
+app.use('/api/products', productsRouter);
+app.use('/api/forecast', forecastRouter);
+app.use('/api/cashflow', cashflowRouter);
+app.use('/api/telegram', telegramRouter);
+app.use('/api/compare', compareRouter);
 app.use('/api/notifications', notificationsRouter);
+app.use('/api/esg', esgRouter);
+app.use('/api/crm/repurchase', repurchaseRouter);
+app.use('/api/audit', auditRouter);
+app.use('/api/insights', insightsRouter);
 
 // Health check (unauthenticated)
 app.get('/health', (_req, res) => {
@@ -83,6 +134,7 @@ async function start(): Promise<void> {
   // gdtValidateWorker is auto-started on import
   void gdtValidateWorker;
   await scheduleTaxDeadlineReminder();
+  await scheduleRepurchaseAlertJob();
   console.info('[Jobs] BullMQ workers started');
 
   app.listen(env.API_PORT, () => {

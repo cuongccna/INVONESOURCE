@@ -6,7 +6,12 @@
 -- Add company_type enum + extra columns to companies
 -- ============================================================
 
-CREATE TYPE company_type AS ENUM ('private', 'jsc', 'partnership', 'household', 'other');
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'company_type') THEN
+    CREATE TYPE company_type AS ENUM ('private', 'jsc', 'partnership', 'household', 'other');
+  END IF;
+END$$;
 
 ALTER TABLE companies
   ADD COLUMN IF NOT EXISTS company_type  company_type  DEFAULT 'private',

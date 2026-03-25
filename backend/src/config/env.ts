@@ -41,6 +41,10 @@ const envSchema = z.object({
     .string({ required_error: 'GEMINI_API_KEY is required' })
     .min(1),
 
+  GEMINI_MODEL: z
+    .string()
+    .default('gemini-1.5-flash'),
+
   APP_URL: z
     .string({ required_error: 'APP_URL is required' })
     .url('APP_URL must be a valid URL')
@@ -50,6 +54,10 @@ const envSchema = z.object({
     .string()
     .url()
     .default('http://localhost:3000'),
+
+  // Optional comma-separated origins, e.g.
+  // FRONTEND_URLS=http://localhost:3000,http://192.168.1.168:3000
+  FRONTEND_URLS: z.string().optional(),
 
   ENCRYPTION_KEY: z
     .string({ required_error: 'ENCRYPTION_KEY is required' })
@@ -61,6 +69,9 @@ const envSchema = z.object({
   GDT_INTERMEDIARY_CLIENT_ID: z.string().optional(),
   GDT_INTERMEDIARY_CLIENT_SECRET: z.string().optional(),
   GDT_INTERMEDIARY_SCOPE: z.string().default('invoice:read'),
+
+  // Telegram bot — optional
+  TELEGRAM_BOT_TOKEN: z.string().optional(),
 });
 
 type Env = z.infer<typeof envSchema>;

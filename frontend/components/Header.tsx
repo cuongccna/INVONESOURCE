@@ -65,15 +65,15 @@ export default function Header() {
 
   const activeOrgId = activeCompany?.organization_id ?? orgId ?? null;
   const modeTitle = mode === 'portfolio'
-    ? 'Toan bo doanh nghiep'
+    ? 'Toàn bộ doanh nghiệp'
     : mode === 'group'
-      ? 'Hop nhat theo nhom'
-      : (activeCompany?.name ?? 'Chon cong ty');
+      ? 'Hợp nhất theo nhóm'
+      : (activeCompany?.name ?? 'Chọn công ty');
   const modeSubtitle = mode === 'single'
     ? (activeCompany?.tax_code ?? '—')
     : mode === 'group'
-      ? `Organization: ${activeOrgId ?? 'Chua xac dinh'}`
-      : `${companies.length} cong ty trong danh muc`;
+      ? `Tổ chức: ${activeOrgId ?? 'Chưa xác định'}`
+      : `${companies.length} công ty trong danh mục`;
 
   return (
     <header className="fixed top-0 left-0 right-0 z-40 bg-white border-b border-gray-100 shadow-sm">
@@ -122,7 +122,7 @@ export default function Header() {
           {showSwitcher && companies.length > 0 && (
             <div className="absolute top-full left-0 mt-1 w-72 bg-white rounded-xl shadow-lg border border-gray-100 overflow-hidden z-50">
               <div className="border-b border-gray-100 p-2 space-y-1.5">
-                <p className="px-2 text-[11px] font-semibold uppercase tracking-wide text-gray-500">Che do xem</p>
+                <p className="px-2 text-[11px] font-semibold uppercase tracking-wide text-gray-500">Chế độ xem</p>
                 <button
                   onClick={() => {
                     if (!activeCompany?.id) return;
@@ -134,7 +134,7 @@ export default function Header() {
                     mode === 'single' ? 'bg-blue-50 text-blue-700' : 'hover:bg-gray-50 text-gray-700'
                   }`}
                 >
-                  Don vi don le
+                  Đơn vị đơn lẻ
                 </button>
                 <button
                   onClick={() => {
@@ -146,7 +146,7 @@ export default function Header() {
                     mode === 'portfolio' ? 'bg-amber-50 text-amber-700' : 'hover:bg-gray-50 text-gray-700'
                   }`}
                 >
-                  Danh muc toan bo
+                  Danh mục toàn bộ
                 </button>
                 <button
                   onClick={() => {
@@ -160,11 +160,11 @@ export default function Header() {
                     mode === 'group' ? 'bg-emerald-50 text-emerald-700' : 'hover:bg-gray-50 text-gray-700'
                   } disabled:bg-gray-100 disabled:text-gray-400`}
                 >
-                  Hop nhat theo nhom
+                  Hợp nhất theo nhóm
                 </button>
               </div>
               <div className="p-2">
-                <p className="px-2 pb-1 text-[11px] font-semibold uppercase tracking-wide text-gray-500">Cong ty</p>
+                <p className="px-2 pb-1 text-[11px] font-semibold uppercase tracking-wide text-gray-500">Công ty</p>
                 {companies.map((c) => (
                   <button
                     key={c.id}

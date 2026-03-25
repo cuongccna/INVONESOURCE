@@ -7,6 +7,7 @@ import { env } from '../config/env';
 import { NormalizedInvoice } from 'shared';
 import { v4 as uuidv4 } from 'uuid';
 import { enqueueGdtValidation } from './GdtValidatorWorker';
+import { priceAnomalyDetector } from '../services/PriceAnomalyDetector';
 
 export interface SyncJobPayload {
   companyId: string;
@@ -297,6 +298,16 @@ export const syncWorker = new Worker<SyncJobPayload>(
         'Đồng bộ hoàn tất',
         `Đồng bộ xong ${totalFetched} hóa đơn`
       );
+
+      // Auto-run price anomaly detection after each sync — isolated, never throws
+      try {
+        const anomalies = await priceAnomalyDetector.detectAnomalies(companyId);
+        if (anomalies.length > 0) {
+          console.log(`[SyncWorker] Anomaly auto-detect: ${anomalies.length} anomalies found for company ${companyId}`);
+        }
+      } catch (err) {
+        console.warn(`[SyncWorker] Anomaly auto-detect failed (non-critical):`, (err as Error).message);
+      }
     }
 
     console.log(`[SyncWorker] Completed sync for company ${companyId}: ${totalFetched} records`);

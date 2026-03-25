@@ -32,7 +32,7 @@ export interface AnomalyReport {
  * then enhances top findings with Gemini AI explanations.
  */
 export class GeminiAnomalyService {
-  private model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+  private model = genAI.getGenerativeModel({ model: env.GEMINI_MODEL });
 
   async analyzeAnomalies(
     companyId: string,

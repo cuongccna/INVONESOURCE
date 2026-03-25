@@ -5,11 +5,15 @@ import { AuthError, ForbiddenError } from '../utils/AppError';
 
 export type UserRole = 'OWNER' | 'ADMIN' | 'ACCOUNTANT' | 'VIEWER';
 
+export type ViewMode = 'single' | 'group' | 'portfolio';
+
 export interface JwtPayload {
   userId: string;
   email: string;
   role: UserRole;
   companyId?: string;
+  viewMode?: ViewMode;
+  organizationId?: string | null;
 }
 
 declare global {

@@ -112,25 +112,54 @@ function TopTable({ rows, caption }: { rows: Analytics['topCustomers']; caption:
   );
 }
 
+interface VatForecast {
+  forecast_output_vat: number;
+  forecast_input_vat: number;
+  forecast_payable: number;
+  carry_forward: number;
+  net_forecast: number;
+  periods_used: number;
+  confidence_note: string;
+}
+
+interface EsgWidgetData {
+  total_tco2e: number;
+  by_category: Array<{ category_name: string; tco2e: number }>;
+}
+
+interface QuickAction {
+  key: string;
+  icon: string;
+  label: string;
+  href: string;
+  count?: number;
+  color: string;
+}
+
 export default function DashboardPage() {
   const [kpi, setKpi] = useState<KpiData | null>(null);
   const [chart, setChart] = useState<ChartData | null>(null);
   const [analytics, setAnalytics] = useState<Analytics | null>(null);
   const [anomalies, setAnomalies] = useState<AnomalyReport | null>(null);
   const [loadingAnomalies, setLoadingAnomalies] = useState(false);
+  const [forecast, setForecast] = useState<VatForecast | null>(null);
+  const [esg, setEsg] = useState<EsgWidgetData | null>(null);
   const [loading, setLoading] = useState(true);
   const [analyticsPeriod, setAnalyticsPeriod] = useState(3);
+  const [quickActions, setQuickActions] = useState<QuickAction[]>([]);
 
   const load = useCallback(async (period = analyticsPeriod) => {
     try {
-      const [kpiRes, chartRes, analyticsRes] = await Promise.all([
+      const [kpiRes, chartRes, analyticsRes, forecastRes] = await Promise.all([
         apiClient.get<{ data: KpiData }>('/dashboard/kpi'),
         apiClient.get<{ data: ChartData }>('/dashboard/charts'),
         apiClient.get<{ data: Analytics }>(`/dashboard/analytics?months=${period}`),
+        apiClient.get<{ data: VatForecast }>('/forecast/vat').catch(() => ({ data: { data: null } })),
       ]);
       setKpi(kpiRes.data.data);
       setChart(chartRes.data.data);
       setAnalytics(analyticsRes.data.data);
+      setForecast((forecastRes as { data: { data: VatForecast | null } }).data.data);
     } catch {
       // silent
     } finally {
@@ -139,6 +168,20 @@ export default function DashboardPage() {
   }, [analyticsPeriod]);
 
   useEffect(() => { void load(); }, [load]);
+
+  useEffect(() => {
+    apiClient.get<{ data: { actions: QuickAction[] } }>('/dashboard/quick-actions')
+      .then((res) => setQuickActions(res.data.data.actions))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const year = new Date().getFullYear();
+    apiClient
+      .get<{ data: EsgWidgetData }>(`/esg/estimate?year=${year}`)
+      .then((res) => setEsg(res.data.data))
+      .catch(() => {});
+  }, []);
 
   const handlePeriodChange = (p: number) => {
     setAnalyticsPeriod(p);
@@ -435,22 +478,130 @@ export default function DashboardPage() {
         )}
       </div>
 
+      {/* ── VAT Forecast + Tax Calendar ── */}
+      {forecast && forecast.periods_used > 0 && (() => {
+        const now2 = new Date();
+        const deadlineDay = 20;
+        const nextMonth = new Date(now2.getFullYear(), now2.getMonth() + 1, deadlineDay);
+        const daysToDeadline = Math.ceil((nextMonth.getTime() - now2.getTime()) / 86_400_000);
+        const currentPayable = kpi?.vat ? Number(kpi.vat.payable_vat) : 0;
+        return (
+          <div className="bg-white rounded-xl shadow-sm p-4 space-y-4">
+            <h2 className="text-sm font-semibold text-gray-700">📈 Dự Báo Thuế GTGT Tháng Sau</h2>
+
+            {/* Forecast compare bar */}
+            <div className="space-y-2">
+              {[
+                { label: 'Tháng này (tt)', val: currentPayable, color: 'bg-blue-400' },
+                { label: 'Dự báo tháng sau', val: forecast.net_forecast, color: 'bg-amber-400' },
+              ].map((row) => {
+                const max = Math.max(currentPayable, forecast.net_forecast, 1);
+                return (
+                  <div key={row.label} className="flex items-center gap-3">
+                    <span className="text-xs text-gray-500 w-36 shrink-0">{row.label}</span>
+                    <div className="flex-1 bg-gray-100 rounded-full h-2.5 overflow-hidden">
+                      <div className={`h-full rounded-full ${row.color}`} style={{ width: `${Math.min((row.val / max) * 100, 100)}%` }} />
+                    </div>
+                    <span className="text-xs font-semibold text-gray-800 w-20 text-right">
+                      {compact(row.val)}₫
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+
+            <p className="text-xs text-gray-400">{forecast.confidence_note}</p>
+
+            {/* Tax calendar */}
+            <div className="border-t border-gray-100 pt-3">
+              <p className="text-xs font-semibold text-gray-600 mb-2">📅 Lịch Thuế</p>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-gray-600">Hạn nộp kỳ này</span>
+                  <span className={`font-semibold ${daysToDeadline <= 5 ? 'text-red-600' : daysToDeadline <= 10 ? 'text-amber-600' : 'text-gray-800'}`}>
+                    Ngày 20/{now2.getMonth() + 2 > 12 ? `01/${now2.getFullYear()+1}` : `${now2.getMonth() + 2}/${now2.getFullYear()}`}
+                    &nbsp;({daysToDeadline > 0 ? `còn ${daysToDeadline} ngày` : 'Đã quá hạn'})
+                  </span>
+                </div>
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-gray-600">Dự kiến phải nộp</span>
+                  <span className="font-semibold text-amber-700">{compact(forecast.net_forecast)}₫</span>
+                </div>
+                {forecast.carry_forward > 0 && (
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="text-gray-600">Khấu trừ chuyển kỳ</span>
+                    <span className="font-semibold text-green-700">-{compact(forecast.carry_forward)}₫</span>
+                  </div>
+                )}
+              </div>
+              {/* Visual timeline */}
+              <div className="mt-3 flex items-center gap-1 text-xs text-gray-400">
+                <div className="flex-1 h-px bg-gray-200" />
+                <div className="flex flex-col items-center gap-0.5">
+                  <div className={`w-3 h-3 rounded-full ${daysToDeadline <= 5 ? 'bg-red-500' : 'bg-amber-400'}`} />
+                  <span>20/{now2.getMonth() + 2 > 12 ? 1 : now2.getMonth() + 2}</span>
+                </div>
+                <div className="flex-1 h-px bg-gray-200" />
+                <div className="flex flex-col items-center gap-0.5">
+                  <div className="w-3 h-3 rounded-full bg-gray-300" />
+                  <span>20/{now2.getMonth() + 3 > 12 ? 1 : now2.getMonth() + 3}</span>
+                </div>
+                <div className="flex-1 h-px bg-gray-200" />
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ── ESG Quick Widget ── */}
+      {esg && (
+        <div className="bg-white rounded-xl shadow-sm p-4">
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-sm font-semibold text-gray-700">Ước Tính Phát Thải Carbon (ESG)</h2>
+            <Link href="/insights/seasonal" className="text-xs text-primary-600 hover:underline">
+              Phân Tích Mùa Vụ →
+            </Link>
+          </div>
+          <p className="text-2xl font-bold text-emerald-700">
+            {esg.total_tco2e.toLocaleString('vi-VN', { maximumFractionDigits: 2 })} tCO2e
+          </p>
+          <p className="text-xs text-gray-400 mt-1">Lượng CO₂ tương đương ước tính từ hóa đơn mua vào năm nay</p>
+          <p className="text-xs text-amber-600 mt-1">⚠️ Chỉ mang tính tham khảo — chưa qua kiểm toán ESG chính thức</p>
+          <div className="mt-3 space-y-1.5">
+            {esg.by_category.slice(0, 3).map((c, i) => (
+              <div key={`${c.category_name}-${i}`} className="flex items-center justify-between text-xs">
+                <span className="text-gray-600 truncate">{c.category_name}</span>
+                <span className="font-semibold text-gray-800">{c.tco2e.toFixed(2)} t</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* ── Quick Actions ── */}
       <div className="bg-white rounded-xl shadow-sm p-4">
         <h2 className="text-sm font-semibold text-gray-700 mb-3">Thao Tác Nhanh</h2>
         <div className="grid grid-cols-2 gap-2">
-          <Link href="/invoices" className="flex items-center gap-2 p-3 rounded-lg bg-blue-50 text-blue-700 text-sm font-medium">
-            <span>📄</span> Xem Hóa Đơn
-          </Link>
-          <Link href="/declarations" className="flex items-center gap-2 p-3 rounded-lg bg-green-50 text-green-700 text-sm font-medium">
-            <span>📊</span> Tờ Khai
-          </Link>
-          <Link href="/settings/connectors" className="flex items-center gap-2 p-3 rounded-lg bg-purple-50 text-purple-700 text-sm font-medium">
-            <span>🔗</span> Kết Nối nhà mạng
-          </Link>
-          <Link href="/ai" className="flex items-center gap-2 p-3 rounded-lg bg-orange-50 text-orange-700 text-sm font-medium">
-            <span>🤖</span> Trợ Lý AI
-          </Link>
+          {(quickActions.length > 0
+            ? quickActions
+            : [
+                { key: 'invoices', icon: '📄', label: 'Xem Hóa Đơn', href: '/invoices', color: 'bg-blue-50 text-blue-700' },
+                { key: 'declarations', icon: '📊', label: 'Tờ Khai', href: '/declarations', color: 'bg-green-50 text-green-700' },
+                { key: 'connectors', icon: '🔗', label: 'Kết Nối nhà mạng', href: '/settings/connectors', color: 'bg-purple-50 text-purple-700' },
+                { key: 'ai', icon: '🤖', label: 'Trợ Lý AI', href: '/ai', color: 'bg-orange-50 text-orange-700' },
+              ]
+          ).map((action) => (
+            <Link key={action.key} href={action.href}
+              className={`flex items-center gap-2 p-3 rounded-lg text-sm font-medium relative ${action.color}`}>
+              <span>{action.icon}</span>
+              <span className="flex-1 leading-tight">{action.label}</span>
+              {action.count != null && action.count > 0 && (
+                <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] px-1 rounded-full bg-red-500 text-white text-[10px] font-bold flex items-center justify-center">
+                  {action.count}
+                </span>
+              )}
+            </Link>
+          ))}
         </div>
       </div>
     </div>

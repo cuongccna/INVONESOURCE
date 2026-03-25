@@ -14,7 +14,7 @@ export interface ChatMessage {
  * Provides context about the company's invoice data for each query.
  */
 export class GeminiChatService {
-  private model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+  private model = genAI.getGenerativeModel({ model: env.GEMINI_MODEL });
 
   async chat(
     companyId: string,

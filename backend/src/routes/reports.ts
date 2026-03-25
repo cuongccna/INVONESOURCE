@@ -129,4 +129,77 @@ router.get('/monthly-summary', async (req: Request, res: Response, next: NextFun
   }
 });
 
+// GET /api/reports/trends?months=12 — monthly trend aggregates for trend analysis page
+router.get('/trends', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const months = Math.min(24, Math.max(3, parseInt(String(req.query['months'] ?? '12'))));
+    const companyId = req.user!.companyId!;
+
+    const [monthly, topCustomers, topSuppliers] = await Promise.all([
+      pool.query<{
+        period_year: number; period_month: number;
+        revenue: string; cost: string; output_vat: string; input_vat: string;
+        payable_vat: string; invoice_count: string; valid_count: string;
+        invalid_count: string; unvalidated_count: string; avg_invoice_value: string;
+      }>(
+        `SELECT
+           EXTRACT(YEAR FROM invoice_date)::int  AS period_year,
+           EXTRACT(MONTH FROM invoice_date)::int AS period_month,
+           COALESCE(SUM(subtotal) FILTER (WHERE direction='output'), 0)            AS revenue,
+           COALESCE(SUM(subtotal) FILTER (WHERE direction='input'), 0)             AS cost,
+           COALESCE(SUM(vat_amount) FILTER (WHERE direction='output'), 0)          AS output_vat,
+           COALESCE(SUM(vat_amount) FILTER (WHERE direction='input'), 0)           AS input_vat,
+           COALESCE(SUM(vat_amount) FILTER (WHERE direction='output'), 0)
+             - COALESCE(SUM(vat_amount) FILTER (WHERE direction='input' AND gdt_validated=true), 0)
+                                                                                   AS payable_vat,
+           COUNT(*)                                                                AS invoice_count,
+           COUNT(*) FILTER (WHERE status='valid')                                 AS valid_count,
+           COUNT(*) FILTER (WHERE status='cancelled')                             AS invalid_count,
+           COUNT(*) FILTER (WHERE gdt_validated=false AND status='valid')         AS unvalidated_count,
+           CASE WHEN COUNT(*) > 0 THEN (SUM(total_amount) / COUNT(*)) ELSE 0 END AS avg_invoice_value
+         FROM invoices
+         WHERE company_id = $1
+           AND invoice_date >= DATE_TRUNC('month', NOW()) - ($2 - 1) * INTERVAL '1 month'
+         GROUP BY period_year, period_month
+         ORDER BY period_year, period_month`,
+        [companyId, months]
+      ),
+      pool.query<{ buyer_name: string; total_revenue: string }>(
+        `SELECT
+           COALESCE(buyer_name, buyer_tax_code) AS buyer_name,
+           SUM(total_amount) AS total_revenue
+         FROM invoices
+         WHERE company_id = $1 AND direction = 'output' AND status = 'valid'
+           AND invoice_date >= NOW() - INTERVAL '12 months'
+           AND buyer_name IS NOT NULL
+         GROUP BY COALESCE(buyer_name, buyer_tax_code)
+         ORDER BY total_revenue DESC NULLS LAST
+         LIMIT 5`,
+        [companyId]
+      ),
+      pool.query<{ seller_name: string; total_spend: string }>(
+        `SELECT
+           COALESCE(seller_name, seller_tax_code) AS seller_name,
+           SUM(total_amount) AS total_spend
+         FROM invoices
+         WHERE company_id = $1 AND direction = 'input' AND status = 'valid'
+           AND invoice_date >= NOW() - INTERVAL '12 months'
+           AND seller_name IS NOT NULL
+         GROUP BY COALESCE(seller_name, seller_tax_code)
+         ORDER BY total_spend DESC NULLS LAST
+         LIMIT 5`,
+        [companyId]
+      ),
+    ]);
+
+    sendSuccess(res, {
+      monthly: monthly.rows,
+      topCustomers: topCustomers.rows,
+      topSuppliers: topSuppliers.rows,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 export default router;

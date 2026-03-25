@@ -158,4 +158,85 @@ router.get('/analytics', async (req: Request, res: Response, next: NextFunction)
   }
 });
 
+// GET /api/dashboard/quick-actions — context-aware action cards
+router.get('/quick-actions', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId;
+    const now = new Date();
+    const month = now.getMonth() + 1;
+    const year = now.getFullYear();
+    const nextMonth20 = new Date(year, month, 20); // 20th of next month
+    const daysUntilDeadline = Math.ceil((nextMonth20.getTime() - now.getTime()) / 86_400_000);
+
+    const [anomalyRes, overdueRes, priceAlertRes, repurchaseRes, circuitRes] = await Promise.all([
+      pool.query<{ cnt: string }>(
+        `SELECT COUNT(*) AS cnt FROM price_anomalies WHERE company_id = $1 AND is_acknowledged = false`,
+        [companyId]
+      ),
+      pool.query<{ cnt: string }>(
+        `SELECT COUNT(DISTINCT buyer_tax_code) AS cnt
+         FROM invoices
+         WHERE company_id = $1 AND direction = 'output' AND status = 'valid'
+           AND payment_date IS NULL
+           AND COALESCE(payment_due_date, invoice_date + INTERVAL '30 days') < NOW()`,
+        [companyId]
+      ),
+      pool.query<{ cnt: string }>(
+        `SELECT COUNT(*) AS cnt FROM price_anomalies WHERE company_id = $1 AND is_acknowledged = false AND severity = 'critical'`,
+        [companyId]
+      ),
+      pool.query<{ cnt: string }>(
+        `SELECT COUNT(*) AS cnt FROM repurchase_predictions WHERE company_id = $1 AND is_actioned = false AND predicted_next_date <= NOW() + INTERVAL '7 days'`,
+        [companyId]
+      ),
+      pool.query<{ cnt: string }>(
+        `SELECT COUNT(*) AS cnt FROM connector_credentials WHERE company_id = $1 AND circuit_state = 'open'`,
+        [companyId]
+      ).catch(() => ({ rows: [{ cnt: '0' }] })),
+    ]);
+
+    const actions: Array<{ key: string; icon: string; label: string; href: string; count?: number; color: string }> = [];
+
+    // Always show
+    actions.push({ key: 'invoices', icon: '📄', label: 'Xem Hóa Đơn', href: '/invoices', color: 'bg-blue-50 text-blue-700' });
+    actions.push({ key: 'ai', icon: '🤖', label: 'Trợ Lý AI', href: '/ai', color: 'bg-orange-50 text-orange-700' });
+
+    // Conditional
+    const anomalyCount = parseInt(anomalyRes.rows[0]?.cnt ?? '0', 10);
+    if (anomalyCount > 0) {
+      actions.push({ key: 'anomalies', icon: '🔴', label: `${anomalyCount} Bất thường giá`, href: '/audit/anomalies', count: anomalyCount, color: 'bg-red-50 text-red-700' });
+    }
+
+    if (daysUntilDeadline <= 10) {
+      actions.push({ key: 'declarations', icon: '📅', label: `Nộp tờ khai (${daysUntilDeadline}d)`, href: '/declarations', color: 'bg-green-50 text-green-700' });
+    }
+
+    const overdueCount = parseInt(overdueRes.rows[0]?.cnt ?? '0', 10);
+    if (overdueCount > 0) {
+      actions.push({ key: 'aging', icon: '💰', label: `${overdueCount} HĐ đến hạn`, href: '/crm/aging', count: overdueCount, color: 'bg-amber-50 text-amber-700' });
+    }
+
+    const repurchaseCount = parseInt(repurchaseRes.rows[0]?.cnt ?? '0', 10);
+    if (repurchaseCount > 0) {
+      actions.push({ key: 'repurchase', icon: '📈', label: 'Dự đoán mua lại', href: '/crm/repurchase', count: repurchaseCount, color: 'bg-indigo-50 text-indigo-700' });
+    }
+
+    const circuitOpen = parseInt(circuitRes.rows[0]?.cnt ?? '0', 10);
+    if (circuitOpen > 0) {
+      actions.push({ key: 'connectors', icon: '⚠️', label: 'Lỗi kết nối', href: '/settings/connectors', color: 'bg-red-50 text-red-700' });
+    }
+
+    const priceAlertCount = parseInt(priceAlertRes.rows[0]?.cnt ?? '0', 10);
+    if (priceAlertCount > 0) {
+      actions.push({ key: 'price-alerts', icon: '🏭', label: `${priceAlertCount} Giá NCC tăng`, href: '/vendors/price-alerts', count: priceAlertCount, color: 'bg-orange-50 text-orange-700' });
+    }
+
+    // Return top 4 most actionable
+    sendSuccess(res, { actions: actions.slice(0, 4) });
+  } catch (err) {
+    next(err);
+  }
+});
+
 export default router;
+
