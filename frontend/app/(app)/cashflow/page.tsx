@@ -31,7 +31,9 @@ interface CashflowData {
   tax_due_date: string | null;
 }
 
-const compact = (n: number) => n.toLocaleString('vi-VN', { notation: 'compact', maximumFractionDigits: 1 });
+import { formatVND, formatVNDShort } from '../../../utils/formatCurrency';
+
+const compact = formatVND;
 
 function daysOverdue(due: string) {
   return Math.floor((Date.now() - new Date(due).getTime()) / 86_400_000);
@@ -162,8 +164,8 @@ export default function CashflowPage() {
               onClick={(e) => e?.activePayload && setSelected(e.activePayload[0]?.payload as DailyFlow)}>
               <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
               <XAxis dataKey="label" tick={{ fontSize: 9 }} angle={-35} textAnchor="end" interval={Math.floor(chartData.length / 8)} />
-              <YAxis yAxisId="bar" tick={{ fontSize: 9 }} tickFormatter={(v: number) => `${(v / 1e6).toFixed(0)}`} />
-              <YAxis yAxisId="line" orientation="right" tick={{ fontSize: 9 }} tickFormatter={(v: number) => `${(v / 1e6).toFixed(0)}`} />
+              <YAxis yAxisId="bar" tick={{ fontSize: 9 }} tickFormatter={(v: number) => formatVNDShort(v)} />
+              <YAxis yAxisId="line" orientation="right" tick={{ fontSize: 9 }} tickFormatter={(v: number) => formatVNDShort(v)} />
               <Tooltip
                 formatter={(v: number, name: string) => [`${compact(v)}₫`, name]}
                 labelFormatter={(l) => `Ngày ${l}`}

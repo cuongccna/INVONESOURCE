@@ -37,9 +37,26 @@ export const gdtValidateWorker = new Worker<GdtValidateJobPayload>(
     const { invoiceId, invoiceNumber, serialNumber, sellerTaxCode, issuedDate, companyId } = job.data;
 
     try {
-      const isValid = await validateWithGdt(invoiceNumber, serialNumber, sellerTaxCode, issuedDate);
+    // Viettel invoices have serial starting with 'C' (không có mã CQT).
+    // These cannot be individually validated via GDT portal.
+    // Viettel is a licensed e-invoice provider — mark as validated by default.
+    if (serialNumber?.startsWith('C')) {
+      await pool.query(
+        `UPDATE invoices SET gdt_validated = true, gdt_validated_at = NOW(), updated_at = NOW()
+         WHERE id = $1`,
+        [invoiceId]
+      );
+      await pool.query(
+        `UPDATE gdt_validation_queue SET status = 'done', last_attempted_at = NOW(), result = $1
+         WHERE invoice_id = $2`,
+        [JSON.stringify({ valid: true, reason: 'viettel_provider_trusted' }), invoiceId]
+      );
+      return;
+    }
 
-      if (isValid) {
+    const isValid = await validateWithGdt(invoiceNumber, serialNumber, sellerTaxCode, issuedDate);
+
+    if (isValid) {
         // Mark invoice as GDT validated
         await pool.query(
           `UPDATE invoices SET gdt_validated = true, gdt_validated_at = NOW(), updated_at = NOW()

@@ -35,11 +35,9 @@ interface TrendsData {
   topSuppliers: TopItem[];
 }
 
-const fmtM = (n: number) => {
-  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}Tỷ`;
-  if (n >= 1_000_000) return `${Math.round(n / 1_000_000)}Trđ`;
-  return `${Math.round(n / 1_000)}K`;
-};
+import { formatVNDShort, formatVND } from '../../../../utils/formatCurrency';
+
+const fmtM = formatVNDShort;
 
 const MONTH_LABELS = ['T1','T2','T3','T4','T5','T6','T7','T8','T9','T10','T11','T12'];
 

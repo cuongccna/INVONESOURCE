@@ -3,12 +3,13 @@
 import { useEffect, useState, useCallback } from 'react';
 import Link from 'next/link';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
+import { formatVND, formatVNDShort } from '../../../utils/formatCurrency';
 import apiClient from '../../../lib/apiClient';
 import { useView } from '../../../contexts/ViewContext';
 
 const compact = (n: number) =>
-  n.toLocaleString('vi-VN', { notation: 'compact', maximumFractionDigits: 1 });
-const mVnd = (n: number) => `${Math.round(n / 1_000_000).toLocaleString('vi-VN')}M`;
+  formatVND(n);
+const mVnd = formatVND;
 
 interface CompanySummary {
   company_id: string;
@@ -147,8 +148,8 @@ export default function PortfolioPage() {
                 <BarChart data={trendChartData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
                   <XAxis dataKey="name" tick={{ fontSize: 10 }} />
-                  <YAxis tick={{ fontSize: 10 }} width={45} />
-                  <Tooltip formatter={(val: number) => `${val.toLocaleString('vi-VN')} triệu`} />
+                  <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v * 1_000_000)} />
+                  <Tooltip formatter={(val: number) => formatVND(Number(val) * 1_000_000)} />
                   <Legend wrapperStyle={{ fontSize: 11 }} />
                   <Bar dataKey="Doanh thu" fill="#f59e0b" radius={[3, 3, 0, 0]} maxBarSize={16} />
                   <Bar dataKey="Chi phí" fill="#94a3b8" radius={[3, 3, 0, 0]} maxBarSize={16} />

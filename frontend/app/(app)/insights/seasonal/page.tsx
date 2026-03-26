@@ -10,6 +10,7 @@ import {
   CartesianGrid,
   Tooltip,
 } from 'recharts';
+import { formatVND } from '../../../../utils/formatCurrency';
 import apiClient from '../../../../lib/apiClient';
 
 interface SeasonalPoint {
@@ -80,7 +81,7 @@ export default function SeasonalInsightsPage() {
               <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
               <XAxis dataKey="name" tick={{ fontSize: 10 }} />
               <YAxis tick={{ fontSize: 10 }} width={45} />
-              <Tooltip formatter={(v: number) => `${v.toLocaleString('vi-VN')} triệu`} />
+              <Tooltip formatter={(v: number) => formatVND(Number(v) * 1_000_000)} />
               <Bar dataKey="revenue" name="Doanh thu" fill="#2563eb" radius={[3, 3, 0, 0]} />
               <Bar dataKey="spend" name="Chi phí" fill="#059669" radius={[3, 3, 0, 0]} />
             </BarChart>
@@ -111,7 +112,7 @@ export default function SeasonalInsightsPage() {
                   style={{ backgroundColor: `rgba(37, 99, 235, ${alpha})` }}
                 >
                   <p className="font-semibold text-white">T{d.month}/{String(d.year).slice(2)}</p>
-                  <p className="text-white/90">{Math.round(d.revenue / 1_000_000).toLocaleString('vi-VN')}M</p>
+                  <p className="text-white/90">{formatVND(d.revenue)}</p>
                 </div>
               );
             })}

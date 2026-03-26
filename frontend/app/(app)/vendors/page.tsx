@@ -15,8 +15,10 @@ interface Vendor {
   has_price_alert?: boolean;
 }
 
-const compact = (n: number) => n.toLocaleString('vi-VN', { notation: 'compact', maximumFractionDigits: 1 });
-const fmtM = (n: number) => `${Math.round(n / 1_000_000).toLocaleString('vi-VN')}M`;
+import { formatVND, formatVNDShort } from '../../../utils/formatCurrency';
+
+const compact = formatVND;
+const fmtM = formatVND;
 
 const TREND_ICON: Record<string, string> = { up: '↑', down: '↓', stable: '→', new: 'MỚI' };
 const TREND_CLASS: Record<string, string> = {

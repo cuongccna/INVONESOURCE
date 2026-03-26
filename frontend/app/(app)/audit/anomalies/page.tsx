@@ -51,8 +51,10 @@ const TYPE_LABEL: Record<string, string> = {
   multi_vendor_same_item: 'Chênh lệch NCC',
 };
 
-const fmtVnd = (n: number) => `${Math.round(n).toLocaleString('vi-VN')}đ`;
-const fmtM = (n: number) => `${Math.round(n / 1_000_000).toLocaleString('vi-VN')}M`;
+import { formatVNDFull, formatVND } from '../../../../utils/formatCurrency';
+
+const fmtVnd = formatVNDFull;
+const fmtM = formatVND;
 
 export default function AuditAnomaliesPage() {
   const [rows, setRows] = useState<Anomaly[]>([]);

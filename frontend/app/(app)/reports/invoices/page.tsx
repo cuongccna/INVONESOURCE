@@ -26,7 +26,9 @@ interface Pagination {
 }
 
 /* ─── Helpers ─────────────────────────────────────────────────────────────── */
-const vnd = (n: string | number) => Number(n).toLocaleString('vi-VN', { maximumFractionDigits: 0 });
+import { formatVNDFull } from '../../../../utils/formatCurrency';
+
+const vnd = (n: string | number) => formatVNDFull(n);
 
 const STATUS_LABELS: Record<string, string> = {
   valid: 'Hợp lệ', cancelled: 'Hủy', replaced: 'Thay thế', adjusted: 'Điều chỉnh',

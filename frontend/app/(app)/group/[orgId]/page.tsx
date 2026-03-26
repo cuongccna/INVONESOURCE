@@ -4,11 +4,12 @@ import { useEffect, useState, useCallback } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
+import { formatVND, formatVNDShort } from '../../../../utils/formatCurrency';
 import apiClient from '../../../../lib/apiClient';
 
 const compact = (n: number) =>
-  n.toLocaleString('vi-VN', { notation: 'compact', maximumFractionDigits: 1 });
-const mVnd = (n: number) => `${Math.round(n / 1_000_000).toLocaleString('vi-VN')}M`;
+  formatVND(n);
+const mVnd = formatVND;
 
 interface EntitySummary {
   company_id: string;
@@ -160,8 +161,8 @@ export default function GroupDashboardPage() {
                   </defs>
                   <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
                   <XAxis dataKey="name" tick={{ fontSize: 10 }} />
-                  <YAxis tick={{ fontSize: 10 }} width={45} />
-                  <Tooltip formatter={(val: number) => `${val.toLocaleString('vi-VN')} triệu`} />
+                  <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v * 1_000_000)} />
+                  <Tooltip formatter={(val: number) => formatVND(Number(val) * 1_000_000)} />
                   <Legend wrapperStyle={{ fontSize: 11 }} />
                   <Area type="monotone" dataKey="Doanh thu" stroke="#10b981" fill="url(#grDt)" strokeWidth={2} dot={false} />
                   <Area type="monotone" dataKey="Chi phí" stroke="#94a3b8" fill="url(#grCp)" strokeWidth={2} dot={false} />

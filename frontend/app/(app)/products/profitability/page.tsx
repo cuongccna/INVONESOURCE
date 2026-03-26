@@ -60,8 +60,10 @@ const MARGIN_COLOR = (pct: number | null) => {
   return 'text-red-500';
 };
 
-const fmt = (n: number) => n.toLocaleString('vi-VN');
-const fmtM = (n: number) => n >= 1e9 ? `${(n / 1e9).toFixed(1)}B` : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${(n / 1e3).toFixed(0)}K`;
+import { formatVND, formatVNDShort, formatVNDFull } from '../../../../utils/formatCurrency';
+
+const fmt = formatVNDFull;
+const fmtM = formatVNDShort;
 
 const now = new Date();
 

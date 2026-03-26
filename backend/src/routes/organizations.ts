@@ -19,16 +19,21 @@ async function assertOrgAccess(userId: string, orgId: string): Promise<void> {
   if (chk.rowCount === 0) throw new AppError('Organization not found or access denied', 403, 'ORG_ACCESS_DENIED');
 }
 
-// GET /api/organizations — list orgs the current user belongs to
+// GET /api/organizations — list orgs the current user belongs to or created
 router.get('/', async (req: Request, res: Response) => {
   const userId = req.user!.userId;
+  // Include orgs that have user's companies AND orgs created by the user (even if empty)
   const result = await pool.query(
     `SELECT o.id, o.name, o.short_name, o.created_at,
-            COUNT(DISTINCT c.id)::int AS company_count,
-            MIN(uc.role) AS user_role
+            COUNT(DISTINCT c.id)::int AS company_count
      FROM organizations o
-     JOIN companies c ON c.organization_id = o.id
-     JOIN user_companies uc ON uc.company_id = c.id AND uc.user_id = $1
+     LEFT JOIN companies c ON c.organization_id = o.id
+     WHERE o.created_by = $1
+        OR EXISTS (
+          SELECT 1 FROM user_companies uc2
+          JOIN companies c2 ON c2.id = uc2.company_id
+          WHERE uc2.user_id = $1 AND c2.organization_id = o.id
+        )
      GROUP BY o.id
      ORDER BY o.name`,
     [userId],
@@ -43,8 +48,8 @@ router.post('/', async (req: Request, res: Response) => {
   if (!name?.trim()) throw new AppError('name is required', 400, 'VALIDATION_ERROR');
 
   const result = await pool.query(
-    `INSERT INTO organizations (name, short_name) VALUES ($1, $2) RETURNING *`,
-    [name.trim(), short_name?.trim() ?? null],
+    `INSERT INTO organizations (name, short_name, created_by) VALUES ($1, $2, $3) RETURNING *`,
+    [name.trim(), short_name?.trim() ?? null, userId],
   );
   res.status(201).json({ success: true, data: result.rows[0] });
 });
@@ -53,7 +58,10 @@ router.post('/', async (req: Request, res: Response) => {
 router.get('/:id', async (req: Request, res: Response) => {
   const userId = req.user!.userId;
   const orgId = req.params.id;
-  await assertOrgAccess(userId, orgId);
+  // Allow access if user created the org OR has companies in it
+  const createdCheck = await pool.query(
+    `SELECT 1 FROM organizations WHERE id = $1 AND created_by = $2`, [orgId, userId]);
+  if (createdCheck.rowCount === 0) await assertOrgAccess(userId, orgId);
 
   const [orgRes, companiesRes] = await Promise.all([
     pool.query(`SELECT * FROM organizations WHERE id = $1`, [orgId]),

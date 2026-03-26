@@ -31,8 +31,10 @@ interface AlertsResponse {
   meta: { total: number; total_overcharge_estimate?: number };
 }
 
-const fmt = (n: string | number) => Number(n).toLocaleString('vi-VN');
-const fmtM = (n: number) => `${Math.round(n / 1_000_000).toLocaleString('vi-VN')}M`;
+import { formatVND, formatVNDFull } from '../../../../utils/formatCurrency';
+
+const fmt = (n: string | number) => formatVNDFull(n);
+const fmtM = formatVND;
 
 const SEV_BORDER: Record<string, string> = {
   critical: 'border-l-red-500',

@@ -4,6 +4,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import apiClient from '../../../lib/apiClient';
 import { useToast } from '../../../components/ToastProvider';
+import { formatVND } from '../../../utils/formatCurrency';
 
 interface Declaration {
   id: string;
@@ -131,19 +132,19 @@ export default function DeclarationsPage() {
                   <div className="text-center">
                     <p className="text-xs text-gray-400">[40a] Đầu Ra</p>
                     <p className="font-bold text-sm text-blue-600">
-                      {(Number(decl.ct40a) / 1_000_000).toFixed(1)}M
+                      {formatVND(decl.ct40a)}
                     </p>
                   </div>
                   <div className="text-center">
                     <p className="text-xs text-gray-400">[41] Phải Nộp</p>
                     <p className={`font-bold text-sm ${payable > 0 ? 'text-red-600' : 'text-gray-400'}`}>
-                      {payable > 0 ? `${(payable / 1_000_000).toFixed(1)}M` : '—'}
+                      {payable > 0 ? formatVND(payable) : '—'}
                     </p>
                   </div>
                   <div className="text-center">
                     <p className="text-xs text-gray-400">[43] Chuyển Kỳ</p>
                     <p className={`font-bold text-sm ${carryFwd > 0 ? 'text-green-600' : 'text-gray-400'}`}>
-                      {carryFwd > 0 ? `${(carryFwd / 1_000_000).toFixed(1)}M` : '—'}
+                      {carryFwd > 0 ? formatVND(carryFwd) : '—'}
                     </p>
                   </div>
                 </div>

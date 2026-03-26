@@ -6,6 +6,7 @@ import Link from 'next/link';
 import apiClient from '../../../../lib/apiClient';
 import { useToast } from '../../../../components/ToastProvider';
 import BackButton from '../../../../components/BackButton';
+import { formatVNDFull } from '../../../../utils/formatCurrency';
 
 /* ─── Types ───────────────────────────────────────────────────────────────── */
 interface Declaration {
@@ -48,7 +49,7 @@ const STATUS_CONFIG: Record<string, { label: string; color: string }> = {
 
 /* ─── Formatter ──────────────────────────────────────────────────────────── */
 const vnd = (n: number | string | undefined) =>
-  Number(n ?? 0).toLocaleString('vi-VN', { maximumFractionDigits: 0 });
+  formatVNDFull(Number(n ?? 0));
 
 /* ─── Row component ──────────────────────────────────────────────────────── */
 function Row({
@@ -247,7 +248,7 @@ export default function DeclarationDetailPage() {
         <div className="bg-red-50 border border-red-200 rounded-xl px-4 py-3 flex items-center gap-2">
           <span className="text-lg">💰</span>
           <p className="text-sm text-red-700">
-            Phải nộp thuế GTGT: <strong className="text-red-800">{vnd(decl.ct41_payable_vat)} ₫</strong>
+            Phải nộp thuế GTGT: <strong className="text-red-800">{vnd(decl.ct41_payable_vat)}</strong>
           </p>
         </div>
       )}
@@ -255,7 +256,7 @@ export default function DeclarationDetailPage() {
         <div className="bg-green-50 border border-green-200 rounded-xl px-4 py-3 flex items-center gap-2">
           <span className="text-lg">✅</span>
           <p className="text-sm text-green-700">
-            Kết chuyển sang kỳ sau: <strong className="text-green-800">{vnd(decl.ct43_carry_forward_vat)} ₫</strong>
+            Kết chuyển sang kỳ sau: <strong className="text-green-800">{vnd(decl.ct43_carry_forward_vat)}</strong>
           </p>
         </div>
       )}
@@ -494,7 +495,7 @@ export default function DeclarationDetailPage() {
             <div className="rounded-2xl bg-gray-50 px-4 py-3 text-sm text-gray-600">
               <p><span className="font-medium text-gray-800">Tờ khai:</span> {decl.form_type}</p>
               <p><span className="font-medium text-gray-800">Kỳ:</span> Tháng {decl.period_month}/{decl.period_year}</p>
-              <p><span className="font-medium text-gray-800">Số phải nộp:</span> {vnd(decl.ct41_payable_vat)} ₫</p>
+              <p><span className="font-medium text-gray-800">Số phải nộp:</span> {vnd(decl.ct41_payable_vat)}</p>
             </div>
 
             <div className="mt-5 flex gap-3">

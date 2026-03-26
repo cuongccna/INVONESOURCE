@@ -35,8 +35,9 @@ interface MonthlySummary {
 }
 
 /* ─── Helpers ─────────────────────────────────────────────────────────────── */
-const vnd = (n: string | number | undefined) =>
-  Number(n ?? 0).toLocaleString('vi-VN', { maximumFractionDigits: 0 });
+import { formatVND, formatVNDFull } from '../../../../../../utils/formatCurrency';
+
+const vnd = (n: string | number | undefined) => formatVNDFull(Number(n ?? 0));
 
 const MONTH_NAMES = ['Tháng 1','Tháng 2','Tháng 3','Tháng 4','Tháng 5','Tháng 6',
   'Tháng 7','Tháng 8','Tháng 9','Tháng 10','Tháng 11','Tháng 12'];
@@ -156,9 +157,9 @@ export default function MonthlyReportPage() {
         )}
 
         {/* ── Invoice summary table ── */}
-        <div className="bg-white rounded-xl border border-gray-100 overflow-hidden">
+        <div className="bg-white rounded-xl border border-gray-100 overflow-x-auto">
           <p className="px-4 pt-4 text-sm font-semibold text-gray-700">Tổng hợp hóa đơn</p>
-          <table className="w-full text-sm mt-3">
+          <table className="w-full min-w-[480px] text-sm mt-3">
             <thead>
               <tr className="border-b border-gray-100 bg-gray-50 text-xs text-gray-500 uppercase">
                 <th className="text-left px-4 py-2">Loại</th>
@@ -194,22 +195,22 @@ export default function MonthlyReportPage() {
             <div className="grid grid-cols-2 gap-3">
               <div className="bg-blue-50 rounded-xl p-3">
                 <p className="text-xs text-gray-500 mb-0.5">Thuế đầu ra</p>
-                <p className="font-bold text-blue-700">{vnd(vat.output_vat)} ₫</p>
+                <p className="font-bold text-blue-700">{vnd(vat.output_vat)}</p>
               </div>
               <div className="bg-green-50 rounded-xl p-3">
                 <p className="text-xs text-gray-500 mb-0.5">Thuế đầu vào</p>
-                <p className="font-bold text-green-700">{vnd(vat.input_vat)} ₫</p>
+                <p className="font-bold text-green-700">{vnd(vat.input_vat)}</p>
               </div>
               {Number(vat.payable_vat) > 0 && (
                 <div className="bg-red-50 rounded-xl p-3 col-span-2">
                   <p className="text-xs text-gray-500 mb-0.5">Phải nộp [41]</p>
-                  <p className="font-bold text-red-600 text-xl">{vnd(vat.payable_vat)} ₫</p>
+                  <p className="font-bold text-red-600 text-xl">{vnd(vat.payable_vat)}</p>
                 </div>
               )}
               {Number(vat.carry_forward_vat) > 0 && (
                 <div className="bg-emerald-50 rounded-xl p-3 col-span-2">
                   <p className="text-xs text-gray-500 mb-0.5">Kết chuyển sang kỳ sau [43]</p>
-                  <p className="font-bold text-emerald-700 text-xl">{vnd(vat.carry_forward_vat)} ₫</p>
+                  <p className="font-bold text-emerald-700 text-xl">{vnd(vat.carry_forward_vat)}</p>
                 </div>
               )}
             </div>
@@ -233,7 +234,7 @@ export default function MonthlyReportPage() {
                     <p className="text-xs text-gray-400 font-mono">{r.counterparty_tax_code}</p>
                   </div>
                   <div className="text-right shrink-0">
-                    <p className="font-semibold text-gray-900">{vnd(r.total_amount)} ₫</p>
+                    <p className="font-semibold text-gray-900">{vnd(r.total_amount)}</p>
                     <p className="text-xs text-gray-400">{r.invoice_count} HĐ</p>
                   </div>
                 </div>
@@ -253,7 +254,7 @@ export default function MonthlyReportPage() {
                     <p className="text-xs text-gray-400 font-mono">{r.counterparty_tax_code}</p>
                   </div>
                   <div className="text-right shrink-0">
-                    <p className="font-semibold text-gray-900">{vnd(r.total_amount)} ₫</p>
+                    <p className="font-semibold text-gray-900">{vnd(r.total_amount)}</p>
                     <p className="text-xs text-gray-400">{r.invoice_count} HĐ</p>
                   </div>
                 </div>

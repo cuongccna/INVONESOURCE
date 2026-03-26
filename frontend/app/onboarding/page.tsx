@@ -16,7 +16,7 @@ interface ConnectorFormData {
 
 const PROVIDERS = [
   { id: 'misa', label: 'MISA meInvoice' },
-  { id: 'viettel', label: 'Viettel SInvoice' },
+  { id: 'viettel', label: 'Viettel VInvoice' },
   { id: 'bkav', label: 'BKAV eInvoice' },
 ];
 

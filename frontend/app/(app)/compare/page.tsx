@@ -9,8 +9,10 @@ import apiClient from '../../../lib/apiClient';
 import { useCompany } from '../../../contexts/CompanyContext';
 
 const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899'];
-const compact = (n: number) => n.toLocaleString('vi-VN', { notation: 'compact', maximumFractionDigits: 1 });
-const mVnd = (n: number) => `${Math.round(n / 1_000_000).toLocaleString('vi-VN')}M`;
+import { formatVND, formatVNDShort } from '../../../utils/formatCurrency';
+
+const compact = formatVND;
+const mVnd = formatVND;
 
 interface CompanyStat {
   id: string; name: string; tax_code: string;
@@ -195,8 +197,8 @@ export default function ComparePage() {
                 <LineChart data={trendData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
                   <XAxis dataKey="name" tick={{ fontSize: 9 }} />
-                  <YAxis tick={{ fontSize: 10 }} width={45} />
-                  <Tooltip formatter={(val: number) => `${val.toLocaleString('vi-VN')} triệu`} />
+                  <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v * 1_000_000)} />
+                  <Tooltip formatter={(val: number) => formatVND(Number(val) * 1_000_000)} />
                   <Legend wrapperStyle={{ fontSize: 10 }} />
                   {result.companies.map((c, i) => (
                     <Line key={c.id} type="monotone" dataKey={c.name}
@@ -220,8 +222,8 @@ export default function ComparePage() {
                 margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
                 <XAxis dataKey="name" tick={{ fontSize: 10 }} />
-                <YAxis tick={{ fontSize: 10 }} width={40} />
-                <Tooltip formatter={(val: number) => `${val.toLocaleString('vi-VN')} triệu`} />
+                <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v * 1_000_000)} />
+                <Tooltip formatter={(val: number) => formatVND(Number(val) * 1_000_000)} />
                 <Bar dataKey="vat" name="VAT" radius={[4, 4, 0, 0]} maxBarSize={40}
                   fill="#ef4444" />
               </BarChart>

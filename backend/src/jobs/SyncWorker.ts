@@ -85,6 +85,9 @@ async function syncPlugin(
       const counts = await upsertInvoices(all, companyId, plugin.id);
       recordsCreated = counts.created;
       recordsUpdated = counts.updated;
+      if (counts.skipped > 0) {
+        errors.push(`${counts.skipped} invoice(s) skipped due to data errors`);
+      }
     }
 
     registry.recordSuccess(plugin.id);
@@ -140,62 +143,71 @@ async function upsertInvoices(
   invoices: NormalizedInvoice[],
   companyId: string,
   provider: string
-): Promise<{ created: number; updated: number }> {
+): Promise<{ created: number; updated: number; skipped: number }> {
   const client = await pool.connect();
   let created = 0;
   let updated = 0;
+  let skipped = 0;
   try {
     for (const inv of invoices) {
-      const result = await client.query(
-        `INSERT INTO invoices (
-          id, company_id, provider, direction, invoice_number, serial_number, invoice_date,
-          seller_tax_code, seller_name, buyer_tax_code, buyer_name,
-          subtotal, vat_rate, vat_amount, total_amount, currency,
-          status, gdt_validated, raw_xml, external_id, sync_at
-        ) VALUES (
-          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW()
-        )
-        ON CONFLICT (company_id, provider, invoice_number, seller_tax_code, invoice_date)
-        DO UPDATE SET
-          status = EXCLUDED.status,
-          vat_amount = EXCLUDED.vat_amount,
-          total_amount = EXCLUDED.total_amount,
-          raw_xml = COALESCE(EXCLUDED.raw_xml, invoices.raw_xml),
-          sync_at = NOW(),
-          updated_at = NOW()
-        RETURNING id, direction, invoice_number, serial_number, seller_tax_code, invoice_date,
-                  (xmax = 0) AS is_new`,
-        [
-          uuidv4(), companyId, provider, inv.direction, inv.invoiceNumber,
-          inv.serialNumber, inv.issuedDate, inv.sellerTaxCode, inv.sellerName,
-          inv.buyerTaxCode, inv.buyerName, inv.subtotal, inv.vatRate,
-          inv.vatAmount, inv.total, inv.currency, inv.status,
-          provider === 'bkav' ? true : false,
-          inv.rawXml ?? null, inv.externalId
-        ]
-      );
-      const row = result.rows[0];
-      if (row?.is_new) created++; else updated++;
+      try {
+        // Clamp vatRate to valid NUMERIC(5,2) range — Vietnamese VAT is 0/5/8/10
+        const safeVatRate = Math.min(Math.max(Number(inv.vatRate) || 0, -99), 99);
+        const result = await client.query(
+          `INSERT INTO invoices (
+            id, company_id, provider, direction, invoice_number, serial_number, invoice_date,
+            seller_tax_code, seller_name, buyer_tax_code, buyer_name,
+            subtotal, vat_rate, vat_amount, total_amount, currency,
+            status, gdt_validated, raw_xml, external_id, sync_at
+          ) VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW()
+          )
+          ON CONFLICT (company_id, provider, invoice_number, seller_tax_code, invoice_date)
+          DO UPDATE SET
+            status = EXCLUDED.status,
+            vat_amount = EXCLUDED.vat_amount,
+            total_amount = EXCLUDED.total_amount,
+            raw_xml = COALESCE(EXCLUDED.raw_xml, invoices.raw_xml),
+            sync_at = NOW(),
+            updated_at = NOW()
+          RETURNING id, direction, invoice_number, serial_number, seller_tax_code, invoice_date,
+                    (xmax = 0) AS is_new`,
+          [
+            uuidv4(), companyId, provider, inv.direction, inv.invoiceNumber,
+            inv.serialNumber, inv.issuedDate, inv.sellerTaxCode, inv.sellerName,
+            inv.buyerTaxCode, inv.buyerName, inv.subtotal, safeVatRate,
+            inv.vatAmount, inv.total, inv.currency, inv.status,
+            provider === 'bkav' ? true : false,
+            inv.rawXml ?? null, inv.externalId
+          ]
+        );
+        const row = result.rows[0];
+        if (row?.is_new) created++; else updated++;
 
-      // Enqueue input invoices (non-BKAV) for GDT validation
-      if (row && inv.direction === 'input' && provider !== 'bkav') {
-        const issuedDateStr = inv.issuedDate instanceof Date
-          ? inv.issuedDate.toISOString().split('T')[0]!
-          : String(inv.issuedDate);
-        await enqueueGdtValidation({
-          invoiceId: row.id as string,
-          invoiceNumber: inv.invoiceNumber,
-          serialNumber: inv.serialNumber,
-          sellerTaxCode: inv.sellerTaxCode,
-          issuedDate: issuedDateStr,
-          companyId,
-        });
+        // Enqueue input invoices (non-BKAV) for GDT validation
+        if (row && inv.direction === 'input' && provider !== 'bkav') {
+          const issuedDateStr = inv.issuedDate instanceof Date
+            ? inv.issuedDate.toISOString().split('T')[0]!
+            : String(inv.issuedDate);
+          await enqueueGdtValidation({
+            invoiceId: row.id as string,
+            invoiceNumber: inv.invoiceNumber,
+            serialNumber: inv.serialNumber,
+            sellerTaxCode: inv.sellerTaxCode,
+            issuedDate: issuedDateStr,
+            companyId,
+          });
+        }
+      } catch (invErr) {
+        // Skip this invoice but continue processing the rest
+        skipped++;
+        console.warn(`[SyncWorker][${provider}] Skipped invoice ${inv.invoiceNumber ?? inv.externalId}: ${(invErr as Error).message}`);
       }
     }
   } finally {
     client.release();
   }
-  return { created, updated };
+  return { created, updated, skipped };
 }
 
 async function createNotification(

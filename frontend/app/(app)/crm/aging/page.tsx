@@ -1,4 +1,5 @@
 ﻿'use client';
+import { formatVND } from '../../../../utils/formatCurrency';
 
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
@@ -20,7 +21,7 @@ interface AgingRow {
 const mVnd = (n: string | number) => {
   const val = Number(n);
   if (val === 0) return '—';
-  return `${Math.round(val / 1_000_000).toLocaleString('vi-VN')}M`;
+  return formatVND(val);
 };
 
 const redShade = (n: number) => {

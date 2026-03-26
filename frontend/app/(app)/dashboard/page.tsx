@@ -60,10 +60,11 @@ const STATUS_VN: Record<string, string> = {
 };
 
 /* ─── Formatters ──────────────────────────────────────────────────────────── */
-const compact = (n: string | number) =>
-  Number(n).toLocaleString('vi-VN', { notation: 'compact', maximumFractionDigits: 1 });
+import { formatVND, formatVNDShort, formatVNDFull } from '../../../utils/formatCurrency';
+
+const compact = formatVND;
 const full = (n: string | number) => Number(n).toLocaleString('vi-VN');
-const mVnd = (n: string | number) => `${Math.round(Number(n) / 1_000_000).toLocaleString('vi-VN')}M`;
+const mVnd = (n: string | number) => formatVND(Number(n));
 function timeAgo(iso: string) {
   const diff = Math.floor((Date.now() - new Date(iso).getTime()) / 60_000);
   if (diff < 1) return 'vừa xong';
@@ -102,7 +103,7 @@ function TopTable({ rows, caption }: { rows: Analytics['topCustomers']; caption:
               </div>
             </div>
             <div className="text-right shrink-0">
-              <p className="text-sm font-bold text-gray-900">{mVnd(r.total_amount)}</p>
+              <p className="text-sm font-bold text-gray-900">{formatVND(r.total_amount)}</p>
               <p className="text-xs text-gray-400">{r.invoice_count} HĐ</p>
             </div>
           </div>
@@ -282,13 +283,13 @@ export default function DashboardPage() {
       {/* ── VAT Trend ── */}
       {vatChartData.length > 0 && (
         <div className="bg-white rounded-xl shadow-sm p-4">
-          <h2 className="text-sm font-semibold text-gray-700 mb-3">Biến Động Thuế GTGT (triệu ₫)</h2>
+          <h2 className="text-sm font-semibold text-gray-700 mb-3">Biến Động Thuế GTGT</h2>
           <ResponsiveContainer width="100%" height={200}>
             <BarChart data={vatChartData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
               <XAxis dataKey="name" tick={{ fontSize: 10 }} />
-              <YAxis tick={{ fontSize: 10 }} width={45} />
-              <Tooltip formatter={(val: number) => `${val.toLocaleString('vi-VN')} triệu`} />
+              <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v * 1_000_000)} />
+              <Tooltip formatter={(val: number) => formatVNDFull(Number(val) * 1_000_000)} />
               <Legend wrapperStyle={{ fontSize: 11 }} />
               <Bar dataKey="Đầu Ra" fill="#3b82f6" radius={[3, 3, 0, 0]} maxBarSize={18} />
               <Bar dataKey="Đầu Vào" fill="#10b981" radius={[3, 3, 0, 0]} maxBarSize={18} />
@@ -301,17 +302,29 @@ export default function DashboardPage() {
       {/* ── Revenue Trend ── */}
       {revenueChartData.length > 0 && (
         <div className="bg-white rounded-xl shadow-sm p-4">
-          <h2 className="text-sm font-semibold text-gray-700 mb-3">Doanh Thu / Chi Phí (triệu ₫)</h2>
+          <h2 className="text-sm font-semibold text-gray-700 mb-3">Doanh Thu / Chi Phí</h2>
           <ResponsiveContainer width="100%" height={180}>
-            <LineChart data={revenueChartData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
-              <XAxis dataKey="name" tick={{ fontSize: 10 }} />
-              <YAxis tick={{ fontSize: 10 }} width={45} />
-              <Tooltip formatter={(val: number) => `${val.toLocaleString('vi-VN')} triệu`} />
-              <Legend wrapperStyle={{ fontSize: 11 }} />
-              <Line type="monotone" dataKey="Bán Ra" stroke="#3b82f6" strokeWidth={2} dot={false} />
-              <Line type="monotone" dataKey="Mua Vào" stroke="#10b981" strokeWidth={2} dot={false} />
-            </LineChart>
+            {revenueChartData.length <= 2 ? (
+              <BarChart data={revenueChartData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
+                <XAxis dataKey="name" tick={{ fontSize: 10 }} />
+                <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v * 1_000_000)} />
+                <Tooltip formatter={(val: number) => formatVNDFull(Number(val) * 1_000_000)} />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+                <Bar dataKey="Bán Ra" fill="#3b82f6" radius={[3, 3, 0, 0]} maxBarSize={30} />
+                <Bar dataKey="Mua Vào" fill="#10b981" radius={[3, 3, 0, 0]} maxBarSize={30} />
+              </BarChart>
+            ) : (
+              <LineChart data={revenueChartData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
+                <XAxis dataKey="name" tick={{ fontSize: 10 }} />
+                <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v * 1_000_000)} />
+                <Tooltip formatter={(val: number) => formatVNDFull(Number(val) * 1_000_000)} />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+                <Line type="monotone" dataKey="Bán Ra" stroke="#3b82f6" strokeWidth={2} dot={false} />
+                <Line type="monotone" dataKey="Mua Vào" stroke="#10b981" strokeWidth={2} dot={false} />
+              </LineChart>
+            )}
           </ResponsiveContainer>
         </div>
       )}
