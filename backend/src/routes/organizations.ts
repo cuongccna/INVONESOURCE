@@ -10,9 +10,16 @@ router.use(authenticate);
 // ─── Helper: assert user has access to org ─────────────────────────────────
 async function assertOrgAccess(userId: string, orgId: string): Promise<void> {
   const chk = await pool.query(
-    `SELECT 1 FROM user_companies uc
-     JOIN companies c ON c.id = uc.company_id
-     WHERE uc.user_id = $1 AND c.organization_id = $2
+    `SELECT 1 FROM organizations o
+     WHERE o.id = $2
+       AND (
+         o.created_by = $1
+         OR EXISTS (
+           SELECT 1 FROM user_companies uc
+           JOIN companies c ON c.id = uc.company_id
+           WHERE uc.user_id = $1 AND c.organization_id = $2
+         )
+       )
      LIMIT 1`,
     [userId, orgId],
   );
@@ -129,7 +136,7 @@ router.post('/:id/companies', async (req: Request, res: Response) => {
   if (access.rowCount === 0) throw new AppError('No access to company', 403, 'FORBIDDEN');
 
   await pool.query(
-    `UPDATE companies SET organization_id=$1, parent_id=$2, entity_type=COALESCE($3::text, entity_type)
+    `UPDATE companies SET organization_id=$1, parent_id=$2, entity_type=COALESCE($3::company_entity_type, entity_type)
      WHERE id=$4`,
     [orgId, parentId ?? null, entityType ?? null, companyId],
   );

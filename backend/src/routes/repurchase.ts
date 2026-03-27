@@ -1,11 +1,13 @@
 import { Router, Request, Response } from 'express';
 import { authenticate } from '../middleware/auth';
+import { requireCompany } from '../middleware/company';
 import { BurnRateService } from '../services/BurnRateService';
 import { sendSuccess, sendPaginated } from '../utils/response';
 import { pool } from '../db/pool';
 
 const router = Router();
 router.use(authenticate);
+router.use(requireCompany);
 
 const burnRate = new BurnRateService();
 

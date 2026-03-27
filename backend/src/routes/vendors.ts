@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { authenticate } from '../middleware/auth';
+import { requireCompany } from '../middleware/company';
 import { pool } from '../db/pool';
 import { sendSuccess, sendPaginated } from '../utils/response';
 import { AppError } from '../utils/AppError';
@@ -7,6 +8,7 @@ import { VendorPriceTrackingService } from '../services/VendorPriceTrackingServi
 
 const router = Router();
 router.use(authenticate);
+router.use(requireCompany);
 
 // GET /api/vendors?month=&year= — vendor list for period
 router.get('/', async (req: Request, res: Response) => {

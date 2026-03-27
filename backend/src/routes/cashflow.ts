@@ -1,10 +1,12 @@
 import { Router } from 'express';
 import { authenticate } from '../middleware/auth';
+import { requireCompany } from '../middleware/company';
 import { sendSuccess } from '../utils/response';
 import { pool } from '../db/pool';
 
 const router = Router();
 router.use(authenticate);
+router.use(requireCompany);
 
 // GET /api/cashflow/projection?days=90
 router.get('/projection', async (req, res) => {

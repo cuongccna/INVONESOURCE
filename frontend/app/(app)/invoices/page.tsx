@@ -1,10 +1,11 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { useSearchParams } from 'next/navigation';
+import { useSearchParams, useRouter } from 'next/navigation';
 import { format } from 'date-fns';
 import { vi } from 'date-fns/locale';
 import apiClient from '../../../lib/apiClient';
+import { useCompany } from '../../../contexts/CompanyContext';
 import { useToast } from '../../../components/ToastProvider';
 
 interface Invoice {
@@ -20,7 +21,7 @@ interface Invoice {
   vat_amount: string;
   vat_rate: number;
   gdt_validated: boolean;
-  source_provider: string;
+  provider: string;
 }
 
 interface PaginatedResponse {
@@ -46,7 +47,10 @@ export default function InvoicesPage() {
   const searchParams = useSearchParams();
   const initialSearch = searchParams.get('search') ?? '';
   const initialDirection = searchParams.get('direction');
+  const importSessionId = searchParams.get('importSessionId');
   const toast = useToast();
+  const router = useRouter();
+  const { activeCompanyId, loading: companyLoading } = useCompany();
 
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [meta, setMeta] = useState({ total: 0, page: 1, pageSize: 50, totalPages: 1 });
@@ -54,6 +58,12 @@ export default function InvoicesPage() {
   const [direction, setDirection] = useState<'output' | 'input' | ''>(
     initialDirection === 'output' || initialDirection === 'input' ? initialDirection : ''
   );
+  const [trashCount, setTrashCount] = useState(0);
+  // Delete modal state
+  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const [deleteReason, setDeleteReason] = useState<'duplicate' | 'invalid' | 'test_data' | 'other'>('other');
+  const [deleting, setDeleting] = useState(false);
+  const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [search, setSearch] = useState(initialSearch);
   const [debouncedSearch, setDebouncedSearch] = useState(initialSearch);
 
@@ -64,23 +74,46 @@ export default function InvoicesPage() {
   }, [search]);
 
   const load = useCallback(async (page = 1) => {
+    if (!activeCompanyId) return;
     setLoading(true);
     try {
       const params: Record<string, unknown> = { page, pageSize: 50 };
       if (direction) params.direction = direction;
       if (debouncedSearch) params.search = debouncedSearch;
+      if (importSessionId) params.importSessionId = importSessionId;
 
-      const res = await apiClient.get<PaginatedResponse>('/invoices', { params });
+      const [res, trashRes] = await Promise.all([
+        apiClient.get<PaginatedResponse>('/invoices', { params }),
+        apiClient.get<{ meta: { total: number } }>('/invoices/trash', { params: { tab: 'deleted', pageSize: 1 } }).catch(() => ({ data: { meta: { total: 0 } } })),
+      ]);
       setInvoices(res.data.data);
       setMeta(res.data.meta);
+      setTrashCount((trashRes as { data: { meta: { total: number } } }).data.meta?.total ?? 0);
     } catch (err) {
       console.error(err);
     } finally {
       setLoading(false);
     }
-  }, [direction, debouncedSearch]);
+  }, [activeCompanyId, direction, debouncedSearch, importSessionId]);
 
-  useEffect(() => { void load(1); }, [load]);
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
+    setDeleting(true);
+    try {
+      await apiClient.delete(`/invoices/${deleteTarget}`, { data: { reason: deleteReason } });
+      toast.success('Hóa đơn đã được ẩn vào thùng rác');
+      setDeleteTarget(null);
+      void load(meta.page);
+    } catch {
+      toast.error('Lỗi khi ẩn hóa đơn. Vui lòng thử lại.');
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!companyLoading) void load(1);
+  }, [load, companyLoading]);
 
   const triggerSync = async () => {
     try {
@@ -97,7 +130,17 @@ export default function InvoicesPage() {
       <div className="flex items-center justify-between mb-4">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Hóa Đơn</h1>
-          <p className="text-sm text-gray-500">{meta.total.toLocaleString('vi-VN')} hóa đơn</p>
+          <div className="flex items-center gap-3">
+            <p className="text-sm text-gray-500">{meta.total.toLocaleString('vi-VN')} hóa đơn</p>
+            {trashCount > 0 && (
+              <button
+                onClick={() => router.push('/invoices/trash')}
+                className="text-xs text-gray-400 hover:text-red-500 underline"
+              >
+                Thùng rác ({trashCount})
+              </button>
+            )}
+          </div>
         </div>
         <button
           onClick={triggerSync}
@@ -109,6 +152,19 @@ export default function InvoicesPage() {
           Đồng Bộ
         </button>
       </div>
+
+      {/* Import session banner */}
+      {importSessionId && (
+        <div className="flex items-center justify-between bg-blue-50 border border-blue-200 rounded-xl px-4 py-2.5 mb-4 text-sm">
+          <span className="text-blue-700 font-medium">📥 Đang xem hóa đơn mới nhập</span>
+          <button
+            onClick={() => { window.location.href = '/invoices'; }}
+            className="text-blue-600 underline text-xs"
+          >
+            Xem tất cả
+          </button>
+        </div>
+      )}
 
       {/* Filters */}
       <div className="flex gap-2 mb-4">
@@ -145,11 +201,42 @@ export default function InvoicesPage() {
           {invoices.map((inv) => {
             const statusInfo = STATUS_LABELS[inv.status] ?? { label: inv.status, color: 'bg-gray-100 text-gray-700' };
             return (
-              <div key={inv.id} className="bg-white rounded-xl shadow-sm p-4">
+              <div
+                key={inv.id}
+                className="bg-white rounded-xl shadow-sm p-4 relative cursor-pointer active:bg-gray-50"
+                onClick={() => { setOpenMenu(null); router.push(`/invoices/${inv.id}`); }}
+              >
+                {/* Menu button — stopPropagation để không trigger navigate */}
+                <button
+                  onClick={(e) => { e.stopPropagation(); setOpenMenu(openMenu === inv.id ? null : inv.id); }}
+                  className="absolute top-3 right-3 p-1.5 rounded-lg text-gray-400 hover:bg-gray-100 z-10"
+                >
+                  <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                    <circle cx="10" cy="4" r="1.5"/><circle cx="10" cy="10" r="1.5"/><circle cx="10" cy="16" r="1.5"/>
+                  </svg>
+                </button>
+                {openMenu === inv.id && (
+                  <div className="absolute top-9 right-3 bg-white rounded-xl shadow-lg border border-gray-100 z-20 py-1 min-w-[140px]">
+                    <button
+                      onClick={(e) => { e.stopPropagation(); router.push(`/invoices/${inv.id}`); setOpenMenu(null); }}
+                      className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50"
+                    >
+                      Xem chi tiết
+                    </button>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setDeleteTarget(inv.id); setOpenMenu(null); }}
+                      className="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50"
+                    >
+                      Ẩn hóa đơn
+                    </button>
+                  </div>
+                )}
+                {/* pr-8 để nội dung không bị đè bởi nút ⋮ */}
+                <div className="pr-8">
                 <div className="flex items-start justify-between mb-2">
                   <div>
                     <p className="font-semibold text-gray-900 text-sm">{inv.invoice_number}</p>
-                    <p className="text-xs text-gray-400">{inv.serial_number} · {PROVIDER_LABELS[inv.source_provider] ?? inv.source_provider}</p>
+                    <p className="text-xs text-gray-400">{inv.serial_number} · {PROVIDER_LABELS[inv.provider] ?? inv.provider}</p>
                   </div>
                   <div className="flex flex-col items-end gap-1">
                     <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${statusInfo.color}`}>
@@ -184,6 +271,7 @@ export default function InvoicesPage() {
                     </p>
                   </div>
                 </div>
+                </div>{/* end pr-8 wrapper */}
               </div>
             );
           })}
@@ -202,6 +290,46 @@ export default function InvoicesPage() {
               {p}
             </button>
           ))}
+        </div>
+      )}
+
+      {/* Delete confirmation modal */}
+      {deleteTarget && (
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-4">
+          <div className="bg-white rounded-2xl w-full max-w-sm p-5 shadow-xl">
+            <h3 className="text-base font-bold text-gray-900 mb-1">Ẩn hóa đơn này?</h3>
+            <p className="text-sm text-gray-500 mb-4">
+              Hóa đơn sẽ vào thùng rác và không xuất hiện trong báo cáo. Có thể khôi phục sau.
+            </p>
+            <div className="mb-4">
+              <label className="text-xs font-medium text-gray-600 mb-1 block">Lý do</label>
+              <select
+                value={deleteReason}
+                onChange={(e) => setDeleteReason(e.target.value as typeof deleteReason)}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
+              >
+                <option value="duplicate">Trùng lặp</option>
+                <option value="invalid">Không hợp lệ</option>
+                <option value="test_data">Dữ liệu test</option>
+                <option value="other">Lý do khác</option>
+              </select>
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setDeleteTarget(null)}
+                className="flex-1 py-2.5 border border-gray-300 rounded-xl text-sm font-medium text-gray-700"
+              >
+                Hủy
+              </button>
+              <button
+                onClick={handleDelete}
+                disabled={deleting}
+                className="flex-1 py-2.5 bg-red-500 text-white rounded-xl text-sm font-medium disabled:opacity-50"
+              >
+                {deleting ? 'Đang ẩn...' : 'Xác nhận ẩn'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

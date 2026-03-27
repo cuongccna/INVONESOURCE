@@ -287,17 +287,65 @@ export default function ConnectorsPage() {
     }
   };
 
+  const [showLegacy, setShowLegacy] = useState(false);
+
   return (
     <div className="p-4 max-w-2xl mx-auto pb-24">
       <BackButton fallbackHref="/dashboard" className="mb-4" />
-      <h1 className="text-2xl font-bold text-gray-900 mb-1">Kết Nối Nhà Mạng</h1>
-      <p className="text-sm text-gray-500 mb-6">Quản lý đồng bộ hóa đơn từ MISA · Viettel · BKAV</p>
+      <h1 className="text-2xl font-bold text-gray-900 mb-1">Nguồn Dữ Liệu Hóa Đơn</h1>
+      <p className="text-sm text-gray-500 mb-6">Quản lý cách hệ thống thu thập hóa đơn đầu vào &amp; đầu ra</p>
+
+      {/* ── Kiến trúc mới banner ── */}
+      <div className="mb-5 bg-blue-50 border border-blue-200 rounded-xl p-4 space-y-2">
+        <p className="font-semibold text-blue-900 text-sm">🏗️ Kiến trúc nguồn dữ liệu mới</p>
+        <p className="text-xs text-blue-800 leading-relaxed">
+          <strong>GDT (hoadondientu.gdt.gov.vn)</strong> là nguồn duy nhất lưu toàn bộ hóa đơn
+          của mọi doanh nghiệp — cả <strong>đầu ra</strong> (bán hàng) lẫn <strong>đầu vào</strong> (mua hàng).
+          MISA/Viettel/BKAV chỉ lưu HĐ do <em>họ</em> phát hành. HĐ mua vào từ nhà cung cấp khác
+          nằm trên hệ thống nhà mạng khác — không lấy được.
+        </p>
+        <div className="flex gap-2 pt-1">
+          <a href="/settings/bot"
+            className="bg-blue-700 text-white text-xs px-3 py-1.5 rounded-lg font-medium hover:bg-blue-800">
+            🤖 Thiết lập GDT Bot
+          </a>
+          <a href="/import"
+            className="border border-blue-400 text-blue-700 text-xs px-3 py-1.5 rounded-lg font-medium hover:bg-blue-100">
+            📁 Import thủ công
+          </a>
+        </div>
+      </div>
+
+      {/* ── Cảnh báo chỉ có đầu ra ── */}
+      {!loading && connectors.some(c => c.is_enabled) && (
+        <div className="mb-5 bg-amber-50 border border-amber-200 rounded-xl p-4 text-xs text-amber-800">
+          ⚠️ <strong>Dữ liệu chưa đầy đủ:</strong> Bạn đang dùng kết nối nhà mạng — chỉ có HĐ đầu ra.
+          Thiết lập <strong>GDT Bot</strong> hoặc <strong>Import thủ công</strong> để có báo cáo thuế GTGT chính xác.
+        </div>
+      )}
 
       {loading ? (
         <div className="flex justify-center py-12">
           <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600" />
         </div>
       ) : (
+        <>
+        {/* ── Legacy connectors — collapsed ── */}
+        <div className="border border-gray-200 rounded-xl overflow-hidden">
+          <button
+            className="w-full flex items-center justify-between px-4 py-3 bg-gray-50 text-sm font-medium text-gray-600 hover:bg-gray-100"
+            onClick={() => setShowLegacy(v => !v)}
+          >
+            <span>🔌 Kết nối nhà mạng (Hạn chế — chỉ HĐ đầu ra)</span>
+            <span className="text-gray-400 text-xs">{showLegacy ? '▲ Thu gọn' : '▼ Mở rộng'}</span>
+          </button>
+          {showLegacy && (
+            <div className="bg-gray-50 border-t border-gray-200 px-4 py-3">
+              <div className="bg-orange-50 border border-orange-200 rounded-lg p-3 text-xs text-orange-800 mb-4">
+                ℹ️ Các nhà mạng chỉ cung cấp <strong>HĐ đầu ra</strong> của doanh nghiệp đó.
+                Để có đầy đủ HĐ đầu vào + đầu ra, sử dụng <strong>GDT Bot</strong> hoặc <strong>Import thủ công</strong> từ cổng thuế.
+                Giữ kết nối này để kiểm tra chéo hoặc nếu bạn muốn dữ liệu một phần.
+              </div>
         <div className="space-y-4">
           {(['misa', 'viettel', 'bkav'] as Provider[]).map(provider => {
             const meta   = PROVIDER_META[provider];
@@ -432,6 +480,10 @@ export default function ConnectorsPage() {
             );
           })}
         </div>
+            </div>
+          )}
+        </div>
+        </>
       )}
     </div>
   );

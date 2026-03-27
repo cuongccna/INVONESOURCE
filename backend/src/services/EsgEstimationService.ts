@@ -30,7 +30,9 @@ export class EsgEstimationService {
       [companyId, String(year)],
     );
 
-    if (cached.rows.length > 0) {
+    if (cached.rows.length > 0 && cached.rows[0].data.total_tco2e > 0) {
+      // Only use cache when it has a non-zero result
+      // (avoids serving stale zero-cache computed before invoices were imported)
       const d = cached.rows[0].data;
       return {
         company_id: companyId,
@@ -59,6 +61,7 @@ export class EsgEstimationService {
        WHERE i.company_id = $1
          AND i.direction = 'input'
          AND i.status != 'cancelled'
+         AND i.deleted_at IS NULL
          AND EXTRACT(YEAR FROM i.invoice_date) = $2
        GROUP BY COALESCE(ili.esg_category, 'other'), ef.category_name, ef.kg_co2_per_1000_vnd`,
       [companyId, year],
@@ -70,18 +73,20 @@ export class EsgEstimationService {
       const totals = await pool.query<{ total_spend: string }>(
         `SELECT SUM(total_amount) AS total_spend FROM invoices
          WHERE company_id = $1 AND direction = 'input' AND status != 'cancelled'
+           AND deleted_at IS NULL
            AND EXTRACT(YEAR FROM invoice_date) = $2`,
         [companyId, year],
       );
       const spend = Number(totals.rows[0]?.total_spend ?? 0);
       // 0.20 kgCO2e per million VND (Khác/default), then /1000 to convert kg→tonne
+      // Use 3 decimal places to avoid rounding to 0 for small amounts
       const tco2e = (spend / 1_000_000) * 0.20 / 1000;
       const result: EsgEstimate = {
         company_id: companyId, calc_year: year,
-        total_tco2e: Math.round(tco2e * 100) / 100,
+        total_tco2e: Math.round(tco2e * 1000) / 1000,
         by_category: [{
           category_code: 'other', category_name: 'Khác (ước tính)',
-          spend, tco2e: Math.round(tco2e * 100) / 100, pct: 100,
+          spend, tco2e: Math.round(tco2e * 1000) / 1000, pct: 100,
         }],
         disclaimer: DISCLAIMER,
       };

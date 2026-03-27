@@ -1,0 +1,215 @@
+<HSoThueDTu xmlns="http://kekhaithue.gdt.gov.vn/TKhaiThue" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <HSoKhaiThue id="NODETOSIGN">
+        <TTinChung>
+            <TTinDVu>
+                <maDVu>TTGQ TTHC</maDVu>
+                <tenDVu>TTGQ TTHC</tenDVu>
+                <pbanDVu>1.0.0</pbanDVu>
+                <ttinNhaCCapDVu>TTGQ TTHC</ttinNhaCCapDVu>
+            </TTinDVu>
+            <TTinTKhaiThue>
+                <TKhaiThue>
+                    <maTKhai>842</maTKhai>
+                    <tenTKhai>TỜ KHAI THUẾ GIÁ TRỊ GIA TĂNG Mẫu số 01/GTGT (TT80/2021)</tenTKhai>
+                    <moTaBMau>01/GTGT</moTaBMau>
+                    <pbanTKhaiXML>2.8.3</pbanTKhaiXML>
+                    <loaiTKhai>C</loaiTKhai>
+                    <soLan>0</soLan>
+                    <KyKKhaiThue>
+                        <kieuKy>Q</kieuKy>
+                        <kyKKhai>4/2025</kyKKhai>
+                        <kyKKhaiTuNgay>01/10/2025</kyKKhaiTuNgay>
+                        <kyKKhaiDenNgay>31/12/2025</kyKKhaiDenNgay>
+                        <kyKKhaiTuThang>10/2025</kyKKhaiTuThang>
+                        <kyKKhaiDenThang>12/2025</kyKKhaiDenThang>
+                    </KyKKhaiThue>
+                    <maCQTNoiNop>70111</maCQTNoiNop>
+                    <tenCQTNoiNop>Thuế cơ sở 6 Thành phố Hồ Chí Minh</tenCQTNoiNop>
+                    <ngayLapTKhai>20/01/2026</ngayLapTKhai>
+                    <nguoiKy/>
+                    <ngayKy>2026-01-20</ngayKy>
+                    <nganhNgheKD/>
+                </TKhaiThue>
+                <NNT>
+                    <mst>0314227971</mst>
+                    <tenNNT>CÔNG TY TNHH TRUYỀN THÔNG TIẾP SỨC SÁNG TẠO</tenNNT>
+                    <dchiNNT>Số 4F Lý Chiêu Hoàng</dchiNNT>
+                    <phuongXa>Phường Bình Phú</phuongXa>
+                    <maHuyenNNT/>
+                    <tenHuyenNNT/>
+                    <maTinhNNT>701</maTinhNNT>
+                    <tenTinhNNT>TP Hồ Chí Minh</tenTinhNNT>
+                    <dthoaiNNT>0909811314</dthoaiNNT>
+                    <faxNNT/>
+                    <emailNNT>phuochien.cjacc@gmail.com</emailNNT>
+                </NNT>
+            </TTinTKhaiThue>
+        </TTinChung>
+        <CTieuTKhaiChinh>
+            <ma_NganhNghe>00</ma_NganhNghe>
+            <ten_NganhNghe>Hoạt động sản xuất kinh doanh thông thường</ten_NganhNghe>
+            <tieuMucHachToan>1701</tieuMucHachToan>
+            <Header>
+                <ct09/>
+                <ct10/>
+                <DiaChiHDSXKDKhacTinhNDTSC>
+                    <ct11a_phuongXa_ma/>
+                    <ct11a_phuongXa_ten/>
+                    <ct11b_quanHuyen_ma xsi:nil="true"/>
+                    <ct11b_quanHuyen_ten xsi:nil="true"/>
+                    <ct11c_tinhTP_ma/>
+                    <ct11c_tinhTP_ten/>
+                </DiaChiHDSXKDKhacTinhNDTSC>
+            </Header>
+            <ct21>false</ct21>
+            <ct22>0</ct22>
+            <GiaTriVaThueGTGTHHDVMuaVao>
+                <ct23>19645704</ct23>
+                <ct24>1293976</ct24>
+            </GiaTriVaThueGTGTHHDVMuaVao>
+            <HangHoaDichVuNhapKhau>
+                <ct23a>0</ct23a>
+                <ct24a>0</ct24a>
+            </HangHoaDichVuNhapKhau>
+            <ct25>1293976</ct25>
+            <ct26>6580000</ct26>
+            <HHDVBRaChiuThueGTGT>
+                <ct27>45679462</ct27>
+                <ct28>3654357</ct28>
+            </HHDVBRaChiuThueGTGT>
+            <ct29>0</ct29>
+            <HHDVBRaChiuTSuat5>
+                <ct30>0</ct30>
+                <ct31>0</ct31>
+            </HHDVBRaChiuTSuat5>
+            <HHDVBRaChiuTSuat10>
+                <ct32>45679462</ct32>
+                <ct33>3654357</ct33>
+            </HHDVBRaChiuTSuat10>
+            <ct32a>0</ct32a>
+            <TongDThuVaThueGTGTHHDVBRa>
+                <ct34>52259462</ct34>
+                <ct35>3654357</ct35>
+            </TongDThuVaThueGTGTHHDVBRa>
+            <ct36>2360381</ct36>
+            <ct37>0</ct37>
+            <ct38>0</ct38>
+            <ct39a>0</ct39a>
+            <ct40a>2360381</ct40a>
+            <ct40b>0</ct40b>
+            <ct40>2360381</ct40>
+            <ct41>0</ct41>
+            <ct42>0</ct42>
+            <ct43>0</ct43>
+        </CTieuTKhaiChinh>
+        <PLuc>
+            <PL_NQ142_GTGT>
+                <HH_DV_MuaVaoTrongKy>
+                    <BangKeTenHHDV ID="1">
+                        <tenHHDVMuaVao>Dịch Vụ Chữ Ký Số NCCA 1 năm - GH</tenHHDVMuaVao>
+                        <giaTriHHDVMuaVao>266665</giaTriHHDVMuaVao>
+                        <thueGTGTHHDV>21333</thueGTGTHHDV>
+                    </BangKeTenHHDV>
+                    <BangKeTenHHDV ID="2">
+                        <tenHHDVMuaVao>Dịch Vụ Chữ Ký Số NCCA 3 năm - GH</tenHHDVMuaVao>
+                        <giaTriHHDVMuaVao>523144</giaTriHHDVMuaVao>
+                        <thueGTGTHHDV>41852</thueGTGTHHDV>
+                    </BangKeTenHHDV>
+                    <BangKeTenHHDV ID="3">
+                        <tenHHDVMuaVao>Dịch Vụ Chữ Ký Số ICA 1 năm</tenHHDVMuaVao>
+                        <giaTriHHDVMuaVao>4510455</giaTriHHDVMuaVao>
+                        <thueGTGTHHDV>360836</thueGTGTHHDV>
+                    </BangKeTenHHDV>
+                    <BangKeTenHHDV ID="4">
+                        <tenHHDVMuaVao>TOKEN</tenHHDVMuaVao>
+                        <giaTriHHDVMuaVao>3200000</giaTriHHDVMuaVao>
+                        <thueGTGTHHDV>256000</thueGTGTHHDV>
+                    </BangKeTenHHDV>
+                    <BangKeTenHHDV ID="5">
+                        <tenHHDVMuaVao>TOKEN</tenHHDVMuaVao>
+                        <giaTriHHDVMuaVao>3200000</giaTriHHDVMuaVao>
+                        <thueGTGTHHDV>256000</thueGTGTHHDV>
+                    </BangKeTenHHDV>
+                    <BangKeTenHHDV ID="6">
+                        <tenHHDVMuaVao>Dịch Vụ Chữ Ký Số ICA 3 năm</tenHHDVMuaVao>
+                        <giaTriHHDVMuaVao>4474440</giaTriHHDVMuaVao>
+                        <thueGTGTHHDV>357955</thueGTGTHHDV>
+                    </BangKeTenHHDV>
+                    <tongCongGiaTriHHDVMuaVao>16174704</tongCongGiaTriHHDVMuaVao>
+                    <tongCongThueGTGTHHDV>1293976</tongCongThueGTGTHHDV>
+                </HH_DV_MuaVaoTrongKy>
+                <HH_DV_BanRaTrongKy>
+                    <BangKeTenHHDV ID="1">
+                        <tenHHDV>Dịch vụ gia hạn chữ ký số 3 năm</tenHHDV>
+                        <giaTriHHDV>2380000</giaTriHHDV>
+                        <thueSuatTheoQuyDinh>10</thueSuatTheoQuyDinh>
+                        <thueSuatSauGiam>8</thueSuatSauGiam>
+                        <thueGTGTDuocGiam>47600</thueGTGTDuocGiam>
+                    </BangKeTenHHDV>
+                    <BangKeTenHHDV ID="2">
+                        <tenHHDV>Dịch vụ chữ ký số - 3 năm</tenHHDV>
+                        <giaTriHHDV>2777778</giaTriHHDV>
+                        <thueSuatTheoQuyDinh>10</thueSuatTheoQuyDinh>
+                        <thueSuatSauGiam>8</thueSuatSauGiam>
+                        <thueGTGTDuocGiam>55556</thueGTGTDuocGiam>
+                    </BangKeTenHHDV>
+                    <BangKeTenHHDV ID="3">
+                        <tenHHDV>Dịch vụ cắt bảng tên Mica - Kích thước 30cm x 40cm</tenHHDV>
+                        <giaTriHHDV>324074</giaTriHHDV>
+                        <thueSuatTheoQuyDinh>10</thueSuatTheoQuyDinh>
+                        <thueSuatSauGiam>8</thueSuatSauGiam>
+                        <thueGTGTDuocGiam>6481</thueGTGTDuocGiam>
+                    </BangKeTenHHDV>
+                    <BangKeTenHHDV ID="4">
+                        <tenHHDV>Dịch vụ đăng ký chữ ký số 3 năm</tenHHDV>
+                        <giaTriHHDV>30100000</giaTriHHDV>
+                        <thueSuatTheoQuyDinh>10</thueSuatTheoQuyDinh>
+                        <thueSuatSauGiam>8</thueSuatSauGiam>
+                        <thueGTGTDuocGiam>602000</thueGTGTDuocGiam>
+                    </BangKeTenHHDV>
+                    <BangKeTenHHDV ID="5">
+                        <tenHHDV>Dịch vụ gia hạn chữ ký số 1 năm</tenHHDV>
+                        <giaTriHHDV>1018519</giaTriHHDV>
+                        <thueSuatTheoQuyDinh>10</thueSuatTheoQuyDinh>
+                        <thueSuatSauGiam>8</thueSuatSauGiam>
+                        <thueGTGTDuocGiam>20370</thueGTGTDuocGiam>
+                    </BangKeTenHHDV>
+                    <BangKeTenHHDV ID="6">
+                        <tenHHDV>Dịch vụ chữ ký số 1 năm</tenHHDV>
+                        <giaTriHHDV>1159091</giaTriHHDV>
+                        <thueSuatTheoQuyDinh>10</thueSuatTheoQuyDinh>
+                        <thueSuatSauGiam>8</thueSuatSauGiam>
+                        <thueGTGTDuocGiam>23182</thueGTGTDuocGiam>
+                    </BangKeTenHHDV>
+                    <BangKeTenHHDV ID="7">
+                        <tenHHDV>Dịch vụ đăng ký chữ ký số 1 năm</tenHHDV>
+                        <giaTriHHDV>4980000</giaTriHHDV>
+                        <thueSuatTheoQuyDinh>10</thueSuatTheoQuyDinh>
+                        <thueSuatSauGiam>8</thueSuatSauGiam>
+                        <thueGTGTDuocGiam>99600</thueGTGTDuocGiam>
+                    </BangKeTenHHDV>
+                    <BangKeTenHHDV ID="8">
+                        <tenHHDV>Dịch vụ đăng ký chữ ký số 1năm</tenHHDV>
+                        <giaTriHHDV>1260000</giaTriHHDV>
+                        <thueSuatTheoQuyDinh>10</thueSuatTheoQuyDinh>
+                        <thueSuatSauGiam>8</thueSuatSauGiam>
+                        <thueGTGTDuocGiam>25200</thueGTGTDuocGiam>
+                    </BangKeTenHHDV>
+                    <BangKeTenHHDV ID="9">
+                        <tenHHDV>Dịch Vụ Chữ Ký Số 3 năm</tenHHDV>
+                        <giaTriHHDV>1680000</giaTriHHDV>
+                        <thueSuatTheoQuyDinh>10</thueSuatTheoQuyDinh>
+                        <thueSuatSauGiam>8</thueSuatSauGiam>
+                        <thueGTGTDuocGiam>33600</thueGTGTDuocGiam>
+                    </BangKeTenHHDV>
+                    <tongCongGiaTriHHDV>45679462</tongCongGiaTriHHDV>
+                    <tongCongThueGTGTDuocGiam>913589</tongCongThueGTGTDuocGiam>
+                </HH_DV_BanRaTrongKy>
+                <ChenhLech>
+                    <ct9>-380387</ct9>
+                </ChenhLech>
+            </PL_NQ142_GTGT>
+        </PLuc>
+    </HSoKhaiThue>
+    <CKyDTu><Signature xmlns="http://www.w3.org/2000/09/xmldsig#" Id="NBan-7175da88d97e4584bafe1e852e69fe80"><SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="#NODETOSIGN"><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue>7VoWbJ/3mVV/nGPnzQNymBlIEfGOnjSjOzEavcO1gv4=</DigestValue></Reference><Reference URI="#SigningTime-64e5087e7bca4079a91d0fbdec609f26"><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue>ejZjScaPpQelGPHlGOPb9oeOoPeHmnCu7kH6s9XGUog=</DigestValue></Reference></SignedInfo><SignatureValue>ehCTPaTuFvABr1VSVp+y4j9I6AG7DLA+uPnWbDFnPlmnI7OKgT0pjOru6hLZQ1LO06ykdzV7sbOcHwN/9BJhMRTWLzuOM+/6UtvJts3hfXX7tSt4j/2zvmQZCq0HnFpJpKr71XMthg/rJObHJrW7b/yJ6gl3qz1pWkEpphlCW7VdtUViJUjvHA/73irHcy4q+VwccLNkduoLYheTHO0nK1EBuKQZPoca+ndczu0JaFWBip0PkKomvZKpmgmymUPzlXrCqt00WMW0VzHydzpIY1ZoU/eDvqSelxEqFq2ZTEYrNeBEZX5TscUlE+dGq5G81xvI8N7d0EtU9muY7ObJYw==</SignatureValue><KeyInfo><X509Data><X509SubjectName>UID=MST:0314227971,CN=CÔNG TY TNHH TRUYỀN THÔNG TIẾP SỨC SÁNG TẠO,O=CÔNG TY TNHH TRUYỀN THÔNG TIẾP SỨC SÁNG TẠO,ST=Hồ Chí Minh,C=VN</X509SubjectName><X509Certificate>MIIE1TCCA72gAwIBAgIQVAESIcmEaX3UmQLuQbsGzDANBgkqhkiG9w0BAQsFADArMQ0wCwYDVQQDDARJLUNBMQ0wCwYDVQQKDARJLUNBMQswCQYDVQQGEwJWTjAeFw0yNTA5MDYwNjU3MjNaFw0yNzAxMjQwODExNDlaMIHIMQswCQYDVQQGEwJWTjEXMBUGA1UECAwOSOG7kyBDaMOtIE1pbmgxPzA9BgNVBAoMNkPDlE5HIFRZIFROSEggVFJVWeG7gE4gVEjDlE5HIFRJ4bq+UCBT4buoQyBTw4FORyBU4bqgTzE/MD0GA1UEAww2Q8OUTkcgVFkgVE5ISCBUUlVZ4buATiBUSMOUTkcgVEnhur5QIFPhu6hDIFPDgU5HIFThuqBPMR4wHAYKCZImiZPyLGQBAQwOTVNUOjAzMTQyMjc5NzEwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQC+WeaYLPOCy4wR3/DJKN3inMlxRN6KFkptqGr2WEsTmXY2urtqCWINuK5AEJzDTKY3PEvwQv22sDnLhiZCwkhiIz5Ctlq237+ygXBDAtPsZVwImZdPc0cX8nSAaJuXqDFoYoIp/tqkju52fQWB4adJPjbxBKSGXueG+72owhKrkQmOMUJVloYu7HExbmIfu1GxgYl2mSA29MKULTGNAeqM7ZbRTQ3V8wIv8UqZhSM7+nTVxIEQw0SxU33TyImWjIVaE+Nuq7ImE7VNwuWUKJLIYWw2J/K8Rq5dLMV1bDG2FulC/XHsyfSlE9UaG75AFjrZkbQb4YztlIK/79UxM70JAgMBAAGjggFVMIIBUTAMBgNVHRMBAf8EAjAAMB8GA1UdIwQYMBaAFMgnCWzCxN9H6hnydyl7Z1xDsSkrMIGVBggrBgEFBQcBAQSBiDCBhTAyBggrBgEFBQcwAoYmaHR0cHM6Ly9yb290Y2EuZ292LnZuL2NydC92bnJjYTI1Ni5wN2IwLgYIKwYBBQUHMAKGImh0dHBzOi8vcm9vdGNhLmdvdi52bi9jcnQvSS1DQS5wN2IwHwYIKwYBBQUHMAGGE2h0dHA6Ly9vY3NwLmktY2Eudm4wNAYDVR0lBC0wKwYIKwYBBQUHAwIGCCsGAQUFBwMEBgorBgEEAYI3CgMMBgkqhkiG9y8BAQUwIwYDVR0fBBwwGjAYoBagFIYSaHR0cDovL2NybC5pLWNhLnZuMB0GA1UdDgQWBBQv54xL95SOOZqFqr7udJYF/9zHRDAOBgNVHQ8BAf8EBAMCBPAwDQYJKoZIhvcNAQELBQADggEBAKrpnhHsb/gBNOmczLajhkxN7OBRKVRgMWL9CQwnQ77d+bvlZMbQjwS6EWgp24YhZlD1rs32Cr5WoNTOAEU9g22HBf5jrt4rxL/5zwjiks3fGYj5MqPZonJ4g5vIMpK80+IVRI8dwJ3a/Tffek049ZNEb1mL/LgdjF6pFEasF3Est1N7OEbmlb7yrdNDcNAC3qzO7bbsusUGbt1BMTpyn/awtTbyqri6g/kEDeR5wAF2sgf5WXkwK3WQnmBTsQdCCF/E+bh+OCkeozveO+pmPHCBvFAV3aJt+kpF04DBYXmZ4rgIkyotHoAPV/KLNK66cX6w7Yqy8lWSWu4GXhoG4fY=</X509Certificate></X509Data></KeyInfo><Object Id="SigningTime-64e5087e7bca4079a91d0fbdec609f26"><SignatureProperties><SignatureProperty Target="signatureProperties"><SigningTime>2026-01-20T13:13:47</SigningTime></SignatureProperty></SignatureProperties></Object></Signature></CKyDTu>
+</HSoThueDTu>

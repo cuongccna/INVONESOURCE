@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { authenticate } from '../middleware/auth';
+import { requireCompany } from '../middleware/company';
 import { pool } from '../db/pool';
 import { sendSuccess, sendPaginated } from '../utils/response';
 import { AppError } from '../utils/AppError';
@@ -11,6 +12,7 @@ const genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
 
 const router = Router();
 router.use(authenticate);
+router.use(requireCompany);
 
 // GET /api/crm/rfm/summary
 router.get('/rfm/summary', async (req: Request, res: Response) => {
@@ -51,18 +53,19 @@ router.get('/aging', async (req: Request, res: Response) => {
        buyer_name,
        COUNT(*) AS invoice_count,
        SUM(total_amount) AS total_amount,
-       SUM(CASE WHEN payment_due_date >= $2::date THEN total_amount ELSE 0 END) AS current_amount,
-       SUM(CASE WHEN $2::date - payment_due_date BETWEEN 1  AND 30 THEN total_amount ELSE 0 END) AS overdue_1_30,
-       SUM(CASE WHEN $2::date - payment_due_date BETWEEN 31 AND 60 THEN total_amount ELSE 0 END) AS overdue_31_60,
-       SUM(CASE WHEN $2::date - payment_due_date BETWEEN 61 AND 90 THEN total_amount ELSE 0 END) AS overdue_61_90,
-       SUM(CASE WHEN $2::date - payment_due_date > 90             THEN total_amount ELSE 0 END) AS overdue_90plus,
+       -- Invoices without payment_due_date are treated as not yet overdue (current)
+       SUM(CASE WHEN COALESCE(payment_due_date, CURRENT_DATE + 30) >= $2::date THEN total_amount ELSE 0 END) AS current_amount,
+       SUM(CASE WHEN $2::date - COALESCE(payment_due_date, CURRENT_DATE + 30) BETWEEN 1  AND 30 THEN total_amount ELSE 0 END) AS overdue_1_30,
+       SUM(CASE WHEN $2::date - COALESCE(payment_due_date, CURRENT_DATE + 30) BETWEEN 31 AND 60 THEN total_amount ELSE 0 END) AS overdue_31_60,
+       SUM(CASE WHEN $2::date - COALESCE(payment_due_date, CURRENT_DATE + 30) BETWEEN 61 AND 90 THEN total_amount ELSE 0 END) AS overdue_61_90,
+       SUM(CASE WHEN $2::date - COALESCE(payment_due_date, CURRENT_DATE + 30) > 90             THEN total_amount ELSE 0 END) AS overdue_90plus,
        MAX(invoice_date) AS last_invoice_date
      FROM invoices
      WHERE company_id = $1
        AND direction = 'output'
        AND status = 'valid'
        AND payment_date IS NULL
-       AND payment_due_date IS NOT NULL
+       AND deleted_at IS NULL
      GROUP BY buyer_tax_code, buyer_name
      ORDER BY total_amount DESC`,
     [companyId, today],

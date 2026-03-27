@@ -1,10 +1,12 @@
 import { Router } from 'express';
 import { authenticate } from '../middleware/auth';
+import { requireCompany } from '../middleware/company';
 import { sendSuccess } from '../utils/response';
 import { productCatalogService } from '../services/ProductCatalogService';
 
 const router = Router();
 router.use(authenticate);
+router.use(requireCompany);
 
 // GET /api/products/profitability?month=&year=
 router.get('/profitability', async (req, res) => {

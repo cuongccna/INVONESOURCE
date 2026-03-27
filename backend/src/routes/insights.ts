@@ -1,10 +1,12 @@
 import { Router, Request, Response } from 'express';
 import { authenticate } from '../middleware/auth';
+import { requireCompany } from '../middleware/company';
 import { esgService } from '../services/EsgEstimationService';
 import { sendSuccess } from '../utils/response';
 
 const router = Router();
 router.use(authenticate);
+router.use(requireCompany);
 
 // GET /api/insights/seasonal
 router.get('/seasonal', async (req: Request, res: Response) => {

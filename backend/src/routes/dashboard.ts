@@ -13,8 +13,8 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const companyId = req.user!.companyId;
     const now = new Date();
-    const month = now.getMonth() + 1;
-    const year = now.getFullYear();
+    const month = req.query['month'] ? parseInt(String(req.query['month']), 10) : now.getMonth() + 1;
+    const year  = req.query['year']  ? parseInt(String(req.query['year']),  10) : now.getFullYear();
 
     const [invoiceStats, vatStats, syncStats] = await Promise.all([
       pool.query<{
@@ -30,13 +30,24 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
          FROM invoices
          WHERE company_id = $1
            AND EXTRACT(MONTH FROM invoice_date) = $2
-           AND EXTRACT(YEAR FROM invoice_date) = $3`,
+           AND EXTRACT(YEAR FROM invoice_date) = $3
+           AND deleted_at IS NULL`,
         [companyId, month, year]
       ),
+      // Calculate VAT directly from invoices (not from vat_reconciliations which requires manual trigger)
       pool.query(
-        `SELECT output_vat, input_vat, payable_vat
-         FROM vat_reconciliations
-         WHERE company_id = $1 AND period_month = $2 AND period_year = $3`,
+        `SELECT
+           COALESCE(SUM(vat_amount) FILTER (WHERE direction = 'output' AND status != 'cancelled'), 0) AS output_vat,
+           COALESCE(SUM(vat_amount) FILTER (WHERE direction = 'input'  AND status != 'cancelled'), 0) AS input_vat,
+           GREATEST(0,
+             COALESCE(SUM(vat_amount) FILTER (WHERE direction = 'output' AND status != 'cancelled'), 0) -
+             COALESCE(SUM(vat_amount) FILTER (WHERE direction = 'input'  AND status != 'cancelled'), 0)
+           ) AS payable_vat
+         FROM invoices
+         WHERE company_id = $1
+           AND EXTRACT(MONTH FROM invoice_date) = $2
+           AND EXTRACT(YEAR FROM invoice_date) = $3
+           AND deleted_at IS NULL`,
         [companyId, month, year]
       ),
       pool.query(
@@ -50,7 +61,8 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
     sendSuccess(res, {
       period: { month, year },
       invoices: invoiceStats.rows[0],
-      vat: vatStats.rows[0] ?? null,
+      // vatStats always returns exactly 1 row (aggregate), ensure non-null
+      vat: vatStats.rows[0] ?? { output_vat: '0', input_vat: '0', payable_vat: '0' },
       recentSyncs: syncStats.rows,
     });
   } catch (err) {
@@ -62,19 +74,36 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
 router.get('/charts', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const companyId = req.user!.companyId;
+    const now = new Date();
+    const endMonth = req.query['month'] ? parseInt(String(req.query['month']), 10) : now.getMonth() + 1;
+    const endYear  = req.query['year']  ? parseInt(String(req.query['year']),  10) : now.getFullYear();
 
+    // Compute start of the 12-month window (11 months before the given period)
+    const endDate  = new Date(endYear, endMonth - 1, 1); // first day of endMonth
+    const startDate = new Date(endYear, endMonth - 1 - 11, 1); // 11 months back
+
+    // Calculate VAT trend directly from invoices grouped by month
     const result = await pool.query(
       `SELECT
-         period_month, period_year,
-         output_vat, input_vat, payable_vat
-       FROM vat_reconciliations
+         EXTRACT(MONTH FROM invoice_date)::int AS period_month,
+         EXTRACT(YEAR  FROM invoice_date)::int AS period_year,
+         COALESCE(SUM(vat_amount) FILTER (WHERE direction = 'output' AND status != 'cancelled'), 0) AS output_vat,
+         COALESCE(SUM(vat_amount) FILTER (WHERE direction = 'input'  AND status != 'cancelled'), 0) AS input_vat,
+         GREATEST(0,
+           COALESCE(SUM(vat_amount) FILTER (WHERE direction = 'output' AND status != 'cancelled'), 0) -
+           COALESCE(SUM(vat_amount) FILTER (WHERE direction = 'input'  AND status != 'cancelled'), 0)
+         ) AS payable_vat
+       FROM invoices
        WHERE company_id = $1
-         AND (period_year * 100 + period_month) >= (EXTRACT(YEAR FROM NOW() - INTERVAL '11 months')::int * 100 + EXTRACT(MONTH FROM NOW() - INTERVAL '11 months')::int)
+         AND invoice_date >= $2
+         AND invoice_date <  $3
+         AND deleted_at IS NULL
+       GROUP BY period_month, period_year
        ORDER BY period_year ASC, period_month ASC`,
-      [companyId]
+      [companyId, startDate.toISOString(), new Date(endYear, endMonth, 1).toISOString()]
     );
 
-    // Invoice count trend by month
+    // Invoice count trend — 12 months ending at the given period
     const countTrend = await pool.query(
       `SELECT
          EXTRACT(MONTH FROM invoice_date)::int as month,
@@ -85,10 +114,12 @@ router.get('/charts', async (req: Request, res: Response, next: NextFunction) =>
          SUM(total_amount) FILTER (WHERE direction = 'input') as input_total
        FROM invoices
        WHERE company_id = $1
-         AND invoice_date >= NOW() - INTERVAL '11 months'
+         AND invoice_date >= $2
+         AND invoice_date <  $3
+         AND deleted_at IS NULL
        GROUP BY 1, 2
        ORDER BY 2 ASC, 1 ASC`,
-      [companyId]
+      [companyId, startDate.toISOString(), new Date(endYear, endMonth, 1).toISOString()]
     );
 
     sendSuccess(res, {
@@ -105,6 +136,12 @@ router.get('/analytics', async (req: Request, res: Response, next: NextFunction)
   try {
     const companyId = req.user!.companyId;
     const months = Math.min(12, Math.max(1, Number(req.query.months ?? 3)));
+    const now = new Date();
+    const endMonth = req.query['month'] ? parseInt(String(req.query['month']), 10) : now.getMonth() + 1;
+    const endYear  = req.query['year']  ? parseInt(String(req.query['year']),  10) : now.getFullYear();
+    // End = last day of endMonth; start = `months` months before
+    const endDate   = new Date(endYear, endMonth, 1);          // exclusive upper bound (first day next month)
+    const startDate = new Date(endYear, endMonth - 1 - (months - 1), 1); // inclusive lower bound
 
     const [customers, suppliers, statusBreakdown] = await Promise.all([
       pool.query(
@@ -114,13 +151,13 @@ router.get('/analytics', async (req: Request, res: Response, next: NextFunction)
                 SUM(vat_amount) AS total_vat
          FROM invoices
          WHERE company_id = $1 AND direction = 'output'
-           AND invoice_date >= NOW() - ($2::int * INTERVAL '1 month')
-           AND status = 'valid'
+           AND invoice_date >= $2 AND invoice_date < $3
+           AND status = 'valid' AND deleted_at IS NULL
            AND buyer_name IS NOT NULL
          GROUP BY buyer_name, buyer_tax_code
          ORDER BY total_amount DESC NULLS LAST
          LIMIT 5`,
-        [companyId, months]
+        [companyId, startDate.toISOString(), endDate.toISOString()]
       ),
       pool.query(
         `SELECT seller_name AS counterparty_name, seller_tax_code AS counterparty_tax_code,
@@ -129,22 +166,23 @@ router.get('/analytics', async (req: Request, res: Response, next: NextFunction)
                 SUM(vat_amount) AS total_vat
          FROM invoices
          WHERE company_id = $1 AND direction = 'input'
-           AND invoice_date >= NOW() - ($2::int * INTERVAL '1 month')
-           AND status = 'valid'
+           AND invoice_date >= $2 AND invoice_date < $3
+           AND status = 'valid' AND deleted_at IS NULL
            AND seller_name IS NOT NULL
          GROUP BY seller_name, seller_tax_code
          ORDER BY total_amount DESC NULLS LAST
          LIMIT 5`,
-        [companyId, months]
+        [companyId, startDate.toISOString(), endDate.toISOString()]
       ),
       pool.query(
         `SELECT status, direction, COUNT(*) AS count
          FROM invoices
          WHERE company_id = $1
-           AND invoice_date >= NOW() - ($2::int * INTERVAL '1 month')
+           AND invoice_date >= $2 AND invoice_date < $3
+           AND deleted_at IS NULL
          GROUP BY status, direction
          ORDER BY count DESC`,
-        [companyId, months]
+        [companyId, startDate.toISOString(), endDate.toISOString()]
       ),
     ]);
 

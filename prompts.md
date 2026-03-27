@@ -4628,3 +4628,898 @@ setInterval(() => {
 // - Add to gdt_bot_configs.proxy_url for per-tenant proxy assignment
 ```
 
+
+---
+
+## GROUP 36 — DANH MỤC TỰ ĐỘNG + TỰ SINH MÃ
+
+### CAT-01 — Auto-code generation engine cho hàng hóa và khách hàng
+```
+[Respond in Vietnamese]
+Create /backend/src/services/AutoCodeService.ts
+Auto-generate codes for products and customers from invoice data.
+
+Goal: Every item and customer extracted from invoices gets a unique, human-readable code.
+Codes must be deterministic (same input = same code) and sequential within each company.
+
+1. Product code generation:
+   Format: HH-{CATEGORY_PREFIX}-{4-digit-seq}
+   Examples: HH-VPPM-0001 (văn phòng phẩm), HH-TPCN-0045, HH-XDCT-0012
+   
+   Category prefixes (auto-detected from item name via Gemini or keyword rules):
+     VPPM: văn phòng phẩm (giấy, bút, mực...)
+     TPCN: thực phẩm & đồ uống
+     XDCT: xây dựng & công trình
+     MTBM: máy tính & thiết bị
+     BBHH: bao bì & đóng gói
+     VLSX: vật liệu sản xuất
+     DVVU: dịch vụ vận tải
+     DVTU: dịch vụ tư vấn
+     DVKH: dịch vụ khác
+     HHKH: hàng hóa khác (default)
+
+2. Customer code generation:
+   Format: KH-{PROVINCE_PREFIX}-{4-digit-seq}
+   Examples: KH-HNO-0001, KH-HCM-0023, KH-DAN-0005
+   
+   Province prefix from buyer_tax_code first 2 digits:
+     01xx: HNO (Hà Nội), 02xx: HAI (Hải Phòng), 03xx: QNI (Quảng Ninh)
+     04xx: BAC (Bắc Ninh), 05xx: HAB (Hà Nam), 07xx: HCM (Hồ Chí Minh)
+     09xx: DAN (Đà Nẵng), 10xx: CAN (Cần Thơ)... (full map in code)
+     Unknown MST prefix: XXX
+
+3. Supplier (vendor) code generation:
+   Format: NCC-{PROVINCE_PREFIX}-{4-digit-seq}
+   Same logic as customer but for seller_tax_code
+
+4. DB schema additions:
+   ALTER TABLE product_catalog ADD COLUMN IF NOT EXISTS
+     item_code VARCHAR(20) UNIQUE,       -- auto-generated: HH-XXXX-0001
+     category_code VARCHAR(10),
+     category_name VARCHAR(100),
+     is_service BOOLEAN DEFAULT false,
+     unit VARCHAR(50),
+     avg_purchase_price NUMERIC(18,2),   -- latest from input invoices
+     avg_sale_price NUMERIC(18,2);       -- latest from output invoices
+
+   CREATE TABLE IF NOT EXISTS customer_catalog (
+     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+     company_id UUID REFERENCES companies(id),
+     customer_code VARCHAR(20),          -- KH-HCM-0001
+     tax_code VARCHAR(20),
+     name VARCHAR(255),
+     address TEXT,
+     phone VARCHAR(20),
+     province_code VARCHAR(10),
+     total_revenue_12m NUMERIC(18,2),
+     invoice_count_12m INT DEFAULT 0,
+     last_invoice_date DATE,
+     rfm_segment VARCHAR(30),
+     created_at TIMESTAMPTZ DEFAULT NOW(),
+     UNIQUE(company_id, tax_code)
+   );
+
+   CREATE TABLE IF NOT EXISTS supplier_catalog (
+     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+     company_id UUID REFERENCES companies(id),
+     supplier_code VARCHAR(20),          -- NCC-HNO-0001
+     tax_code VARCHAR(20),
+     name VARCHAR(255),
+     total_spend_12m NUMERIC(18,2),
+     invoice_count_12m INT DEFAULT 0,
+     last_invoice_date DATE,
+     created_at TIMESTAMPTZ DEFAULT NOW(),
+     UNIQUE(company_id, tax_code)
+   );
+
+5. Sequence management:
+   CREATE SEQUENCE IF NOT EXISTS product_code_seq START 1;
+   CREATE SEQUENCE IF NOT EXISTS customer_code_seq START 1;
+   CREATE SEQUENCE IF NOT EXISTS supplier_code_seq START 1;
+   -- Per-company sequences stored in: code_sequences(company_id, type, current_val)
+
+6. Auto-run after every import/sync:
+   - Scan all invoices for new buyer_tax_code → create customer_catalog entry + assign code
+   - Scan all line_items for new item_name → create product_catalog entry + assign code
+   - Scan all invoices for new seller_tax_code → create supplier_catalog entry + assign code
+   - Never re-assign codes (idempotent — same tax_code always gets same code)
+
+7. Frontend pages:
+   /catalogs/products  → searchable product list, show code, category, prices
+   /catalogs/customers → customer list with codes (linked to CRM data)
+   /catalogs/suppliers → supplier list with codes (linked to vendor data)
+   Each page: [Xuất Excel] button, [Sửa] per row, search by code/name/MST
+```
+
+---
+
+## GROUP 37 — XUẤT NHẬP TỒN (INVENTORY TRACKING)
+
+### INV-01 — Inventory movement engine
+```
+[Respond in Vietnamese]
+Create inventory tracking from invoice line items.
+This derives inventory movements WITHOUT requiring a separate warehouse system —
+purely from purchase (input) and sales (output) invoices.
+
+Concept:
+  Input invoice line item  → NHẬP KHO (stock in)
+  Output invoice line item → XUẤT KHO (stock out)
+  Tồn = cumulative (nhập - xuất) per item per period
+
+DB Schema:
+CREATE TABLE inventory_movements (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  company_id UUID REFERENCES companies(id),
+  invoice_id UUID REFERENCES invoices(id),
+  line_item_id UUID REFERENCES invoice_line_items(id),
+  movement_type VARCHAR(10),            -- 'IN' (nhập) | 'OUT' (xuất)
+  item_code VARCHAR(20),                -- from product_catalog
+  item_name TEXT,
+  normalized_item_name TEXT,
+  unit VARCHAR(50),
+  quantity NUMERIC(18,4),
+  unit_cost NUMERIC(18,2),              -- giá vốn (from input invoice)
+  unit_price NUMERIC(18,2),             -- giá bán (from output invoice)
+  total_value NUMERIC(18,2),            -- quantity × unit_cost or unit_price
+  movement_date DATE,
+  partner_name VARCHAR(255),
+  partner_tax_code VARCHAR(20),
+  source VARCHAR(20),                   -- 'invoice' | 'manual_adjust' | 'opening_balance'
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_inv_mov_company_date ON inventory_movements(company_id, movement_date DESC);
+CREATE INDEX idx_inv_mov_item ON inventory_movements(company_id, normalized_item_name);
+
+-- Materialized view for fast balance queries
+CREATE MATERIALIZED VIEW inventory_balance AS
+SELECT
+  company_id,
+  item_code,
+  normalized_item_name,
+  item_name,
+  unit,
+  SUM(CASE WHEN movement_type='IN'  THEN quantity ELSE 0 END) AS total_in,
+  SUM(CASE WHEN movement_type='OUT' THEN quantity ELSE 0 END) AS total_out,
+  SUM(CASE WHEN movement_type='IN'  THEN quantity ELSE 0 END) -
+  SUM(CASE WHEN movement_type='OUT' THEN quantity ELSE 0 END) AS balance_qty,
+  SUM(CASE WHEN movement_type='IN'  THEN total_value ELSE 0 END) AS total_in_value,
+  SUM(CASE WHEN movement_type='OUT' THEN total_value ELSE 0 END) AS total_out_value,
+  AVG(CASE WHEN movement_type='IN'  THEN unit_cost END) AS avg_cost_price,
+  MAX(movement_date) AS last_movement_date
+FROM inventory_movements
+GROUP BY company_id, item_code, normalized_item_name, item_name, unit;
+
+REFRESH MATERIALIZED VIEW CONCURRENTLY inventory_balance;
+
+Create /backend/src/services/InventoryService.ts:
+  buildMovements(companyId, month, year): scan invoice_line_items → insert inventory_movements
+  getBalanceReport(companyId, asOfDate): query inventory_balance
+  getMovementDetail(companyId, itemCode, from, to): list all IN/OUT for one item
+  
+Run buildMovements() after each import/sync.
+```
+
+### INV-02 — Báo cáo Xuất Nhập Tồn page
+```
+[Respond in Vietnamese]
+Create /reports/inventory page — Báo cáo Xuất Nhập Tồn (XNT report).
+Standard Vietnamese accounting report format.
+
+Backend: GET /api/reports/inventory?companyId=&month=&year=&itemCode=
+
+Report structure (matches Vietnamese accounting standard):
+  Header: Công ty [name] | MST: [tax_code] | Kỳ: Tháng [M]/[Y]
+  
+  Table columns (chuẩn báo cáo XNT):
+    STT | Mã hàng | Tên hàng hóa | ĐVT | 
+    TỒN ĐẦU KỲ (SL - Giá trị) |
+    NHẬP TRONG KỲ (SL - Giá trị) |
+    XUẤT TRONG KỲ (SL - Giá trị) |
+    TỒN CUỐI KỲ (SL - Giá trị)
+  
+  Tồn đầu kỳ = Tồn cuối kỳ trước
+  Tồn cuối kỳ = Tồn đầu + Nhập - Xuất
+  Giá trị tồn = Bình quân gia quyền (weighted average cost)
+  
+  Footer: Tổng cộng row (sum of all value columns)
+
+Features:
+  - Filter by item category, item code, item name
+  - Toggle: show items with zero balance | hide zero-balance items
+  - Negative balance warning: highlight red (sold more than bought — data gap)
+  - [Xuất Excel] → download properly formatted Excel (chuẩn kế toán VN)
+  - [In báo cáo] → print-optimized A4 layout
+
+Alert box if negative balance items exist:
+  "⚠️ [N] mặt hàng có tồn kho âm — có thể do thiếu dữ liệu đầu vào.
+  Kiểm tra lại hóa đơn mua vào hoặc nhập số dư đầu kỳ."
+
+Opening balance import:
+  Button: "Nhập số dư đầu kỳ" → modal to enter initial stock quantities/values
+  Stored as movement_type='opening_balance'
+
+Mobile view: show as cards (item name + opening + net movement + closing)
+```
+
+---
+
+## GROUP 38 — SỔ QUỸ TIỀN (CASH BOOK)
+
+### CASH-01 — Cash book data model + auto-population
+```
+[Respond in Vietnamese]
+Create /backend/src/services/CashBookService.ts — sổ quỹ tiền mặt.
+
+Important context: Invoice data does not directly give us cash flow timing.
+We derive cash entries from:
+  - Output invoices + payment_date (thu tiền khi khách thanh toán)
+  - Input invoices + payment_date (chi tiền khi trả NCC)
+  - Manual entries (thu/chi không có hóa đơn)
+
+DB Schema:
+CREATE TABLE cash_book_entries (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  company_id UUID REFERENCES companies(id),
+  entry_type VARCHAR(10),             -- 'receipt' (thu) | 'payment' (chi) | 'transfer'
+  entry_date DATE NOT NULL,
+  amount NUMERIC(18,2) NOT NULL,
+  description TEXT,
+  partner_name VARCHAR(255),
+  partner_tax_code VARCHAR(20),
+  invoice_id UUID REFERENCES invoices(id) NULL,  -- linked invoice if any
+  reference_number VARCHAR(50),       -- số phiếu thu/chi
+  category VARCHAR(50),               -- 'bán hàng'|'mua hàng'|'lương'|'thuê mặt bằng'|'khác'
+  payment_method VARCHAR(20),         -- 'cash'|'bank_transfer'|'check'
+  bank_account VARCHAR(50),           -- if bank transfer
+  is_auto_generated BOOLEAN DEFAULT false,  -- true if from invoice.payment_date
+  running_balance NUMERIC(18,2),      -- calculated field
+  created_by UUID REFERENCES users(id),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_cash_book_date ON cash_book_entries(company_id, entry_date DESC);
+
+Auto-populate from paid invoices:
+  When invoice.payment_date is set:
+    - Output invoice paid → INSERT receipt entry (thu tiền bán hàng)
+    - Input invoice paid → INSERT payment entry (chi tiền mua hàng)
+    - is_auto_generated = true, invoice_id = that invoice
+
+Manual entry support:
+  POST /api/cash-book/entries — add manual thu/chi
+  PUT  /api/cash-book/entries/:id — edit
+  DELETE /api/cash-book/entries/:id — soft delete
+
+Running balance recalculation:
+  After any insert/update/delete: recalculate running_balance for all entries
+  from that date forward (use window function: SUM OVER ORDER BY entry_date, id)
+  
+Opening balance:
+  Special entry: entry_type='opening', description='Số dư đầu kỳ'
+  Always the first entry for a company — user inputs manually
+```
+
+### CASH-02 — Sổ Quỹ page
+```
+[Respond in Vietnamese]
+Create /reports/cash-book page — Sổ Quỹ Tiền Mặt.
+Format matches Vietnamese accounting standard for cash journal.
+
+Backend: GET /api/cash-book?companyId=&month=&year=&method=cash|bank|all
+
+Page layout:
+
+Header section:
+  Company name + MST | Kỳ: Tháng [M]/[Y] | Đơn vị tiền: VND
+  Opening balance: [amount] (carried from previous period)
+
+Main table (chuẩn sổ quỹ VN):
+  Ngày | Số chứng từ | Diễn giải | Đối tác | Thu (Nợ) | Chi (Có) | Tồn quỹ
+  
+  Rows auto-sorted by entry_date ASC, then by id
+  Color coding: Thu rows (green left border) | Chi rows (red left border)
+  Auto-generated rows (from invoices): gray background with HĐ icon
+  Manual entries: white background with pencil icon
+  
+  Last row: CỘNG PHÁT SINH (sum of thu, sum of chi)
+  After that: TỒN QUỸ CUỐI KỲ = Đầu kỳ + Thu - Chi
+
+Features:
+  [+ Phiếu Thu] button → modal: date, amount, partner, category, description, reference#
+  [+ Phiếu Chi] button → same modal with type=payment
+  Click row → expand: link to invoice (if auto-generated), edit/delete for manual entries
+  
+  Filter tabs: Tất cả | Tiền mặt | Chuyển khoản | Tự động (từ HĐ) | Thủ công
+  
+  Discrepancy alert: if running_balance goes negative → red warning
+  "⚠️ Tồn quỹ âm ngày [date]: kiểm tra số dư đầu kỳ hoặc nhập thiếu phiếu thu"
+
+  [Xuất Excel] → A4 format, standard VN cash book layout
+  [Đối chiếu ngân hàng] → compare cash book with bank statement (future feature)
+
+Tab toggle: Tiền Mặt | Tiền Gửi Ngân Hàng (separate books per bank account)
+```
+
+---
+
+## GROUP 39 — NHẬT KÝ MUA BÁN + BÁO CÁO DOANH THU / CHI PHÍ
+
+### JRN-01 — Purchase & Sales journals (Nhật ký mua/bán hàng)
+```
+[Respond in Vietnamese]
+Create /reports/purchase-journal and /reports/sales-journal pages.
+These are standard Vietnamese accounting journals derived from invoice data.
+
+Backend: GET /api/reports/sales-journal?companyId=&month=&year=
+         GET /api/reports/purchase-journal?companyId=&month=&year=
+
+Sales Journal (Nhật ký bán hàng) format:
+  Header: Tên DN | MST | Nhật ký bán hàng | Tháng [M]/[Y]
+  
+  Table columns:
+    STT | Ngày | Số HĐ | Ký hiệu | Tên khách hàng | MST khách |
+    Doanh thu 0% | Doanh thu 5% | Doanh thu 8% | Doanh thu 10% |
+    Thuế GTGT 5% | Thuế GTGT 8% | Thuế GTGT 10% |
+    Tổng tiền thanh toán
+
+  Footer: CỘNG PHÁT SINH THÁNG (sum each column)
+  Grand total row: tổng doanh thu + tổng thuế
+
+Purchase Journal (Nhật ký mua hàng) format:
+  Same structure but:
+    STT | Ngày | Số HĐ | Ký hiệu | Tên nhà cung cấp | MST NCC |
+    Hàng mua 0% | Hàng mua 5% | Hàng mua 8% | Hàng mua 10% |
+    Thuế GTGT được khấu trừ 5% | ... 8% | ... 10% |
+    Tổng tiền
+
+Query logic:
+  - Group output invoices by VAT rate → split into separate columns
+  - Sort by invoice_date ASC, then invoice_number
+  - Only include status='valid' invoices (exclude cancelled/replaced)
+
+Both pages share the same UI structure:
+  - Period selector (month/year)
+  - Summary totals at top: Tổng HĐ | Tổng doanh thu | Tổng thuế
+  - Full scrollable table
+  - [Xuất Excel] → properly formatted Excel for accountants
+  - [In báo cáo] → A4 print layout
+
+Note: These journals are the source data for:
+  - VAT declaration form 01/GTGT (already built)
+  - Revenue/expense reports (this group)
+  - P&L statement (next group)
+```
+
+### JRN-02 — Revenue & Expense Report (Báo cáo Doanh Thu & Chi Phí)
+```
+[Respond in Vietnamese]
+Create /reports/revenue-expense page — detailed revenue and expense report.
+More detailed than dashboard charts — this is the accountant-facing report.
+
+Backend: GET /api/reports/revenue-expense?companyId=&month=&year=&groupBy=category|partner|vatRate
+
+Report sections:
+
+SECTION 1 — DOANH THU (Revenue from output invoices):
+  By VAT rate:
+    Doanh thu chịu thuế 0%:    [subtotal] | [vat: 0]
+    Doanh thu chịu thuế 5%:    [subtotal] | [vat: X]
+    Doanh thu chịu thuế 8%:    [subtotal] | [vat: X]
+    Doanh thu chịu thuế 10%:   [subtotal] | [vat: X]
+    Doanh thu không chịu thuế: [subtotal] | [vat: 0]
+    ─────────────────────────────────────────────────
+    TỔNG DOANH THU:            [total]    | [total VAT]
+
+  By top customers (collapsible):
+    Khách hàng A | MST | [invoice count] | [revenue] | [vat]
+    ...
+
+SECTION 2 — CHI PHÍ MUA HÀNG (Costs from input invoices):
+  By VAT rate: same structure as revenue
+  By top suppliers: same structure as customers
+  TỔNG CHI PHÍ MUA HÀNG: [total]
+
+SECTION 3 — TỔNG HỢP:
+  Doanh thu thuần:     [revenue]
+  Chi phí mua hàng:    [cost]
+  Lợi nhuận gộp:       [revenue - cost]
+  Tỉ lệ lợi nhuận gộp: [%]
+
+  VAT phải nộp:        [output_vat - input_vat]
+
+Period selector: Tháng | Quý | Năm | Tùy chỉnh
+Compare toggle: "So với kỳ trước" → show delta columns
+[Xuất Excel] → multi-sheet workbook (revenue sheet + expense sheet + summary)
+[In báo cáo] → A4 landscape format
+```
+
+---
+
+## GROUP 40 — KẾT QUẢ KINH DOANH (P&L STATEMENT)
+
+### PL-01 — P&L calculation engine (chuẩn VN)
+```
+[Respond in Vietnamese]
+Create /backend/src/services/ProfitLossService.ts
+P&L following Vietnamese accounting standard (Thông tư 200/2014/TT-BTC or TT133/2016).
+
+Function calculatePL(companyId: string, month: number, year: number): Promise<PLStatement>
+
+Data sources:
+  Revenue (DT):    output invoices, status=valid, direction=output
+  COGS (GVHB):     input invoices matched to items sold in same period (from line_items cross-match)
+  Other expenses:  cash_book_entries WHERE entry_type='payment' AND category != 'mua hàng'
+
+P&L structure (mẫu chuẩn B02-DN Thông tư 200):
+
+  1. Doanh thu bán hàng và CCDV (01) = SUM(output subtotal)
+  2. Các khoản giảm trừ doanh thu (02) = 0 (unless returns tracked)
+  3. Doanh thu thuần về BH và CCDV (10) = (01) - (02)
+  4. Giá vốn hàng bán (11) = SUM(input subtotal matched to sold items)
+     [If no line_item match: use industry COGS ratio as estimate, mark as estimated]
+  5. Lợi nhuận gộp về BH và CCDV (20) = (10) - (11)
+  6. Doanh thu hoạt động tài chính (21) = 0 (bank interest — manual entry)
+  7. Chi phí tài chính (22) = 0 (loan interest — manual entry)
+  8. Chi phí bán hàng (25) = cash_book WHERE category='chi phí bán hàng'
+  9. Chi phí QLDN (26) = cash_book WHERE category='chi phí quản lý'
+  10. Lợi nhuận thuần từ HĐKD (30) = (20) + (21) - (22) - (25) - (26)
+  11. Thu nhập khác (31) = cash_book WHERE entry_type='receipt' AND category='thu nhập khác'
+  12. Chi phí khác (32) = cash_book WHERE entry_type='payment' AND category='chi phí khác'
+  13. Lợi nhuận khác (40) = (31) - (32)
+  14. Tổng LN trước thuế (50) = (30) + (40)
+  15. Chi phí thuế TNDN hiện hành (51) = (50) × 20% (nếu là DN, if positive)
+      Hộ KD: thuế khoán hoặc theo bảng biểu riêng (see HKD-01)
+  16. Lợi nhuận sau thuế TNDN (60) = (50) - (51)
+
+Store result in:
+  profit_loss_statements(id, company_id, period_month, period_year,
+    line_01 through line_60 as NUMERIC(22,2), has_estimates BOOLEAN,
+    estimate_notes TEXT, generated_at TIMESTAMPTZ)
+```
+
+### PL-02 — Báo cáo Kết Quả Kinh Doanh page
+```
+[Respond in Vietnamese]
+Create /reports/profit-loss page — P&L statement display.
+
+Backend: GET /api/reports/profit-loss?companyId=&month=&year=
+         POST /api/reports/profit-loss/generate → recalculate
+
+Page layout:
+
+Header:
+  "BÁO CÁO KẾT QUẢ HOẠT ĐỘNG KINH DOANH"
+  Công ty: [name] | MST: [code] | Kỳ: Tháng [M]/[Y]
+  
+If has_estimates = true: show orange banner:
+  "⚠️ Một số chỉ tiêu được ước tính do chưa đủ dữ liệu giá vốn hàng bán.
+  Kết quả sẽ chính xác hơn khi có đầy đủ hóa đơn đầu vào với chi tiết hàng hóa."
+
+Main table (2 columns: Chỉ tiêu | Mã số | Kỳ này | Kỳ trước):
+  
+  Row group 1 — DOANH THU:
+    Doanh thu BH và CCDV          01  [+value]
+    Các khoản giảm trừ DT         02  [-value]
+    Doanh thu thuần                10  [=value]  (bold)
+  
+  Row group 2 — CHI PHÍ & LN GỘP:
+    Giá vốn hàng bán               11  [-value]
+    Lợi nhuận gộp                  20  [=value]  (bold, green if positive)
+  
+  Row group 3 — CHI PHÍ HOẠT ĐỘNG:
+    DT hoạt động tài chính         21  [+value]
+    Chi phí tài chính              22  [-value]
+    Chi phí bán hàng               25  [-value]
+    Chi phí quản lý DN             26  [-value]
+    Lợi nhuận thuần HĐKD           30  [=value]  (bold, red if negative)
+  
+  Row group 4 — THU NHẬP/CHI PHÍ KHÁC:
+    Thu nhập khác                  31  [+value]
+    Chi phí khác                   32  [-value]
+    Lợi nhuận khác                 40  [=value]
+  
+  Row group 5 — KẾT QUẢ:
+    Tổng lợi nhuận trước thuế      50  [=value]  (bold, large font)
+    Thuế thu nhập DN               51  [-value]
+    LỢI NHUẬN SAU THUẾ             60  [=value]  (bold, large, green/red)
+
+Visual: 
+  Positive final P&L = green background on row 60
+  Negative final P&L = red background on row 60
+  Mini sparkline: 6-month P&L trend above the table
+  
+Actions:
+  [+ Nhập chi phí thủ công] → add cash_book entry for QLDN/bán hàng/khác
+  [Tính lại] → POST recalculate
+  [Xuất Excel] → standard B02-DN format
+  [In báo cáo] → A4 portrait, official format
+  
+Year comparison: toggle to show 12-month table (each month = one column)
+```
+
+---
+
+## GROUP 41 — THUẾ GTGT HỘ KINH DOANH (VAT FOR HKD)
+
+### HKD-01 — Hộ Kinh Doanh tax forms + calculation
+```
+[Respond in Vietnamese]
+Create VAT and tax forms specifically for Hộ Kinh Doanh (HKD) — small businesses.
+HKD uses different tax forms than enterprises (DN).
+
+Context: Vietnam has 2 tax regimes for small businesses:
+  A) Thuế khoán (fixed tax): lump sum, no monthly declaration needed
+  B) Thuế theo doanh thu thực tế (actual revenue): declare monthly if >100M/year
+
+DB addition:
+  ALTER TABLE companies ADD COLUMN IF NOT EXISTS
+    business_type ENUM('DN','HKD','HND','CA_NHAN') DEFAULT 'DN',
+    tax_regime ENUM('khoan','thuc_te','khau_tru') DEFAULT 'khau_tru',
+    -- khau_tru = deduction method (DN default)
+    -- thuc_te  = actual revenue method (HKD option)
+    -- khoan    = fixed tax (small HKD)
+    vat_rate_hkd NUMERIC(4,2) DEFAULT 1.0;  -- tỉ lệ thuế GTGT HKD (1% or 3% or 5%)
+
+Form 01/GTGT for DN (already built in P9.1) stays as-is.
+
+New form for HKD — Tờ khai thuế theo phương pháp trực tiếp (Mẫu 04/GTGT):
+  Used by: HKD nộp thuế theo doanh thu thực tế
+  
+  Function calculateHkdTax(companyId, month, year): HkdTaxStatement
+    revenue = SUM(output invoices subtotal) for period
+    vat_rate = company.vat_rate_hkd  -- typically 1% for trading, 3% for services, 5% for others
+    vat_payable = revenue × vat_rate
+    personal_income_tax = revenue × 0.5%  -- thuế TNCN (HKD pays both VAT + PIT)
+    total_payable = vat_payable + personal_income_tax
+    deadline = 20th of following month
+
+New form for HKD — Tờ khai thuế khoán:
+  Form 01/TK-HKDBSS (annual fixed tax declaration)
+  Filled once per year, not monthly
+  Fields: estimated annual revenue, tax authority pre-assigned fixed amount
+  Manual input — system can't auto-calculate (fixed by tax authority)
+
+Tỉ lệ thuế GTGT theo ngành (HKD - Thông tư 40/2021):
+  Phân phối, cung cấp hàng hóa: 1%
+  Dịch vụ, xây dựng không bao thầu VLXD: 5%
+  Sản xuất, vận tải, dịch vụ gắn với hàng hóa: 3%
+  Hoạt động khác: 2%
+
+Frontend: When company.business_type = 'HKD':
+  - Replace "Tờ khai 01/GTGT" with "Tờ khai thuế HKD (04/GTGT)"
+  - Show VAT rate selector: 1% | 2% | 3% | 5%
+  - Show both: VAT payable + Personal income tax payable
+  - Display in separate card: "Tổng thuế phải nộp = [VAT] + [TNCN]"
+  - Alert if monthly revenue > 8.33M (100M/year threshold for mandatory declaration)
+```
+
+### HKD-02 — Business type selector in company settings
+```
+[Respond in Vietnamese]
+Update company setup and settings to support different business types.
+
+In /settings/companies and company onboarding:
+Add section "Loại hình & Chế độ thuế":
+
+  Loại hình kinh doanh: (radio)
+    ○ Doanh nghiệp (Công ty TNHH, CP, DNTW...)  → DN
+    ○ Hộ Kinh Doanh                               → HKD
+    ○ Hộ Gia Đình Kinh Doanh                      → HND
+    ○ Cá nhân kinh doanh                          → CA_NHAN
+
+  [IF HKD/HND/CA_NHAN selected, show:]
+  
+  Phương pháp nộp thuế: (radio)
+    ○ Thuế khoán (cơ quan thuế ấn định)
+    ○ Thuế theo doanh thu thực tế (nộp hàng tháng nếu DT > 100 triệu/năm)
+  
+  [IF thuế thực tế selected:]
+  
+  Tỉ lệ thuế GTGT áp dụng: (select)
+    ○ 1% — Phân phối, bán hàng hóa
+    ○ 2% — Hoạt động khác
+    ○ 3% — Sản xuất, vận tải, dịch vụ gắn hàng hóa
+    ○ 5% — Dịch vụ, xây dựng
+
+  Tỉ lệ thuế TNCN: 0.5% (fixed per TT40/2021, display only)
+
+When business_type is set:
+  - All tax reports automatically switch to correct form
+  - Dashboard labels change: "Thuế GTGT" → "Thuế GTGT + TNCN"
+  - Tờ Khai page shows correct form template
+  - VAT rate used in calculations updates accordingly
+
+API: PATCH /api/companies/:id/tax-settings
+  Body: { businessType, taxRegime, vatRateHkd }
+```
+
+
+---
+
+## GROUP 42 — DATA MANAGEMENT & MAINTENANCE
+
+> Mục tiêu: Cho phép user kiểm soát dữ liệu hóa đơn mà không sợ mất vĩnh viễn,
+> đồng thời đảm bảo GDT Bot không bao giờ tái nhập những HĐ đã bị chủ động loại bỏ.
+
+### P42.1 — Soft Delete Logic + RLS Filter
+```
+[Respond in Vietnamese]
+Implement soft delete across all invoice-related tables.
+Currently invoices are never deleted — add controlled deletion with recovery support.
+
+STEP 1 — DB migration /scripts/011_soft_delete.sql:
+
+-- Ensure deleted_at column exists on all relevant tables
+ALTER TABLE invoices
+  ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS deleted_by UUID REFERENCES users(id),
+  ADD COLUMN IF NOT EXISTS delete_reason VARCHAR(100),
+  ADD COLUMN IF NOT EXISTS is_permanently_ignored BOOLEAN DEFAULT false;
+  -- is_permanently_ignored = true means: bot will NEVER re-import this invoice
+
+ALTER TABLE invoice_line_items
+  ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ DEFAULT NULL;
+
+ALTER TABLE inventory_movements
+  ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ DEFAULT NULL;
+
+ALTER TABLE cash_book_entries
+  ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ DEFAULT NULL;
+
+-- Index to make "active only" queries fast
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_invoices_not_deleted
+  ON invoices(company_id, invoice_date DESC)
+  WHERE deleted_at IS NULL AND is_permanently_ignored = false;
+
+STEP 2 — Update ALL existing queries to filter soft-deleted rows:
+  Every SELECT on invoices must add: WHERE deleted_at IS NULL
+  This applies to: dashboard stats, VAT reconciliation, P&L, cash book, reports,
+  inventory movements, RFM calculation, anomaly detection, repurchase predictions.
+
+  Create a DB view for convenience:
+  CREATE OR REPLACE VIEW active_invoices AS
+    SELECT * FROM invoices
+    WHERE deleted_at IS NULL
+      AND is_permanently_ignored = false;
+  
+  Update all backend services to query active_invoices view instead of invoices table
+  directly. This ensures no soft-deleted or ignored invoice ever appears in any report.
+
+STEP 3 — Update Row-Level Security:
+  -- Existing RLS policy on invoices — update to also exclude deleted rows
+  DROP POLICY IF EXISTS invoices_company_isolation ON invoices;
+  
+  CREATE POLICY invoices_company_isolation ON invoices
+    USING (
+      company_id IN (
+        SELECT company_id FROM user_companies
+        WHERE user_id = current_setting('app.current_user_id', true)::uuid
+      )
+      AND deleted_at IS NULL          -- RLS automatically hides soft-deleted rows
+      AND is_permanently_ignored = false
+    );
+
+  -- Separate policy for OWNER/ADMIN role: can see trash bin (deleted_at IS NOT NULL)
+  CREATE POLICY invoices_trash_access ON invoices
+    AS PERMISSIVE
+    USING (
+      company_id IN (
+        SELECT company_id FROM user_companies
+        WHERE user_id = current_setting('app.current_user_id', true)::uuid
+          AND role IN ('OWNER', 'ADMIN')
+      )
+      -- no deleted_at filter here — allows seeing deleted rows in trash
+    );
+
+  Note: Use SET LOCAL for the policy switch:
+    To query trash: SET LOCAL app.include_deleted = 'true';
+
+STEP 4 — Soft delete API endpoints:
+  DELETE /api/invoices/:id
+    Body: { reason: 'duplicate'|'invalid'|'test_data'|'other', note?: string }
+    Action: SET deleted_at=NOW(), deleted_by=userId, delete_reason=reason
+    Do NOT physically delete. Return 200.
+  
+  DELETE /api/invoices/:id/permanent-ignore
+    Body: { reason: string }
+    Action: SET deleted_at=NOW(), is_permanently_ignored=true
+    This invoice will NEVER be re-imported by the bot.
+    Require confirmation: must send { confirm: 'IGNORE_PERMANENTLY' } in body.
+  
+  POST /api/invoices/:id/restore
+    Action: SET deleted_at=NULL, deleted_by=NULL, delete_reason=NULL
+    Only works if is_permanently_ignored=false.
+    Log restore action to audit_logs.
+
+STEP 5 — Bulk operations:
+  DELETE /api/invoices/bulk-delete
+    Body: { ids: string[], reason: string }
+    Max 500 IDs per request.
+  
+  POST /api/invoices/bulk-restore
+    Body: { ids: string[] }
+```
+
+### P42.2 — Trash Bin UI (Thùng Rác)
+```
+[Respond in Vietnamese]
+Create /invoices/trash page — Thùng Rác Hóa Đơn.
+Accessible from /invoices page via button "Thùng rác ([count])" in top-right area.
+
+Backend: GET /api/invoices/trash?companyId=&page=1&pageSize=50
+  Query invoices WHERE deleted_at IS NOT NULL AND company_id=X
+  (requires bypassing RLS — use admin DB role for this endpoint)
+  Require role: OWNER or ADMIN only (403 for ACCOUNTANT/VIEWER)
+  
+  Return: same invoice fields + deleted_at + deleted_by (user name) + delete_reason + is_permanently_ignored
+
+Page layout:
+
+Header:
+  "Thùng Rác" + back arrow to /invoices
+  Subtitle: "Hóa đơn đã ẩn — [N] mục | Vĩnh viễn bị bỏ qua: [M] mục"
+  
+  Info banner (blue):
+  "Hóa đơn trong thùng rác không xuất hiện trong bất kỳ báo cáo nào.
+  Khôi phục để đưa trở lại hệ thống, hoặc xóa vĩnh viễn nếu chắc chắn."
+
+Filter tabs:
+  Đã ẩn (có thể khôi phục) | Bỏ qua vĩnh viễn (bot sẽ không tải lại)
+
+Invoice list (same card style as /invoices but with muted/gray styling):
+  Each card shows:
+    [Gray background, 0.5 opacity]
+    Số HĐ | Ngày | Tên đối tác | Số tiền | VAT%
+    Reason badge: "Trùng lặp" | "Không hợp lệ" | "Dữ liệu test" | "Khác"
+    Deleted info: "Đã ẩn bởi [username] lúc [time]"
+    [is_permanently_ignored=true]: Show "⛔ Bot không tải lại" badge in red
+  
+  Per-card actions (OWNER/ADMIN only):
+    [Khôi phục] button (green) — only shown if is_permanently_ignored=false
+      → POST /api/invoices/:id/restore
+      → Toast: "Đã khôi phục — hóa đơn xuất hiện lại trong báo cáo"
+      → Card disappears from trash list
+    
+    [Xóa vĩnh viễn] button (red, text only — no fill)
+      → Confirmation dialog: "Thao tác này không thể hoàn tác. Hóa đơn sẽ bị xóa hoàn toàn khỏi database."
+      → Type "XÓA" to confirm
+      → DELETE /api/invoices/:id/hard-delete (OWNER only, requires 2nd password confirm)
+
+Bulk actions (checkbox selection):
+  Select all on page | Deselect all
+  [Khôi phục X hóa đơn đã chọn] | [Xóa vĩnh viễn X hóa đơn]
+
+Empty state:
+  Trash icon + "Thùng rác trống"
+  "Khi bạn ẩn hóa đơn, chúng sẽ xuất hiện ở đây"
+
+Access from /invoices page:
+  Add to invoice list header: "Thùng rác ([count])" as a small text link
+  count = number of soft-deleted invoices for active company (cached, refresh every 5 min)
+  Only visible to OWNER/ADMIN role
+```
+
+### P42.3 — Permanent Ignore: Bot Blocklist
+```
+[Respond in Vietnamese]
+Create the "Permanent Ignore" mechanism so the GDT Bot never re-imports
+invoices that the user has intentionally removed.
+
+This is critical: without this, every time the bot syncs, it will re-import
+deleted invoices and they will reappear in reports — defeating the purpose of deletion.
+
+STEP 1 — Ignored invoice registry:
+  The is_permanently_ignored=true flag on invoices table (added in P42.1) is the
+  source of truth. But we also need a separate blocklist for invoices that were
+  NEVER imported (e.g., user wants to pre-block a known bad invoice number).
+
+  CREATE TABLE invoice_ignore_list (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id UUID REFERENCES companies(id),
+    invoice_number VARCHAR(50) NOT NULL,
+    seller_tax_code VARCHAR(20),          -- NULL = ignore this number from ANY seller
+    invoice_date DATE,                    -- NULL = ignore regardless of date
+    reason VARCHAR(200),
+    ignored_by UUID REFERENCES users(id),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(company_id, invoice_number, seller_tax_code)
+  );
+  
+  CREATE INDEX idx_ignore_list_lookup
+    ON invoice_ignore_list(company_id, invoice_number, seller_tax_code);
+
+STEP 2 — Bot integration (update sync.worker.ts and GDT parsers):
+  Before inserting any invoice from the bot or import:
+  
+  async function shouldIgnoreInvoice(
+    companyId: string,
+    invoiceNumber: string,
+    sellerTaxCode: string
+  ): Promise<boolean> {
+    // Check 1: is it in invoice_ignore_list?
+    const inList = await db.query(`
+      SELECT 1 FROM invoice_ignore_list
+      WHERE company_id = $1
+        AND invoice_number = $2
+        AND (seller_tax_code IS NULL OR seller_tax_code = $3)
+      LIMIT 1
+    `, [companyId, invoiceNumber, sellerTaxCode])
+    if (inList.rowCount > 0) return true
+    
+    // Check 2: is it already in invoices with is_permanently_ignored=true?
+    const inInvoices = await db.query(`
+      SELECT 1 FROM invoices
+      WHERE company_id = $1
+        AND invoice_number = $2
+        AND seller_tax_code = $3
+        AND is_permanently_ignored = true
+      LIMIT 1
+    `, [companyId, invoiceNumber, sellerTaxCode])
+    return (inInvoices.rowCount ?? 0) > 0
+  }
+  
+  // In bulkUpsertInvoices(): filter before insert
+  const filtered = await Promise.all(
+    invoices.map(async inv => ({
+      inv,
+      ignored: await shouldIgnoreInvoice(companyId, inv.invoice_number, inv.seller_tax_code)
+    }))
+  )
+  const toInsert = filtered.filter(x => !x.ignored).map(x => x.inv)
+  
+  // Log skipped count
+  const skippedCount = filtered.length - toInsert.length
+  if (skippedCount > 0) {
+    logger.info(`[Sync] Skipped ${skippedCount} permanently ignored invoices for company ${companyId}`)
+  }
+
+STEP 3 — UI: "Bỏ qua vĩnh viễn" action on invoice cards:
+  On /invoices page, each invoice card action menu (⋮ icon):
+    [Ẩn hóa đơn]             → soft delete, recoverable
+    [Bỏ qua vĩnh viễn...]    → soft delete + add to ignore_list (bot won't reimport)
+  
+  "Bỏ qua vĩnh viễn" confirmation modal:
+    Warning icon (red)
+    "Hóa đơn này sẽ bị ẩn khỏi tất cả báo cáo và bot sẽ KHÔNG BAO GIỜ tải lại."
+    "Thao tác này có thể hoàn tác trong Thùng Rác nếu bạn chưa xóa vĩnh viễn."
+    [Hủy] [Xác nhận bỏ qua]
+    
+  On confirm: 
+    1. SET invoices.is_permanently_ignored = true, deleted_at = NOW()
+    2. INSERT INTO invoice_ignore_list (company_id, invoice_number, seller_tax_code, reason)
+    3. Toast: "Đã bỏ qua — bot sẽ không tải lại hóa đơn này"
+
+STEP 4 — Ignore list management page:
+  /settings/data/ignore-list — for OWNER/ADMIN only
+  
+  "Danh sách hóa đơn bỏ qua vĩnh viễn"
+  Table: Số HĐ | MST người bán | Ngày bỏ qua | Lý do | Người thực hiện | Hành động
+  
+  [Xóa khỏi danh sách bỏ qua] per row:
+    → DELETE from invoice_ignore_list
+    → SET invoices.is_permanently_ignored = false WHERE matching
+    → Note: Invoice itself stays soft-deleted — user must manually restore from trash if needed
+    → Toast: "Đã gỡ bỏ khỏi danh sách. Lần đồng bộ sau bot có thể tải lại hóa đơn này."
+  
+  [+ Thêm thủ công] button: add invoice to ignore list without it existing in DB
+    Fields: Số hóa đơn, MST người bán (optional), Lý do
+    Use case: pre-block known bad invoices before they're imported
+
+STEP 5 — Audit log for all deletion actions:
+  Every delete/restore/ignore action must be logged:
+  INSERT INTO audit_logs(user_id, company_id, action, entity_type, entity_id, 
+    old_values, new_values, ip_address, created_at)
+  
+  Actions to log:
+    'INVOICE_SOFT_DELETE'
+    'INVOICE_PERMANENT_IGNORE'
+    'INVOICE_RESTORE'
+    'INVOICE_HARD_DELETE'
+    'IGNORE_LIST_ADD'
+    'IGNORE_LIST_REMOVE'
+  
+  This gives the owner a full audit trail of who deleted what and when.
+```
+

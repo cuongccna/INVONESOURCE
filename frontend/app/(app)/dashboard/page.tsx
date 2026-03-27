@@ -7,6 +7,7 @@ import {
 } from 'recharts';
 import Link from 'next/link';
 import apiClient from '../../../lib/apiClient';
+import { useCompany } from '../../../contexts/CompanyContext';
 
 /* ─── Types ───────────────────────────────────────────────────────────────── */
 interface KpiData {
@@ -138,6 +139,7 @@ interface QuickAction {
 }
 
 export default function DashboardPage() {
+  const { activeCompanyId } = useCompany();
   const [kpi, setKpi] = useState<KpiData | null>(null);
   const [chart, setChart] = useState<ChartData | null>(null);
   const [analytics, setAnalytics] = useState<Analytics | null>(null);
@@ -149,12 +151,26 @@ export default function DashboardPage() {
   const [analyticsPeriod, setAnalyticsPeriod] = useState(3);
   const [quickActions, setQuickActions] = useState<QuickAction[]>([]);
 
-  const load = useCallback(async (period = analyticsPeriod) => {
+  // Period navigator: default to current month/year
+  const now = new Date();
+  const [periodMonth, setPeriodMonth] = useState(now.getMonth() + 1);
+  const [periodYear, setPeriodYear] = useState(now.getFullYear());
+
+  const navigatePeriod = (delta: number) => {
+    let newMonth = periodMonth + delta;
+    let newYear = periodYear;
+    if (newMonth < 1)  { newYear -= 1; newMonth = 12; }
+    if (newMonth > 12) { newYear += 1; newMonth = 1; }
+    setPeriodMonth(newMonth);
+    setPeriodYear(newYear);
+  };
+
+  const load = useCallback(async (period = analyticsPeriod, month = periodMonth, year = periodYear) => {
     try {
       const [kpiRes, chartRes, analyticsRes, forecastRes] = await Promise.all([
-        apiClient.get<{ data: KpiData }>('/dashboard/kpi'),
-        apiClient.get<{ data: ChartData }>('/dashboard/charts'),
-        apiClient.get<{ data: Analytics }>(`/dashboard/analytics?months=${period}`),
+        apiClient.get<{ data: KpiData }>(`/dashboard/kpi?month=${month}&year=${year}`),
+        apiClient.get<{ data: ChartData }>(`/dashboard/charts?month=${month}&year=${year}`),
+        apiClient.get<{ data: Analytics }>(`/dashboard/analytics?months=${period}&month=${month}&year=${year}`),
         apiClient.get<{ data: VatForecast }>('/forecast/vat').catch(() => ({ data: { data: null } })),
       ]);
       setKpi(kpiRes.data.data);
@@ -166,27 +182,33 @@ export default function DashboardPage() {
     } finally {
       setLoading(false);
     }
-  }, [analyticsPeriod]);
+  }, [analyticsPeriod, periodMonth, periodYear]);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => { void load(); }, [load, activeCompanyId]);
+
+  useEffect(() => {
+    setLoading(true);
+    void load(analyticsPeriod, periodMonth, periodYear);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [periodMonth, periodYear]);
 
   useEffect(() => {
     apiClient.get<{ data: { actions: QuickAction[] } }>('/dashboard/quick-actions')
       .then((res) => setQuickActions(res.data.data.actions))
       .catch(() => {});
-  }, []);
+  }, [activeCompanyId]);
 
   useEffect(() => {
     const year = new Date().getFullYear();
     apiClient
       .get<{ data: EsgWidgetData }>(`/esg/estimate?year=${year}`)
       .then((res) => setEsg(res.data.data))
-      .catch(() => {});
-  }, []);
+      .catch(() => setEsg(null));
+  }, [activeCompanyId]);
 
   const handlePeriodChange = (p: number) => {
     setAnalyticsPeriod(p);
-    void load(p);
+    void load(p, periodMonth, periodYear);
   };
 
   const detectAnomalies = async () => {
@@ -236,11 +258,6 @@ export default function DashboardPage() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Tổng Quan</h1>
-          {kpi && (
-            <p className="text-sm text-gray-500 mt-0.5">
-              Kỳ kê khai: Tháng {kpi.period.month}/{kpi.period.year}
-            </p>
-          )}
         </div>
         <button
           onClick={() => void load()}
@@ -248,6 +265,39 @@ export default function DashboardPage() {
           title="Làm mới"
         >
           ↻ Làm mới
+        </button>
+      </div>
+
+      {/* ── Period Navigator ── */}
+      <div className="bg-white rounded-xl shadow-sm px-4 py-2.5 flex items-center justify-between">
+        <button
+          onClick={() => navigatePeriod(-1)}
+          className="text-gray-500 hover:text-gray-900 text-lg font-bold px-2 py-0.5 rounded hover:bg-gray-100 transition-colors"
+          aria-label="Tháng trước"
+        >
+          ‹
+        </button>
+        <div className="text-center">
+          <p className="text-sm font-semibold text-gray-800">
+            Kỳ kê khai: Tháng {periodMonth}/{periodYear}
+          </p>
+          {periodMonth !== (now.getMonth() + 1) || periodYear !== now.getFullYear() ? (
+            <button
+              onClick={() => { setPeriodMonth(now.getMonth() + 1); setPeriodYear(now.getFullYear()); }}
+              className="text-xs text-primary-600 hover:underline"
+            >
+              Về tháng hiện tại
+            </button>
+          ) : (
+            <p className="text-xs text-gray-400">Tháng hiện tại</p>
+          )}
+        </div>
+        <button
+          onClick={() => navigatePeriod(1)}
+          className="text-gray-500 hover:text-gray-900 text-lg font-bold px-2 py-0.5 rounded hover:bg-gray-100 transition-colors"
+          aria-label="Tháng sau"
+        >
+          ›
         </button>
       </div>
 

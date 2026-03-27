@@ -1,11 +1,13 @@
 import { Router } from 'express';
 import { authenticate } from '../middleware/auth';
+import { requireCompany } from '../middleware/company';
 import { sendSuccess } from '../utils/response';
 import { telegramService, TelegramEvent } from '../services/TelegramNotificationService';
 import { env } from '../config/env';
 
 const router = Router();
 router.use(authenticate);
+router.use(requireCompany);
 
 // GET /api/telegram/configs
 router.get('/configs', async (req, res) => {

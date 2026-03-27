@@ -1,11 +1,13 @@
 import { Router, Request, Response } from 'express';
 import { authenticate } from '../middleware/auth';
+import { requireCompany } from '../middleware/company';
 import { priceAnomalyDetector } from '../services/PriceAnomalyDetector';
 import { pool } from '../db/pool';
 import { sendSuccess } from '../utils/response';
 
 const router = Router();
 router.use(authenticate);
+router.use(requireCompany);
 
 // POST /api/audit/scan — trigger anomaly detection
 router.post('/scan', async (req: Request, res: Response) => {

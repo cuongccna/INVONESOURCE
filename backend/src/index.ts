@@ -31,6 +31,14 @@ import esgRouter from './routes/esg';
 import repurchaseRouter from './routes/repurchase';
 import auditRouter from './routes/audit';
 import insightsRouter from './routes/insights';
+import importRouter from './routes/import';
+import botRouter from './routes/bot';
+import catalogsRouter from './routes/catalogs';
+import inventoryRouter from './routes/inventory';
+import cashBookRouter from './routes/cash-book';
+import journalsRouter from './routes/journals';
+import profitLossRouter from './routes/profit-loss';
+import hkdRouter from './routes/hkd';
 import { registry } from './connectors/ConnectorRegistry';
 import { MisaConnector } from './connectors/MisaConnector';
 import { ViettelConnector } from './connectors/ViettelConnector';
@@ -102,6 +110,14 @@ app.use('/api/esg', esgRouter);
 app.use('/api/crm/repurchase', repurchaseRouter);
 app.use('/api/audit', auditRouter);
 app.use('/api/insights', insightsRouter);
+app.use('/api/import', importRouter);
+app.use('/api/bot', botRouter);
+app.use('/api/catalogs', catalogsRouter);
+app.use('/api/inventory', inventoryRouter);
+app.use('/api/cash-book', cashBookRouter);
+app.use('/api/journals', journalsRouter);
+app.use('/api/reports/profit-loss', profitLossRouter);
+app.use('/api/hkd', hkdRouter);
 
 // Health check (unauthenticated)
 app.get('/health', (_req, res) => {
