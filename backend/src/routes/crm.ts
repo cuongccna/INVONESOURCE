@@ -17,6 +17,8 @@ router.use(requireCompany);
 // GET /api/crm/rfm/summary
 router.get('/rfm/summary', async (req: Request, res: Response) => {
   const companyId = req.user!.companyId!;
+  // Auto-recalculate to ensure stale entries from deleted invoices are purged
+  await RfmAnalysisService.calculateRfm(companyId);
   const data = await RfmAnalysisService.getSummary(companyId);
   sendSuccess(res, data);
 });

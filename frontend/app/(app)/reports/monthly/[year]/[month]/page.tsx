@@ -4,6 +4,11 @@ import { useEffect, useState, useCallback } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import apiClient from '../../../../../../lib/apiClient';
 import BackButton from '../../../../../../components/BackButton';
+import PeriodSelector, {
+  type PeriodValue,
+  periodToParams,
+  periodLabel,
+} from '../../../../../../components/PeriodSelector';
 
 /* ─── Types ───────────────────────────────────────────────────────────────── */
 interface MonthlySummary {
@@ -46,8 +51,16 @@ const MONTH_NAMES = ['Tháng 1','Tháng 2','Tháng 3','Tháng 4','Tháng 5','Th�
 export default function MonthlyReportPage() {
   const params = useParams<{ year: string; month: string }>();
   const router = useRouter();
-  const month = Number(params.month);
-  const year = Number(params.year);
+
+  const [period, setPeriod] = useState<PeriodValue>(() => {
+    const m = Number(params.month);
+    return {
+      periodType: 'monthly',
+      month: m,
+      quarter: Math.ceil(m / 3),
+      year: Number(params.year),
+    };
+  });
 
   const [report, setReport] = useState<MonthlySummary | null>(null);
   const [loading, setLoading] = useState(true);
@@ -55,7 +68,7 @@ export default function MonthlyReportPage() {
   const load = useCallback(async () => {
     try {
       const res = await apiClient.get<{ data: MonthlySummary }>(
-        `/reports/monthly-summary?month=${month}&year=${year}`
+        `/reports/monthly-summary?${periodToParams(period)}`
       );
       setReport(res.data.data);
     } catch {
@@ -63,16 +76,39 @@ export default function MonthlyReportPage() {
     } finally {
       setLoading(false);
     }
-  }, [month, year]);
+  }, [period]);
 
   useEffect(() => { void load(); }, [load]);
 
-  const goTo = (m: number, y: number) => router.push(`/reports/monthly/${y}/${m}`);
+  // Keep URL in sync for monthly mode (bookmarking / back-compat)
+  useEffect(() => {
+    if (period.periodType === 'monthly') {
+      void router.replace(`/reports/monthly/${period.year}/${period.month}`, { scroll: false });
+    }
+  }, [period, router]);
 
-  const prevMonth = month === 1 ? { m: 12, y: year - 1 } : { m: month - 1, y: year };
-  const nextMonth = month === 12 ? { m: 1, y: year + 1 } : { m: month + 1, y: year };
-  const isCurrentOrFuture = year > new Date().getFullYear() ||
-    (year === new Date().getFullYear() && month >= new Date().getMonth() + 1);
+  const month = period.month;
+  const year = period.year;
+  const prevPeriod = (): PeriodValue => {
+    if (period.periodType === 'monthly') {
+      return { ...period, month: month === 1 ? 12 : month - 1, year: month === 1 ? year - 1 : year };
+    }
+    if (period.periodType === 'quarterly') {
+      return { ...period, quarter: period.quarter === 1 ? 4 : period.quarter - 1,
+               year: period.quarter === 1 ? year - 1 : year };
+    }
+    return { ...period, year: year - 1 };
+  };
+  const nextPeriod = (): PeriodValue => {
+    if (period.periodType === 'monthly') {
+      return { ...period, month: month === 12 ? 1 : month + 1, year: month === 12 ? year + 1 : year };
+    }
+    if (period.periodType === 'quarterly') {
+      return { ...period, quarter: period.quarter === 4 ? 1 : period.quarter + 1,
+               year: period.quarter === 4 ? year + 1 : year };
+    }
+    return { ...period, year: year + 1 };
+  };
 
   const outputRow = report?.invoiceSummary.find((r) => r.direction === 'output');
   const inputRow  = report?.invoiceSummary.find((r) => r.direction === 'input');
@@ -105,25 +141,25 @@ export default function MonthlyReportPage() {
         </div>
 
         {/* ── Nav ── */}
-        <div className="no-print flex items-center justify-between">
+        <div className="no-print flex items-center justify-between flex-wrap gap-3">
           <button
-            onClick={() => goTo(prevMonth.m, prevMonth.y)}
+            onClick={() => setPeriod(prevPeriod())}
             className="text-sm text-gray-500 hover:text-gray-800 flex items-center gap-1"
           >
-            ← {MONTH_NAMES[prevMonth.m - 1]}/{prevMonth.y}
+            ← {periodLabel(prevPeriod())}
           </button>
-          <h1 className="text-xl font-bold text-gray-900">
-            {MONTH_NAMES[month - 1]} {year}
-          </h1>
-          {!isCurrentOrFuture && (
-            <button
-              onClick={() => goTo(nextMonth.m, nextMonth.y)}
-              className="text-sm text-gray-500 hover:text-gray-800 flex items-center gap-1"
-            >
-              {MONTH_NAMES[nextMonth.m - 1]}/{nextMonth.y} →
-            </button>
-          )}
-          {isCurrentOrFuture && <div />}
+          <h1 className="text-xl font-bold text-gray-900">{periodLabel(period)}</h1>
+          <button
+            onClick={() => setPeriod(nextPeriod())}
+            className="text-sm text-gray-500 hover:text-gray-800 flex items-center gap-1"
+          >
+            {periodLabel(nextPeriod())} →
+          </button>
+        </div>
+
+        {/* ── Period selector ── */}
+        <div className="no-print flex justify-center">
+          <PeriodSelector value={period} onChange={(v) => { setPeriod(v); setLoading(true); }} />
         </div>
 
         {/* ── Print button ── */}
@@ -139,7 +175,7 @@ export default function MonthlyReportPage() {
         {/* ── Header (print only) ── */}
         <div className="hidden print:block text-center mb-4">
           <p className="text-xs text-gray-500">BÁO CÁO TÌNH HÌNH HÓA ĐƠN</p>
-          <h2 className="text-lg font-bold">{MONTH_NAMES[month - 1].toUpperCase()} {year}</h2>
+          <h2 className="text-lg font-bold">{periodLabel(period).toUpperCase()}</h2>
           {report?.company && (
             <p className="text-sm">{report.company.name} — MST: {report.company.tax_code}</p>
           )}

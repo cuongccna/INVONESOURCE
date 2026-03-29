@@ -119,6 +119,9 @@ export class GdtExcelParser {
       invoice_type:    null,
       source:          'gdt_bot',
       gdt_validated:   true,
+      // Excel exports don't distinguish coded vs non-coded; default to true
+      // (XML fetch will fail gracefully if not available)
+      xml_available:   true,
     };
   }
 

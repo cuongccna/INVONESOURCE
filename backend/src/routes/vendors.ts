@@ -73,6 +73,7 @@ router.get('/:taxCode/history', async (req: Request, res: Response) => {
      WHERE inv.company_id = $1
        AND inv.seller_tax_code = $2
        AND inv.direction = 'input' AND inv.status = 'valid'
+       AND inv.deleted_at IS NULL
        AND il.unit_price > 0
        ${itemFilter}
      GROUP BY il.item_name, EXTRACT(MONTH FROM inv.invoice_date), EXTRACT(YEAR FROM inv.invoice_date)

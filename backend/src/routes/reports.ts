@@ -1,17 +1,18 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { z } from 'zod';
 import { pool } from '../db/pool';
 import { authenticate, requireRole } from '../middleware/auth';
 import { requireCompany } from '../middleware/company';
 import { VatDeclarationGenerator } from '../reports/VatDeclarationGenerator';
 import { sendSuccess } from '../utils/response';
 import { ValidationError } from '../utils/AppError';
+import { resolvePeriod } from '../utils/period';
+import { z } from 'zod';
 
 const router = Router();
 router.use(authenticate);
 router.use(requireCompany);
 
-const periodSchema = z.object({
+const monthPeriodSchema = z.object({
   month: z.coerce.number().int().min(1).max(12),
   year: z.coerce.number().int().min(2020).max(2100),
 });
@@ -19,7 +20,7 @@ const periodSchema = z.object({
 // GET /api/reports/pl011?month=&year= — Bảng kê bán ra (output invoices)
 router.get('/pl011', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const parsed = periodSchema.safeParse(req.query);
+    const parsed = monthPeriodSchema.safeParse(req.query);
     if (!parsed.success) throw new ValidationError(parsed.error.issues[0]?.message ?? 'Invalid query');
 
     const { month, year } = parsed.data;
@@ -37,7 +38,7 @@ router.get('/pl011', async (req: Request, res: Response, next: NextFunction) => 
 // GET /api/reports/pl012?month=&year= — Bảng kê mua vào (input invoices)
 router.get('/pl012', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const parsed = periodSchema.safeParse(req.query);
+    const parsed = monthPeriodSchema.safeParse(req.query);
     if (!parsed.success) throw new ValidationError(parsed.error.issues[0]?.message ?? 'Invalid query');
 
     const { month, year } = parsed.data;
@@ -52,13 +53,10 @@ router.get('/pl012', async (req: Request, res: Response, next: NextFunction) => 
   }
 });
 
-// GET /api/reports/monthly-summary?month=&year= — JSON data for printable report
+// GET /api/reports/monthly-summary?month=&year=&periodType=monthly|quarterly|yearly&quarter=
 router.get('/monthly-summary', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const parsed = periodSchema.safeParse(req.query);
-    if (!parsed.success) throw new ValidationError(parsed.error.issues[0]?.message ?? 'Invalid query');
-
-    const { month, year } = parsed.data;
+    const { start, end, month, year } = resolvePeriod(req.query);
     const companyId = req.user!.companyId!;
 
     const [company, invoiceSummary, vatRecon, topCounterparties] = await Promise.all([
@@ -78,23 +76,25 @@ router.get('/monthly-summary', async (req: Request, res: Response, next: NextFun
            COUNT(*) FILTER (WHERE gdt_validated = false AND status = 'valid') AS unvalidated_count
          FROM invoices
          WHERE company_id = $1
-           AND EXTRACT(MONTH FROM invoice_date) = $2
-           AND EXTRACT(YEAR FROM invoice_date) = $3
+           AND deleted_at IS NULL
+           AND invoice_date BETWEEN $2 AND $3
          GROUP BY direction`,
-        [companyId, month, year]
+        [companyId, start, end]
       ),
       pool.query(
-        `SELECT vr.output_vat,
-                vr.input_vat,
-                vr.payable_vat,
-                COALESCE(td.ct43_carry_forward_vat, 0) AS carry_forward_vat
+        `SELECT
+           SUM(vr.output_vat) AS output_vat,
+           SUM(vr.input_vat) AS input_vat,
+           SUM(vr.payable_vat) AS payable_vat,
+           SUM(COALESCE(td.ct43_carry_forward_vat, 0)) AS carry_forward_vat
          FROM vat_reconciliations vr
          LEFT JOIN tax_declarations td
            ON td.company_id = vr.company_id
           AND td.period_month = vr.period_month
           AND td.period_year = vr.period_year
-         WHERE vr.company_id = $1 AND vr.period_month = $2 AND vr.period_year = $3`,
-        [companyId, month, year]
+         WHERE vr.company_id = $1
+           AND MAKE_DATE(vr.period_year::int, vr.period_month::int, 1) BETWEEN $2::date AND $3::date`,
+        [companyId, start, end]
       ),
       pool.query(
         `SELECT direction,
@@ -104,8 +104,8 @@ router.get('/monthly-summary', async (req: Request, res: Response, next: NextFun
                 SUM(total_amount) AS total_amount
          FROM invoices
          WHERE company_id = $1
-           AND EXTRACT(MONTH FROM invoice_date) = $2
-           AND EXTRACT(YEAR FROM invoice_date) = $3
+           AND deleted_at IS NULL
+           AND invoice_date BETWEEN $2 AND $3
            AND status = 'valid'
            AND (CASE WHEN direction = 'output' THEN buyer_name ELSE seller_name END) IS NOT NULL
          GROUP BY direction,
@@ -113,7 +113,7 @@ router.get('/monthly-summary', async (req: Request, res: Response, next: NextFun
                   CASE WHEN direction = 'output' THEN buyer_tax_code ELSE seller_tax_code END
          ORDER BY total_amount DESC NULLS LAST
          LIMIT 10`,
-        [companyId, month, year]
+        [companyId, start, end]
       ),
     ]);
 
@@ -121,7 +121,7 @@ router.get('/monthly-summary', async (req: Request, res: Response, next: NextFun
       period: { month, year },
       company: company.rows[0] ?? null,
       invoiceSummary: invoiceSummary.rows,
-      vatReconciliation: vatRecon.rows[0] ?? null,
+      vatReconciliation: vatRecon.rows[0]?.output_vat != null ? vatRecon.rows[0] : null,
       topCounterparties: topCounterparties.rows,
     });
   } catch (err) {
@@ -159,6 +159,7 @@ router.get('/trends', async (req: Request, res: Response, next: NextFunction) =>
            CASE WHEN COUNT(*) > 0 THEN (SUM(total_amount) / COUNT(*)) ELSE 0 END AS avg_invoice_value
          FROM invoices
          WHERE company_id = $1
+           AND deleted_at IS NULL
            AND invoice_date >= DATE_TRUNC('month', NOW()) - ($2 - 1) * INTERVAL '1 month'
          GROUP BY period_year, period_month
          ORDER BY period_year, period_month`,
@@ -170,6 +171,7 @@ router.get('/trends', async (req: Request, res: Response, next: NextFunction) =>
            SUM(total_amount) AS total_revenue
          FROM invoices
          WHERE company_id = $1 AND direction = 'output' AND status = 'valid'
+           AND deleted_at IS NULL
            AND invoice_date >= NOW() - INTERVAL '12 months'
            AND buyer_name IS NOT NULL
          GROUP BY COALESCE(buyer_name, buyer_tax_code)
@@ -183,6 +185,7 @@ router.get('/trends', async (req: Request, res: Response, next: NextFunction) =>
            SUM(total_amount) AS total_spend
          FROM invoices
          WHERE company_id = $1 AND direction = 'input' AND status = 'valid'
+           AND deleted_at IS NULL
            AND invoice_date >= NOW() - INTERVAL '12 months'
            AND seller_name IS NOT NULL
          GROUP BY COALESCE(seller_name, seller_tax_code)

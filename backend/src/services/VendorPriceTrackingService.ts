@@ -40,6 +40,7 @@ export class VendorPriceTrackingService {
          JOIN invoices inv ON inv.id = il.invoice_id
          WHERE inv.company_id = $1
            AND inv.direction = 'input' AND inv.status = 'valid'
+           AND inv.deleted_at IS NULL
            AND EXTRACT(MONTH FROM inv.invoice_date) = $2
            AND EXTRACT(YEAR  FROM inv.invoice_date) = $3
            AND il.unit_price > 0 AND il.item_name IS NOT NULL
@@ -52,6 +53,7 @@ export class VendorPriceTrackingService {
          JOIN invoices inv ON inv.id = il.invoice_id
          WHERE inv.company_id = $1
            AND inv.direction = 'input' AND inv.status = 'valid'
+           AND inv.deleted_at IS NULL
            AND EXTRACT(MONTH FROM inv.invoice_date) = $4
            AND EXTRACT(YEAR  FROM inv.invoice_date) = $5
            AND il.unit_price > 0 AND il.item_name IS NOT NULL
@@ -134,6 +136,7 @@ export class VendorPriceTrackingService {
        FROM invoices inv
        WHERE inv.company_id = $1
          AND inv.direction = 'input' AND inv.status = 'valid'
+         AND inv.deleted_at IS NULL
          AND EXTRACT(MONTH FROM inv.invoice_date) = $2
          AND EXTRACT(YEAR  FROM inv.invoice_date) = $3
          AND inv.seller_tax_code IS NOT NULL

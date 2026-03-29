@@ -28,7 +28,11 @@ export class ProductCatalogService {
     companyId: string,
     month: number,
     year: number,
+    startOverride?: string,
+    endOverride?: string,
   ): Promise<ProductProfitabilitySummary> {
+    const start = startOverride ?? `${year}-${String(month).padStart(2, '0')}-01`;
+    const end = endOverride ?? new Date(year, month, 0).toISOString().split('T')[0];
     // Build Pareto (ABC) profitability from invoice_line_items for the period
     const { rows } = await pool.query<{
       product_code: string | null;
@@ -54,8 +58,7 @@ export class ProductCatalogService {
         FROM invoice_line_items ili
         JOIN invoices inv ON inv.id = ili.invoice_id
         WHERE inv.company_id = $1
-          AND EXTRACT(MONTH FROM inv.invoice_date) = $2
-          AND EXTRACT(YEAR  FROM inv.invoice_date) = $3
+          AND inv.invoice_date BETWEEN $2 AND $3
           AND inv.direction = 'output'
           AND inv.status != 'cancelled'
         GROUP BY ili.item_code, ili.item_name, ili.unit
@@ -68,7 +71,7 @@ export class ProductCatalogService {
         t.grand_total
       FROM line_totals lt, totals t
       ORDER BY lt.total_revenue DESC`,
-      [companyId, month, year],
+      [companyId, start, end],
     );
 
     const grandTotal = rows.length > 0 ? Number(rows[0].grand_total) : 0;

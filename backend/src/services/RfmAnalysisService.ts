@@ -52,13 +52,18 @@ export class RfmAnalysisService {
        WHERE company_id = $1
          AND direction = 'output'
          AND status = 'valid'
+         AND deleted_at IS NULL
          AND invoice_date >= NOW() - INTERVAL '12 months'
          AND buyer_tax_code IS NOT NULL
        GROUP BY buyer_tax_code`,
       [companyId],
     );
 
-    if (aggRes.rowCount === 0) return;
+    if (aggRes.rowCount === 0) {
+      // No valid invoices — purge all stale RFM entries for this company
+      await pool.query(`DELETE FROM customer_rfm WHERE company_id = $1`, [companyId]);
+      return;
+    }
 
     const rows = aggRes.rows;
 
@@ -111,6 +116,19 @@ export class RfmAnalysisService {
         ],
       );
     }
+
+    // Remove stale entries for buyers no longer present in valid invoices (last 12 months)
+    await pool.query(
+      `DELETE FROM customer_rfm
+       WHERE company_id = $1
+         AND buyer_tax_code NOT IN (
+           SELECT DISTINCT buyer_tax_code FROM invoices
+           WHERE company_id = $1 AND direction = 'output' AND status = 'valid'
+             AND deleted_at IS NULL AND buyer_tax_code IS NOT NULL
+             AND invoice_date >= NOW() - INTERVAL '12 months'
+         )`,
+      [companyId],
+    );
   }
 
   static async getSummary(companyId: string): Promise<unknown> {

@@ -48,6 +48,9 @@ import { scheduleSyncCron } from './jobs/SyncWorker';
 import { gdtValidateWorker } from './jobs/GdtValidatorWorker';
 import { scheduleTaxDeadlineReminder } from './jobs/TaxDeadlineReminderJob';
 import { scheduleRepurchaseAlertJob } from './jobs/RepurchaseAlertJob';
+import { scheduleGdtBotSync, gdtBotSchedulerWorker } from './jobs/GdtBotSchedulerJob';
+import { scheduleQuotaReset } from './jobs/QuotaResetJob';
+import adminRouter from './routes/admin';
 
 const app = express();
 
@@ -118,6 +121,7 @@ app.use('/api/cash-book', cashBookRouter);
 app.use('/api/journals', journalsRouter);
 app.use('/api/reports/profit-loss', profitLossRouter);
 app.use('/api/hkd', hkdRouter);
+app.use('/api/admin', adminRouter);
 
 // Health check (unauthenticated)
 app.get('/health', (_req, res) => {
@@ -149,8 +153,12 @@ async function start(): Promise<void> {
   await scheduleSyncCron();
   // gdtValidateWorker is auto-started on import
   void gdtValidateWorker;
+  // GDT Bot per-company periodic scheduler (checks every 30min, enqueues due companies)
+  void gdtBotSchedulerWorker;   // auto-started on import
+  await scheduleGdtBotSync();
   await scheduleTaxDeadlineReminder();
   await scheduleRepurchaseAlertJob();
+  await scheduleQuotaReset();
   console.info('[Jobs] BullMQ workers started');
 
   app.listen(env.API_PORT, () => {

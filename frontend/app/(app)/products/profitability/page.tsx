@@ -61,29 +61,33 @@ const MARGIN_COLOR = (pct: number | null) => {
 };
 
 import { formatVND, formatVNDShort, formatVNDFull } from '../../../../utils/formatCurrency';
+import PeriodSelector, {
+  type PeriodValue,
+  defaultPeriod,
+  periodToParams,
+  periodLabel,
+} from '../../../../components/PeriodSelector';
 
 const fmt = formatVNDFull;
 const fmtM = formatVNDShort;
 
-const now = new Date();
 
 export default function ProductProfitabilityPage() {
   const [data, setData] = useState<ProfitData | null>(null);
   const [loading, setLoading] = useState(true);
-  const [month, setMonth] = useState(now.getMonth() + 1);
-  const [year, setYear] = useState(now.getFullYear());
+  const [period, setPeriod] = useState<PeriodValue>(defaultPeriod);
   const [filter, setFilter] = useState<'ALL' | BcgClass>('ALL');
   const [sortBy, setSortBy] = useState<'revenue' | 'margin' | 'profit'>('revenue');
 
   const load = async () => {
     setLoading(true);
     try {
-      const res = await apiClient.get<{ data: ProfitData }>(`/products/profitability?month=${month}&year=${year}`);
+      const res = await apiClient.get<{ data: ProfitData }>(`/products/profitability?${periodToParams(period)}`);
       setData(res.data.data);
     } catch { /* silent */ } finally { setLoading(false); }
   };
 
-  useEffect(() => { void load(); }, [month, year]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { void load(); }, [period]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const items = data?.items ?? [];
 
@@ -99,9 +103,6 @@ export default function ProductProfitabilityPage() {
 
   // Top 20 for Pareto chart
   const chartItems = itemsWithBcg.slice(0, 20);
-
-  const years = Array.from({ length: 3 }, (_, i) => now.getFullYear() - i);
-  const months = Array.from({ length: 12 }, (_, i) => i + 1);
 
   // Dormant items (not in current period but recent purchase)
   const dormant = items.filter((i) => i.last_purchase_date && !i.quantity_sold);
@@ -122,17 +123,14 @@ export default function ProductProfitabilityPage() {
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Lợi Nhuận Sản Phẩm</h1>
-          <p className="text-sm text-gray-500">Phân tích BCG + hiệu quả kinh doanh theo mặt hàng</p>
+          <p className="text-sm text-gray-500">Phân tích BCG + hiệu quả kinh doanh · {periodLabel(period)}</p>
         </div>
         <div className="flex items-center gap-2">
-          <select value={month} onChange={(e) => setMonth(Number(e.target.value))}
-            className="text-sm border border-gray-200 rounded-lg px-2 py-1.5">
-            {months.map((m) => <option key={m} value={m}>T{m}</option>)}
-          </select>
-          <select value={year} onChange={(e) => setYear(Number(e.target.value))}
-            className="text-sm border border-gray-200 rounded-lg px-2 py-1.5">
-            {years.map((y) => <option key={y} value={y}>{y}</option>)}
-          </select>
+          <PeriodSelector value={period} onChange={setPeriod} />
+          <button onClick={() => void load()}
+            className="px-3 py-1.5 bg-gray-100 border border-gray-200 rounded-lg text-sm">
+            🔄 Tính lại
+          </button>
         </div>
       </div>
 

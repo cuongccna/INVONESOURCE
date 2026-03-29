@@ -8,21 +8,34 @@ import { requireCompany } from '../middleware/company';
 import { sendSuccess } from '../utils/response';
 import { AppError } from '../utils/AppError';
 import { cashBookService } from '../services/CashBookService';
+import { resolvePeriod } from '../utils/period';
 
 const router = Router();
 router.use(authenticate);
 router.use(requireCompany);
 
-// GET /api/cash-book?month=&year=&method=cash|bank
+// GET /api/cash-book?month=&year=&periodType=monthly|quarterly|yearly&quarter=&method=cash|bank
 router.get('/', async (req: Request, res: Response) => {
   const companyId = req.user!.companyId!;
-  const month = parseInt(req.query.month as string) || new Date().getMonth() + 1;
-  const year = parseInt(req.query.year as string) || new Date().getFullYear();
-  const method = req.query.method as string | undefined;
-  if (month < 1 || month > 12) throw new AppError('month must be 1-12', 400, 'VALIDATION');
+  const { start, end, month, year } = resolvePeriod(req.query);
+  const method = req.query['method'] as string | undefined;
 
-  const data = await cashBookService.getEntries(companyId, month, year, method);
+  const data = await cashBookService.getEntries(companyId, month, year, method, start, end);
   sendSuccess(res, data);
+});
+
+// POST /api/cash-book/rebuild  — rebuild auto entries from invoices for a period
+router.post('/rebuild', async (req: Request, res: Response) => {
+  const companyId = req.user!.companyId!;
+  const body = req.body as { month?: number; year?: number; quarter?: number; periodType?: string };
+  const { start, end } = resolvePeriod({
+    month: String(body.month ?? new Date().getMonth() + 1),
+    year: String(body.year ?? new Date().getFullYear()),
+    quarter: String(body.quarter ?? 1),
+    periodType: body.periodType ?? 'monthly',
+  } as Record<string, string>);
+  const count = await cashBookService.rebuildAutoEntries(companyId, start, end);
+  sendSuccess(res, { rebuilt: count }, `Đã tính lại sổ quỹ (${count} HĐ)`);
 });
 
 // POST /api/cash-book/entries  — manual phieu thu/chi

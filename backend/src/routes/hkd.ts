@@ -48,6 +48,7 @@ if (!comp) throw new AppError('Company not found', 404, 'NOT_FOUND');
   const revRes = await pool.query<{ total: string }>(
     `SELECT COALESCE(SUM(subtotal),0) AS total FROM invoices
      WHERE company_id=$1 AND direction='output' AND status='valid'
+       AND deleted_at IS NULL
        AND invoice_date BETWEEN $2 AND $3`,
     [companyId, startDate, endDate],
   );
@@ -97,6 +98,7 @@ router.post('/generate', async (req: Request, res: Response) => {
     pool.query<{ total: string }>(
       `SELECT COALESCE(SUM(subtotal),0) AS total FROM invoices
        WHERE company_id=$1 AND direction='output' AND status='valid'
+         AND deleted_at IS NULL
          AND invoice_date BETWEEN $2 AND $3`,
       [companyId, startDate, endDate],
     ),
@@ -115,7 +117,7 @@ router.post('/generate', async (req: Request, res: Response) => {
        (company_id, period_month, period_year, revenue, vat_rate, vat_payable, pit_payable, total_payable)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
      ON CONFLICT (company_id, period_month, period_year) DO UPDATE SET
-       revenue=$4, vat_rate=$5, vat_payable=$6, pit_payable=$7, total_payable=$8, updated_at=NOW()
+       revenue=$4, vat_rate=$5, vat_payable=$6, pit_payable=$7, total_payable=$8, generated_at=NOW()
      RETURNING *`,
     [companyId, m, y, revenue, vatRate, vatPayable, pitPayable, totalPayable],
   );

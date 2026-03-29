@@ -60,7 +60,37 @@ export default function BotSettingsPage() {
   const [showSetup, setShowSetup] = useState(false);
   const [otp, setOtp]             = useState('');
   const [showOtp, setShowOtp]     = useState(false);
-  const [running, setRunning]     = useState(false);
+  const [running, setRunning]         = useState(false);
+  const [showDatePicker, setShowDatePicker] = useState(false);
+  const [runFrom, setRunFrom]         = useState('');
+  const [runTo, setRunTo]             = useState('');
+  const [dateError, setDateError]     = useState('');
+
+  /** Khi người dùng chọn Từ ngày, tự động điền Đến ngày = cuối tháng đó (giới hạn hôm nay). */
+  const validateAndSetFrom = (val: string) => {
+    setRunFrom(val);
+    setDateError('');
+    if (!val) return;
+    const today = new Date().toISOString().slice(0, 10);
+    // Auto-fill to end of the selected month, capped at today
+    const d = new Date(val + 'T00:00:00');
+    const endOfMonth = new Date(d.getFullYear(), d.getMonth() + 1, 0).toISOString().slice(0, 10);
+    const autoTo = endOfMonth > today ? today : endOfMonth;
+    setRunTo(autoTo);
+  };
+  const validateAndSetTo = (val: string) => {
+    setRunTo(val);
+    setDateError('');
+    if (!val || !runFrom) return;
+    const diffMs = new Date(val).getTime() - new Date(runFrom).getTime();
+    if (diffMs < 0) { setDateError('Đến ngày phải lớn hơn Từ ngày'); return; }
+    if (diffMs > 31 * 24 * 60 * 60 * 1000) {
+      // Cap fromDate = toDate - 31 days
+      const capped = new Date(new Date(val).getTime() - 31 * 24 * 60 * 60 * 1000);
+      setRunFrom(capped.toISOString().slice(0, 10));
+      setDateError('');
+    }
+  };
 
   // Setup form
   const [form, setForm] = useState({
@@ -81,6 +111,14 @@ export default function BotSettingsPage() {
 
   useEffect(() => { void load(); }, [load]);
 
+  // Auto-poll every 5 s while the bot is actively running
+  const isRunning = status?.config?.last_run_status === 'running';
+  useEffect(() => {
+    if (!isRunning) return;
+    const interval = setInterval(() => void load(), 5000);
+    return () => clearInterval(interval);
+  }, [isRunning, load]);
+
   const saveConfig = async () => {
     try {
       await apiClient.post('/bot/setup', form);
@@ -94,14 +132,23 @@ export default function BotSettingsPage() {
     }
   };
 
-  const runNow = async () => {
+  const runNow = async (fromDate?: string, toDate?: string) => {
     setRunning(true);
     try {
-      await apiClient.post('/bot/run-now');
-      toast.success('Đã thêm vào hàng đợi đồng bộ');
+      const body: Record<string, string> = {};
+      if (fromDate) body['from_date'] = fromDate;
+      if (toDate)   body['to_date']   = toDate;
+      await apiClient.post('/bot/run-now', body);
+      toast.success(fromDate ? `Đã xếp hàng lấy dữ liệu từ ${fromDate}` : 'Đã thêm vào hàng đợi đồng bộ');
       setTimeout(() => void load(), 2000);
-    } catch {
-      toast.error('Lỗi kích hoạt đồng bộ');
+    } catch (err: unknown) {
+      const e = err as { response?: { data?: { error?: { code?: string; waitMinutes?: number; message?: string } } } };
+      const apiErr = e?.response?.data?.error;
+      if (apiErr?.code === 'COOLDOWN') {
+        toast.error(`⏳ Bot đang trong thời gian nghỉ. Vui lòng chờ thêm ${apiErr.waitMinutes} phút.`);
+      } else {
+        toast.error(apiErr?.message ?? 'Lỗi kích hoạt đồng bộ');
+      }
     } finally {
       setRunning(false);
     }
@@ -142,6 +189,16 @@ export default function BotSettingsPage() {
 
   return (
     <div className="p-4 max-w-2xl mx-auto pb-24 space-y-5">
+      {/* ── Running progress indicator ── */}
+      {lastStatus === 'running' && (
+        <div className="sticky top-14 -mx-4 px-4 py-2.5 bg-blue-600 text-white z-30 flex items-center gap-3 shadow-sm">
+          <div className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent flex-shrink-0" />
+          <div className="flex-1 min-w-0">
+            <span className="text-sm font-semibold">⚙️ Bot đang đồng bộ hóa đơn</span>
+            <span className="text-xs text-blue-100 ml-2 hidden sm:inline">· tự động cập nhật sau 5 giây</span>
+          </div>
+        </div>
+      )}
       <BackButton fallbackHref="/settings/connectors" />
       <div>
         <h1 className="text-2xl font-bold text-gray-900">GDT Crawler Bot</h1>
@@ -214,16 +271,27 @@ export default function BotSettingsPage() {
           )}
 
           <div className="flex gap-2">
-            <button onClick={runNow} disabled={running}
-              className="flex-1 border border-blue-300 text-blue-700 rounded-xl py-2.5 text-sm font-medium disabled:opacity-50">
-              {running ? '⏳ Đang xử lý...' : '▶ Chạy ngay'}
+            <button
+              onClick={() => {
+                const today = new Date();
+                const todayStr = today.toISOString().slice(0, 10);
+                const firstOfMonth = new Date(today.getFullYear(), today.getMonth(), 1).toISOString().slice(0, 10);
+                setRunFrom(firstOfMonth);
+                setRunTo(todayStr);
+                setDateError('');
+                setShowDatePicker(true);
+              }}
+              disabled={running}
+              className="flex-1 bg-blue-600 text-white rounded-xl py-2.5 text-sm font-medium disabled:opacity-50 hover:bg-blue-700"
+            >
+              {running ? '⏳ Đang xử lý...' : '▶ Đồng bộ hóa đơn'}
             </button>
-            <button onClick={() => setShowSetup(true)}
-              className="border border-gray-300 text-gray-700 rounded-xl px-4 py-2.5 text-sm">
+            <button onClick={() => setShowSetup(true)} disabled={running}
+              className="border border-gray-300 text-gray-700 rounded-xl px-4 py-2.5 text-sm hover:bg-gray-50 disabled:opacity-50">
               ✏️ Sửa
             </button>
             <button onClick={deleteConfig}
-              className="border border-red-200 text-red-600 rounded-xl px-4 py-2.5 text-sm">
+              className="border border-red-200 text-red-600 rounded-xl px-4 py-2.5 text-sm hover:bg-red-50">
               🗑
             </button>
           </div>
@@ -329,6 +397,66 @@ export default function BotSettingsPage() {
                   Lưu & Kết nối
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Date picker modal — Lấy dữ liệu lịch sử ── */}
+      {showDatePicker && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-4">
+          <div className="bg-white rounded-2xl w-full max-w-sm shadow-xl p-5 space-y-4">
+            <div className="flex items-center justify-between">
+              <h2 className="font-bold text-gray-900">🕒 Lấy dữ liệu theo khoảng thời gian</h2>
+              <button onClick={() => setShowDatePicker(false)} className="text-gray-400 hover:text-gray-700 text-xl">✕</button>
+            </div>
+            <p className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+              ⚠️ Quy định GDT: chỉ được phép tra cứu tối đa <strong>31 ngày</strong> mỗi lần.
+            </p>
+            <div className="space-y-3">
+              <div>
+                <label className="text-xs font-medium text-gray-600 block mb-1">Từ ngày</label>
+                <input
+                  type="date"
+                  value={runFrom}
+                  max={runTo || new Date().toISOString().slice(0, 10)}
+                  onChange={e => validateAndSetFrom(e.target.value)}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="text-xs font-medium text-gray-600 block mb-1">Đến ngày</label>
+                <input
+                  type="date"
+                  value={runTo}
+                  min={runFrom}
+                  max={new Date().toISOString().slice(0, 10)}
+                  onChange={e => validateAndSetTo(e.target.value)}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
+                />
+              </div>
+              {dateError && <p className="text-xs text-red-600">{dateError}</p>}
+              {runFrom && runTo && !dateError && (() => {
+                const diffDays = Math.round((new Date(runTo).getTime() - new Date(runFrom).getTime()) / 86400000);
+                return <p className="text-xs text-green-600">✓ Khoảng: {diffDays} ngày</p>;
+              })()}
+            </div>
+            <div className="flex gap-3">
+              <button onClick={() => setShowDatePicker(false)}
+                className="flex-1 border border-gray-300 rounded-xl py-2.5 text-sm">
+                Hủy
+              </button>
+              <button
+                onClick={() => {
+                  if (!runFrom || !runTo || dateError) return;
+                  setShowDatePicker(false);
+                  void runNow(runFrom, runTo);
+                }}
+                disabled={!runFrom || !runTo || !!dateError || running}
+                className="flex-1 bg-blue-600 text-white rounded-xl py-2.5 text-sm font-medium disabled:opacity-50"
+              >
+                Lấy dữ liệu
+              </button>
             </div>
           </div>
         </div>

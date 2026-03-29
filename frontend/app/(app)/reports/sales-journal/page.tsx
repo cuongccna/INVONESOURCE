@@ -4,6 +4,12 @@ import { useEffect, useState } from 'react';
 import apiClient from '../../../../lib/apiClient';
 import { useCompany } from '../../../../contexts/CompanyContext';
 import { formatVND } from '../../../../utils/formatCurrency';
+import PeriodSelector, {
+  type PeriodValue,
+  defaultPeriod,
+  periodToParams,
+  periodLabel,
+} from '../../../../components/PeriodSelector';
 
 interface JournalInvoice {
   id: string;
@@ -54,18 +60,17 @@ export default function JournalsPage() {
   const [tab, setTab] = useState<JournalType>('sales');
   const [data, setData] = useState<JournalData | null>(null);
   const [loading, setLoading] = useState(true);
-  const [month, setMonth] = useState(() => new Date().getMonth() + 1);
-  const [year, setYear] = useState(() => new Date().getFullYear());
+  const [period, setPeriod] = useState<PeriodValue>(defaultPeriod);
 
   useEffect(() => {
     if (!activeCompanyId) return;
     setLoading(true);
     apiClient
-      .get<{ data: JournalData }>(`/journals/${tab}?month=${month}&year=${year}`)
+      .get<{ data: JournalData }>(`/journals/${tab}?${periodToParams(period)}`)
       .then((r) => setData(r.data.data))
       .catch(() => setData(null))
       .finally(() => setLoading(false));
-  }, [activeCompanyId, tab, month, year]);
+  }, [activeCompanyId, tab, period]);
 
   const f = (v: string | number) => formatVND(Number(v));
   const emptyTotals: JournalTotals = {
@@ -82,7 +87,7 @@ export default function JournalsPage() {
           <h1 className="text-2xl font-bold text-gray-900">
             {tab === 'sales' ? 'Bảng Kê Hóa Đơn Bán Ra' : 'Bảng Kê Hóa Đơn Mua Vào'}
           </h1>
-          <p className="text-sm text-gray-500">{data?.invoices.length ?? 0} hóa đơn kỳ này</p>
+          <p className="text-sm text-gray-500">{data?.invoices.length ?? 0} hóa đơn · {periodLabel(period)}</p>
         </div>
         <div className="flex gap-2 flex-wrap">
           <div className="flex bg-gray-100 rounded-lg p-1">
@@ -95,18 +100,7 @@ export default function JournalsPage() {
               Mua vào
             </button>
           </div>
-          <select value={month} onChange={(e) => setMonth(Number(e.target.value))}
-            className="border rounded-lg px-2 py-1 text-sm">
-            {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
-              <option key={m} value={m}>Tháng {m}</option>
-            ))}
-          </select>
-          <select value={year} onChange={(e) => setYear(Number(e.target.value))}
-            className="border rounded-lg px-2 py-1 text-sm">
-            {[2023, 2024, 2025, 2026].map((y) => (
-              <option key={y} value={y}>{y}</option>
-            ))}
-          </select>
+          <PeriodSelector value={period} onChange={setPeriod} />
         </div>
       </div>
 

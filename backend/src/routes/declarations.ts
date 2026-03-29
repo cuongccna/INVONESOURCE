@@ -16,8 +16,11 @@ router.use(authenticate);
 router.use(requireCompany);
 
 const calcSchema = z.object({
-  month: z.number().int().min(1).max(12),
-  year: z.number().int().min(2020).max(2100),
+  month:   z.number().int().min(1).max(12).optional(),
+  quarter: z.number().int().min(1).max(4).optional(),
+  year:    z.number().int().min(2020).max(2100),
+}).refine(d => d.month !== undefined || d.quarter !== undefined, {
+  message: 'Phải cung cấp month hoặc quarter',
 });
 
 // GET /api/declarations
@@ -30,7 +33,7 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
     const [countResult, dataResult] = await Promise.all([
       pool.query(`SELECT COUNT(*) FROM tax_declarations WHERE company_id = $1`, [req.user!.companyId]),
       pool.query(
-        `SELECT id, period_month, period_year,
+        `SELECT id, period_month, period_year, period_type,
                 submission_status AS status,
                 ct40a_total_output_vat AS ct40a,
                 ct41_payable_vat        AS ct41,
@@ -73,11 +76,16 @@ router.post(
       if (!parsed.success) throw new ValidationError(parsed.error.issues[0]?.message ?? 'Invalid input');
 
       const engine = new TaxDeclarationEngine();
-      const declaration = await engine.calculateDeclaration(
-        req.user!.companyId!,
-        parsed.data.month,
-        parsed.data.year
-      );
+      let declaration;
+      if (parsed.data.quarter !== undefined) {
+        declaration = await engine.calculateQuarterlyDeclaration(
+          req.user!.companyId!, parsed.data.quarter, parsed.data.year
+        );
+      } else {
+        declaration = await engine.calculateDeclaration(
+          req.user!.companyId!, parsed.data.month!, parsed.data.year
+        );
+      }
       sendSuccess(res, declaration);
     } catch (err) {
       next(err);
@@ -127,8 +135,11 @@ router.get('/:id/xml', async (req: Request, res: Response, next: NextFunction) =
       xml = await generator.generate(decl as TaxDeclaration);
     }
 
-    const { period_month, period_year } = decl;
-    const filename = `01GTGT_${period_year}_${String(period_month).padStart(2, '0')}.xml`;
+    const { period_month, period_year, period_type } = decl;
+    const isQuarterly = period_type === 'quarterly';
+    const filename = isQuarterly
+      ? `01GTGT_${period_year}_Q${period_month}.xml`
+      : `01GTGT_${period_year}_${String(period_month).padStart(2, '0')}.xml`;
     res.setHeader('Content-Type', 'application/xml; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.send(xml);
@@ -192,6 +203,31 @@ router.get(
       const tvan = new TVanSubmissionService();
       const status = await tvan.pollStatus(decl.submission_ref as string);
       sendSuccess(res, status);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// DELETE /api/declarations/:id — xóa vĩnh viễn tờ khai (chỉ khi còn draft/ready)
+router.delete(
+  '/:id',
+  requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const result = await pool.query(
+        `DELETE FROM tax_declarations
+         WHERE id = $1 AND company_id = $2
+           AND submission_status IN ('draft', 'ready')
+         RETURNING id`,
+        [req.params.id, req.user!.companyId]
+      );
+      if (!result.rows[0]) {
+        throw new NotFoundError(
+          'Không tìm thấy tờ khai hoặc tờ khai đã nộp (không thể xóa)'
+        );
+      }
+      sendSuccess(res, null, 'Đã xóa tờ khai');
     } catch (err) {
       next(err);
     }

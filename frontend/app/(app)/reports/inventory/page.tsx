@@ -4,6 +4,12 @@ import { useEffect, useState } from 'react';
 import apiClient from '../../../../lib/apiClient';
 import { useCompany } from '../../../../contexts/CompanyContext';
 import { formatVND } from '../../../../utils/formatCurrency';
+import PeriodSelector, {
+  type PeriodValue,
+  defaultPeriod,
+  periodToParams,
+  periodLabel,
+} from '../../../../components/PeriodSelector';
 
 interface InventoryBalanceRow {
   item_code: string | null;
@@ -26,33 +32,37 @@ export default function InventoryReportPage() {
   const [rows, setRows] = useState<InventoryBalanceRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [building, setBuilding] = useState(false);
-  const [month, setMonth] = useState(() => new Date().getMonth() + 1);
-  const [year, setYear] = useState(() => new Date().getFullYear());
+  const [period, setPeriod] = useState<PeriodValue>(defaultPeriod);
   const [showOpeningModal, setShowOpeningModal] = useState(false);
   const [openingForm, setOpeningForm] = useState({ item_name: '', unit: '', quantity: '', unit_cost: '' });
   const [msg, setMsg] = useState('');
 
-  const fetch = (m = month, y = year) => {
+  const fetch = (p = period) => {
     if (!activeCompanyId) return;
     setLoading(true);
     apiClient
-      .get<{ data: InventoryBalanceRow[] }>(`/inventory?month=${m}&year=${y}`)
+      .get<{ data: InventoryBalanceRow[] }>(`/inventory?${periodToParams(p)}`)
       .then((r) => setRows(r.data.data))
       .catch(() => {})
       .finally(() => setLoading(false));
   };
 
-  useEffect(() => { fetch(); }, [activeCompanyId, month, year]);
+  useEffect(() => { fetch(); }, [activeCompanyId, period]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const build = async () => {
     setBuilding(true);
     setMsg('');
     try {
-      await apiClient.post('/inventory/build', { month, year });
-      setMsg('Đã xây dựng phiếu xuất nhập tồn.');
+      await apiClient.post('/inventory/build', {
+        month: period.month,
+        year: period.year,
+        quarter: period.quarter,
+        periodType: period.periodType,
+      });
+      setMsg('Đã tính lại xuất nhập tồn.');
       fetch();
     } catch {
-      setMsg('Lỗi khi build.');
+      setMsg('Lỗi khi tính lại.');
     } finally {
       setBuilding(false);
     }
@@ -65,7 +75,7 @@ export default function InventoryReportPage() {
         unit: openingForm.unit || undefined,
         quantity: Number(openingForm.quantity),
         unit_cost: Number(openingForm.unit_cost),
-        as_of_date: `${year}-${String(month).padStart(2, '0')}-01`,
+        as_of_date: `${period.year}-${String(period.month).padStart(2, '0')}-01`,
       });
       setShowOpeningModal(false);
       setOpeningForm({ item_name: '', unit: '', quantity: '', unit_cost: '' });
@@ -82,26 +92,15 @@ export default function InventoryReportPage() {
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Xuất Nhập Tồn</h1>
-          <p className="text-sm text-gray-500">{rows.length} mặt hàng kỳ này</p>
+          <p className="text-sm text-gray-500">{rows.length} mặt hàng · {periodLabel(period)}</p>
         </div>
         <div className="flex gap-2 flex-wrap">
-          <select value={month} onChange={(e) => setMonth(Number(e.target.value))}
-            className="border rounded-lg px-2 py-1 text-sm">
-            {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
-              <option key={m} value={m}>Tháng {m}</option>
-            ))}
-          </select>
-          <select value={year} onChange={(e) => setYear(Number(e.target.value))}
-            className="border rounded-lg px-2 py-1 text-sm">
-            {[2023, 2024, 2025, 2026].map((y) => (
-              <option key={y} value={y}>{y}</option>
-            ))}
-          </select>
+          <PeriodSelector value={period} onChange={setPeriod} />
           <button onClick={() => setShowOpeningModal(true)}
             className="px-3 py-1 bg-gray-100 border rounded-lg text-sm">+ Tồn đầu kỳ</button>
           <button onClick={build} disabled={building}
             className="px-4 py-1 bg-blue-600 text-white rounded-lg text-sm disabled:opacity-50">
-            {building ? 'Đang build...' : '🔄 Build XNT'}
+            {building ? 'Đang tính...' : '🔄 Tính lại'}
           </button>
         </div>
       </div>

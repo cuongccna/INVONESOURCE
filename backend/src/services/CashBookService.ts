@@ -67,15 +67,34 @@ export class CashBookService {
     await this.recalcRunningBalance(i.company_id, i.payment_date!);
   }
 
+  /** Rebuild auto-generated entries from invoices for a date range. */
+  async rebuildAutoEntries(companyId: string, start: string, end: string): Promise<number> {
+    // Remove stale auto-generated entries in the range
+    await pool.query(
+      `DELETE FROM cash_book_entries WHERE company_id=$1 AND entry_date BETWEEN $2 AND $3 AND is_auto_generated=true`,
+      [companyId, start, end],
+    );
+    // Find all invoices with payment_date in the range
+    const { rows } = await pool.query<{ id: string }>(
+      `SELECT id FROM invoices WHERE company_id=$1 AND deleted_at IS NULL AND payment_date BETWEEN $2 AND $3`,
+      [companyId, start, end],
+    );
+    for (const inv of rows) await this.syncFromInvoice(inv.id);
+    if (rows.length > 0) await this.recalcRunningBalance(companyId, start);
+    return rows.length;
+  }
+
   /** Get cash book entries for a period, optionally filtered by payment_method. */
   async getEntries(
     companyId: string,
     month: number,
     year: number,
     method?: string,
+    startDateOverride?: string,
+    endDateOverride?: string,
   ): Promise<{ entries: CashBookEntry[]; opening_balance: number; total_receipt: number; total_payment: number }> {
-    const startDate = `${year}-${String(month).padStart(2, '0')}-01`;
-    const endDate = new Date(year, month, 0).toISOString().split('T')[0];
+    const startDate = startDateOverride ?? `${year}-${String(month).padStart(2, '0')}-01`;
+    const endDate = endDateOverride ?? new Date(year, month, 0).toISOString().split('T')[0];
 
     // Opening balance = running_balance of last entry before period
     const ob = await pool.query<{ running_balance: string }>(

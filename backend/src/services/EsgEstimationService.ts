@@ -160,6 +160,7 @@ export class EsgEstimationService {
          COUNT(*) AS invoice_count
        FROM invoices
        WHERE company_id = $1 AND status != 'cancelled'
+         AND deleted_at IS NULL
          AND invoice_date >= (CURRENT_DATE - INTERVAL '24 months')
        GROUP BY period_month, period_year
        ORDER BY period_year, period_month`,

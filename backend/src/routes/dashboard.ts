@@ -215,6 +215,7 @@ router.get('/quick-actions', async (req: Request, res: Response, next: NextFunct
         `SELECT COUNT(DISTINCT buyer_tax_code) AS cnt
          FROM invoices
          WHERE company_id = $1 AND direction = 'output' AND status = 'valid'
+           AND deleted_at IS NULL
            AND payment_date IS NULL
            AND COALESCE(payment_due_date, invoice_date + INTERVAL '30 days') < NOW()`,
         [companyId]

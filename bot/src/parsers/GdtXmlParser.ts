@@ -4,25 +4,18 @@
  * Parses TT78/2021 / TT80/2021 XML format from hoadondientu.gdt.gov.vn.
  *
  * XML structure (simplified):
- *   <TDiep>
- *     <DLieu>
- *       <TBao>
- *         <DLHDon>
- *           <DSHDon>
- *             <HDon>
- *               <TTChung> SHDon, NLap, TTHThue, ... </TTChung>
- *               <NDHDon>  TSuat, TgTThue, TgTTTBSo, ... </NDHDon>
- *               <NBan>    Ten, MST </NBan>
- *               <NMua>    Ten, MST </NMua>
- *             </HDon>
- *           </DSHDon>
- *         </DLHDon>
- *       </TBao>
- *     </DLieu>
- *   </TDiep>
+ *   Bulk XML (list export):
+ *     <TDiep><DLieu><TBao><DLHDon><DSHDon>
+ *       <HDon><TTChung>...</TTChung><NDHDon>...</NDHDon></HDon>
+ *
+ *   Single-invoice XML (export-xml endpoint, served inside a ZIP archive):
+ *     <HDon><DLHDon><TTChung>...</TTChung><NDHDon>...<DSHHDVu><HHDVu/></DSHHDVu></NDHDon></DLHDon></HDon>
+ *   The export-xml endpoint returns a ZIP file. The ZIP contains invoice.xml (the actual XML),
+ *   invoice.html, details.js, sign images, etc.
  *
  * Both camelCase and PascalCase variants are handled.
  */
+import * as zlib from 'zlib';
 import { XMLParser } from 'fast-xml-parser';
 import { logger } from '../logger';
 
@@ -42,6 +35,25 @@ export interface RawInvoice {
   invoice_type:    string | null;
   source:          'gdt_bot';
   gdt_validated:   true;
+  /**
+   * Whether GDT has a signed XML for this invoice.
+   * false for ttxly==6 (không mã) and ttxly==8 (ủy nhiệm) —
+   * these are paper/non-coded invoices; calling export-xml returns HTTP 500.
+   */
+  xml_available:   boolean;
+}
+
+export interface LineItem {
+  line_number: number | null;
+  item_code:   string | null;
+  item_name:   string | null;
+  unit:        string | null;
+  quantity:    number | null;
+  unit_price:  number | null;
+  subtotal:    number | null;
+  vat_rate:    number | null;
+  vat_amount:  number | null;
+  total:       number | null;
 }
 
 // GDT invoice status codes (TTHThue field)
@@ -137,6 +149,8 @@ export class GdtXmlParser {
       invoice_type:    this._str(ttchung, 'THDon', 'tHDon'),
       source:          'gdt_bot',
       gdt_validated:   true,
+      // Invoices parsed directly from XML by definition have XML available
+      xml_available:   true,
     };
   }
 
@@ -195,5 +209,156 @@ export class GdtXmlParser {
     if (s === '8' || s === '8%') return '8%';
     if (s === '10' || s === '10%') return '10%';
     return s.toLowerCase() || null;
+  }
+
+  /**
+   * Parse line items (mặt hàng) from a single-invoice buffer.
+   *
+   * The export-xml endpoint returns a ZIP archive containing invoice.xml (+ html, images, etc.).
+   * This method auto-detects ZIP (PK magic bytes) and extracts invoice.xml before parsing.
+   *
+   * Single-invoice XML structure:
+   *   <HDon><DLHDon><TTChung/><NDHDon><DSHHDVu><HHDVu/></DSHHDVu></NDHDon></DLHDon></HDon>
+   *
+   * Returns [] if the buffer is not parseable or has no line item data.
+   */
+  parseLineItems(buffer: Buffer): LineItem[] {
+    // Step 1: If the buffer is a ZIP archive, extract invoice.xml from it
+    const xmlBuffer = this._extractXmlFromZip(buffer) ?? buffer;
+
+    let obj: Record<string, unknown>;
+    try {
+      obj = this.parser.parse(xmlBuffer.toString('utf-8')) as Record<string, unknown>;
+    } catch {
+      return [];
+    }
+
+    // Find first invoice node
+    const invoices = this._findInvoices(obj);
+    if (invoices.length === 0) return [];
+    const inv = invoices[0] as Record<string, unknown>;
+
+    // Single-invoice XML wraps content in DLHDon:
+    //   inv = { DLHDon: { TTChung, NDHDon }, DLQRCode, ... }
+    // Bulk XML has NDHDon directly in inv.
+    // Try both layouts.
+    const payload: Record<string, unknown> =
+      (this._obj(inv, 'DLHDon', 'dLHDon', 'dlhdon') as Record<string, unknown> | null) ?? inv;
+
+    const ndhdon = this._obj(payload, 'NDHDon', 'ndhdon', 'ndHDon');
+    if (!ndhdon) return [];
+
+    // DSHHDVu may be an array or single object depending on parser config
+    const dshhd = ndhdon['DSHHDVu'] ?? ndhdon['dSHHDVu'] ?? ndhdon['dsHHDVu'];
+    if (!dshhd || typeof dshhd !== 'object') return [];
+
+    const hhdvu = (dshhd as Record<string, unknown>)['HHDVu'] ??
+                  (dshhd as Record<string, unknown>)['hHDVu'];
+    if (!hhdvu) return [];
+
+    const rows = Array.isArray(hhdvu) ? hhdvu : [hhdvu];
+
+    return rows.map((row, idx): LineItem => {
+      const r = row as Record<string, unknown>;
+
+      // Normalise VAT rate to numeric (e.g. "10%" → 10)
+      const vatRateRaw = this._val(r, 'TSuat', 'tSuat', 'TsT');
+      const vatRateNum = (() => {
+        if (vatRateRaw == null) return null;
+        const s = String(vatRateRaw).replace('%', '').trim();
+        if (s === 'KCT' || s === 'KKKTT' || s === '') return 0;
+        const n = parseFloat(s);
+        return isNaN(n) ? null : n;
+      })();
+
+      return {
+        line_number: this._num(r, 'STT', 'stt') ?? idx + 1,
+        item_code:   this._str(r, 'MHHDVu', 'mHHDVu', 'MHH', 'ma_hh'),
+        item_name:   this._str(r, 'THHDVu', 'tHHDVu', 'Ten', 'ten_hh'),
+        unit:        this._str(r, 'DVTinh', 'dVTinh', 'dvt'),
+        quantity:    this._num(r, 'SLuong', 'sLuong', 'so_luong'),
+        unit_price:  this._num(r, 'DGia', 'dGia', 'don_gia'),
+        subtotal:    this._num(r, 'ThTien', 'thTien', 'thanh_tien'),
+        vat_rate:    vatRateNum,
+        vat_amount:  this._num(r, 'TienThue', 'tienThue', 'tien_thue'),
+        total:       this._num(r, 'TgTTTBSo', 'tgTTTBSo', 'TToan', 'tToan'),
+      };
+    }).filter(item => item.item_name != null);
+  }
+
+  // ── ZIP extraction helper ────────────────────────────────────────────────────
+
+  /**
+   * The GDT export-xml endpoint returns a ZIP archive, not raw XML.
+   * The ZIP contains invoice.xml (the signed e-invoice), invoice.html, images, and JS.
+   *
+   * The ZIP uses data descriptors (bit 3 in general-purpose flag) which means the
+   * compressed size in each local file header is ZERO — the real sizes are only in
+   * the ZIP Central Directory at the end of the file. This method reads the Central
+   * Directory first, then extracts invoice.xml using the correct offsets.
+   *
+   * Supports ZIP compression methods:
+   *   0 = stored (no compression)
+   *   8 = deflate (raw DEFLATE via zlib.inflateRawSync)
+   *
+   * Returns null if the buffer is not a ZIP or does not contain invoice.xml.
+   */
+  private _extractXmlFromZip(buffer: Buffer): Buffer | null {
+    // ZIP magic: PK\x03\x04 = 0x04034b50
+    if (buffer.length < 22 || buffer.readUInt32LE(0) !== 0x04034b50) return null;
+
+    // ── Step 1: Find End of Central Directory (EOCD) ──────────────────────────
+    // EOCD signature: PK\x05\x06 = 0x06054b50
+    // Located at the end of the file (before optional comment)
+    let eocdOffset = -1;
+    for (let i = buffer.length - 22; i >= 0; i--) {
+      if (buffer.readUInt32LE(i) === 0x06054b50) {
+        eocdOffset = i;
+        break;
+      }
+    }
+    if (eocdOffset < 0) return null;
+
+    const cdOffset = buffer.readUInt32LE(eocdOffset + 16); // start of central directory
+    const cdSize   = buffer.readUInt32LE(eocdOffset + 12); // size of central directory
+
+    // ── Step 2: Walk Central Directory ────────────────────────────────────────
+    // Central directory file header signature: PK\x01\x02 = 0x02014b50
+    let cdPos = cdOffset;
+    const cdEnd = cdOffset + cdSize;
+
+    while (cdPos + 46 <= cdEnd) {
+      if (buffer.readUInt32LE(cdPos) !== 0x02014b50) break;
+
+      const compressionMethod  = buffer.readUInt16LE(cdPos + 10);
+      const compressedSize     = buffer.readUInt32LE(cdPos + 20);
+      const fileNameLen        = buffer.readUInt16LE(cdPos + 28);
+      const extraFieldLen      = buffer.readUInt16LE(cdPos + 30);
+      const fileCommentLen     = buffer.readUInt16LE(cdPos + 32);
+      const localHeaderOffset  = buffer.readUInt32LE(cdPos + 42);
+
+      const fileName = buffer.slice(cdPos + 46, cdPos + 46 + fileNameLen).toString('utf-8');
+      cdPos += 46 + fileNameLen + extraFieldLen + fileCommentLen;
+
+      if (fileName !== 'invoice.xml') continue;
+
+      // ── Step 3: Read local file header to find data start ─────────────────
+      // Local file header: PK\x03\x04, offsets 26=fnLen, 28=extraLen
+      if (localHeaderOffset + 30 > buffer.length) return null;
+      const localFnLen    = buffer.readUInt16LE(localHeaderOffset + 26);
+      const localExtraLen = buffer.readUInt16LE(localHeaderOffset + 28);
+      const dataStart     = localHeaderOffset + 30 + localFnLen + localExtraLen;
+      const dataEnd       = dataStart + compressedSize;
+
+      if (dataEnd > buffer.length) return null;
+
+      const data = buffer.slice(dataStart, dataEnd);
+      if (compressionMethod === 0) return data;   // stored
+      if (compressionMethod === 8) {
+        try { return zlib.inflateRawSync(data); } catch { return null; }
+      }
+      return null; // unsupported compression
+    }
+    return null;
   }
 }

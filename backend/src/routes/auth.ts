@@ -30,6 +30,7 @@ router.post('/login', async (req: Request, res: Response, next: NextFunction) =>
 
     const userResult = await pool.query(
       `SELECT u.id, u.email, u.password_hash, u.full_name,
+              u.is_platform_admin,
               uc.role, uc.company_id
        FROM users u
        LEFT JOIN user_companies uc ON uc.user_id = u.id
@@ -44,7 +45,13 @@ router.post('/login', async (req: Request, res: Response, next: NextFunction) =>
     if (!valid) throw new AuthError('Invalid email or password');
 
     const accessToken = jwt.sign(
-      { userId: user.id, email: user.email, role: user.role ?? 'VIEWER', companyId: user.company_id },
+      {
+        userId: user.id,
+        email: user.email,
+        role: user.role ?? 'VIEWER',
+        companyId: user.company_id,
+        ...(user.is_platform_admin ? { is_platform_admin: true } : {}),
+      },
       env.JWT_SECRET,
       { expiresIn: '1h' }
     );
@@ -67,7 +74,14 @@ router.post('/login', async (req: Request, res: Response, next: NextFunction) =>
 
     sendSuccess(res, {
       accessToken,
-      user: { id: user.id, email: user.email, fullName: user.full_name, role: user.role, companyId: user.company_id },
+      user: {
+        id: user.id,
+        email: user.email,
+        fullName: user.full_name,
+        role: user.role,
+        companyId: user.company_id,
+        ...(user.is_platform_admin ? { is_platform_admin: true } : {}),
+      },
     });
   } catch (err) {
     next(err);
@@ -81,10 +95,10 @@ router.post('/refresh', async (req: Request, res: Response, next: NextFunction) 
     if (!token) throw new AuthError('No refresh token');
 
     const tokenResult = await pool.query(
-      `SELECT rt.user_id, rt.expires_at, u.email,
+      `SELECT rt.user_id, rt.expires_at, u.email, u.full_name, u.is_platform_admin,
               uc.role, uc.company_id
        FROM refresh_tokens rt
-       JOIN users u ON u.id = rt.user_id
+       JOIN users u ON u.id = rt.user_id AND u.is_active = true
        LEFT JOIN user_companies uc ON uc.user_id = rt.user_id
        WHERE rt.token_hash = $1 AND rt.expires_at > NOW() AND rt.revoked_at IS NULL`,
       [hashToken(token)]
@@ -94,7 +108,13 @@ router.post('/refresh', async (req: Request, res: Response, next: NextFunction) 
     if (!row) throw new AuthError('Invalid or expired refresh token');
 
     const accessToken = jwt.sign(
-      { userId: row.user_id, email: row.email, role: row.role ?? 'VIEWER', companyId: row.company_id },
+      {
+        userId: row.user_id,
+        email: row.email,
+        role: row.role ?? 'VIEWER',
+        companyId: row.company_id,
+        ...(row.is_platform_admin ? { is_platform_admin: true } : {}),
+      },
       env.JWT_SECRET,
       { expiresIn: '1h' }
     );
@@ -126,7 +146,8 @@ router.post('/logout', authenticate, async (req: Request, res: Response, next: N
 router.get('/me', authenticate, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const result = await pool.query(
-      `SELECT u.id, u.email, u.full_name, u.phone, uc.role, uc.company_id
+      `SELECT u.id, u.email, u.full_name, u.phone, u.is_platform_admin,
+              uc.role, uc.company_id
        FROM users u
        LEFT JOIN user_companies uc ON uc.user_id = u.id
        WHERE u.id = $1`,

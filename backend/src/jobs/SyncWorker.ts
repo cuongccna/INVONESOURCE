@@ -257,14 +257,14 @@ export const syncWorker = new Worker<SyncJobPayload>(
     }
     const taxCode: string = companRows[0].tax_code;
 
-    // Load active connectors for this company
+    let totalFetched = 0;
+
+    // ── Normal mode: load connectors from company_connectors table ──
     const { rows: connectors } = await pool.query(
       `SELECT provider, credentials_encrypted FROM company_connectors
        WHERE company_id = $1 AND enabled = true`,
       [companyId]
     );
-
-    let totalFetched = 0;
 
     for (const connector of connectors) {
       const plugin = registry.get(connector.provider);

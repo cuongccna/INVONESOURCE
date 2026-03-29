@@ -7,25 +7,16 @@ import { authenticate } from '../middleware/auth';
 import { requireCompany } from '../middleware/company';
 import { pool } from '../db/pool';
 import { sendSuccess } from '../utils/response';
-import { AppError } from '../utils/AppError';
+import { resolvePeriod } from '../utils/period';
 
 const router = Router();
 router.use(authenticate);
 router.use(requireCompany);
 
-function periodParams(month: number, year: number) {
-  const start = `${year}-${String(month).padStart(2, '0')}-01`;
-  const end = new Date(year, month, 0).toISOString().split('T')[0];
-  return { start, end };
-}
-
-// GET /api/journals/sales?month=&year=
+// GET /api/journals/sales?month=&year=&periodType=monthly|quarterly|yearly&quarter=
 router.get('/sales', async (req: Request, res: Response) => {
   const companyId = req.user!.companyId!;
-  const month = parseInt(req.query.month as string) || new Date().getMonth() + 1;
-  const year = parseInt(req.query.year as string) || new Date().getFullYear();
-  if (month < 1 || month > 12) throw new AppError('month must be 1-12', 400, 'VALIDATION');
-  const { start, end } = periodParams(month, year);
+  const { start, end, month, year } = resolvePeriod(req.query);
 
   const { rows } = await pool.query(
     `SELECT
@@ -43,6 +34,7 @@ router.get('/sales', async (req: Request, res: Response) => {
        CASE WHEN i.vat_rate=10  THEN i.vat_amount ELSE 0 END AS vat_10pct
      FROM invoices i
      WHERE i.company_id=$1 AND i.direction='output' AND i.status='valid'
+       AND i.deleted_at IS NULL
        AND i.invoice_date BETWEEN $2 AND $3
      ORDER BY i.invoice_date, i.invoice_number`,
     [companyId, start, end],
@@ -70,13 +62,10 @@ router.get('/sales', async (req: Request, res: Response) => {
   sendSuccess(res, { invoices: rows, totals, period: { month, year } });
 });
 
-// GET /api/journals/purchase?month=&year=
+// GET /api/journals/purchase?month=&year=&periodType=monthly|quarterly|yearly&quarter=
 router.get('/purchase', async (req: Request, res: Response) => {
   const companyId = req.user!.companyId!;
-  const month = parseInt(req.query.month as string) || new Date().getMonth() + 1;
-  const year = parseInt(req.query.year as string) || new Date().getFullYear();
-  if (month < 1 || month > 12) throw new AppError('month must be 1-12', 400, 'VALIDATION');
-  const { start, end } = periodParams(month, year);
+  const { start, end, month, year } = resolvePeriod(req.query);
 
   const { rows } = await pool.query(
     `SELECT
@@ -94,6 +83,7 @@ router.get('/purchase', async (req: Request, res: Response) => {
        CASE WHEN i.vat_rate=10  THEN i.vat_amount ELSE 0 END AS vat_10pct
      FROM invoices i
      WHERE i.company_id=$1 AND i.direction='input' AND i.status='valid'
+       AND i.deleted_at IS NULL
        AND i.invoice_date BETWEEN $2 AND $3
      ORDER BY i.invoice_date, i.invoice_number`,
     [companyId, start, end],
@@ -121,13 +111,10 @@ router.get('/purchase', async (req: Request, res: Response) => {
   sendSuccess(res, { invoices: rows, totals, period: { month, year } });
 });
 
-// GET /api/journals/revenue-expense?month=&year=&groupBy=month|customer|supplier
+// GET /api/journals/revenue-expense?month=&year=&periodType=monthly|quarterly|yearly&quarter=
 router.get('/revenue-expense', async (req: Request, res: Response) => {
   const companyId = req.user!.companyId!;
-  const month = parseInt(req.query.month as string) || new Date().getMonth() + 1;
-  const year = parseInt(req.query.year as string) || new Date().getFullYear();
-  if (month < 1 || month > 12) throw new AppError('month must be 1-12', 400, 'VALIDATION');
-  const { start, end } = periodParams(month, year);
+  const { start, end, month, year } = resolvePeriod(req.query);
 
   // Revenue by VAT rate
   const revenueByRate = await pool.query(
@@ -135,6 +122,7 @@ router.get('/revenue-expense', async (req: Request, res: Response) => {
        SUM(subtotal) AS subtotal, SUM(vat_amount) AS vat_amount, SUM(total_amount) AS total_amount,
        COUNT(*) AS invoice_count
      FROM invoices WHERE company_id=$1 AND direction='output' AND status='valid'
+       AND deleted_at IS NULL
        AND invoice_date BETWEEN $2 AND $3
      GROUP BY vat_rate ORDER BY vat_rate`,
     [companyId, start, end],
@@ -146,6 +134,7 @@ router.get('/revenue-expense', async (req: Request, res: Response) => {
        SUM(subtotal) AS subtotal, SUM(vat_amount) AS vat_amount, SUM(total_amount) AS total_amount,
        COUNT(*) AS invoice_count
      FROM invoices WHERE company_id=$1 AND direction='input' AND status='valid'
+       AND deleted_at IS NULL
        AND invoice_date BETWEEN $2 AND $3
      GROUP BY vat_rate ORDER BY vat_rate`,
     [companyId, start, end],
@@ -156,6 +145,7 @@ router.get('/revenue-expense', async (req: Request, res: Response) => {
     `SELECT buyer_name, buyer_tax_code,
        SUM(subtotal) AS total_revenue, COUNT(*) AS invoice_count
      FROM invoices WHERE company_id=$1 AND direction='output' AND status='valid'
+       AND deleted_at IS NULL
        AND invoice_date BETWEEN $2 AND $3
      GROUP BY buyer_name, buyer_tax_code ORDER BY total_revenue DESC LIMIT 10`,
     [companyId, start, end],
@@ -166,6 +156,7 @@ router.get('/revenue-expense', async (req: Request, res: Response) => {
     `SELECT seller_name, seller_tax_code,
        SUM(subtotal) AS total_spend, COUNT(*) AS invoice_count
      FROM invoices WHERE company_id=$1 AND direction='input' AND status='valid'
+       AND deleted_at IS NULL
        AND invoice_date BETWEEN $2 AND $3
      GROUP BY seller_name, seller_tax_code ORDER BY total_spend DESC LIMIT 10`,
     [companyId, start, end],

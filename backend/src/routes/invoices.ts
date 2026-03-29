@@ -226,22 +226,115 @@ router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
   }
 });
 
-// POST /api/invoices/sync — trigger manual sync
+// POST /api/invoices/sync — trigger manual GDT Bot sync
 // NOTE: must be defined AFTER static routes but this is a POST so no conflict with GET /:id
 router.post('/sync', requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { syncQueue } = await import('../jobs/SyncWorker');
     const companyId = req.user!.companyId;
     if (!companyId) throw new Error('Company not associated with user');
-    const now = new Date();
-    const fromDate = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
-    const toDate = now.toISOString();
-    const jobId = await syncQueue.add(
-      'manual-sync',
-      { companyId, fromDate, toDate, triggeredBy: 'manual' },
-      { jobId: `manual-${companyId}-${Date.now()}` }
+
+    // Accept explicit date range from body (UI always sends this now).
+    // Validate: max 31 days per GDT rule. If not provided, fall back to smart default.
+    const bodyFrom = typeof req.body?.from_date === 'string' ? req.body.from_date : null;
+    const bodyTo   = typeof req.body?.to_date   === 'string' ? req.body.to_date   : null;
+    if (bodyFrom && bodyTo) {
+      const diff = new Date(bodyTo).getTime() - new Date(bodyFrom).getTime();
+      if (diff < 0 || diff > 31 * 24 * 60 * 60 * 1000) {
+        res.status(400).json({
+          success: false,
+          error: { code: 'DATE_RANGE_TOO_LARGE', message: 'Khoảng thời gian tối đa 31 ngày theo quy định GDT.' },
+        });
+        return;
+      }
+    }
+
+    // ── Check if GDT Bot has been configured for this company ──
+    const cfgRes = await pool.query(
+      `SELECT id, is_active FROM gdt_bot_configs WHERE company_id = $1`,
+      [companyId]
     );
-    sendSuccess(res, { jobId: jobId.id }, 'Sync job queued');
+    if (cfgRes.rows.length === 0) {
+      res.status(428).json({
+        success: false,
+        error: {
+          code: 'BOT_NOT_CONFIGURED',
+          message: 'Chưa cấu hình đồng bộ GDT. Vui lòng nhập mật khẩu cổng thuế.',
+        },
+      });
+      return;
+    }
+    if (!cfgRes.rows[0].is_active) {
+      res.status(403).json({
+        success: false,
+        error: { code: 'BOT_DISABLED', message: 'GDT Bot hiện đang tắt.' },
+      });
+      return;
+    }
+
+    // ── Check for already-running or waiting bot sync for this company ──
+    const { Queue } = await import('bullmq');
+    const { env } = await import('../config/env');
+    const botQueue = new Queue('gdt-bot-sync', {
+      connection: { url: env.REDIS_URL } as unknown,
+    } as ConstructorParameters<typeof Queue>[1]);
+
+    const [activeJobs, waitingJobs] = await Promise.all([
+      botQueue.getJobs(['active']),
+      botQueue.getJobs(['waiting']),
+    ]);
+    const inFlight = [...activeJobs, ...waitingJobs].find(
+      (j) => j.data.companyId === companyId
+    );
+    if (inFlight) {
+      res.status(409).json({
+        success: false,
+        error: {
+          code: 'SYNC_ALREADY_RUNNING',
+          message: 'Đang có đồng bộ đang chạy cho công ty này. Vui lòng đợi hoàn tất.',
+        },
+      });
+      return;
+    }
+
+    // ── Determine fromDate / toDate ─────────────────────────────────────────
+    // Priority: (1) explicit body params → (2) last successful run - 5min → (3) start of current month
+    let fromDate: string;
+    let toDate: string;
+    if (bodyFrom && bodyTo) {
+      fromDate = bodyFrom;
+      toDate   = bodyTo;
+    } else {
+      const now = new Date();
+      const lastRunRes = await pool.query<{ finished_at: Date }>(
+        `SELECT finished_at FROM gdt_bot_runs
+         WHERE company_id = $1 AND status = 'success'
+         ORDER BY finished_at DESC LIMIT 1`,
+        [companyId]
+      );
+      // Default: start of current month (NOT 24 months — GDT only allows 1 month)
+      const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0]!;
+      fromDate = lastRunRes.rows.length
+        ? new Date(lastRunRes.rows[0].finished_at.getTime() - 5 * 60 * 1000).toISOString().split('T')[0]!
+        : startOfMonth;
+      toDate = now.toISOString().split('T')[0]!;
+      // Safety clamp: never exceed 31 days even in fallback path
+      if (new Date(toDate).getTime() - new Date(fromDate).getTime() > 31 * 24 * 60 * 60 * 1000) {
+        fromDate = new Date(new Date(toDate).getTime() - 31 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]!;
+      }
+    };
+
+    const jobId = `gdt-bot-manual-${companyId}-${Date.now()}`;
+    const job = await botQueue.add('sync', {
+      companyId,
+      fromDate,
+      toDate,
+    }, {
+      jobId,
+      attempts: 2,
+      backoff: { type: 'exponential', delay: 30000 },
+    });
+
+    sendSuccess(res, { jobId: job.id, fromDate, toDate }, 'Sync job queued');
   } catch (err) {
     next(err);
   }

@@ -288,7 +288,7 @@ router.patch('/:id/onboarded', async (req: Request, res: Response, next: NextFun
   }
 });
 
-// DELETE /api/companies/:id — soft delete (OWNER only)
+// DELETE /api/companies/:id — xóa vĩnh viễn toàn bộ dữ liệu công ty (OWNER only)
 router.delete('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const access = await pool.query(
@@ -298,11 +298,28 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction) =>
     if (!access.rows[0]) throw new NotFoundError('Company not found');
     if (access.rows[0].role !== 'OWNER') throw new ForbiddenError('Chỉ OWNER mới được xóa công ty');
 
-    await pool.query(
-      `UPDATE companies SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL`,
-      [req.params.id]
-    );
-    sendSuccess(res, null);
+    const companyId = req.params.id;
+
+    // Cascade hard-delete tất cả dữ liệu liên quan, sau đó xóa company
+    // Thứ tự: xóa bảng con trước (FK), company sau cùng.
+    await pool.query('DELETE FROM gdt_bot_runs       WHERE company_id = $1', [companyId]);
+    await pool.query('DELETE FROM gdt_bot_configs    WHERE company_id = $1', [companyId]);
+    await pool.query('DELETE FROM gdt_validation_queue WHERE invoice_id IN (SELECT id FROM invoices WHERE company_id = $1)', [companyId]);
+    await pool.query('DELETE FROM invoice_line_items WHERE invoice_id IN (SELECT id FROM invoices WHERE company_id = $1)', [companyId]);
+    await pool.query('DELETE FROM invoices           WHERE company_id = $1', [companyId]);
+    await pool.query('DELETE FROM tax_declarations   WHERE company_id = $1', [companyId]);
+    await pool.query('DELETE FROM vat_reconciliations WHERE company_id = $1', [companyId]);
+    await pool.query('DELETE FROM cash_book_entries  WHERE company_id = $1', [companyId]);
+    await pool.query('DELETE FROM inventory_movements WHERE company_id = $1', [companyId]);
+    await pool.query('DELETE FROM profit_loss_statements WHERE company_id = $1', [companyId]);
+    await pool.query('DELETE FROM hkd_tax_statements WHERE company_id = $1', [companyId]);
+    await pool.query('DELETE FROM sync_logs          WHERE company_id = $1', [companyId]);
+    await pool.query('DELETE FROM notifications      WHERE company_id = $1', [companyId]);
+    await pool.query('DELETE FROM company_connectors WHERE company_id = $1', [companyId]);
+    await pool.query('DELETE FROM user_companies     WHERE company_id = $1', [companyId]);
+    await pool.query('DELETE FROM companies          WHERE id = $1',         [companyId]);
+
+    sendSuccess(res, null, 'Đã xóa công ty và toàn bộ dữ liệu liên quan');
   } catch (err) {
     next(err);
   }

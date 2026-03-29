@@ -4,6 +4,12 @@ import { useEffect, useState } from 'react';
 import apiClient from '../../../../lib/apiClient';
 import { useCompany } from '../../../../contexts/CompanyContext';
 import { formatVND } from '../../../../utils/formatCurrency';
+import PeriodSelector, {
+  type PeriodValue,
+  defaultPeriod,
+  periodToParams,
+  periodLabel,
+} from '../../../../components/PeriodSelector';
 
 interface PLStatement {
   company_id: string;
@@ -58,15 +64,14 @@ export default function ProfitLossPage() {
   const [data, setData] = useState<PLData | null>(null);
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
-  const [month, setMonth] = useState(() => new Date().getMonth() + 1);
-  const [year, setYear] = useState(() => new Date().getFullYear());
+  const [period, setPeriod] = useState<PeriodValue>(defaultPeriod);
   const [compare, setCompare] = useState(false);
 
   const fetch = () => {
     if (!activeCompanyId) return;
     setLoading(true);
-    const params = new URLSearchParams({ month: String(month), year: String(year) });
-    if (compare) params.append('compare', 'true');
+    const params = periodToParams(period);
+    if (compare && period.periodType === 'monthly') params.append('compare', 'true');
     apiClient
       .get<{ data: PLData }>(`/reports/profit-loss?${params}`)
       .then((r) => setData(r.data.data))
@@ -74,12 +79,15 @@ export default function ProfitLossPage() {
       .finally(() => setLoading(false));
   };
 
-  useEffect(() => { fetch(); }, [activeCompanyId, month, year, compare]);
+  useEffect(() => { fetch(); }, [activeCompanyId, period, compare]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const generate = async () => {
     setGenerating(true);
     try {
-      await apiClient.post('/reports/profit-loss/generate', { month, year });
+      const body: Record<string, unknown> = { year: period.year, periodType: period.periodType };
+      if (period.periodType === 'monthly') body.month = period.month;
+      if (period.periodType === 'quarterly') body.quarter = period.quarter;
+      await apiClient.post('/reports/profit-loss/generate', body);
       fetch();
     } catch {
       // ignore
@@ -108,25 +116,16 @@ export default function ProfitLossPage() {
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Kết Quả Hoạt Động Kinh Doanh</h1>
-          <p className="text-sm text-gray-500">Mẫu B02-DN (TT 200/2014/TT-BTC)</p>
+          <p className="text-sm text-gray-500">{periodLabel(period)} · Mẫu B02-DN</p>
         </div>
-        <div className="flex gap-2 flex-wrap">
-          <select value={month} onChange={(e) => setMonth(Number(e.target.value))}
-            className="border rounded-lg px-2 py-1 text-sm">
-            {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
-              <option key={m} value={m}>Tháng {m}</option>
-            ))}
-          </select>
-          <select value={year} onChange={(e) => setYear(Number(e.target.value))}
-            className="border rounded-lg px-2 py-1 text-sm">
-            {[2023, 2024, 2025, 2026].map((y) => (
-              <option key={y} value={y}>{y}</option>
-            ))}
-          </select>
-          <label className="flex items-center gap-1 text-sm cursor-pointer">
-            <input type="checkbox" checked={compare} onChange={(e) => setCompare(e.target.checked)} />
-            So sánh
-          </label>
+        <div className="flex gap-2 flex-wrap items-center">
+          <PeriodSelector value={period} onChange={setPeriod} />
+          {period.periodType === 'monthly' && (
+            <label className="flex items-center gap-1 text-sm cursor-pointer">
+              <input type="checkbox" checked={compare} onChange={(e) => setCompare(e.target.checked)} />
+              So sánh
+            </label>
+          )}
           <button onClick={generate} disabled={generating}
             className="px-4 py-1 bg-blue-600 text-white rounded-lg text-sm disabled:opacity-50">
             {generating ? 'Đang tính...' : '📊 Tính lại'}
@@ -157,11 +156,11 @@ export default function ProfitLossPage() {
               <tr>
                 <th className="px-4 py-2 text-left">Chỉ tiêu</th>
                 <th className="px-4 py-2 text-right">
-                  T{month}/{year}
+                  {periodLabel(period)}
                 </th>
                 {compare && data.previous && (
                   <th className="px-4 py-2 text-right text-gray-400">
-                    T{month === 1 ? 12 : month - 1}/{month === 1 ? year - 1 : year}
+                    T{period.month === 1 ? 12 : period.month - 1}/{period.month === 1 ? period.year - 1 : period.year}
                   </th>
                 )}
                 {compare && data.previous && (

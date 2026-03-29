@@ -4,6 +4,12 @@ import { useEffect, useState } from 'react';
 import apiClient from '../../../../lib/apiClient';
 import { useCompany } from '../../../../contexts/CompanyContext';
 import { formatVND } from '../../../../utils/formatCurrency';
+import PeriodSelector, {
+  type PeriodValue,
+  defaultPeriod,
+  periodToParams,
+  periodLabel,
+} from '../../../../components/PeriodSelector';
 
 interface RateGroup {
   vat_rate: string | null;
@@ -35,18 +41,17 @@ export default function RevenueExpensePage() {
   const { activeCompanyId } = useCompany();
   const [data, setData] = useState<RevenueExpenseData | null>(null);
   const [loading, setLoading] = useState(true);
-  const [month, setMonth] = useState(() => new Date().getMonth() + 1);
-  const [year, setYear] = useState(() => new Date().getFullYear());
+  const [period, setPeriod] = useState<PeriodValue>(defaultPeriod);
 
   useEffect(() => {
     if (!activeCompanyId) return;
     setLoading(true);
     apiClient
-      .get<{ data: RevenueExpenseData }>(`/journals/revenue-expense?month=${month}&year=${year}`)
+      .get<{ data: RevenueExpenseData }>(`/journals/revenue-expense?${periodToParams(period)}`)
       .then((r) => setData(r.data.data))
       .catch(() => setData(null))
       .finally(() => setLoading(false));
-  }, [activeCompanyId, month, year]);
+  }, [activeCompanyId, period]);
 
   const totalRevenue = data?.revenue_by_rate.reduce((s, r) => s + Number(r.subtotal), 0) ?? 0;
   const totalExpense = data?.expense_by_rate.reduce((s, r) => s + Number(r.subtotal), 0) ?? 0;
@@ -57,22 +62,9 @@ export default function RevenueExpensePage() {
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Doanh Thu & Chi Phí</h1>
-          <p className="text-sm text-gray-500">Phân tích theo kỳ kê khai</p>
+          <p className="text-sm text-gray-500">{periodLabel(period)}</p>
         </div>
-        <div className="flex gap-2">
-          <select value={month} onChange={(e) => setMonth(Number(e.target.value))}
-            className="border rounded-lg px-2 py-1 text-sm">
-            {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
-              <option key={m} value={m}>Tháng {m}</option>
-            ))}
-          </select>
-          <select value={year} onChange={(e) => setYear(Number(e.target.value))}
-            className="border rounded-lg px-2 py-1 text-sm">
-            {[2023, 2024, 2025, 2026].map((y) => (
-              <option key={y} value={y}>{y}</option>
-            ))}
-          </select>
-        </div>
+        <PeriodSelector value={period} onChange={setPeriod} />
       </div>
 
       {/* KPI summary */}

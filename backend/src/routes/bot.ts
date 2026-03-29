@@ -34,6 +34,15 @@ const setupSchema = z.object({
   sync_frequency_hours: z.number().int().min(0).max(168).default(6),
 });
 
+const runNowSchema = z.object({
+  from_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  to_date:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+}).refine(data => {
+  if (!data.from_date || !data.to_date) return true;
+  const diffMs = new Date(data.to_date).getTime() - new Date(data.from_date).getTime();
+  return diffMs >= 0 && diffMs <= 31 * 24 * 60 * 60 * 1000;
+}, { message: 'Khoảng thời gian tối đa 31 ngày theo quy định GDT. Vui lòng chọn lại.' });
+
 const otpSchema = z.object({
   otp: z.string().min(4).max(10),
 });
@@ -136,14 +145,40 @@ router.post(
       const companyId = req.user!.companyId;
 
       const cfgRes = await pool.query(
-        `SELECT id, is_active FROM gdt_bot_configs WHERE company_id = $1`,
+        `SELECT id, is_active, last_run_at FROM gdt_bot_configs WHERE company_id = $1`,
         [companyId]
       );
       if (cfgRes.rows.length === 0) throw new NotFoundError('GDT Bot chưa được cấu hình');
       if (!cfgRes.rows[0].is_active) throw new ValidationError('GDT Bot hiện đang tắt');
 
+      // Enforce same 15-minute login cooldown as sync.worker — give user a clear message
+      const MIN_LOGIN_INTERVAL_MS = 15 * 60 * 1000;
+      if (cfgRes.rows[0].last_run_at) {
+        const elapsedMs = Date.now() - new Date(cfgRes.rows[0].last_run_at as string).getTime();
+        if (elapsedMs < MIN_LOGIN_INTERVAL_MS) {
+          const waitMinutes = Math.ceil((MIN_LOGIN_INTERVAL_MS - elapsedMs) / 60_000);
+          res.status(429).json({
+            success: false,
+            error: {
+              code:    'COOLDOWN',
+              waitMinutes,
+              message: `Bot vừa chạy xong. Vui lòng chờ thêm ${waitMinutes} phút trước khi đồng bộ lại.`,
+            },
+          });
+          return;
+        }
+      }
+
+      const parsed = runNowSchema.safeParse(req.body);
+      if (!parsed.success) throw new ValidationError(parsed.error.issues[0]?.message ?? 'Invalid input');
+      const { from_date, to_date } = parsed.data;
+
       const jobId = `gdt-bot-manual-${companyId}-${Date.now()}`;
-      await getBotQueue().add('sync', { companyId }, {
+      await getBotQueue().add('sync', {
+        companyId,
+        ...(from_date ? { fromDate: from_date } : {}),
+        ...(to_date   ? { toDate:   to_date   } : {}),
+      }, {
         jobId,
         attempts: 2,
         backoff:  { type: 'exponential', delay: 30000 },

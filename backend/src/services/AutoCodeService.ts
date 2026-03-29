@@ -181,10 +181,11 @@ export class AutoCodeService {
 
   /** Rebuild all catalogs for a company from existing invoice data. */
   async rebuildCatalogs(companyId: string): Promise<void> {
-    // Customers (from output invoices)
+    // Customers (from output invoices — exclude deleted)
     const customers = await pool.query<{ tax_code: string; name: string; date: string }>(
       `SELECT DISTINCT ON (buyer_tax_code) buyer_tax_code AS tax_code, buyer_name AS name, invoice_date::text AS date
        FROM invoices WHERE company_id=$1 AND direction='output' AND buyer_tax_code IS NOT NULL
+         AND deleted_at IS NULL
        ORDER BY buyer_tax_code, invoice_date DESC`,
       [companyId],
     );
@@ -192,10 +193,23 @@ export class AutoCodeService {
       if (r.tax_code) await this.ensureCustomer(companyId, r.tax_code, r.name ?? '', r.date);
     }
 
-    // Suppliers (from input invoices)
+    // Remove customer catalog entries that no longer have any valid invoices
+    await pool.query(
+      `DELETE FROM customer_catalog
+       WHERE company_id = $1
+         AND tax_code NOT IN (
+           SELECT DISTINCT buyer_tax_code FROM invoices
+           WHERE company_id = $1 AND direction = 'output'
+             AND buyer_tax_code IS NOT NULL AND deleted_at IS NULL
+         )`,
+      [companyId],
+    );
+
+    // Suppliers (from input invoices — exclude deleted)
     const suppliers = await pool.query<{ tax_code: string; name: string; date: string }>(
       `SELECT DISTINCT ON (seller_tax_code) seller_tax_code AS tax_code, seller_name AS name, invoice_date::text AS date
        FROM invoices WHERE company_id=$1 AND direction='input' AND seller_tax_code IS NOT NULL
+         AND deleted_at IS NULL
        ORDER BY seller_tax_code, invoice_date DESC`,
       [companyId],
     );
@@ -203,11 +217,24 @@ export class AutoCodeService {
       if (r.tax_code) await this.ensureSupplier(companyId, r.tax_code, r.name ?? '', r.date);
     }
 
-    // Products (from line items)
+    // Remove supplier catalog entries that no longer have any valid invoices
+    await pool.query(
+      `DELETE FROM supplier_catalog
+       WHERE company_id = $1
+         AND tax_code NOT IN (
+           SELECT DISTINCT seller_tax_code FROM invoices
+           WHERE company_id = $1 AND direction = 'input'
+             AND seller_tax_code IS NOT NULL AND deleted_at IS NULL
+         )`,
+      [companyId],
+    );
+
+    // Products (from line items — exclude deleted invoices)
     const items = await pool.query<{ item_name: string }>(
       `SELECT DISTINCT ili.item_name FROM invoice_line_items ili
        JOIN invoices i ON i.id = ili.invoice_id
-       WHERE i.company_id=$1 AND ili.item_name IS NOT NULL AND TRIM(ili.item_name) != ''`,
+       WHERE i.company_id=$1 AND i.deleted_at IS NULL
+         AND ili.item_name IS NOT NULL AND TRIM(ili.item_name) != ''`,
       [companyId],
     );
     for (const r of items.rows) {

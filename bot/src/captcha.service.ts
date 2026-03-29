@@ -20,15 +20,18 @@ export class CaptchaService {
 
   /** Submit base64 image captcha and poll for result */
   async solve(imageBase64: string): Promise<{ text: string; captchaId: string }> {
-    const submitRes = await axios.post<string>(`${API_URL}/in.php`, null, {
-      params: {
-        key:    this.apiKey,
-        method: 'base64',
-        body:   imageBase64,
-        json:   1,
-      },
+    // Must send as form-encoded body — NOT as URL query params — because
+    // base64 can be tens of KB which causes 414 URI Too Long in query string
+    const formBody = new URLSearchParams({
+      key:    this.apiKey,
+      method: 'base64',
+      body:   imageBase64,
+      json:   '1',
+    });
+    const submitRes = await axios.post<string>(`${API_URL}/in.php`, formBody, {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       responseType: 'json',
-      timeout: 30_000,
+      timeout: 60_000,  // PNG can be large, allow more time
     });
 
     const submitted = (submitRes.data as unknown) as { status: number; request: string };

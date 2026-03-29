@@ -14,6 +14,9 @@ export interface JwtPayload {
   companyId?: string;
   viewMode?: ViewMode;
   organizationId?: string | null;
+  /** true when user is a platform superadmin — used by frontend to gate /admin layout only.
+   *  Backend admin routes re-validate from DB (requireAdmin middleware). */
+  is_platform_admin?: boolean;
 }
 
 declare global {

@@ -29,6 +29,7 @@ router.get('/projection', async (req, res) => {
      WHERE company_id = $1
        AND direction = 'output'
        AND status != 'cancelled'
+       AND deleted_at IS NULL
        AND payment_date IS NULL
        AND COALESCE(payment_due_date, invoice_date + INTERVAL '30 days') BETWEEN $2 AND $3
      GROUP BY due_date
@@ -48,6 +49,7 @@ router.get('/projection', async (req, res) => {
      WHERE company_id = $1
        AND direction = 'input'
        AND status != 'cancelled'
+       AND deleted_at IS NULL
        AND payment_date IS NULL
        AND COALESCE(payment_due_date, invoice_date + INTERVAL '30 days') BETWEEN $2 AND $3
      GROUP BY due_date
@@ -136,6 +138,7 @@ router.get('/projection', async (req, res) => {
      WHERE company_id = $1
        AND direction = 'output'
        AND status != 'cancelled'
+       AND deleted_at IS NULL
        AND payment_date IS NULL
        AND COALESCE(payment_due_date, invoice_date + INTERVAL '30 days') < $2
      ORDER BY payment_due_date ASC

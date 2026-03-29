@@ -10,6 +10,7 @@ interface Declaration {
   id: string;
   period_month: number;
   period_year: number;
+  period_type: string;  // 'monthly' | 'quarterly'
   status: string;
   ct40a: string;
   ct41: string;
@@ -32,6 +33,13 @@ export default function DeclarationsPage() {
   const [declarations, setDeclarations] = useState<Declaration[]>([]);
   const [loading, setLoading] = useState(true);
   const [calculating, setCalculating] = useState(false);
+  const [showCalcModal, setShowCalcModal] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<Declaration | null>(null);
+  const [calcType, setCalcType]     = useState<'monthly' | 'quarterly'>('monthly');
+  const [calcMonth, setCalcMonth]   = useState(() => new Date().getMonth() + 1);
+  const [calcQuarter, setCalcQuarter] = useState(() => Math.ceil((new Date().getMonth() + 1) / 3));
+  const [calcYear, setCalcYear]     = useState(() => new Date().getFullYear());
 
   const load = useCallback(async () => {
     try {
@@ -47,14 +55,14 @@ export default function DeclarationsPage() {
   useEffect(() => { void load(); }, [load]);
 
   const calculate = async () => {
-    const now = new Date();
     setCalculating(true);
+    setShowCalcModal(false);
     try {
-      await apiClient.post('/declarations/calculate', {
-        month: now.getMonth() + 1,
-        year: now.getFullYear(),
-      });
-      toast.success('Đã tính toán tờ khai thành công');
+      const body = calcType === 'quarterly'
+        ? { quarter: calcQuarter, year: calcYear }
+        : { month: calcMonth,  year: calcYear };
+      await apiClient.post('/declarations/calculate', body);
+      toast.success('\u0110ã tính toán tờ khai thành công');
       await load();
     } catch {
       toast.error('Lỗi tính toán tờ khai. Vui lòng thử lại.');
@@ -77,6 +85,20 @@ export default function DeclarationsPage() {
     }
   };
 
+  const handleDelete = async (decl: Declaration) => {
+    setDeletingId(decl.id);
+    setConfirmDelete(null);
+    try {
+      await apiClient.delete(`/declarations/${decl.id}`);
+      toast.success('Đã xóa tờ khai.');
+      setDeclarations(prev => prev.filter(d => d.id !== decl.id));
+    } catch {
+      toast.error('Lỗi xóa tờ khai. Vui lòng thử lại.');
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
   return (
     <div className="p-4 max-w-2xl mx-auto">
       <div className="flex items-center justify-between mb-6">
@@ -85,7 +107,7 @@ export default function DeclarationsPage() {
           <p className="text-sm text-gray-500 mt-1">01/GTGT — Kê khai thuế GTGT</p>
         </div>
         <button
-          onClick={calculate}
+          onClick={() => setShowCalcModal(true)}
           disabled={calculating}
           className="bg-primary-600 text-white px-4 py-2 rounded-lg text-sm font-medium disabled:opacity-50"
         >
@@ -117,15 +139,31 @@ export default function DeclarationsPage() {
                 <div className="flex items-center justify-between mb-3">
                   <div>
                     <p className="font-bold text-gray-900">
-                      Tháng {decl.period_month}/{decl.period_year}
+                      {decl.period_type === 'quarterly'
+                        ? `Quý ${decl.period_month}/${decl.period_year}`
+                        : `Tháng ${decl.period_month}/${decl.period_year}`
+                      }
                     </p>
                     <p className="text-xs text-gray-400">
                       Tạo: {new Date(decl.created_at).toLocaleDateString('vi-VN')}
                     </p>
                   </div>
-                  <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${statusInfo.color}`}>
-                    {statusInfo.label}
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${statusInfo.color}`}>
+                      {statusInfo.label}
+                    </span>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setConfirmDelete(decl); }}
+                      disabled={deletingId === decl.id}
+                      className="p-1.5 rounded-lg text-gray-400 hover:text-red-500 hover:bg-red-50 transition-colors disabled:opacity-40"
+                      title="Xóa tờ khai"
+                    >
+                      {deletingId === decl.id
+                        ? <span className="text-xs">...</span>
+                        : <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                      }
+                    </button>
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-3 gap-2 mb-3">
@@ -158,6 +196,120 @@ export default function DeclarationsPage() {
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* ── Confirm delete modal ── */}
+      {confirmDelete && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-4">
+          <div className="bg-white rounded-2xl w-full max-w-sm shadow-xl p-5 space-y-4">
+            <h2 className="font-bold text-gray-900 text-lg">Xóa tờ khai?</h2>
+            <p className="text-sm text-gray-600">
+              Bạn có chắc chắn muốn xóa tờ khai{' '}
+              <strong>
+                {confirmDelete.period_type === 'quarterly'
+                  ? `Quý ${confirmDelete.period_month}/${confirmDelete.period_year}`
+                  : `Tháng ${confirmDelete.period_month}/${confirmDelete.period_year}`}
+              </strong>?
+              Hành động này không thể hoàn tác.
+            </p>
+            <div className="flex gap-3 pt-1">
+              <button
+                onClick={() => setConfirmDelete(null)}
+                className="flex-1 border border-gray-300 rounded-lg py-2.5 text-sm font-medium text-gray-700"
+              >
+                Hủy
+              </button>
+              <button
+                onClick={() => void handleDelete(confirmDelete)}
+                className="flex-1 bg-red-600 text-white rounded-lg py-2.5 text-sm font-medium"
+              >
+                Xóa
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Calc period modal ── */}
+      {showCalcModal && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-4">
+          <div className="bg-white rounded-2xl w-full max-w-sm shadow-xl p-5 space-y-4">
+            <div className="flex items-center justify-between">
+              <h2 className="font-bold text-gray-900">Tính tờ khai mới</h2>
+              <button onClick={() => setShowCalcModal(false)} className="text-gray-400 hover:text-gray-700 text-xl">✕</button>
+            </div>
+
+            {/* Toggle monthly / quarterly */}
+            <div className="flex rounded-xl border border-gray-200 overflow-hidden">
+              <button
+                onClick={() => setCalcType('monthly')}
+                className={`flex-1 py-2 text-sm font-medium transition-colors ${calcType === 'monthly' ? 'bg-primary-600 text-white' : 'text-gray-600 hover:bg-gray-50'}`}
+              >
+                📅 Hàng tháng
+              </button>
+              <button
+                onClick={() => setCalcType('quarterly')}
+                className={`flex-1 py-2 text-sm font-medium transition-colors ${calcType === 'quarterly' ? 'bg-primary-600 text-white' : 'text-gray-600 hover:bg-gray-50'}`}
+              >
+                📊 Theo quý
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              {calcType === 'monthly' ? (
+                <div>
+                  <label className="text-xs font-medium text-gray-600 block mb-1">Tháng</label>
+                  <select
+                    value={calcMonth}
+                    onChange={e => setCalcMonth(Number(e.target.value))}
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white"
+                  >
+                    {[1,2,3,4,5,6,7,8,9,10,11,12].map(m => (
+                      <option key={m} value={m}>Tháng {m}</option>
+                    ))}
+                  </select>
+                </div>
+              ) : (
+                <div>
+                  <label className="text-xs font-medium text-gray-600 block mb-1">Quý</label>
+                  <select
+                    value={calcQuarter}
+                    onChange={e => setCalcQuarter(Number(e.target.value))}
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white"
+                  >
+                    <option value={1}>Quý 1 (Tháng 1–3)</option>
+                    <option value={2}>Quý 2 (Tháng 4–6)</option>
+                    <option value={3}>Quý 3 (Tháng 7–9)</option>
+                    <option value={4}>Quý 4 (Tháng 10–12)</option>
+                  </select>
+                </div>
+              )}
+              <div>
+                <label className="text-xs font-medium text-gray-600 block mb-1">Năm</label>
+                <select
+                  value={calcYear}
+                  onChange={e => setCalcYear(Number(e.target.value))}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white"
+                >
+                  {[2024, 2025, 2026, 2027].map(y => (
+                    <option key={y} value={y}>{y}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="flex gap-3">
+              <button onClick={() => setShowCalcModal(false)}
+                className="flex-1 border border-gray-300 rounded-xl py-2.5 text-sm">
+                Hủy
+              </button>
+              <button onClick={calculate}
+                className="flex-1 bg-primary-600 text-white rounded-xl py-2.5 text-sm font-medium">
+                Tính toán
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

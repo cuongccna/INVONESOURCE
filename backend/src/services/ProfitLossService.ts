@@ -37,6 +37,7 @@ export class ProfitLossService {
     const revRes = await pool.query<{ total: string }>(
       `SELECT COALESCE(SUM(subtotal),0) AS total FROM invoices
        WHERE company_id=$1 AND direction='output' AND status='valid'
+         AND deleted_at IS NULL
          AND invoice_date BETWEEN $2 AND $3`,
       [companyId, startDate, endDate],
     );
@@ -49,12 +50,14 @@ export class ProfitLossService {
        FROM invoice_line_items ili
        JOIN invoices i ON i.id = ili.invoice_id
        WHERE i.company_id=$1 AND i.direction='input' AND i.status='valid'
+         AND i.deleted_at IS NULL
          AND i.invoice_date BETWEEN $2 AND $3
          AND ili.item_name IN (
            SELECT DISTINCT ili2.item_name
            FROM invoice_line_items ili2
            JOIN invoices i2 ON i2.id = ili2.invoice_id
            WHERE i2.company_id=$1 AND i2.direction='output' AND i2.status='valid'
+             AND i2.deleted_at IS NULL
              AND i2.invoice_date BETWEEN $2 AND $3
          )`,
       [companyId, startDate, endDate],
@@ -69,6 +72,7 @@ export class ProfitLossService {
       const inputRes = await pool.query<{ total: string }>(
         `SELECT COALESCE(SUM(subtotal),0) AS total FROM invoices
          WHERE company_id=$1 AND direction='input' AND status='valid'
+           AND deleted_at IS NULL
            AND invoice_date BETWEEN $2 AND $3`,
         [companyId, startDate, endDate],
       );
@@ -161,6 +165,56 @@ export class ProfitLossService {
     );
 
     return result;
+  }
+
+  /** Aggregate P&L across multiple months (for quarterly / yearly views). Re-derives computed lines. */
+  async getAggregatedPL(
+    companyId: string,
+    year: number,
+    fromMonth: number,
+    toMonth: number,
+  ): Promise<PLStatement | null> {
+    const { rows } = await pool.query<{
+      line_01: string; line_02: string; line_11: string;
+      line_21: string; line_22: string; line_25: string; line_26: string;
+      line_31: string; line_32: string; line_51: string;
+      has_estimates: boolean; found_months: string;
+    }>(
+      `SELECT
+         SUM(line_01) AS line_01, SUM(line_02) AS line_02,
+         SUM(line_11) AS line_11,
+         SUM(line_21) AS line_21, SUM(line_22) AS line_22,
+         SUM(line_25) AS line_25, SUM(line_26) AS line_26,
+         SUM(line_31) AS line_31, SUM(line_32) AS line_32,
+         SUM(line_51) AS line_51,
+         BOOL_OR(has_estimates) AS has_estimates,
+         COUNT(*) AS found_months
+       FROM profit_loss_statements
+       WHERE company_id=$1 AND period_year=$2 AND period_month BETWEEN $3 AND $4`,
+      [companyId, year, fromMonth, toMonth],
+    );
+    if (!rows.length || Number(rows[0]!.found_months) === 0) return null;
+    const r = rows[0]!;
+    const l01 = Number(r.line_01);  const l02 = Number(r.line_02);
+    const l10 = l01 - l02;
+    const l11 = Number(r.line_11);  const l20 = l10 - l11;
+    const l21 = Number(r.line_21);  const l22 = Number(r.line_22);
+    const l25 = Number(r.line_25);  const l26 = Number(r.line_26);
+    const l30 = l20 + l21 - l22 - l25 - l26;
+    const l31 = Number(r.line_31);  const l32 = Number(r.line_32);
+    const l40 = l31 - l32;
+    const l50 = l30 + l40;
+    const l51 = Number(r.line_51);  const l60 = l50 - l51;
+    return {
+      company_id: companyId, period_month: fromMonth, period_year: year,
+      line_01: l01, line_02: l02, line_10: l10,
+      line_11: l11, line_20: l20,
+      line_21: l21, line_22: l22, line_25: l25, line_26: l26,
+      line_30: l30, line_31: l31, line_32: l32,
+      line_40: l40, line_50: l50, line_51: l51, line_60: l60,
+      has_estimates: r.has_estimates as boolean,
+      estimate_notes: '',
+    };
   }
 
   async getPL(companyId: string, month: number, year: number): Promise<PLStatement | null> {

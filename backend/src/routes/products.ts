@@ -3,19 +3,18 @@ import { authenticate } from '../middleware/auth';
 import { requireCompany } from '../middleware/company';
 import { sendSuccess } from '../utils/response';
 import { productCatalogService } from '../services/ProductCatalogService';
+import { resolvePeriod } from '../utils/period';
 
 const router = Router();
 router.use(authenticate);
 router.use(requireCompany);
 
-// GET /api/products/profitability?month=&year=
+// GET /api/products/profitability?month=&year=&periodType=monthly|quarterly|yearly&quarter=
 router.get('/profitability', async (req, res) => {
   const companyId = req.user!.companyId!;
-  const now = new Date();
-  const month = Number(req.query.month) || now.getMonth() + 1;
-  const year = Number(req.query.year) || now.getFullYear();
+  const { start, end, month, year } = resolvePeriod(req.query);
 
-  const data = await productCatalogService.getProfitability(companyId, month, year);
+  const data = await productCatalogService.getProfitability(companyId, month, year, start, end);
   sendSuccess(res, data);
 });
 

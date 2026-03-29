@@ -5523,3 +5523,1171 @@ STEP 5 — Audit log for all deletion actions:
   This gives the owner a full audit trail of who deleted what and when.
 ```
 
+
+---
+
+## GROUP 43 — KIỂM TRA CÔNG TY MA (GHOST COMPANY DETECTION)
+
+> Tính năng này hoàn toàn CHƯA CÓ trong dự án. Đây là gap rủi ro pháp lý cao nhất:
+> khấu trừ VAT từ hóa đơn của công ty ma → bị truy thu 100% số thuế + phạt 20%.
+> Nguồn chính thức: tracuunnt.gdt.gov.vn (GDT) + dangkykinhdoanh.gov.vn (Bộ KH&ĐT)
+
+### GHOST-01 — DB Schema + Company Verification Service
+```
+[Respond in Vietnamese]
+Create the company verification infrastructure to detect ghost/shell companies
+from invoice seller_tax_code and buyer_tax_code data.
+
+STEP 1 — DB Schema /scripts/012_company_verification.sql:
+
+CREATE TABLE company_verification_cache (
+  tax_code          VARCHAR(20) PRIMARY KEY,
+  company_name      VARCHAR(500),
+  company_name_en   VARCHAR(500),
+  legal_rep         VARCHAR(255),         -- Người đại diện pháp luật
+  address           VARCHAR(1000),
+  province_code     VARCHAR(10),
+  registered_date   DATE,                 -- Ngày đăng ký
+  dissolved_date    DATE,                 -- Ngày giải thể (NULL = active)
+  mst_status        VARCHAR(30),          -- 'active'|'suspended'|'dissolved'|'not_found'
+  business_type     VARCHAR(100),         -- Loại hình DN
+  industry_code     VARCHAR(20),          -- Mã ngành nghề chính
+  source            VARCHAR(30),          -- 'gdt'|'dkkd'|'masothue'
+  raw_data          JSONB,                -- Full response for audit
+  verified_at       TIMESTAMPTZ DEFAULT NOW(),
+  expires_at        TIMESTAMPTZ DEFAULT NOW() + INTERVAL '30 days',
+  CONSTRAINT valid_status CHECK (mst_status IN ('active','suspended','dissolved','not_found','error'))
+);
+
+CREATE INDEX idx_company_verify_status ON company_verification_cache(mst_status);
+CREATE INDEX idx_company_verify_expires ON company_verification_cache(expires_at);
+
+-- Risk flags per invoice-company relationship
+CREATE TABLE company_risk_flags (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  company_id        UUID REFERENCES companies(id),
+  tax_code          VARCHAR(20),            -- the partner being flagged
+  partner_type      VARCHAR(10),            -- 'seller' | 'buyer'
+  risk_level        VARCHAR(10),            -- 'critical'|'high'|'medium'|'low'
+  flag_types        TEXT[],                 -- array of flag codes (see below)
+  flag_details      JSONB,                  -- details per flag
+  invoice_ids       UUID[],                 -- affected invoices
+  total_vat_at_risk NUMERIC(22,2),          -- total VAT from this partner at risk
+  is_acknowledged   BOOLEAN DEFAULT false,
+  acknowledged_by   UUID REFERENCES users(id),
+  acknowledged_at   TIMESTAMPTZ,
+  created_at        TIMESTAMPTZ DEFAULT NOW(),
+  updated_at        TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(company_id, tax_code)
+);
+
+Flag codes (flag_types array values):
+  'MST_NOT_FOUND'       -- MST không tồn tại trên GDT
+  'MST_DISSOLVED'       -- DN đã giải thể/bị thu hồi MST
+  'MST_SUSPENDED'       -- DN đang tạm ngừng hoạt động
+  'NAME_MISMATCH'       -- Tên DN trên HĐ khác tên trên GDT >70%
+  'ADDRESS_MISMATCH'    -- Địa chỉ không khớp
+  'NEW_COMPANY_BIG_INV' -- DN mới (<6 tháng) với HĐ lớn (>50M)
+  'SPLIT_INVOICE'       -- Nhiều HĐ nhỏ cùng ngày cùng MST (tránh duyệt)
+  'HIGH_FREQUENCY'      -- Tần suất HĐ bất thường (>3 HĐ/tuần)
+  'ZERO_HISTORY'        -- Không có lịch sử HĐ với bất kỳ DN nào trước đây
+  'ROUND_AMOUNTS'       -- Tất cả HĐ đều số tiền tròn (dấu hiệu làm giả)
+
+STEP 2 — Verification queue table:
+CREATE TABLE verification_queue (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tax_code    VARCHAR(20) NOT NULL,
+  priority    SMALLINT DEFAULT 5,    -- 1=highest (new critical partner), 10=lowest (refresh)
+  status      VARCHAR(20) DEFAULT 'pending',
+  attempts    SMALLINT DEFAULT 0,
+  error       TEXT,
+  created_at  TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(tax_code)
+);
+```
+
+### GHOST-02 — Company Lookup Service (GDT + DKKD)
+```
+[Respond in Vietnamese]
+Create /backend/src/services/CompanyVerificationService.ts
+
+This service looks up company information from official Vietnamese government sources
+to detect ghost/inactive companies.
+
+Data sources (in priority order):
+  1. Internal cache: company_verification_cache (check expires_at first)
+  2. GDT portal: http://tracuunnt.gdt.gov.vn/tcnnt/mstdn.jsp
+     Method: HTTP POST form submission (no public API — must scrape)
+     Returns: company name, address, status, registration date
+  3. DKKD portal: https://dangkykinhdoanh.gov.vn
+     Returns: legal rep, business type, registered capital
+  4. Fallback masothue.com: GET https://masothue.com/Search/Party?s={MST}
+     Semi-official aggregator, useful for quick checks
+
+import axios from 'axios'
+import * as cheerio from 'cheerio'  // npm install cheerio
+
+const GDT_LOOKUP_URL = 'http://tracuunnt.gdt.gov.vn/tcnnt/mstdn.jsp'
+const HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+  'Referer': 'http://tracuunnt.gdt.gov.vn/',
+  'Accept': 'text/html,application/xhtml+xml',
+  'Accept-Language': 'vi-VN,vi;q=0.9',
+  'Content-Type': 'application/x-www-form-urlencoded'
+}
+
+export class CompanyVerificationService {
+
+  async verify(taxCode: string, forceRefresh = false): Promise<CompanyInfo> {
+    // 1. Check cache first
+    if (!forceRefresh) {
+      const cached = await this.getFromCache(taxCode)
+      if (cached && new Date(cached.expires_at) > new Date()) {
+        return cached
+      }
+    }
+
+    // 2. Lookup from GDT
+    const result = await this.lookupFromGdt(taxCode)
+    
+    // 3. Save to cache
+    await this.saveToCache(taxCode, result)
+    return result
+  }
+
+  private async lookupFromGdt(taxCode: string): Promise<CompanyInfo> {
+    try {
+      // GDT uses form POST with MST parameter
+      const response = await axios.post(GDT_LOOKUP_URL,
+        new URLSearchParams({ 'mst': taxCode.trim() }),
+        { headers: HEADERS, timeout: 15_000 }
+      )
+
+      const $ = cheerio.load(response.data)
+      
+      // Parse GDT response table (structure may change — use flexible selectors)
+      const rows: Record<string, string> = {}
+      $('table tr').each((_, row) => {
+        const cells = $(row).find('td')
+        if (cells.length >= 2) {
+          const key   = $(cells[0]).text().trim()
+          const value = $(cells[1]).text().trim()
+          if (key && value) rows[key] = value
+        }
+      })
+
+      // Check if company was found
+      const pageText = $('body').text()
+      if (pageText.includes('Không tìm thấy') || pageText.includes('không tồn tại')) {
+        return {
+          taxCode,
+          mst_status: 'not_found',
+          source: 'gdt',
+          verified_at: new Date()
+        }
+      }
+
+      // Extract fields (Vietnamese label matching)
+      const name       = rows['Tên người nộp thuế:'] || rows['Tên đơn vị:'] || ''
+      const address    = rows['Địa chỉ:'] || rows['Địa chỉ trụ sở:'] || ''
+      const statusRaw  = rows['Tình trạng người nộp thuế:'] || rows['Trạng thái:'] || ''
+      const regDate    = rows['Ngày bắt đầu hoạt động:'] || rows['Ngày cấp MST:'] || ''
+
+      // Normalize status
+      let mst_status: string
+      if (statusRaw.toLowerCase().includes('đang hoạt động')) mst_status = 'active'
+      else if (statusRaw.toLowerCase().includes('tạm ngừng'))  mst_status = 'suspended'
+      else if (statusRaw.toLowerCase().includes('giải thể') ||
+               statusRaw.toLowerCase().includes('thu hồi'))    mst_status = 'dissolved'
+      else mst_status = 'active'  // default if status unclear
+
+      return {
+        taxCode, company_name: name, address, mst_status,
+        registered_date: this.parseVnDate(regDate),
+        source: 'gdt',
+        raw_data: rows,
+        verified_at: new Date()
+      }
+    } catch (err: any) {
+      console.error(`[CompanyVerify] GDT lookup failed for ${taxCode}:`, err.message)
+      // Fallback to masothue.com
+      return this.lookupFromMasothue(taxCode)
+    }
+  }
+
+  private async lookupFromMasothue(taxCode: string): Promise<CompanyInfo> {
+    try {
+      const res = await axios.get(
+        `https://masothue.com/Search/Party?s=${taxCode}`,
+        { headers: { ...HEADERS, 'Accept': 'application/json' }, timeout: 10_000 }
+      )
+      // Parse masothue JSON response
+      const data = res.data
+      if (!data || data.length === 0) {
+        return { taxCode, mst_status: 'not_found', source: 'masothue', verified_at: new Date() }
+      }
+      const company = Array.isArray(data) ? data[0] : data
+      return {
+        taxCode,
+        company_name:   company.name || company.ten || '',
+        address:        company.address || company.diaChi || '',
+        legal_rep:      company.legalRep || company.nguoiDaiDien || '',
+        mst_status:     (company.status === '00' || !company.status) ? 'active' : 'dissolved',
+        registered_date: this.parseVnDate(company.regDate || ''),
+        source:         'masothue',
+        raw_data:       company,
+        verified_at:    new Date()
+      }
+    } catch {
+      return { taxCode, mst_status: 'error', source: 'masothue', verified_at: new Date() }
+    }
+  }
+
+  // Compare company name on invoice vs GDT — flag if very different
+  compareNames(invoiceName: string, gdtName: string): number {
+    // Simple similarity: normalize both and check word overlap
+    const normalize = (s: string) => s.toLowerCase()
+      .replace(/công ty|tnhh|cổ phần|cp|hd|ltd|co\.|,|\./g, '')
+      .replace(/\s+/g, ' ').trim()
+    const a = normalize(invoiceName).split(' ')
+    const b = normalize(gdtName).split(' ')
+    const common = a.filter(w => b.includes(w) && w.length > 2).length
+    return common / Math.max(a.length, b.length)  // 0-1, higher = more similar
+  }
+
+  private parseVnDate(str: string): Date | undefined {
+    if (!str) return undefined
+    const match = str.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/)
+    if (!match) return undefined
+    return new Date(`${match[3]}-${match[2].padStart(2,'0')}-${match[1].padStart(2,'0')}`)
+  }
+
+  private async getFromCache(taxCode: string) {
+    const res = await db.query(
+      'SELECT * FROM company_verification_cache WHERE tax_code=$1', [taxCode]
+    )
+    return res.rows[0] || null
+  }
+
+  private async saveToCache(taxCode: string, info: CompanyInfo) {
+    await db.query(`
+      INSERT INTO company_verification_cache
+        (tax_code, company_name, address, legal_rep, mst_status, registered_date,
+         dissolved_date, source, raw_data, verified_at, expires_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),NOW()+INTERVAL '30 days')
+      ON CONFLICT (tax_code) DO UPDATE SET
+        company_name=EXCLUDED.company_name, address=EXCLUDED.address,
+        mst_status=EXCLUDED.mst_status, verified_at=NOW(), expires_at=NOW()+INTERVAL '30 days'
+    `, [taxCode, info.company_name, info.address, info.legal_rep,
+        info.mst_status, info.registered_date, info.dissolved_date,
+        info.source, JSON.stringify(info.raw_data)])
+  }
+}
+```
+
+### GHOST-03 — Risk Analysis Engine (Phát hiện công ty ma)
+```
+[Respond in Vietnamese]
+Create /backend/src/services/GhostCompanyDetector.ts
+Runs after each sync to analyze all unique seller/buyer tax codes in input invoices.
+
+import { CompanyVerificationService } from './CompanyVerificationService'
+
+export class GhostCompanyDetector {
+  private verifier = new CompanyVerificationService()
+
+  async analyzeCompany(
+    companyId: string,
+    partnerTaxCode: string,
+    partnerType: 'seller' | 'buyer'
+  ): Promise<RiskFlag[]> {
+    const flags: RiskFlag[] = []
+
+    // Get verification data
+    const info = await this.verifier.verify(partnerTaxCode)
+
+    // Get all invoices with this partner
+    const invoices = await db.query(`
+      SELECT * FROM invoices
+      WHERE company_id=$1 AND deleted_at IS NULL
+        AND CASE WHEN $3='seller' THEN seller_tax_code ELSE buyer_tax_code END = $2
+      ORDER BY invoice_date DESC`, 
+      [companyId, partnerTaxCode, partnerType]
+    )
+    const invList = invoices.rows
+    const totalVatAtRisk = invList.reduce((s, i) => s + parseFloat(i.vat_amount || 0), 0)
+
+    // ─── FLAG 1: MST không tồn tại ───────────────────────────────
+    if (info.mst_status === 'not_found') {
+      flags.push({
+        code: 'MST_NOT_FOUND',
+        level: 'critical',
+        message: `MST ${partnerTaxCode} không tồn tại trên hệ thống GDT`,
+        vat_at_risk: totalVatAtRisk
+      })
+    }
+
+    // ─── FLAG 2: MST đã giải thể / thu hồi ────────────────────────
+    if (info.mst_status === 'dissolved') {
+      const lastInv = invList[0]
+      if (lastInv && info.dissolved_date) {
+        if (new Date(lastInv.invoice_date) > new Date(info.dissolved_date)) {
+          flags.push({
+            code: 'MST_DISSOLVED',
+            level: 'critical',
+            message: `${info.company_name} đã giải thể từ ${info.dissolved_date} nhưng vẫn xuất HĐ`,
+            vat_at_risk: totalVatAtRisk,
+            details: { dissolved_date: info.dissolved_date }
+          })
+        }
+      }
+    }
+
+    // ─── FLAG 3: MST đang tạm ngừng ────────────────────────────────
+    if (info.mst_status === 'suspended') {
+      flags.push({
+        code: 'MST_SUSPENDED',
+        level: 'high',
+        message: `${info.company_name} đang tạm ngừng hoạt động — HĐ có thể không hợp lệ`,
+        vat_at_risk: totalVatAtRisk
+      })
+    }
+
+    // ─── FLAG 4: Tên không khớp ────────────────────────────────────
+    if (info.company_name && invList.length > 0) {
+      const invName = partnerType === 'seller' ? invList[0].seller_name : invList[0].buyer_name
+      const similarity = this.verifier.compareNames(invName, info.company_name)
+      if (similarity < 0.4) {  // less than 40% word match
+        flags.push({
+          code: 'NAME_MISMATCH',
+          level: 'high',
+          message: `Tên trên HĐ "${invName}" khác biệt với GDT "${info.company_name}"`,
+          details: { similarity: Math.round(similarity * 100) + '%' }
+        })
+      }
+    }
+
+    // ─── FLAG 5: DN mới + HĐ lớn ───────────────────────────────────
+    if (info.registered_date && partnerType === 'seller') {
+      const monthsOld = (Date.now() - new Date(info.registered_date).getTime())
+                        / (1000 * 60 * 60 * 24 * 30)
+      const bigInvoices = invList.filter(i => parseFloat(i.total_amount) > 50_000_000)
+      if (monthsOld < 6 && bigInvoices.length > 0) {
+        flags.push({
+          code: 'NEW_COMPANY_BIG_INV',
+          level: 'high',
+          message: `DN mới thành lập ${Math.round(monthsOld)} tháng nhưng đã xuất ${bigInvoices.length} HĐ > 50 triệu`,
+          details: { months_old: Math.round(monthsOld), big_invoice_count: bigInvoices.length }
+        })
+      }
+    }
+
+    // ─── FLAG 6: Phân nhỏ HĐ (nhiều HĐ nhỏ cùng ngày) ────────────
+    const byDate: Record<string, number> = {}
+    invList.forEach(i => {
+      const d = i.invoice_date?.toISOString().slice(0, 10)
+      byDate[d] = (byDate[d] || 0) + 1
+    })
+    const splitDays = Object.values(byDate).filter(count => count >= 3)
+    if (splitDays.length > 0) {
+      flags.push({
+        code: 'SPLIT_INVOICE',
+        level: 'medium',
+        message: `Phát hiện ${splitDays.length} ngày có từ 3+ HĐ từ cùng 1 NCC — có thể chia nhỏ để tránh duyệt`,
+        details: { affected_days: splitDays.length }
+      })
+    }
+
+    // ─── FLAG 7: Toàn bộ HĐ có số tiền tròn ────────────────────────
+    if (invList.length >= 3) {
+      const roundCount = invList.filter(i => {
+        const amt = parseFloat(i.total_amount)
+        return amt > 0 && amt % 1_000_000 === 0
+      }).length
+      if (roundCount / invList.length > 0.9) {
+        flags.push({
+          code: 'ROUND_AMOUNTS',
+          level: 'medium',
+          message: `${roundCount}/${invList.length} HĐ có số tiền tròn chính xác (triệu VND) — dấu hiệu bất thường`,
+        })
+      }
+    }
+
+    return flags
+  }
+
+  async runForCompany(companyId: string): Promise<void> {
+    // Get all unique seller tax codes from input invoices (direction='input')
+    const sellers = await db.query(`
+      SELECT DISTINCT seller_tax_code, seller_name,
+        SUM(vat_amount) as total_vat, COUNT(*) as invoice_count
+      FROM invoices
+      WHERE company_id=$1 AND direction='input'
+        AND deleted_at IS NULL AND is_permanently_ignored=false
+        AND seller_tax_code IS NOT NULL AND seller_tax_code != 'B2C'
+      GROUP BY seller_tax_code, seller_name
+      HAVING SUM(vat_amount) > 0
+      ORDER BY SUM(vat_amount) DESC
+    `, [companyId])
+
+    for (const seller of sellers.rows) {
+      // Rate limit: 1 verification per 2 seconds
+      await new Promise(r => setTimeout(r, 2_000))
+      
+      const flags = await this.analyzeCompany(companyId, seller.seller_tax_code, 'seller')
+      if (flags.length > 0) {
+        await this.saveRiskFlags(companyId, seller.seller_tax_code, 'seller', flags, seller.total_vat)
+      }
+    }
+  }
+
+  private async saveRiskFlags(
+    companyId: string, taxCode: string, partnerType: string,
+    flags: RiskFlag[], totalVatAtRisk: number
+  ) {
+    const maxLevel = flags.some(f => f.level === 'critical') ? 'critical'
+                   : flags.some(f => f.level === 'high') ? 'high' : 'medium'
+    
+    await db.query(`
+      INSERT INTO company_risk_flags
+        (company_id, tax_code, partner_type, risk_level, flag_types, flag_details, total_vat_at_risk)
+      VALUES ($1,$2,$3,$4,$5,$6,$7)
+      ON CONFLICT (company_id, tax_code) DO UPDATE SET
+        risk_level=$4, flag_types=$5, flag_details=$6,
+        total_vat_at_risk=$7, updated_at=NOW(), is_acknowledged=false
+    `, [companyId, taxCode, partnerType, maxLevel,
+        flags.map(f => f.code), JSON.stringify(flags), totalVatAtRisk])
+
+    // Create notification for critical flags
+    if (maxLevel === 'critical') {
+      const info = await this.verifier.verify(taxCode)
+      await createNotification(companyId, {
+        type: 'GHOST_COMPANY_CRITICAL',
+        title: '🚨 Phát hiện công ty nghi ngờ ma',
+        body: `NCC "${info.company_name || taxCode}" có dấu hiệu bất thường nghiêm trọng — ${flags[0].message}. VAT đầu vào có nguy cơ: ${formatVND(totalVatAtRisk)}`
+      })
+    }
+  }
+}
+```
+
+### GHOST-04 — Ghost Company Alert UI
+```
+[Respond in Vietnamese]
+Create /audit/ghost-companies page — "Kiểm Tra Công Ty Ma" dashboard.
+This is a critical compliance feature — accountants check this before finalizing VAT declaration.
+
+Backend:
+  GET /api/audit/ghost-companies?companyId=&riskLevel=&acknowledged=false
+  GET /api/audit/ghost-companies/summary?companyId=
+    Returns: { critical: N, high: N, medium: N, total_vat_at_risk: amount }
+  POST /api/audit/ghost-companies/:taxCode/verify-now → trigger immediate re-verification
+  PATCH /api/audit/ghost-companies/:taxCode/acknowledge → mark as reviewed
+  GET /api/audit/ghost-companies/:taxCode/detail → full company info + all flags + invoices
+
+Page layout:
+
+Header: "Kiểm Tra Đối Tác — Phát Hiện Công Ty Ma" + shield icon
+
+Summary alert banner (RED if critical > 0):
+  "🚨 Phát hiện [N] nhà cung cấp có dấu hiệu bất thường
+  Tổng VAT đầu vào có thể bị loại khỏi khấu trừ: [amount]
+  [Xem chi tiết] button"
+
+Explanation card (collapsible, shown first time):
+  "Công ty ma là doanh nghiệp đã giải thể, tạm ngừng hoặc không tồn tại
+  nhưng vẫn xuất hóa đơn. Nếu DN bạn khấu trừ VAT từ các hóa đơn này,
+  cơ quan thuế có thể truy thu 100% số thuế + phạt 20%."
+
+Severity filter tabs:
+  🔴 Nghiêm trọng ([N]) | 🟠 Cảnh báo ([N]) | 🟡 Lưu ý ([N]) | ✅ Đã kiểm tra
+
+Risk company cards:
+  Left border color: red=critical, orange=high, yellow=medium
+  
+  Card header:
+    Tên công ty (from GDT) vs Tên trên HĐ (from invoice) — show both if different
+    MST: [tax_code] | Trạng thái GDT: [badge: Đã giải thể / Tạm ngừng / Không tồn tại / Đang hoạt động]
+    VAT đầu vào có nguy cơ: [total_vat_at_risk] (red, large font)
+    [N] hóa đơn bị ảnh hưởng
+  
+  Flag list (inside card):
+    Each flag as a row:
+      [FLAG ICON] [FLAG NAME] — [explanation in Vietnamese]
+    Examples:
+      🚫 MST đã giải thể — Công ty này đã giải thể từ 01/2024 nhưng vẫn xuất HĐ trong T3/2026
+      ⚠️ Tên không khớp — "Cty TNHH ABC" (HĐ) vs "Công ty TNHH Alpha Beta" (GDT) — chỉ 30% tương đồng
+      📋 DN mới, HĐ lớn — Mới thành lập 3 tháng, đã xuất 5 HĐ > 50 triệu
+  
+  Company info (from GDT, collapsible):
+    Tên chính thức | Người đại diện | Địa chỉ đăng ký | Ngày thành lập | Trạng thái
+  
+  Action buttons:
+    [Xem hóa đơn liên quan] → /invoices?sellerTaxCode=X (filtered)
+    [Kiểm tra lại ngay] → POST verify-now (re-fetch from GDT)
+    [Đánh dấu đã kiểm tra] → acknowledge with note
+      Modal: "Ghi chú xác nhận" textarea + "Tôi xác nhận đã kiểm tra và chấp nhận rủi ro" checkbox
+    [Bỏ qua toàn bộ HĐ] → bulk permanent-ignore all invoices from this partner
+
+Warning box at bottom of page:
+  "Lưu ý: Dữ liệu từ tracuunnt.gdt.gov.vn được cập nhật mỗi 30 ngày.
+  Bấm 'Kiểm tra lại ngay' để lấy thông tin mới nhất trước khi nộp tờ khai thuế."
+```
+
+### GHOST-05 — Integration: Auto-verify on import + dashboard widget
+```
+[Respond in Vietnamese]
+Integrate ghost company detection into the existing workflows.
+
+1. Auto-run after every import/sync:
+   In SyncWorker (sync.worker.ts) and manual import flow:
+   After bulkUpsertInvoices() completes:
+     const detector = new GhostCompanyDetector()
+     await detector.runForCompany(companyId)
+     -- runs in background, don't block main sync flow
+     -- queue it as a BullMQ job: 'ghost-detection-queue' with delay 5000ms
+
+2. Dashboard widget — "Kiểm Tra Đối Tác" card:
+   Add to dashboard (next to AI Anomaly widget):
+   
+   GET /api/audit/ghost-companies/summary?companyId= (cached 1h)
+   
+   If critical > 0:
+     Red card: "🚨 [N] đối tác nghi ngờ công ty ma | VAT nguy cơ: [amount]"
+     [Kiểm tra ngay →] link to /audit/ghost-companies
+   
+   If high > 0 but no critical:
+     Orange card: "⚠️ [N] đối tác cần xem xét | VAT nguy cơ: [amount]"
+   
+   If all clear:
+     Green card: "✅ Tất cả [N] đối tác đã được xác minh — không phát hiện bất thường"
+     Sub: "Cập nhật lúc: [last_run_time]"
+
+3. VAT Reconciliation gate:
+   In TaxDeclarationEngine.calculateDeclaration():
+   Before finalizing [23] (deductible input VAT):
+   
+   const criticalPartners = await db.query(`
+     SELECT tax_code, total_vat_at_risk FROM company_risk_flags
+     WHERE company_id=$1 AND risk_level='critical' AND is_acknowledged=false
+   `, [companyId])
+   
+   If criticalPartners.rows.length > 0:
+     declaration.warnings.push({
+       type: 'UNVERIFIED_CRITICAL_PARTNERS',
+       message: `Có ${criticalPartners.rows.length} NCC nghi ngờ công ty ma chưa được xác nhận.
+                 VAT đầu vào có nguy cơ bị loại: ${totalAtRisk}.
+                 Kiểm tra tại /audit/ghost-companies trước khi nộp tờ khai.`
+     })
+     declaration.ct23_confidence = 'low'  -- flag as uncertain
+
+4. Rate limiting for GDT verification:
+   BullMQ queue 'ghost-detection-queue':
+     Rate limiter: max 1 verification per 3 seconds (avoid GDT blocking)
+     concurrency: 1 (sequential, not parallel)
+     Process new companies first (priority by total_vat_at_risk DESC)
+     Re-verify existing cache every 30 days automatically
+```
+
+
+---
+
+## GROUP 44 — ADMIN LICENSE MANAGEMENT SYSTEM
+
+> Hệ thống Admin quản lý license và quota cho toàn bộ user của platform HĐĐT.
+> Admin là superuser riêng biệt — không phải OWNER/ADMIN của một công ty.
+> Quota = số hóa đơn đồng bộ từ GDT về mỗi tháng (đầu vào + đầu ra tính chung).
+
+### LIC-01 — DB Schema: License Plans + User Subscriptions
+```
+[Respond in Vietnamese]
+Create migration /scripts/013_license_system.sql
+
+-- 1. License plans (admin-managed pricing tiers)
+CREATE TABLE license_plans (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  code            VARCHAR(30) UNIQUE NOT NULL,   -- 'BASIC_1K','BASIC_2500','ENT_100K'
+  name            VARCHAR(100) NOT NULL,           -- "Gói 1.000 HĐ/tháng"
+  tier            VARCHAR(20) NOT NULL,            -- 'basic' | 'enterprise'
+  invoice_quota   INT NOT NULL,                    -- max invoices per month
+  price_per_month NUMERIC(12,0) NOT NULL,          -- VND/month
+  price_per_invoice NUMERIC(8,0),                  -- VND per invoice (display only)
+  max_companies   INT DEFAULT 5,                   -- max companies per subscription
+  max_users       INT DEFAULT 3,                   -- max team members
+  features        JSONB DEFAULT '{}',              -- { ai_chat, anomaly_detection, ... }
+  is_active       BOOLEAN DEFAULT true,
+  sort_order      SMALLINT DEFAULT 0,
+  created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Seed from pricing table in image
+INSERT INTO license_plans (code, name, tier, invoice_quota, price_per_month, price_per_invoice, max_companies, max_users) VALUES
+  ('BASIC_1K',    'Gói 1.000 HĐ/tháng',    'basic',      1000,   250000,  250, 2,  2),
+  ('BASIC_2500',  'Gói 2.500 HĐ/tháng',    'basic',      2500,   500000,  200, 3,  3),
+  ('BASIC_5K',    'Gói 5.000 HĐ/tháng',    'basic',      5000,   750000,  150, 5,  5),
+  ('BASIC_10K',   'Gói 10.000 HĐ/tháng',   'basic',      10000,  1000000, 100, 10, 10),
+  ('ENT_20K',     'Gói 20.000 HĐ/tháng',   'enterprise', 20000,  1600000, 80,  20, 20),
+  ('ENT_50K',     'Gói 50.000 HĐ/tháng',   'enterprise', 50000,  3500000, 70,  50, 50),
+  ('ENT_80K',     'Gói 80.000 HĐ/tháng',   'enterprise', 80000,  4800000, 60,  100,100),
+  ('ENT_100K',    'Gói 100.000 HĐ/tháng',  'enterprise', 100000, 5000000, 50,  999,999);
+
+-- 2. User subscriptions
+CREATE TABLE user_subscriptions (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id           UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  plan_id           UUID NOT NULL REFERENCES license_plans(id),
+  status            VARCHAR(20) NOT NULL DEFAULT 'active',
+  -- 'trial'|'active'|'suspended'|'expired'|'cancelled'
+  
+  -- Billing period
+  started_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at        TIMESTAMPTZ NOT NULL,           -- end of current period
+  trial_ends_at     TIMESTAMPTZ,                    -- NULL if not trial
+  
+  -- Quota tracking (reset monthly by cron)
+  quota_total       INT NOT NULL,                   -- copy from plan at purchase
+  quota_used        INT NOT NULL DEFAULT 0,         -- invoices synced this month
+  quota_reset_at    TIMESTAMPTZ,                    -- when quota was last reset
+  
+  -- Admin management
+  granted_by        UUID REFERENCES users(id),      -- admin who issued this license
+  grant_notes       TEXT,                            -- admin notes
+  is_manually_set   BOOLEAN DEFAULT false,           -- true = admin override
+  
+  -- Payment (basic tracking, not full billing system)
+  last_paid_at      TIMESTAMPTZ,
+  payment_reference VARCHAR(100),                   -- bank transfer reference, etc.
+  
+  created_at        TIMESTAMPTZ DEFAULT NOW(),
+  updated_at        TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(user_id)  -- one active subscription per user
+);
+
+-- 3. Quota usage log (for audit + analytics)
+CREATE TABLE quota_usage_log (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id       UUID REFERENCES users(id),
+  company_id    UUID REFERENCES companies(id),
+  invoices_added INT NOT NULL,
+  source        VARCHAR(20),    -- 'gdt_bot'|'manual_import'|'provider_sync'
+  logged_at     TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 4. Admin users (separate from regular users)
+-- Add to existing users table:
+ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS is_platform_admin BOOLEAN DEFAULT false,
+  ADD COLUMN IF NOT EXISTS admin_notes TEXT;
+
+-- 5. License history (audit trail)
+CREATE TABLE license_history (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id       UUID REFERENCES users(id),
+  action        VARCHAR(30),  -- 'grant'|'renew'|'upgrade'|'downgrade'|'suspend'|'enable'|'cancel'
+  old_plan_id   UUID REFERENCES license_plans(id),
+  new_plan_id   UUID REFERENCES license_plans(id),
+  old_status    VARCHAR(20),
+  new_status    VARCHAR(20),
+  expires_at    TIMESTAMPTZ,
+  performed_by  UUID REFERENCES users(id),  -- admin user
+  notes         TEXT,
+  created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 6. Indexes
+CREATE INDEX idx_subscriptions_user    ON user_subscriptions(user_id);
+CREATE INDEX idx_subscriptions_status  ON user_subscriptions(status);
+CREATE INDEX idx_subscriptions_expires ON user_subscriptions(expires_at);
+CREATE INDEX idx_quota_log_user_month  ON quota_usage_log(user_id, logged_at DESC);
+```
+
+### LIC-02 — Quota Enforcement Service
+```
+[Respond in Vietnamese]
+Create /backend/src/services/QuotaService.ts
+This service enforces invoice sync limits and is called before every sync operation.
+
+export class QuotaService {
+
+  async getSubscription(userId: string): Promise<Subscription | null> {
+    const res = await db.query(`
+      SELECT s.*, p.invoice_quota, p.code as plan_code, p.name as plan_name,
+             p.tier, p.max_companies, p.max_users
+      FROM user_subscriptions s
+      JOIN license_plans p ON s.plan_id = p.id
+      WHERE s.user_id = $1
+    `, [userId])
+    return res.rows[0] || null
+  }
+
+  async checkCanSync(userId: string, estimatedInvoices: number = 1): Promise<QuotaCheck> {
+    const sub = await this.getSubscription(userId)
+    
+    if (!sub) {
+      return { allowed: false, reason: 'NO_SUBSCRIPTION', message: 'Tài khoản chưa có gói dịch vụ' }
+    }
+    if (sub.status === 'suspended') {
+      return { allowed: false, reason: 'SUSPENDED', message: 'Tài khoản đã bị tạm ngừng. Liên hệ admin.' }
+    }
+    if (sub.status === 'expired') {
+      return { allowed: false, reason: 'EXPIRED', message: 'Gói dịch vụ đã hết hạn. Vui lòng gia hạn.' }
+    }
+    if (new Date(sub.expires_at) < new Date()) {
+      await this.expireSubscription(sub.id)
+      return { allowed: false, reason: 'EXPIRED', message: 'Gói dịch vụ đã hết hạn. Vui lòng gia hạn.' }
+    }
+    
+    const remaining = sub.quota_total - sub.quota_used
+    const usedPct   = (sub.quota_used / sub.quota_total) * 100
+    
+    if (remaining <= 0) {
+      return {
+        allowed: false, reason: 'QUOTA_EXCEEDED',
+        message: `Đã dùng hết ${sub.quota_total.toLocaleString()} HĐ trong tháng này.`,
+        quota: { used: sub.quota_used, total: sub.quota_total, remaining: 0, usedPct: 100 }
+      }
+    }
+    if (remaining < estimatedInvoices) {
+      return {
+        allowed: false, reason: 'QUOTA_INSUFFICIENT',
+        message: `Chỉ còn ${remaining} HĐ trong hạn mức, không đủ để đồng bộ ${estimatedInvoices} HĐ.`,
+        quota: { used: sub.quota_used, total: sub.quota_total, remaining, usedPct }
+      }
+    }
+
+    return {
+      allowed: true, reason: null,
+      warning: usedPct >= 80 ? this.buildWarning(usedPct, remaining, sub) : null,
+      quota: { used: sub.quota_used, total: sub.quota_total, remaining, usedPct }
+    }
+  }
+
+  async consumeQuota(userId: string, companyId: string, count: number, source: string): Promise<void> {
+    await db.query('BEGIN')
+    try {
+      await db.query(`
+        UPDATE user_subscriptions
+        SET quota_used = quota_used + $2, updated_at = NOW()
+        WHERE user_id = $1 AND status = 'active'
+      `, [userId, count])
+      
+      await db.query(`
+        INSERT INTO quota_usage_log (user_id, company_id, invoices_added, source)
+        VALUES ($1, $2, $3, $4)
+      `, [userId, companyId, count, source])
+      
+      await db.query('COMMIT')
+    } catch (err) {
+      await db.query('ROLLBACK')
+      throw err
+    }
+    
+    // Check if warning threshold crossed — send notification
+    const sub = await this.getSubscription(userId)
+    if (sub) {
+      const usedPct = (sub.quota_used / sub.quota_total) * 100
+      if (usedPct >= 90 && usedPct - (count / sub.quota_total * 100) < 90) {
+        await this.sendQuotaWarning(userId, usedPct, sub.quota_total - sub.quota_used)
+      }
+    }
+  }
+
+  // Cron job: reset quota on 1st of each month
+  async resetMonthlyQuotas(): Promise<void> {
+    const res = await db.query(`
+      UPDATE user_subscriptions
+      SET quota_used = 0, quota_reset_at = NOW(), updated_at = NOW()
+      WHERE status IN ('active', 'trial')
+      RETURNING user_id
+    `)
+    console.log(`[QuotaService] Reset quotas for ${res.rowCount} active subscriptions`)
+  }
+
+  private buildWarning(usedPct: number, remaining: number, sub: any) {
+    if (usedPct >= 95) return {
+      level: 'critical',
+      message: `Còn ${remaining} HĐ (${(100-usedPct).toFixed(0)}%) — Gần hết hạn mức!`,
+      action: 'upgrade'
+    }
+    if (usedPct >= 80) return {
+      level: 'warning',
+      message: `Đã dùng ${usedPct.toFixed(0)}% hạn mức tháng này`,
+      action: 'consider_upgrade'
+    }
+    return null
+  }
+
+  private async sendQuotaWarning(userId: string, usedPct: number, remaining: number) {
+    await createNotification(userId, null, {
+      type: 'QUOTA_WARNING',
+      title: usedPct >= 95 ? '🚨 Sắp hết hạn mức đồng bộ' : '⚠️ Hạn mức sắp cạn',
+      body: `Đã dùng ${usedPct.toFixed(0)}% hạn mức — còn ${remaining} hóa đơn. Nâng gói để tiếp tục đồng bộ.`
+    })
+    // Also push to VAPID
+  }
+
+  private async expireSubscription(subId: string) {
+    await db.query(
+      "UPDATE user_subscriptions SET status='expired', updated_at=NOW() WHERE id=$1",
+      [subId]
+    )
+  }
+}
+
+export const quotaService = new QuotaService()
+
+-- Integrate into SyncWorker (sync.worker.ts):
+-- BEFORE starting sync:
+  const userId = await getUserIdForCompany(companyId)
+  const check  = await quotaService.checkCanSync(userId, estimatedCount)
+  if (!check.allowed) {
+    throw new UnrecoverableError(`Sync blocked: ${check.reason} — ${check.message}`)
+  }
+
+-- AFTER successful sync:
+  await quotaService.consumeQuota(userId, companyId, actualCount, 'gdt_bot')
+```
+
+### LIC-03 — Admin Panel Backend APIs
+```
+[Respond in Vietnamese]
+Create /backend/src/routes/admin.ts — Admin-only API routes.
+All routes require: is_platform_admin = true (checked in middleware).
+
+Create middleware /backend/src/middleware/adminAuth.ts:
+  Check: decoded JWT user has is_platform_admin=true
+  If not: return 403 { error: 'ADMIN_ONLY', message: 'Chỉ Admin hệ thống mới có quyền truy cập' }
+
+Admin API endpoints:
+
+-- USER MANAGEMENT
+GET  /admin/users
+  Query params: status, plan, search (name/email), page, pageSize=20
+  Returns: users with subscription info, usage stats, company count
+  SQL: JOIN users + user_subscriptions + license_plans
+       + subquery: company count, total invoices this month
+
+GET  /admin/users/:id
+  Returns: full user profile + subscription + license history + all companies with stats
+
+PATCH /admin/users/:id/status
+  Body: { status: 'active'|'suspended', reason: string }
+  If suspended: also suspend subscription
+  Log to license_history
+
+-- LICENSE MANAGEMENT
+POST /admin/users/:id/grant-license
+  Body: { planCode: string, months: number, notes?: string, paymentRef?: string }
+  Logic:
+    1. Find plan by code
+    2. Calculate expires_at = NOW() + months
+    3. Upsert user_subscriptions (reset quota_used=0)
+    4. Log to license_history (action='grant')
+    5. Send welcome notification to user
+  Return: { subscription, plan }
+
+PATCH /admin/users/:id/renew
+  Body: { months: number, notes?: string, paymentRef?: string }
+  Logic: extend expires_at by N months from current expiry (not from now)
+  Log to license_history (action='renew')
+
+PATCH /admin/users/:id/upgrade
+  Body: { newPlanCode: string, notes?: string }
+  Logic: change plan, update quota_total, keep quota_used, recalculate expires_at
+  Log to license_history (action='upgrade' or 'downgrade')
+
+PATCH /admin/users/:id/suspend
+  Body: { reason: string }
+  Set subscription.status='suspended', user active=false
+  Send notification to user
+
+PATCH /admin/users/:id/enable
+  Body: { notes?: string }
+  Set subscription.status='active', user active=true
+  Send notification to user
+
+DELETE /admin/users/:id/subscription
+  Body: { reason: string, confirm: 'CANCEL_SUBSCRIPTION' }
+  Soft-cancel: set status='cancelled', keep data
+
+-- QUOTA MANAGEMENT
+GET /admin/users/:id/quota
+  Returns: current quota usage + monthly history (last 6 months)
+
+PATCH /admin/users/:id/quota/adjust
+  Body: { adjustment: number, reason: string }
+  Add or subtract from quota_used (admin override)
+  Example: { adjustment: -500, reason: 'Error correction — refund 500 invoices' }
+  Log to quota_usage_log with source='admin_adjustment'
+
+POST /admin/quota/reset-all
+  Reset all active subscriptions to quota_used=0
+  Typically run on 1st of month by cron, but admin can trigger manually
+  Require: { confirm: 'RESET_ALL_QUOTAS' } in body
+
+-- PLAN MANAGEMENT
+GET    /admin/plans             → list all plans
+POST   /admin/plans             → create new plan
+PATCH  /admin/plans/:id        → update plan (price, quota, features)
+DELETE /admin/plans/:id        → deactivate plan (set is_active=false)
+
+-- OVERVIEW & ANALYTICS
+GET /admin/overview
+  Returns:
+    total_users, active_users, trial_users, suspended_users, expired_users
+    total_revenue_this_month (sum of plan prices for active subs)
+    total_invoices_synced_this_month (across all users)
+    top_usage_users: top 10 by quota_used this month
+    expiring_soon: users with expires_at < NOW()+7 days
+    new_signups_this_month: count
+
+GET /admin/analytics/usage
+  Returns monthly usage stats: invoices synced, active users, new users (12 months)
+```
+
+### LIC-04 — Admin Frontend: /admin pages
+```
+[Respond in Vietnamese]
+Create the complete Admin Panel frontend.
+Admin panel lives at /admin/* routes — completely separate from user-facing /dashboard etc.
+Redirect non-admin users away immediately.
+
+Admin layout (/admin/layout.tsx):
+  Sidebar navigation:
+    📊 Tổng quan (/admin)
+    👥 Quản lý User (/admin/users)
+    📋 Gói dịch vụ (/admin/plans)
+    📈 Báo cáo (/admin/reports)
+  Header: "Admin Panel" badge + logged-in admin name
+  Dark/professional theme option (optional)
+
+Page 1 — /admin (Overview Dashboard):
+
+  Top stats row (4 cards):
+    Tổng user: [N] | Active: [N] (green) | Trial: [N] (blue) | Hết hạn: [N] (red)
+  
+  Revenue summary card:
+    Doanh thu ước tính tháng này: SUM of plan prices for active subs
+    Format: [amount VND]
+    Sub: "[N] gói đang hoạt động"
+  
+  Expiring soon alert table:
+    Users whose expires_at < NOW() + 7 days
+    Columns: Tên user | Email | Gói | Hết hạn | Ngày còn lại | [Gia hạn ngay]
+    Sort by days remaining ASC (most urgent first)
+  
+  Top usage users table:
+    Top 10 users by quota_used this month
+    Columns: User | Gói | Hạn mức | Đã dùng | % | Số công ty | [Xem chi tiết]
+    Progress bar in % column
+  
+  Recent activity feed:
+    Last 20 license_history entries
+    "[Admin] cấp gói ENT_20K cho [user] — 1 tháng | 2h trước"
+
+Page 2 — /admin/users (User Management):
+
+  Search + filter bar:
+    Search: email/name | Filter: Status dropdown | Plan dropdown | Tier dropdown
+    Sort: by created_at | quota_used | expires_at
+  
+  User table (sortable):
+    Avatar | Tên | Email | Gói hiện tại | Trạng thái | Hạn mức (bar) | Hết hạn | Số CT | Hành động
+  
+  Status badges: Active(green) | Trial(blue) | Suspended(red) | Expired(gray) | Cancelled(dark)
+  
+  Quota column: mini progress bar [██████░░] 65% (color: green<80, orange<95, red>=95)
+  
+  Action menu per row (⋮):
+    [Xem chi tiết]
+    [Cấp / Đổi gói]
+    [Gia hạn]
+    [Điều chỉnh hạn mức]
+    [Tạm ngừng] / [Kích hoạt]
+    [Xem lịch sử]
+
+Page 3 — /admin/users/:id (User Detail):
+
+  User profile section:
+    Avatar + Name + Email + Phone | Created at | Last login
+    [Tạm ngừng tài khoản] / [Kích hoạt] button (top-right)
+  
+  Current subscription card:
+    Plan name + tier badge | Status badge
+    Hết hạn: [date] — Còn [N] ngày (red if < 7)
+    Quota: [used] / [total] HĐ — [N] còn lại
+    Progress bar (full width)
+    [Gia hạn] [Đổi gói] [Điều chỉnh quota] buttons
+  
+  Companies section:
+    Table: Tên CT | MST | Số HĐ tháng này | Tổng DT | Tổng CP | Kết nối
+  
+  License history table:
+    Action | Gói cũ → Gói mới | Admin | Ghi chú | Thời gian
+  
+  Grant/Renew modal (shared):
+    Select plan: radio list of all active plans (show price + quota per plan)
+    Duration: [1 tháng] [3 tháng] [6 tháng] [12 tháng] (radio, price shown)
+    Ghi chú admin: textarea
+    Mã thanh toán: text (bank transfer ref)
+    [Xác nhận cấp license]
+
+Page 4 — /admin/plans (Plan Management):
+
+  Plan list table:
+    Code | Tên gói | Tier | Hạn mức | Giá/tháng | Đ.giá/HĐ | Max CT | Đang dùng | Trạng thái | Sửa
+  
+  "Đang dùng" = COUNT of active subscriptions with this plan
+  
+  [+ Tạo gói mới] button → form modal:
+    Code, Name, Tier, invoice_quota, price_per_month, max_companies, max_users
+    Features checkboxes: AI Chat, Anomaly Detection, Ghost Company Check, ESG Report
+  
+  Edit plan: same form, pre-filled
+  Deactivate: confirm dialog "Gói này đang có [N] user đang dùng. Họ sẽ giữ nguyên cho đến khi hết hạn."
+```
+
+### LIC-05 — User-Facing Quota UI (Warnings + Upgrade Prompts)
+```
+[Respond in Vietnamese]
+Create quota status components visible to end users (non-admin).
+
+1. Quota status bar (show in app header or settings):
+   GET /api/subscription/me → returns current subscription + quota info
+   
+   QuotaStatusBar component (show in settings or /dashboard header):
+     Label: "Hạn mức tháng này:"
+     Progress bar: [████████░░] 82% — 1.800 / 2.500 HĐ
+     Color: green<80%, orange 80-95%, red≥95%
+     Sub-text: "Còn [N] HĐ | Làm mới ngày 01/[next month]"
+     [Nâng gói] button (shown when >80%)
+
+2. Warning Banner (sticky, dismissible):
+   Show when quota_used/quota_total >= 80%
+
+   Level WARNING (80-95%): orange background
+     "⚠️ Bạn đã dùng [X]% hạn mức đồng bộ tháng này — còn [N] hóa đơn.
+     Nâng gói để không bị gián đoạn."
+     [Nâng gói ngay] [Nhắc sau]
+
+   Level CRITICAL (95-99%): red background
+     "🚨 Chỉ còn [N] hóa đơn trong hạn mức! Đồng bộ sẽ bị dừng khi hết."
+     [Nâng gói ngay] — no dismiss option
+
+3. Quota Exceeded State (quota_used >= quota_total):
+   Full-screen overlay (not blocking navigation, but blocking sync actions):
+   
+   Modal / large card:
+     Lock icon (🔒)
+     "Đã hết hạn mức đồng bộ tháng này"
+     Sub: "Bạn đã đồng bộ [N] hóa đơn — đã đạt giới hạn gói [Plan Name]."
+     
+     Upgrade options (show 2 next tiers):
+       Current plan:   [Plan Name]     [N] HĐ/tháng    [price]    Hiện tại
+       Next tier:      [Plan Name+1]   [N] HĐ/tháng    [price]    [Nâng cấp]
+       Skip tier:      [Plan Name+2]   [N] HĐ/tháng    [price]    [Nâng cấp]
+     
+     "Hoặc liên hệ admin để được hỗ trợ: [admin email/phone]"
+     [Đóng] — user can still view existing data, just can't sync
+
+4. Subscription Expired State:
+   Show when status='expired' OR expires_at < NOW():
+   
+   Banner (persistent, top of every page):
+     "📅 Gói dịch vụ của bạn đã hết hạn ngày [date].
+     Dữ liệu của bạn vẫn được lưu trữ an toàn — hãy gia hạn để tiếp tục sử dụng."
+     [Liên hệ gia hạn] → mailto or contact form
+   
+   Disabled features (gray out, show lock icon):
+     Đồng bộ hóa đơn → locked
+     Export dữ liệu → locked (can still view)
+     AI features → locked
+     (Can still view/read all existing data)
+
+5. Suspended State:
+   Full-page block (can't access any features):
+   
+   "Tài khoản tạm ngừng hoạt động"
+   "Tài khoản của bạn đã bị tạm ngừng. Vui lòng liên hệ quản trị viên để biết thêm chi tiết."
+   [Liên hệ Admin] button
+   [Đăng xuất]
+
+6. Trial State (trial_ends_at is set):
+   Small banner (dismissible):
+   "🎁 Bạn đang dùng thử — còn [N] ngày | [N] HĐ còn lại trong gói thử"
+   [Đăng ký gói chính thức]
+
+Component integration:
+  - Add QuotaStatusBar to /settings/profile and /dashboard
+  - Check quota state in layout.tsx and show appropriate banners
+  - In SyncWorker error handling: catch QUOTA_EXCEEDED → update UI state via WebSocket or polling
+  - Cache subscription state in React Context, refresh every 5 minutes
+```
+
+### LIC-06 — Billing & Notifications
+```
+[Respond in Vietnamese]
+Create subscription lifecycle notifications and basic billing tracking.
+
+1. Automated notification schedule (BullMQ cron jobs):
+
+  Job: ExpiryReminderJob (runs daily at 9:00 AM)
+    Find subscriptions where expires_at BETWEEN NOW() AND NOW()+7 days
+    AND last_reminder_sent < NOW()-2 days (avoid spam)
+    
+    For each: send push + Telegram (if configured):
+      7 days before: "📅 Gói dịch vụ hết hạn sau 7 ngày — [date]. Liên hệ admin để gia hạn."
+      3 days before: "⚠️ Còn 3 ngày! Gói [plan] hết hạn ngày [date]."
+      1 day before:  "🚨 KHẨN: Gói hết hạn ngày mai! Liên hệ ngay để tránh gián đoạn."
+      On expiry day: "❌ Gói dịch vụ đã hết hạn hôm nay. Đồng bộ đã bị dừng."
+
+  Job: QuotaResetJob (runs at 00:01 on 1st of each month)
+    Call quotaService.resetMonthlyQuotas()
+    Send notification to all active users:
+      "🔄 Hạn mức đồng bộ đã được làm mới — [N] HĐ/tháng cho tháng [M]/[Y]"
+
+  Job: QuotaWarningJob (runs every 6 hours)
+    Find subscriptions where quota_used/quota_total >= 0.80
+    AND no warning sent in last 3 days
+    Send push notification (see LIC-05 warning messages)
+
+2. Admin notification:
+  When any user reaches 95% quota: notify platform admin
+  When any user's subscription expires: notify platform admin
+  
+  Admin daily digest email (optional, 8:00 AM):
+    Summary: N expiring this week | N at quota limit | N new signups | Revenue estimate
+
+3. Invoice for subscription (basic):
+  POST /admin/users/:id/generate-invoice
+    Generate simple text/PDF invoice:
+      Đơn vị cung cấp: [Your company]
+      Người dùng: [name, email]
+      Gói dịch vụ: [plan name]
+      Kỳ sử dụng: [from] → [to]
+      Số tiền: [price VND]
+      Hình thức thanh toán: Chuyển khoản
+    
+    Save to user_invoices table (simple, not linked to HĐĐT invoices)
+    Email PDF to user
+
+4. Subscription status API for frontend:
+  GET /api/subscription/me
+  Response: {
+    plan: { name, code, tier, invoice_quota },
+    status: 'active'|'trial'|'suspended'|'expired',
+    expires_at: ISO date,
+    days_remaining: number,
+    quota: {
+      total: number,
+      used: number,
+      remaining: number,
+      used_pct: number,
+      reset_at: ISO date  -- 1st of next month
+    },
+    warnings: [{ level: 'critical'|'warning', message: string }],
+    upgrade_suggestions: [{ planCode, name, quota, price }]  -- next 2 tiers
+  }
+  Cache: Redis TTL 5 minutes per userId
+```
+

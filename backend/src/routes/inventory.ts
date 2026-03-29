@@ -8,32 +8,46 @@ import { requireCompany } from '../middleware/company';
 import { sendSuccess } from '../utils/response';
 import { AppError } from '../utils/AppError';
 import { inventoryService } from '../services/InventoryService';
+import { resolvePeriod } from '../utils/period';
 
 const router = Router();
 router.use(authenticate);
 router.use(requireCompany);
 
-// GET /api/inventory?month=&year=
+// GET /api/inventory?month=&year=&periodType=monthly|quarterly|yearly&quarter=
 router.get('/', async (req: Request, res: Response) => {
   const companyId = req.user!.companyId!;
-  const month = parseInt(req.query.month as string) || new Date().getMonth() + 1;
-  const year = parseInt(req.query.year as string) || new Date().getFullYear();
-  if (month < 1 || month > 12) throw new AppError('month must be 1-12', 400, 'VALIDATION');
+  const { start, end, month, year } = resolvePeriod(req.query);
 
-  const rows = await inventoryService.getBalanceReport(companyId, month, year);
+  const rows = await inventoryService.getBalanceReport(companyId, month, year, start, end);
   sendSuccess(res, rows);
 });
 
 // POST /api/inventory/build  — rebuild inventory movements for a period
 router.post('/build', async (req: Request, res: Response) => {
   const companyId = req.user!.companyId!;
-  const { month, year } = req.body as { month?: number; year?: number };
-  const m = parseInt(String(month)) || new Date().getMonth() + 1;
-  const y = parseInt(String(year)) || new Date().getFullYear();
-  if (m < 1 || m > 12) throw new AppError('month must be 1-12', 400, 'VALIDATION');
+  const body = req.body as { month?: number; year?: number; quarter?: number; periodType?: string };
+  const { start, end, month: m, year: y, periodType } = resolvePeriod({
+    month: String(body.month ?? new Date().getMonth() + 1),
+    year: String(body.year ?? new Date().getFullYear()),
+    quarter: String(body.quarter ?? 1),
+    periodType: body.periodType ?? 'monthly',
+  } as Record<string, string>);
 
-  const count = await inventoryService.buildMovements(companyId, m, y);
-  sendSuccess(res, { movements_built: count, month: m, year: y });
+  let totalCount = 0;
+  if (periodType === 'monthly') {
+    totalCount = await inventoryService.buildMovements(companyId, m, y);
+  } else {
+    // For quarterly/yearly: build for each month in the date range
+    const startDate = new Date(start);
+    const endDate = new Date(end);
+    for (let d = new Date(startDate.getFullYear(), startDate.getMonth(), 1);
+         d <= endDate;
+         d.setMonth(d.getMonth() + 1)) {
+      totalCount += await inventoryService.buildMovements(companyId, d.getMonth() + 1, d.getFullYear());
+    }
+  }
+  sendSuccess(res, { movements_built: totalCount, periodType, start, end });
 });
 
 // GET /api/inventory/detail?item=&from=&to=

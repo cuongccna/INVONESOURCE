@@ -13,6 +13,7 @@ interface Declaration {
   id: string;
   period_month: number;
   period_year: number;
+  period_type: string;
   form_type: string;
   submission_status: string;
   ct22_total_input_vat: number;
@@ -220,7 +221,10 @@ export default function DeclarationDetailPage() {
         <BackButton fallbackHref="/declarations" />
         <div className="flex-1">
           <h1 className="text-xl font-bold text-gray-900">
-            Tờ khai {decl.form_type} — Tháng {decl.period_month}/{decl.period_year}
+            Tờ khai {decl.form_type} —{' '}
+            {decl.period_type === 'quarterly'
+              ? `Quý ${decl.period_month}/${decl.period_year}`
+              : `Tháng ${decl.period_month}/${decl.period_year}`}
           </h1>
           <p className="text-xs text-gray-400 mt-0.5">
             Tạo: {new Date(decl.created_at).toLocaleDateString('vi-VN')}

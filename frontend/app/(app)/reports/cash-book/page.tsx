@@ -4,6 +4,12 @@ import { useEffect, useState } from 'react';
 import apiClient from '../../../../lib/apiClient';
 import { useCompany } from '../../../../contexts/CompanyContext';
 import { formatVND } from '../../../../utils/formatCurrency';
+import PeriodSelector, {
+  type PeriodValue,
+  defaultPeriod,
+  periodToParams,
+  periodLabel,
+} from '../../../../components/PeriodSelector';
 
 interface CashBookEntry {
   id: string;
@@ -41,9 +47,9 @@ export default function CashBookPage() {
   const { activeCompanyId } = useCompany();
   const [data, setData] = useState<CashBookData | null>(null);
   const [loading, setLoading] = useState(true);
-  const [month, setMonth] = useState(() => new Date().getMonth() + 1);
-  const [year, setYear] = useState(() => new Date().getFullYear());
+  const [period, setPeriod] = useState<PeriodValue>(defaultPeriod);
   const [method, setMethod] = useState('');
+  const [rebuilding, setRebuilding] = useState(false);
   const [showModal, setShowModal] = useState(false);
   const [form, setForm] = useState<NewEntryForm>({
     entry_type: 'receipt', entry_date: new Date().toISOString().split('T')[0],
@@ -54,7 +60,7 @@ export default function CashBookPage() {
   const fetch = () => {
     if (!activeCompanyId) return;
     setLoading(true);
-    const params = new URLSearchParams({ month: String(month), year: String(year) });
+    const params = periodToParams(period);
     if (method) params.append('method', method);
     apiClient
       .get<{ data: CashBookData }>(`/cash-book?${params}`)
@@ -63,7 +69,22 @@ export default function CashBookPage() {
       .finally(() => setLoading(false));
   };
 
-  useEffect(() => { fetch(); }, [activeCompanyId, month, year, method]);
+  useEffect(() => { fetch(); }, [activeCompanyId, period, method]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const rebuild = async () => {
+    setRebuilding(true);
+    try {
+      await apiClient.post('/cash-book/rebuild', {
+        month: period.month,
+        year: period.year,
+        quarter: period.quarter,
+        periodType: period.periodType,
+      });
+      fetch();
+    } catch { /* ignore */ } finally {
+      setRebuilding(false);
+    }
+  };
 
   const saveEntry = async () => {
     if (!form.amount || Number(form.amount) <= 0) return;
@@ -103,27 +124,20 @@ export default function CashBookPage() {
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Sổ Quỹ Tiền</h1>
-          <p className="text-sm text-gray-500">Theo dõi thu chi theo tháng</p>
+          <p className="text-sm text-gray-500">{periodLabel(period)}</p>
         </div>
         <div className="flex gap-2 flex-wrap">
-          <select value={month} onChange={(e) => setMonth(Number(e.target.value))}
-            className="border rounded-lg px-2 py-1 text-sm">
-            {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
-              <option key={m} value={m}>Tháng {m}</option>
-            ))}
-          </select>
-          <select value={year} onChange={(e) => setYear(Number(e.target.value))}
-            className="border rounded-lg px-2 py-1 text-sm">
-            {[2023, 2024, 2025, 2026].map((y) => (
-              <option key={y} value={y}>{y}</option>
-            ))}
-          </select>
+          <PeriodSelector value={period} onChange={setPeriod} />
           <select value={method} onChange={(e) => setMethod(e.target.value)}
             className="border rounded-lg px-2 py-1 text-sm">
             <option value="">Tất cả</option>
             <option value="cash">Tiền mặt</option>
             <option value="bank">Ngân hàng</option>
           </select>
+          <button onClick={rebuild} disabled={rebuilding}
+            className="px-3 py-1 bg-gray-100 border rounded-lg text-sm disabled:opacity-50">
+            {rebuilding ? 'Đang tính...' : '🔄 Tính lại'}
+          </button>
           <button onClick={() => setShowModal(true)}
             className="px-4 py-1 bg-blue-600 text-white rounded-lg text-sm">+ Phiếu thu/chi</button>
         </div>

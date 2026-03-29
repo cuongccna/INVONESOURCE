@@ -379,10 +379,14 @@ export default function CompaniesSettingsPage() {
       {deleteTarget && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
           <div className="bg-white rounded-2xl shadow-xl max-w-sm w-full p-6">
-            <h3 className="text-lg font-semibold text-gray-900 mb-2">Xoá công ty?</h3>
-            <p className="text-sm text-gray-500 mb-5">
-              Công ty <strong>{deleteTarget.name}</strong> sẽ bị ẩn khỏi hệ thống. Dữ liệu hóa đơn không bị xóa.
-            </p>
+            <h3 className="text-lg font-semibold text-gray-900 mb-2">Xóa vĩnh viễn công ty?</h3>
+            <div className="bg-red-50 border border-red-200 rounded-xl px-4 py-3 mb-4">
+              <p className="text-sm text-red-700 font-medium mb-1">⚠️ Cảnh báo: Không thể hoàn tác!</p>
+              <p className="text-sm text-red-600">
+                Toàn bộ dữ liệu của <strong>{deleteTarget.name}</strong> sẽ bị xóa vĩnh viễn, bao gồm:
+                hóa đơn, tờ khai thuế, sổ tiền mặt, báo cáo KQKD, cấu hình bot và tất cả dữ liệu liên quan.
+              </p>
+            </div>
             <div className="flex gap-3">
               <button
                 onClick={() => setDeleteTarget(null)}
@@ -394,7 +398,7 @@ export default function CompaniesSettingsPage() {
                 onClick={() => void handleDelete()}
                 className="flex-1 bg-red-600 text-white py-2.5 rounded-xl text-sm font-medium hover:bg-red-700 transition-colors"
               >
-                Xoá
+                Xóa vĩnh viễn
               </button>
             </div>
           </div>

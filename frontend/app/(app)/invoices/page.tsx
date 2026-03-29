@@ -50,7 +50,7 @@ export default function InvoicesPage() {
   const importSessionId = searchParams.get('importSessionId');
   const toast = useToast();
   const router = useRouter();
-  const { activeCompanyId, loading: companyLoading } = useCompany();
+  const { activeCompany, activeCompanyId, loading: companyLoading } = useCompany();
 
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [meta, setMeta] = useState({ total: 0, page: 1, pageSize: 50, totalPages: 1 });
@@ -115,12 +115,81 @@ export default function InvoicesPage() {
     if (!companyLoading) void load(1);
   }, [load, companyLoading]);
 
-  const triggerSync = async () => {
+  const [syncing, setSyncing] = useState(false);
+  const [showBotSetup, setShowBotSetup] = useState(false);
+  const [botPassword, setBotPassword] = useState('');
+  const [botSetupLoading, setBotSetupLoading] = useState(false);
+  // Date picker for sync
+  const [showSyncPicker, setShowSyncPicker] = useState(false);
+  const [syncFrom, setSyncFrom]   = useState('');
+  const [syncTo, setSyncTo]       = useState('');
+  const [syncDateErr, setSyncDateErr] = useState('');
+
+  const openSyncPicker = () => {
+    const today = new Date();
+    setSyncFrom(new Date(today.getFullYear(), today.getMonth(), 1).toISOString().slice(0, 10));
+    setSyncTo(today.toISOString().slice(0, 10));
+    setSyncDateErr('');
+    setShowSyncPicker(true);
+  };
+
+  const onSyncFromChange = (val: string) => {
+    setSyncFrom(val);
+    setSyncDateErr('');
+    if (!val || !syncTo) return;
+    const diff = new Date(syncTo).getTime() - new Date(val).getTime();
+    if (diff < 0) { setSyncDateErr('Từ ngày phải nhỏ hơn Đến ngày'); return; }
+    if (diff > 31 * 86400000) setSyncTo(new Date(new Date(val).getTime() + 31 * 86400000).toISOString().slice(0, 10));
+  };
+  const onSyncToChange = (val: string) => {
+    setSyncTo(val);
+    setSyncDateErr('');
+    if (!val || !syncFrom) return;
+    const diff = new Date(val).getTime() - new Date(syncFrom).getTime();
+    if (diff < 0) { setSyncDateErr('Đến ngày phải lớn hơn Từ ngày'); return; }
+    if (diff > 31 * 86400000) setSyncFrom(new Date(new Date(val).getTime() - 31 * 86400000).toISOString().slice(0, 10));
+  };
+
+  const triggerSync = async (fromDate: string, toDate: string) => {
+    if (syncing) return;
+    setShowSyncPicker(false);
+    setSyncing(true);
     try {
+      await apiClient.post('/invoices/sync', { from_date: fromDate, to_date: toDate });
+      toast.success(`Đã kích hoạt đồng bộ từ ${fromDate} → ${toDate}. Hóa đơn sẽ cập nhật sau ít phút.`);
+      setTimeout(() => void load(1), 3000);
+    } catch (err: unknown) {
+      const status = (err as { response?: { status?: number } })?.response?.status;
+      if (status === 409) {
+        toast.error('⚠️ Đang có đồng bộ đang chạy. Vui lòng đợi hoàn tất rồi thử lại.');
+      } else if (status === 428) {
+        setShowBotSetup(true);
+      } else {
+        toast.error('Lỗi kích hoạt đồng bộ. Vui lòng thử lại.');
+      }
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const handleBotSetup = async () => {
+    if (!botPassword.trim()) {
+      toast.error('Vui lòng nhập mật khẩu.');
+      return;
+    }
+    setBotSetupLoading(true);
+    try {
+      await apiClient.post('/bot/setup', { password: botPassword });
+      setShowBotSetup(false);
+      setBotPassword('');
+      // Now trigger sync
       await apiClient.post('/invoices/sync');
-      toast.success('Đã kích hoạt đồng bộ hóa đơn!');
+      toast.success('Đã cấu hình và kích hoạt đồng bộ. Hóa đơn sẽ cập nhật sau ít phút.');
+      setTimeout(() => void load(1), 3000);
     } catch {
-      toast.error('Lỗi kích hoạt đồng bộ. Vui lòng thử lại.');
+      toast.error('Lỗi cấu hình. Vui lòng kiểm tra lại mật khẩu cổng thuế.');
+    } finally {
+      setBotSetupLoading(false);
     }
   };
 
@@ -142,15 +211,28 @@ export default function InvoicesPage() {
             )}
           </div>
         </div>
-        <button
-          onClick={triggerSync}
-          className="flex items-center gap-2 bg-primary-600 text-white px-4 py-2 rounded-lg text-sm font-medium active:bg-primary-700"
-        >
-          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-          </svg>
-          Đồng Bộ
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => void load(meta.page)}
+            disabled={loading}
+            title="Tải lại danh sách"
+            className="p-2 rounded-lg border border-gray-300 text-gray-500 hover:bg-gray-50 disabled:opacity-40"
+          >
+            <svg className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+            </svg>
+          </button>
+          <button
+            onClick={openSyncPicker}
+            disabled={syncing}
+            className="flex items-center gap-2 bg-primary-600 text-white px-4 py-2 rounded-lg text-sm font-medium active:bg-primary-700 disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            <svg className={`w-4 h-4 ${syncing ? 'animate-spin' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+            </svg>
+            {syncing ? 'Đang xử lý...' : 'Đồng Bộ'}
+          </button>
+        </div>
       </div>
 
       {/* Import session banner */}
@@ -327,6 +409,115 @@ export default function InvoicesPage() {
                 className="flex-1 py-2.5 bg-red-500 text-white rounded-xl text-sm font-medium disabled:opacity-50"
               >
                 {deleting ? 'Đang ẩn...' : 'Xác nhận ẩn'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Sync date picker modal */}
+      {showSyncPicker && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 p-4">
+          <div className="bg-white rounded-2xl w-full max-w-sm p-5 shadow-xl space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="font-bold text-gray-900">Chọn khoảng thời gian</h3>
+              <button onClick={() => setShowSyncPicker(false)} className="text-gray-400 hover:text-gray-700 text-xl">✕</button>
+            </div>
+            <p className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+              ⚠️ Quy định GDT: tối đa <strong>31 ngày</strong> mỗi lần đồng bộ.
+            </p>
+            <div className="space-y-3">
+              <div>
+                <label className="text-xs font-medium text-gray-600 block mb-1">Từ ngày</label>
+                <input
+                  type="date"
+                  value={syncFrom}
+                  max={syncTo || new Date().toISOString().slice(0, 10)}
+                  onChange={e => onSyncFromChange(e.target.value)}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="text-xs font-medium text-gray-600 block mb-1">Đến ngày</label>
+                <input
+                  type="date"
+                  value={syncTo}
+                  min={syncFrom}
+                  max={new Date().toISOString().slice(0, 10)}
+                  onChange={e => onSyncToChange(e.target.value)}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
+                />
+              </div>
+              {syncDateErr && <p className="text-xs text-red-600">{syncDateErr}</p>}
+              {syncFrom && syncTo && !syncDateErr && (
+                <p className="text-xs text-green-600">
+                  ✓ {Math.round((new Date(syncTo).getTime() - new Date(syncFrom).getTime()) / 86400000)} ngày
+                </p>
+              )}
+            </div>
+            <div className="flex gap-3">
+              <button onClick={() => setShowSyncPicker(false)}
+                className="flex-1 border border-gray-300 rounded-xl py-2.5 text-sm text-gray-700">
+                Hủy
+              </button>
+              <button
+                onClick={() => { if (syncFrom && syncTo && !syncDateErr) void triggerSync(syncFrom, syncTo); }}
+                disabled={!syncFrom || !syncTo || !!syncDateErr || syncing}
+                className="flex-1 bg-primary-600 text-white rounded-xl py-2.5 text-sm font-medium disabled:opacity-50"
+              >
+                Đồng bộ
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* GDT Bot setup modal — shown when bot not yet configured */}
+      {showBotSetup && (
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-4">
+          <div className="bg-white rounded-2xl w-full max-w-sm p-5 shadow-xl">
+            <h3 className="text-base font-bold text-gray-900 mb-1">Cấu hình đồng bộ GDT</h3>
+            <p className="text-sm text-gray-500 mb-4">
+              Nhập mật khẩu cổng thuế điện tử để bắt đầu đồng bộ hóa đơn.
+            </p>
+            <div className="mb-3">
+              <label className="text-xs font-medium text-gray-600 mb-1 block">
+                Tên đăng nhập (MST công ty — tự động)
+              </label>
+              <input
+                type="text"
+                disabled
+                value={activeCompany?.tax_code ?? ''}
+                className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm bg-gray-50 text-gray-400 cursor-not-allowed"
+              />
+            </div>
+            <div className="mb-5">
+              <label className="text-xs font-medium text-gray-600 mb-1 block">
+                Mật khẩu cổng thuế điện tử
+              </label>
+              <input
+                type="password"
+                value={botPassword}
+                onChange={(e) => setBotPassword(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') void handleBotSetup(); }}
+                placeholder="Nhập mật khẩu..."
+                autoFocus
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+              />
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={() => { setShowBotSetup(false); setBotPassword(''); }}
+                className="flex-1 py-2.5 border border-gray-300 rounded-xl text-sm font-medium text-gray-700"
+              >
+                Hủy
+              </button>
+              <button
+                onClick={() => void handleBotSetup()}
+                disabled={botSetupLoading || !botPassword.trim()}
+                className="flex-1 py-2.5 bg-primary-600 text-white rounded-xl text-sm font-medium disabled:opacity-50"
+              >
+                {botSetupLoading ? 'Đang lưu...' : 'Lưu & Đồng Bộ'}
               </button>
             </div>
           </div>

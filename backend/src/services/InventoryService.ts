@@ -58,9 +58,9 @@ export class InventoryService {
       const partner = r.direction === 'input' ? r.seller_name : r.buyer_name;
       const partnerTax = r.direction === 'input' ? r.seller_tax_code : r.buyer_tax_code;
 
-      // Get item code from product_catalog
+      // Get item code from product_catalog (normalized_name is stored lowercase/trimmed by AutoCodeService)
       const pc = await pool.query<{ item_code: string }>(
-        `SELECT item_code FROM product_catalog WHERE company_id=$1 AND LOWER(TRIM(item_name))=$2 LIMIT 1`,
+        `SELECT item_code FROM product_catalog WHERE company_id=$1 AND normalized_name=$2 LIMIT 1`,
         [companyId, normalizedName],
       );
       const itemCode = pc.rows[0]?.item_code ?? null;
@@ -80,9 +80,15 @@ export class InventoryService {
   }
 
   /** Get balance report for a given period (opening = before period, closing = through period). */
-  async getBalanceReport(companyId: string, month: number, year: number): Promise<InventoryBalanceRow[]> {
-    const periodStart = `${year}-${String(month).padStart(2, '0')}-01`;
-    const periodEnd = new Date(year, month, 0).toISOString().split('T')[0]; // last day of month
+  async getBalanceReport(
+    companyId: string,
+    month: number,
+    year: number,
+    startDateOverride?: string,
+    endDateOverride?: string,
+  ): Promise<InventoryBalanceRow[]> {
+    const periodStart = startDateOverride ?? `${year}-${String(month).padStart(2, '0')}-01`;
+    const periodEnd = endDateOverride ?? new Date(year, month, 0).toISOString().split('T')[0]; // last day of month
 
     const { rows } = await pool.query<{
       item_code: string; normalized_item_name: string; item_name: string; unit: string;

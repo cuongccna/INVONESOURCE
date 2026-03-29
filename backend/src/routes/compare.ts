@@ -52,6 +52,7 @@ router.get('/', async (req: Request, res: Response) => {
               SUM(vat_amount)   AS vat_amount
        FROM invoices
        WHERE direction = 'output' AND status = 'valid'
+         AND deleted_at IS NULL
          AND EXTRACT(MONTH FROM invoice_date) = $2
          AND EXTRACT(YEAR  FROM invoice_date) = $3
          AND company_id = ANY($1::uuid[])
@@ -64,6 +65,7 @@ router.get('/', async (req: Request, res: Response) => {
               SUM(vat_amount)   AS vat_amount
        FROM invoices
        WHERE direction = 'input' AND status = 'valid'
+         AND deleted_at IS NULL
          AND EXTRACT(MONTH FROM invoice_date) = $2
          AND EXTRACT(YEAR  FROM invoice_date) = $3
          AND company_id = ANY($1::uuid[])
@@ -73,6 +75,7 @@ router.get('/', async (req: Request, res: Response) => {
        SELECT company_id, COUNT(*) AS unvalidated
        FROM invoices
        WHERE gdt_validated = false AND status != 'cancelled'
+         AND deleted_at IS NULL
          AND company_id = ANY($1::uuid[])
        GROUP BY company_id
      ) u ON c.id = u.company_id
@@ -94,6 +97,7 @@ router.get('/', async (req: Request, res: Response) => {
      FROM invoices
      WHERE company_id = ANY($1::uuid[])
        AND status = 'valid'
+       AND deleted_at IS NULL
        AND invoice_date >= NOW() - INTERVAL '12 months'
      GROUP BY company_id, EXTRACT(MONTH FROM invoice_date), EXTRACT(YEAR FROM invoice_date)
      ORDER BY year, month`,
