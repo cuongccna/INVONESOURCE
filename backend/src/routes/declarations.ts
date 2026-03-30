@@ -93,6 +93,55 @@ router.post(
   }
 );
 
+// PATCH /api/declarations/:id/opening-balance — nhập số đầu kỳ [22] cho doanh nghiệp mới
+router.patch(
+  '/:id/opening-balance',
+  requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { opening_balance } = z
+        .object({ opening_balance: z.number().int().min(0) })
+        .parse(req.body);
+
+      // Fetch current declaration to recalculate ct25, ct41, ct43
+      const { rows } = await pool.query(
+        `SELECT ct23_deductible_input_vat, ct40a_total_output_vat, ct36_nq_vat_reduction
+         FROM tax_declarations WHERE id = $1 AND company_id = $2`,
+        [req.params.id, req.user!.companyId]
+      );
+      if (!rows[0]) throw new NotFoundError('Declaration not found');
+
+      const ct24 = opening_balance;
+      const ct23 = Number(rows[0].ct23_deductible_input_vat ?? 0);
+      const ct40a_raw = Number(rows[0].ct40a_total_output_vat ?? 0);
+      const ct36_nq  = Number(rows[0].ct36_nq_vat_reduction ?? 0);
+      const ct25 = ct23 + ct24;
+      const ct40a_adj = ct40a_raw - ct36_nq;
+      const ct41 = Math.max(0, ct40a_adj - ct25);
+      const ct43 = Math.max(0, ct25 - ct40a_adj);
+
+      const result = await pool.query(
+        `UPDATE tax_declarations
+         SET ct24_carried_over_vat = $1,
+             ct25_total_deductible  = $2,
+             ct41_payable_vat       = $3,
+             ct43_carry_forward_vat = $4,
+             xml_content            = NULL,
+             xml_generated_at       = NULL,
+             updated_at             = NOW()
+         WHERE id = $5 AND company_id = $6
+           AND submission_status NOT IN ('submitted','accepted')
+         RETURNING *`,
+        [ct24, ct25, ct41, ct43, req.params.id, req.user!.companyId]
+      );
+      if (!result.rows[0]) throw new NotFoundError('Declaration not found or already submitted');
+      sendSuccess(res, result.rows[0], 'Đã cập nhật số đầu kỳ');
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
 // PATCH /api/declarations/:id/status
 router.patch(
   '/:id/status',

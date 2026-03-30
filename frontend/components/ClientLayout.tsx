@@ -1,15 +1,32 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { useRouter, usePathname } from 'next/navigation';
 import axios from 'axios';
 import { setAccessToken } from '../lib/apiClient';
 import { CompanyProvider } from '../contexts/CompanyContext';
 import { ViewProvider } from '../contexts/ViewContext';
 import Header from './Header';
 import BottomNav from './BottomNav';
+import { useCompany } from '../contexts/CompanyContext';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
+
+/** Redirects to company creation when user has no companies yet, except on the settings page itself. */
+function NoCompanyGuard() {
+  const { companies, loading } = useCompany();
+  const router = useRouter();
+  const pathname = usePathname();
+
+  useEffect(() => {
+    if (loading) return;
+    if (companies.length === 0 && pathname !== '/settings/companies') {
+      router.replace('/settings/companies');
+    }
+  }, [loading, companies.length, pathname, router]);
+
+  return null;
+}
 
 export default function ClientLayout({ children }: { children: React.ReactNode }) {
   const [ready, setReady] = useState(false);
@@ -49,6 +66,7 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
     <CompanyProvider>
       <ViewProvider>
         <div className="min-h-screen bg-gray-50">
+          <NoCompanyGuard />
           <Header />
           <main className="pb-20 pt-14 safe-bottom">{children}</main>
           <BottomNav />

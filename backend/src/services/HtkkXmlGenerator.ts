@@ -9,6 +9,20 @@ interface CompanyInfo {
   email: string | null;
 }
 
+/** Một dòng hàng hóa/dịch vụ trong phụ lục NQ142 — phía MUA VÀO (8%). */
+interface PlucInputRow {
+  name:      string;
+  subtotal:  number;   // giá trị chưa VAT
+  vatAmount: number;   // VAT 8%
+}
+
+/** Một dòng hàng hóa/dịch vụ trong phụ lục NQ142 — phía BÁN RA (giảm 10%→8%). */
+interface PlucOutputRow {
+  name:         string;
+  subtotal:     number;   // giá trị chưa VAT
+  vatReduction: number;   // thueGTGTDuocGiam = subtotal × 2%
+}
+
 /**
  * HtkkXmlGenerator — tạo XML HTKK chuẩn TT80/2021 cho tờ khai 01/GTGT (maTKhai=842).
  *
@@ -23,14 +37,18 @@ interface CompanyInfo {
  *   </HSoThueDTu>
  *
  * Ánh xạ chỉ tiêu DB → XML (TT80/2021):
- *   ct23_deductible_input_vat  → GiaTriVaThueGTGTHHDVMuaVao/ct24
+ *   ct24_carried_over_vat      → ct22  (kết chuyển kỳ trước)
+ *   ct23_input_subtotal        → GiaTriVaThueGTGTHHDVMuaVao/ct23  (giá trị mua vào chưa VAT)
+ *   ct23_deductible_input_vat  → GiaTriVaThueGTGTHHDVMuaVao/ct24  (thuế mua vào khấu trừ)
  *   ct25_total_deductible      → ct25
- *   ct30_exempt_revenue        → ct29 (không chịu thuế)
+ *   ct30_exempt_revenue        → ct26  (HHDV không chịu thuế GTGT)
+ *   ct29 = 0                   (xuất khẩu 0% — chưa phân biệt riêng)
  *   ct32_revenue_5pct + ct33   → HHDVBRaChiuTSuat5/ct30, ct31
  *   ct36_revenue_10pct + ct34  → HHDVBRaChiuTSuat10/ct32, ct33  (8% gộp vào nhóm 10%)
- *   ct37_vat_10pct + ct35      → HHDVBRaChiuTSuat10/ct33
  *   ct40_total_output_revenue  → TongDThuVaThueGTGTHHDVBRa/ct34
- *   ct40a_total_output_vat     → ct35, ct36, ct40a, ct40
+ *   ct40a_total_output_vat     → ct35  (trước NQ142)
+ *   plucOutputSumReduction     → ct36  (giảm theo NQ142/NQ204 = 2% × DT đầu ra 8%)
+ *   ct40a - ct36               → ct40a, ct40  (sau NQ142)
  *   ct41_payable_vat           → ct41
  *   ct43_carry_forward_vat     → ct43
  */
@@ -45,32 +63,46 @@ export class HtkkXmlGenerator {
     const co = companyRows[0];
 
     // ── 2. Giá trị hàng mua vào đủ điều kiện khấu trừ (chưa VAT) ────────────
-    // HTKK ct23 (GiaTriVaThueGTGTHHDVMuaVao) = tổng subtotal (chưa VAT) của
-    // hoá đơn đầu vào hợp lệ/đã xác thực GDT trong kỳ.
-    const isQuarterly = declaration.filing_frequency === 'quarterly';
-    const inputSubtotal = await _fetchDeductibleInputSubtotal(
-      declaration.company_id,
-      declaration.period_month,
-      declaration.period_year,
-      isQuarterly
-    );
+    // Dùng giá trị đã lưu sẵn trong declaration; fallback về query nếu chưa có (khai báo cũ).
+    const isQuarterly = declaration.period_type === 'quarterly';
+    const inputSubtotal: number = (declaration.ct23_input_subtotal > 0)
+      ? declaration.ct23_input_subtotal
+      : await _fetchDeductibleInputSubtotal(
+          declaration.company_id,
+          declaration.period_month,
+          declaration.period_year,
+          isQuarterly
+        );
 
     // ── 3. Tính toán các chỉ tiêu XML ────────────────────────────────────────
     const d = declaration;
 
-    // Nhóm 10%: gộp hoá đơn 8% (giảm thuế theo NQ) vào nhóm 10%
-    const xml_ct32_revenue = d.ct36_revenue_10pct + d.ct34_revenue_8pct;
-    const xml_ct33_vat     = d.ct37_vat_10pct + d.ct35_vat_8pct;
+    // Nhóm 10%: gộp hoá đơn 8% (giảm thuế theo NQ) vào nhóm 10% trong bảng kê
+    const xml_ct32_revenue = n(d.ct36_revenue_10pct) + n(d.ct34_revenue_8pct);
+    const xml_ct33_vat     = n(d.ct37_vat_10pct) + n(d.ct35_vat_8pct);
 
     // ct27 = tổng doanh thu chịu thuế (5%+8%+10%), không bao gồm miễn thuế
-    const xml_ct27_taxable = d.ct32_revenue_5pct + xml_ct32_revenue;
-    // ct28 = tổng VAT đầu ra = ct40a
-    const xml_ct28_vat     = d.ct40a_total_output_vat;
-    // ct35 (tổng cộng bảng kê bán ra) = ct40a
-    const xml_ct35_total   = d.ct40a_total_output_vat;
-    // ct36 (thuế GTGT phải kê khai sau điều chỉnh) = ct40a
-    // (NQ142 PLuc chưa áp dụng trong generator này — ct36 = ct35)
-    const xml_ct36_declared = d.ct40a_total_output_vat;
+    const xml_ct27_taxable = n(d.ct32_revenue_5pct) + xml_ct32_revenue;
+    // ct28 = tổng VAT đầu ra gộp
+    const xml_ct28_vat     = n(d.ct40a_total_output_vat);
+    // ct35 (TongDThuVaThueGTGTHHDVBRa) = tổng VAT đầu ra gộp (trước điều chỉnh NQ142)
+    const xml_ct35_total   = n(d.ct40a_total_output_vat);
+
+    // ── 3b. Phụ lục NQ142 — chỉ lấy hoá đơn VAT = 8% ──────────────────────
+    const [plucInputItems, plucOutputItems] = await Promise.all([
+      _fetchPluc8InputItems(d.company_id, d.period_month, d.period_year, isQuarterly),
+      _fetchPluc8OutputItems(d.company_id, d.period_month, d.period_year, isQuarterly),
+    ]);
+
+    const plucInputSumSubtotal   = plucInputItems.reduce((s, r) => s + r.subtotal,     0);
+    const plucInputSumVat        = plucInputItems.reduce((s, r) => s + r.vatAmount,    0);
+    const plucOutputSumSubtotal  = plucOutputItems.reduce((s, r) => s + r.subtotal,    0);
+    const plucOutputSumReduction = plucOutputItems.reduce((s, r) => s + r.vatReduction, 0);
+
+    // ct36 = giảm thuế GTGT theo NQ142 = 2% × doanh thu bán ra 8% (từ PLuc)
+    const xml_ct36_nq142 = plucOutputSumReduction;
+    // ct40a (xml) = tổng thuế đầu ra - giảm NQ142
+    const xml_ct40a = n(d.ct40a_total_output_vat) - xml_ct36_nq142;
 
     // ── 4. Ngày kỳ khai ──────────────────────────────────────────────────────
     const period = buildPeriod(declaration.period_month, declaration.period_year, isQuarterly);
@@ -145,25 +177,25 @@ export class HtkkXmlGenerator {
                 </DiaChiHDSXKDKhacTinhNDTSC>
             </Header>
             <ct21>false</ct21>
-            <ct22>0</ct22>
+            <ct22>${n(d.ct24_carried_over_vat)}</ct22>
             <GiaTriVaThueGTGTHHDVMuaVao>
-                <ct23>${inputSubtotal}</ct23>
-                <ct24>${d.ct23_deductible_input_vat}</ct24>
+                <ct23>${n(inputSubtotal)}</ct23>
+                <ct24>${n(d.ct23_deductible_input_vat)}</ct24>
             </GiaTriVaThueGTGTHHDVMuaVao>
             <HangHoaDichVuNhapKhau>
                 <ct23a>0</ct23a>
                 <ct24a>0</ct24a>
             </HangHoaDichVuNhapKhau>
-            <ct25>${d.ct25_total_deductible}</ct25>
-            <ct26>0</ct26>
+            <ct25>${n(d.ct25_total_deductible)}</ct25>
+            <ct26>${n(d.ct30_exempt_revenue)}</ct26>
             <HHDVBRaChiuThueGTGT>
                 <ct27>${xml_ct27_taxable}</ct27>
                 <ct28>${xml_ct28_vat}</ct28>
             </HHDVBRaChiuThueGTGT>
-            <ct29>${d.ct30_exempt_revenue}</ct29>
+            <ct29>0</ct29>
             <HHDVBRaChiuTSuat5>
-                <ct30>${d.ct32_revenue_5pct}</ct30>
-                <ct31>${d.ct33_vat_5pct}</ct31>
+                <ct30>${n(d.ct32_revenue_5pct)}</ct30>
+                <ct31>${n(d.ct33_vat_5pct)}</ct31>
             </HHDVBRaChiuTSuat5>
             <HHDVBRaChiuTSuat10>
                 <ct32>${xml_ct32_revenue}</ct32>
@@ -171,21 +203,21 @@ export class HtkkXmlGenerator {
             </HHDVBRaChiuTSuat10>
             <ct32a>0</ct32a>
             <TongDThuVaThueGTGTHHDVBRa>
-                <ct34>${d.ct40_total_output_revenue}</ct34>
+                <ct34>${n(d.ct40_total_output_revenue)}</ct34>
                 <ct35>${xml_ct35_total}</ct35>
             </TongDThuVaThueGTGTHHDVBRa>
-            <ct36>${xml_ct36_declared}</ct36>
+            <ct36>${xml_ct36_nq142}</ct36>
             <ct37>0</ct37>
             <ct38>0</ct38>
             <ct39a>0</ct39a>
-            <ct40a>${d.ct40a_total_output_vat}</ct40a>
+            <ct40a>${xml_ct40a}</ct40a>
             <ct40b>0</ct40b>
-            <ct40>${d.ct40a_total_output_vat}</ct40>
-            <ct41>${d.ct41_payable_vat}</ct41>
+            <ct40>${xml_ct40a}</ct40>
+            <ct41>${n(d.ct41_payable_vat)}</ct41>
             <ct42>0</ct42>
-            <ct43>${d.ct43_carry_forward_vat}</ct43>
+            <ct43>${n(d.ct43_carry_forward_vat)}</ct43>
         </CTieuTKhaiChinh>
-        <PLuc/>
+        ${_buildPlucXml(plucInputItems, plucOutputItems, plucInputSumSubtotal, plucInputSumVat, plucOutputSumSubtotal, plucOutputSumReduction)}
     </HSoKhaiThue>
     <CKyDTu/>
 </HSoThueDTu>`;
@@ -239,6 +271,221 @@ async function _fetchDeductibleInputSubtotal(
     params
   );
   return Math.round(parseFloat(rows[0]?.total ?? '0'));
+}
+
+// ── Helpers: period date filter ───────────────────────────────────────────────
+/** Trả về điều kiện WHERE + params cho lọc kỳ kê khai theo ngày hoá đơn. */
+function _buildPeriodFilter(
+  periodMonth: number,
+  periodYear: number,
+  quarterly: boolean,
+  dateCol: string,
+  startIdx: number   // $N starting index for the next bind params
+): { clause: string; params: unknown[] } {
+  if (quarterly) {
+    const firstMonth = (periodMonth - 1) * 3 + 1;
+    const lastMonth  = periodMonth * 3;
+    return {
+      clause: `EXTRACT(MONTH FROM ${dateCol}) BETWEEN $${startIdx} AND $${startIdx + 1}
+                   AND EXTRACT(YEAR FROM ${dateCol}) = $${startIdx + 2}`,
+      params: [firstMonth, lastMonth, periodYear],
+    };
+  }
+  return {
+    clause: `EXTRACT(MONTH FROM ${dateCol}) = $${startIdx}
+                   AND EXTRACT(YEAR FROM ${dateCol}) = $${startIdx + 1}`,
+    params: [periodMonth, periodYear],
+  };
+}
+
+/**
+ * Lấy các mặt hàng MUA VÀO với VAT = 8% (NQ142) trong kỳ.
+ * Ưu tiên `invoice_line_items`; fallback về invoice header (seller_name).
+ */
+async function _fetchPluc8InputItems(
+  companyId: string,
+  periodMonth: number,
+  periodYear: number,
+  quarterly: boolean,
+): Promise<PlucInputRow[]> {
+  const pf = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'i.invoice_date', 3);
+
+  // Thử lấy từ bảng line items trước
+  const { rows: lineRows } = await pool.query<{ name: string; subtotal: string; vat_amount: string }>(
+    `SELECT
+       COALESCE(NULLIF(TRIM(ili.item_name), ''), 'Hàng hóa/dịch vụ tổng hợp') AS name,
+       COALESCE(ROUND(SUM(ili.subtotal)), 0)::bigint AS subtotal,
+       COALESCE(
+         ROUND(SUM(
+           CASE WHEN ili.vat_amount IS NOT NULL AND ili.vat_amount <> 0
+                THEN ili.vat_amount
+                ELSE ili.subtotal * ili.vat_rate / 100.0
+           END
+         )), 0
+       )::bigint AS vat_amount
+     FROM invoice_line_items ili
+     JOIN invoices i ON i.id = ili.invoice_id
+     WHERE i.company_id = $1
+       AND i.direction = 'input'
+       AND i.status = 'valid'
+       AND i.deleted_at IS NULL
+       AND ili.vat_rate = $2
+       AND ${pf.clause}
+     GROUP BY 1
+     ORDER BY SUM(ili.subtotal) DESC`,
+    [companyId, 8, ...pf.params],
+  );
+
+  if (lineRows.length > 0) {
+    return lineRows.map(r => ({
+      name:      r.name,
+      subtotal:  Math.round(n(r.subtotal)),
+      vatAmount: Math.round(n(r.vat_amount)),
+    }));
+  }
+
+  // Fallback: dùng invoice header, gom theo seller_name
+  const pf2 = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'invoice_date', 2);
+  const { rows: invRows } = await pool.query<{ name: string; subtotal: string; vat_amount: string }>(
+    `SELECT
+       COALESCE(NULLIF(TRIM(seller_name), ''), 'Hàng hóa/dịch vụ tổng hợp') AS name,
+       COALESCE(ROUND(SUM(subtotal)), 0)::bigint AS subtotal,
+       COALESCE(
+         ROUND(SUM(
+           CASE WHEN vat_amount IS NOT NULL AND vat_amount <> 0
+                THEN vat_amount
+                ELSE subtotal * vat_rate / 100.0
+           END
+         )), 0
+       )::bigint AS vat_amount
+     FROM invoices
+     WHERE company_id = $1
+       AND direction = 'input'
+       AND vat_rate = 8
+       AND status = 'valid'
+       AND deleted_at IS NULL
+       AND ${pf2.clause}
+     GROUP BY 1
+     ORDER BY SUM(subtotal) DESC`,
+    [companyId, ...pf2.params],
+  );
+
+  return invRows.map(r => ({
+    name:      r.name,
+    subtotal:  Math.round(n(r.subtotal)),
+    vatAmount: Math.round(n(r.vat_amount)),
+  }));
+}
+
+/**
+ * Lấy các mặt hàng BÁN RA với VAT = 8% (NQ142, giảm từ 10%) trong kỳ.
+ * Ưu tiên `invoice_line_items`; fallback về invoice header (buyer_name).
+ */
+async function _fetchPluc8OutputItems(
+  companyId: string,
+  periodMonth: number,
+  periodYear: number,
+  quarterly: boolean,
+): Promise<PlucOutputRow[]> {
+  const pf = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'i.invoice_date', 3);
+
+  const { rows: lineRows } = await pool.query<{ name: string; subtotal: string }>(
+    `SELECT
+       COALESCE(NULLIF(TRIM(ili.item_name), ''), 'Hàng hóa/dịch vụ tổng hợp') AS name,
+       COALESCE(ROUND(SUM(ili.subtotal)), 0)::bigint AS subtotal
+     FROM invoice_line_items ili
+     JOIN invoices i ON i.id = ili.invoice_id
+     WHERE i.company_id = $1
+       AND i.direction = 'output'
+       AND i.status = 'valid'
+       AND i.deleted_at IS NULL
+       AND ili.vat_rate = $2
+       AND ${pf.clause}
+     GROUP BY 1
+     ORDER BY SUM(ili.subtotal) DESC`,
+    [companyId, 8, ...pf.params],
+  );
+
+  const toOutputRow = (name: string, subtotal: number): PlucOutputRow => ({
+    name,
+    subtotal,
+    vatReduction: Math.round(subtotal * 0.02),  // giảm 2% = (10% - 8%)
+  });
+
+  if (lineRows.length > 0) {
+    return lineRows.map(r => toOutputRow(r.name, Math.round(n(r.subtotal))));
+  }
+
+  // Fallback: gom theo buyer_name (hoặc tên generic nếu không có)
+  const pf2 = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'invoice_date', 2);
+  const { rows: invRows } = await pool.query<{ name: string; subtotal: string }>(
+    `SELECT
+       COALESCE(NULLIF(TRIM(buyer_name), ''), 'Hàng hóa/dịch vụ tổng hợp') AS name,
+       COALESCE(ROUND(SUM(subtotal)), 0)::bigint AS subtotal
+     FROM invoices
+     WHERE company_id = $1
+       AND direction = 'output'
+       AND vat_rate = 8
+       AND status = 'valid'
+       AND deleted_at IS NULL
+       AND ${pf2.clause}
+     GROUP BY 1
+     ORDER BY SUM(subtotal) DESC`,
+    [companyId, ...pf2.params],
+  );
+
+  return invRows.map(r => toOutputRow(r.name, Math.round(n(r.subtotal))));
+}
+
+/**
+ * Tạo block XML <PLuc> cho phụ lục NQ142.
+ * Trả về <PLuc/> nếu không có mặt hàng 8% nào.
+ */
+function _buildPlucXml(
+  inputItems:         PlucInputRow[],
+  outputItems:        PlucOutputRow[],
+  inputSumSubtotal:   number,
+  inputSumVat:        number,
+  outputSumSubtotal:  number,
+  outputSumReduction: number,
+): string {
+  if (inputItems.length === 0 && outputItems.length === 0) return '<PLuc/>';
+
+  const ct9 = outputSumReduction - inputSumVat;
+
+  const inputRows = inputItems.map((item, i) => `\
+                    <BangKeTenHHDV ID="${i + 1}">
+                        <tenHHDVMuaVao>${escapeXml(item.name)}</tenHHDVMuaVao>
+                        <giaTriHHDVMuaVao>${item.subtotal}</giaTriHHDVMuaVao>
+                        <thueGTGTHHDV>${item.vatAmount}</thueGTGTHHDV>
+                    </BangKeTenHHDV>`).join('\n');
+
+  const outputRows = outputItems.map((item, i) => `\
+                    <BangKeTenHHDV ID="${i + 1}">
+                        <tenHHDV>${escapeXml(item.name)}</tenHHDV>
+                        <giaTriHHDV>${item.subtotal}</giaTriHHDV>
+                        <thueSuatTheoQuyDinh>10</thueSuatTheoQuyDinh>
+                        <thueSuatSauGiam>8</thueSuatSauGiam>
+                        <thueGTGTDuocGiam>${item.vatReduction}</thueGTGTDuocGiam>
+                    </BangKeTenHHDV>`).join('\n');
+
+  return `<PLuc>
+            <PL_NQ142_GTGT>
+                <HH_DV_MuaVaoTrongKy>
+${inputRows}
+                    <tongCongGiaTriHHDVMuaVao>${inputSumSubtotal}</tongCongGiaTriHHDVMuaVao>
+                    <tongCongThueGTGTHHDV>${inputSumVat}</tongCongThueGTGTHHDV>
+                </HH_DV_MuaVaoTrongKy>
+                <HH_DV_BanRaTrongKy>
+${outputRows}
+                    <tongCongGiaTriHHDV>${outputSumSubtotal}</tongCongGiaTriHHDV>
+                    <tongCongThueGTGTDuocGiam>${outputSumReduction}</tongCongThueGTGTDuocGiam>
+                </HH_DV_BanRaTrongKy>
+                <ChenhLech>
+                    <ct9>${ct9}</ct9>
+                </ChenhLech>
+            </PL_NQ142_GTGT>
+        </PLuc>`;
 }
 
 interface PeriodInfo {
@@ -301,4 +548,10 @@ function escapeXml(str: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&apos;');
+}
+
+/** Chuyển đổi an toàn giá trị null/undefined/NaN từ DB về số (mặc định 0). */
+function n(val: unknown): number {
+  const x = Number(val);
+  return isNaN(x) ? 0 : x;
 }

@@ -18,6 +18,7 @@ interface Declaration {
   submission_status: string;
   ct22_total_input_vat: number;
   ct23_deductible_input_vat: number;
+  ct23_input_subtotal: number;
   ct24_carried_over_vat: number;
   ct25_total_deductible: number;
   ct29_total_revenue: number;
@@ -28,6 +29,7 @@ interface Declaration {
   ct35_vat_8pct: number;
   ct36_revenue_10pct: number;
   ct37_vat_10pct: number;
+  ct36_nq_vat_reduction: number;
   ct40_total_output_revenue: number;
   ct40a_total_output_vat: number;
   ct41_payable_vat: number;
@@ -106,6 +108,9 @@ export default function DeclarationDetailPage() {
   const [showTvanConfirm, setShowTvanConfirm] = useState(false);
   const [tvanResult, setTvanResult] = useState<{ submissionId: string; status: string; message?: string } | null>(null);
   const [activeTab, setActiveTab] = useState<'form' | 'pl011' | 'pl012'>('form');
+  const [editingOB, setEditingOB] = useState(false);
+  const [obInput, setObInput] = useState('');
+  const [savingOB, setSavingOB] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -156,6 +161,27 @@ export default function DeclarationDetailPage() {
       URL.revokeObjectURL(url);
     } catch {
       toast.error('Lỗi tải bảng kê. Vui lòng thử lại.');
+    }
+  };
+
+  const saveOpeningBalance = async () => {
+    if (!decl) return;
+    const raw = obInput.replace(/[^0-9]/g, '');
+    const val = parseInt(raw || '0', 10);
+    setSavingOB(true);
+    try {
+      // Use PATCH response directly to update state — instant recompute of ct25/ct41/ct43
+      const res = await apiClient.patch<{ data: Declaration }>(
+        `/declarations/${decl.id}/opening-balance`,
+        { opening_balance: val }
+      );
+      setDecl(res.data.data);
+      setEditingOB(false);
+      toast.success('Đã lưu số đầu kỳ');
+    } catch {
+      toast.error('Lỗi lưu số đầu kỳ. Vui lòng thử lại.');
+    } finally {
+      setSavingOB(false);
     }
   };
 
@@ -285,74 +311,204 @@ export default function DeclarationDetailPage() {
         <div className="bg-white rounded-xl border border-gray-100 overflow-hidden">
           <table className="w-full px-4">
             <tbody className="divide-y divide-transparent px-4">
+              {/* ─ Section I: Thuế đầu vào ─ */}
               <tr><td colSpan={3} className="px-4 pt-4 pb-1">
                 <p className="text-xs font-semibold text-primary-700 uppercase tracking-wider">I. Thuế đầu vào</p>
               </td></tr>
-              <tr className="border-b border-gray-50 hover:bg-gray-50/50">
+              {/* ── [22] row: display + inline pencil edit trigger ── */}
+              <tr className={`border-b ${editingOB ? 'border-primary-100 bg-primary-50/30' : 'border-gray-50 hover:bg-gray-50/50'}`}>
                 <td className="py-2 pr-3 w-12 pl-4">
                   <span className="text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-mono">[22]</span>
                 </td>
-                <td className="py-2 pr-3 text-sm text-gray-600">Tổng thuế GTGT đầu vào</td>
-                <td className="py-2 pr-4 text-right text-sm tabular-nums text-gray-900">{vnd(decl.ct22_total_input_vat)}</td>
+                <td className="py-2 pr-3 text-sm text-gray-600 leading-snug">
+                  Thuế GTGT còn được khấu trừ kỳ trước chuyển sang
+                </td>
+                <td className="py-2 pr-4 text-right text-sm tabular-nums">
+                  <div className="flex items-center justify-end gap-2">
+                    <span className={decl.ct24_carried_over_vat === 0 ? 'text-gray-400' : 'text-gray-900'}>
+                      {vnd(decl.ct24_carried_over_vat)}
+                    </span>
+                    {!editingOB && !['submitted', 'accepted'].includes(decl.submission_status) && (
+                      <button
+                        onClick={() => { setObInput(String(decl.ct24_carried_over_vat || '')); setEditingOB(true); }}
+                        title="Nhập số đầu kỳ"
+                        className="flex-shrink-0 text-gray-300 hover:text-primary-500 transition-colors"
+                      >
+                        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.536L16.732 3.732z" />
+                        </svg>
+                      </button>
+                    )}
+                  </div>
+                </td>
               </tr>
+              {/* ── [22] edit form: spans full width, mobile-friendly ── */}
+              {editingOB && (
+                <tr>
+                  <td colSpan={3} className="px-4 pb-3 pt-2">
+                    <div className="flex items-center gap-2 bg-white border border-primary-300 rounded-xl px-3 py-2.5 shadow-sm">
+                      <label className="text-xs text-primary-700 font-medium whitespace-nowrap flex-shrink-0">Số đầu kỳ:</label>
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        className="flex-1 min-w-0 border border-gray-200 rounded-lg px-2.5 py-1.5 text-right text-sm tabular-nums focus:outline-none focus:ring-2 focus:ring-primary-300 focus:border-primary-400"
+                        value={obInput}
+                        onChange={e => setObInput(e.target.value.replace(/[^0-9]/g, ''))}
+                        onKeyDown={e => { if (e.key === 'Enter') void saveOpeningBalance(); if (e.key === 'Escape') setEditingOB(false); }}
+                        autoFocus
+                        placeholder="0"
+                      />
+                      <button
+                        onClick={() => void saveOpeningBalance()}
+                        disabled={savingOB}
+                        className="flex-shrink-0 px-3 py-1.5 bg-primary-600 text-white rounded-lg text-xs font-semibold hover:bg-primary-700 disabled:opacity-50 transition-colors"
+                      >
+                        {savingOB ? '…' : 'Lưu'}
+                      </button>
+                      <button
+                        onClick={() => setEditingOB(false)}
+                        className="flex-shrink-0 px-3 py-1.5 bg-gray-100 text-gray-600 rounded-lg text-xs hover:bg-gray-200 transition-colors"
+                      >
+                        Huỷ
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              )}
+              {/* Opening balance hint for new users */}
+              {decl.ct24_carried_over_vat === 0 && !editingOB && !['submitted','accepted'].includes(decl.submission_status) && (
+                <tr>
+                  <td colSpan={3} className="px-4 pb-2 pt-0">
+                    <button
+                      onClick={() => { setObInput(''); setEditingOB(true); }}
+                      className="text-xs text-primary-600 hover:text-primary-700 underline underline-offset-2"
+                    >
+                      + Nhập số đầu kỳ (nếu doanh nghiệp đang chuyển từ hệ thống khác)
+                    </button>
+                  </td>
+                </tr>
+              )}
               <tr className="border-b border-gray-50 hover:bg-gray-50/50">
                 <td className="py-2 pr-3 w-12 pl-4">
                   <span className="text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-mono">[23]</span>
                 </td>
-                <td className="py-2 pr-3 text-sm text-gray-600">Thuế đầu vào được khấu trừ kỳ này</td>
-                <td className="py-2 pr-4 text-right text-sm tabular-nums font-semibold text-gray-900">{vnd(decl.ct23_deductible_input_vat)}</td>
+                <td className="py-2 pr-3 text-sm text-gray-600">Giá trị HHDV mua vào trong kỳ (chưa thuế)</td>
+                <td className="py-2 pr-4 text-right text-sm tabular-nums text-gray-900">{vnd(decl.ct23_input_subtotal)}</td>
               </tr>
               <tr className="border-b border-gray-50 hover:bg-gray-50/50">
                 <td className="py-2 pr-3 w-12 pl-4">
                   <span className="text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-mono">[24]</span>
                 </td>
-                <td className="py-2 pr-3 text-sm text-gray-600">Thuế kết chuyển từ kỳ trước</td>
-                <td className="py-2 pr-4 text-right text-sm tabular-nums text-gray-900">{vnd(decl.ct24_carried_over_vat)}</td>
+                <td className="py-2 pr-3 text-sm text-gray-600">Thuế GTGT HHDV mua vào đủ điều kiện khấu trừ</td>
+                <td className="py-2 pr-4 text-right text-sm tabular-nums font-semibold text-gray-900">{vnd(decl.ct23_deductible_input_vat)}</td>
               </tr>
               <tr className="border-b border-gray-100 hover:bg-gray-50/50">
                 <td className="py-2 pr-3 w-12 pl-4">
                   <span className="text-xs bg-primary-100 text-primary-700 px-1.5 py-0.5 rounded font-mono font-bold">[25]</span>
                 </td>
-                <td className="py-2 pr-3 text-sm font-semibold text-gray-700">Tổng thuế đầu vào được khấu trừ = [23]+[24]</td>
+                <td className="py-2 pr-3 text-sm font-semibold text-gray-700">Tổng thuế đầu vào được khấu trừ = [22]+[24]</td>
                 <td className="py-2 pr-4 text-right text-sm tabular-nums font-bold text-gray-900">{vnd(decl.ct25_total_deductible)}</td>
               </tr>
 
+              {/* ─ Section II: Doanh thu & Thuế đầu ra ─ */}
               <tr><td colSpan={3} className="px-4 pt-5 pb-1">
-                <p className="text-xs font-semibold text-primary-700 uppercase tracking-wider">II. Doanh thu & Thuế đầu ra</p>
+                <p className="text-xs font-semibold text-primary-700 uppercase tracking-wider">II. Doanh thu &amp; Thuế đầu ra</p>
               </td></tr>
-              {[
-                { code: '29', label: 'Tổng doanh thu hàng hoá, dịch vụ bán ra', value: decl.ct29_total_revenue },
-                { code: '30', label: 'Doanh thu không chịu thuế (0%)', value: decl.ct30_exempt_revenue },
-                { code: '32', label: 'Doanh thu thuế suất 5%', value: decl.ct32_revenue_5pct },
-                { code: '33', label: 'Thuế GTGT 5%', value: decl.ct33_vat_5pct },
-                { code: '34', label: 'Doanh thu thuế suất 8%', value: decl.ct34_revenue_8pct },
-                { code: '35', label: 'Thuế GTGT 8%', value: decl.ct35_vat_8pct },
-                { code: '36', label: 'Doanh thu thuế suất 10%', value: decl.ct36_revenue_10pct },
-                { code: '37', label: 'Thuế GTGT 10%', value: decl.ct37_vat_10pct },
-              ].map((r) => (
-                <tr key={r.code} className="border-b border-gray-50 hover:bg-gray-50/50">
+              {decl.ct30_exempt_revenue > 0 && (
+                <tr className="border-b border-gray-50 hover:bg-gray-50/50">
                   <td className="py-2 pr-3 w-12 pl-4">
-                    <span className="text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-mono">[{r.code}]</span>
+                    <span className="text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-mono">[26]</span>
                   </td>
-                  <td className="py-2 pr-3 text-sm text-gray-600">{r.label}</td>
-                  <td className="py-2 pr-4 text-right text-sm tabular-nums text-gray-900">{vnd(r.value)}</td>
+                  <td className="py-2 pr-3 text-sm text-gray-600">HHDV không chịu thuế GTGT</td>
+                  <td className="py-2 pr-4 text-right text-sm tabular-nums text-gray-900">{vnd(decl.ct30_exempt_revenue)}</td>
                 </tr>
-              ))}
+              )}
+              {(decl.ct32_revenue_5pct > 0 || decl.ct33_vat_5pct > 0) && (<>
+                <tr className="border-b border-gray-50 hover:bg-gray-50/50">
+                  <td className="py-2 pr-3 w-12 pl-4">
+                    <span className="text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-mono">[30]</span>
+                  </td>
+                  <td className="py-2 pr-3 text-sm text-gray-600">Doanh thu HHDV thuế suất 5%</td>
+                  <td className="py-2 pr-4 text-right text-sm tabular-nums text-gray-900">{vnd(decl.ct32_revenue_5pct)}</td>
+                </tr>
+                <tr className="border-b border-gray-50 hover:bg-gray-50/50">
+                  <td className="py-2 pr-3 w-12 pl-4">
+                    <span className="text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-mono">[31]</span>
+                  </td>
+                  <td className="py-2 pr-3 text-sm text-gray-600">Thuế GTGT 5%</td>
+                  <td className="py-2 pr-4 text-right text-sm tabular-nums text-gray-900">{vnd(decl.ct33_vat_5pct)}</td>
+                </tr>
+              </>)}
+              {/* 10% group (gộp 8%+10% per NQ142) */}
+              {(() => {
+                const rev10 = decl.ct36_revenue_10pct + decl.ct34_revenue_8pct;
+                const vat10 = decl.ct37_vat_10pct + decl.ct35_vat_8pct;
+                if (rev10 === 0 && vat10 === 0) return null;
+                return (<>
+                  <tr className="border-b border-gray-50 hover:bg-gray-50/50">
+                    <td className="py-2 pr-3 w-12 pl-4">
+                      <span className="text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-mono">[32]</span>
+                    </td>
+                    <td className="py-2 pr-3 text-sm text-gray-600">
+                      Doanh thu HHDV thuế suất 10%
+                      {decl.ct34_revenue_8pct > 0 && (
+                        <span className="ml-1.5 text-xs text-amber-600">(bao gồm {vnd(decl.ct34_revenue_8pct)} tạm giảm 8% theo NQ)</span>
+                      )}
+                    </td>
+                    <td className="py-2 pr-4 text-right text-sm tabular-nums text-gray-900">{vnd(rev10)}</td>
+                  </tr>
+                  <tr className="border-b border-gray-50 hover:bg-gray-50/50">
+                    <td className="py-2 pr-3 w-12 pl-4">
+                      <span className="text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-mono">[33]</span>
+                    </td>
+                    <td className="py-2 pr-3 text-sm text-gray-600">Thuế GTGT 10%</td>
+                    <td className="py-2 pr-4 text-right text-sm tabular-nums text-gray-900">{vnd(vat10)}</td>
+                  </tr>
+                </>);
+              })()}
               <tr className="border-b border-gray-50 hover:bg-gray-50/50">
                 <td className="py-2 pr-3 w-12 pl-4">
-                  <span className="text-xs bg-primary-100 text-primary-700 px-1.5 py-0.5 rounded font-mono font-bold">[40]</span>
+                  <span className="text-xs bg-primary-100 text-primary-700 px-1.5 py-0.5 rounded font-mono font-bold">[34]</span>
                 </td>
-                <td className="py-2 pr-3 text-sm font-semibold text-gray-700">Tổng doanh thu (không kể miễn thuế)</td>
+                <td className="py-2 pr-3 text-sm font-semibold text-gray-700">Tổng doanh thu HHDV bán ra</td>
                 <td className="py-2 pr-4 text-right text-sm tabular-nums font-bold text-gray-900">{vnd(decl.ct40_total_output_revenue)}</td>
               </tr>
               <tr className="border-b border-gray-50 hover:bg-gray-50/50">
                 <td className="py-2 pr-3 w-12 pl-4">
-                  <span className="text-xs bg-primary-100 text-primary-700 px-1.5 py-0.5 rounded font-mono font-bold">[40a]</span>
+                  <span className="text-xs bg-primary-100 text-primary-700 px-1.5 py-0.5 rounded font-mono font-bold">[35]</span>
                 </td>
-                <td className="py-2 pr-3 text-sm font-semibold text-gray-700">Tổng thuế GTGT đầu ra</td>
+                <td className="py-2 pr-3 text-sm font-semibold text-gray-700">Tổng thuế GTGT đầu ra (trước điều chỉnh NQ)</td>
                 <td className="py-2 pr-4 text-right text-sm tabular-nums font-bold text-gray-900">{vnd(decl.ct40a_total_output_vat)}</td>
               </tr>
+              {(() => {
+                const nq = Number(decl.ct36_nq_vat_reduction ?? 0);
+                if (nq === 0) return null;
+                return (
+                  <tr className="border-b border-amber-50 bg-amber-50/30 hover:bg-amber-50/60">
+                    <td className="py-2 pr-3 w-12 pl-4">
+                      <span className="text-xs bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded font-mono font-bold">[36]</span>
+                    </td>
+                    <td className="py-2 pr-3 text-sm text-amber-800">Giảm thuế GTGT theo NQ142/NQ204 (2% × DT 8%)</td>
+                    <td className="py-2 pr-4 text-right text-sm tabular-nums font-semibold text-amber-700">− {vnd(nq)}</td>
+                  </tr>
+                );
+              })()}
+              {(() => {
+                const nq = Number(decl.ct36_nq_vat_reduction ?? 0);
+                if (nq === 0) return null;
+                const adj = decl.ct40a_total_output_vat - nq;
+                return (
+                  <tr className="border-b border-gray-100 hover:bg-gray-50/50">
+                    <td className="py-2 pr-3 w-12 pl-4">
+                      <span className="text-xs bg-primary-100 text-primary-700 px-1.5 py-0.5 rounded font-mono font-bold">[40a]</span>
+                    </td>
+                    <td className="py-2 pr-3 text-sm font-semibold text-gray-700">Tổng thuế đầu ra sau điều chỉnh NQ = [35]−[36]</td>
+                    <td className="py-2 pr-4 text-right text-sm tabular-nums font-bold text-gray-900">{vnd(adj)}</td>
+                  </tr>
+                );
+              })()}
 
+              {/* ─ Section III: Kết quả ─ */}
               <tr><td colSpan={3} className="px-4 pt-5 pb-1">
                 <p className="text-xs font-semibold text-primary-700 uppercase tracking-wider">III. Kết quả</p>
               </td></tr>

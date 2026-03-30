@@ -152,10 +152,12 @@ export interface TaxDeclaration {
   period_month: number;
   period_year: number;
   form_type: string;
+  period_type: string;             // 'monthly' | 'quarterly' — giá trị thực tế trong DB
   declaration_method: DeclarationMethod;
   filing_frequency: FilingFrequency;
   ct22_total_input_vat: number;
   ct23_deductible_input_vat: number;
+  ct23_input_subtotal: number;
   ct24_carried_over_vat: number;
   ct25_total_deductible: number;
   ct29_total_revenue: number;
@@ -166,6 +168,7 @@ export interface TaxDeclaration {
   ct35_vat_8pct: number;
   ct36_revenue_10pct: number;
   ct37_vat_10pct: number;
+  ct36_nq_vat_reduction: number;
   ct40_total_output_revenue: number;
   ct40a_total_output_vat: number;
   ct41_payable_vat: number;

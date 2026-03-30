@@ -29,32 +29,41 @@ export class TaxDeclarationEngine {
     // [25] = [23] + [24]
     const ct25 = vat.ct23_deductible_input_vat + ct24;
 
-    // [41] = MAX(0, [40a] - [25]) → must pay
-    const ct41 = Math.max(0, vat.ct40a_total_output_vat - ct25);
+    // NQ142/NQ204: giảm thuế = 2% × doanh thu đầu ra 8%
+    const ct36_nq = Math.round(vat.ct34_revenue_8pct * 0.02);
 
-    // [43] = MAX(0, [25] - [40a]) → carry to next period
-    const ct43 = Math.max(0, ct25 - vat.ct40a_total_output_vat);
+    // [40a] sau NQ142 = tổng thuế đầu ra - giảm NQ
+    const ct40a_adjusted = Math.round(vat.ct40a_total_output_vat) - ct36_nq;
+
+    // [41] = MAX(0, [40a_adj] - [25]) → phải nộp
+    const ct41 = Math.max(0, ct40a_adjusted - ct25);
+
+    // [43] = MAX(0, [25] - [40a_adj]) → kết chuyển
+    const ct43 = Math.max(0, ct25 - ct40a_adjusted);
 
     // Upsert tax_declarations
     const id = uuidv4();
     await pool.query(
       `INSERT INTO tax_declarations (
         id, company_id, period_month, period_year, form_type, period_type,
-        ct22_total_input_vat, ct23_deductible_input_vat, ct24_carried_over_vat, ct25_total_deductible,
+        ct22_total_input_vat, ct23_deductible_input_vat, ct23_input_subtotal,
+        ct24_carried_over_vat, ct25_total_deductible,
         ct29_total_revenue, ct30_exempt_revenue,
         ct32_revenue_5pct, ct33_vat_5pct,
         ct34_revenue_8pct, ct35_vat_8pct,
         ct36_revenue_10pct, ct37_vat_10pct,
+        ct36_nq_vat_reduction,
         ct40_total_output_revenue, ct40a_total_output_vat,
         ct41_payable_vat, ct43_carry_forward_vat,
         submission_status, updated_at
       ) VALUES (
-        $1,$2,$3,$4,'01/GTGT','monthly',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,NOW()
+        $1,$2,$3,$4,'01/GTGT','monthly',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,NOW()
       )
       ON CONFLICT (company_id, period_month, period_year, form_type, period_type)
       DO UPDATE SET
         ct22_total_input_vat = EXCLUDED.ct22_total_input_vat,
         ct23_deductible_input_vat = EXCLUDED.ct23_deductible_input_vat,
+        ct23_input_subtotal = EXCLUDED.ct23_input_subtotal,
         ct24_carried_over_vat = EXCLUDED.ct24_carried_over_vat,
         ct25_total_deductible = EXCLUDED.ct25_total_deductible,
         ct29_total_revenue = EXCLUDED.ct29_total_revenue,
@@ -65,6 +74,7 @@ export class TaxDeclarationEngine {
         ct35_vat_8pct = EXCLUDED.ct35_vat_8pct,
         ct36_revenue_10pct = EXCLUDED.ct36_revenue_10pct,
         ct37_vat_10pct = EXCLUDED.ct37_vat_10pct,
+        ct36_nq_vat_reduction = EXCLUDED.ct36_nq_vat_reduction,
         ct40_total_output_revenue = EXCLUDED.ct40_total_output_revenue,
         ct40a_total_output_vat = EXCLUDED.ct40a_total_output_vat,
         ct41_payable_vat = EXCLUDED.ct41_payable_vat,
@@ -77,6 +87,7 @@ export class TaxDeclarationEngine {
         id, companyId, month, year,
         Math.round(vat.ct22_total_input_vat),
         Math.round(vat.ct23_deductible_input_vat),
+        Math.round(vat.ct23_input_subtotal),
         Math.round(ct24),
         Math.round(ct25),
         Math.round(vat.ct29_total_revenue),
@@ -87,6 +98,7 @@ export class TaxDeclarationEngine {
         Math.round(vat.ct35_vat_8pct),
         Math.round(vat.ct36_revenue_10pct),
         Math.round(vat.ct37_vat_10pct),
+        ct36_nq,
         Math.round(vat.ct40_total_output_revenue),
         Math.round(vat.ct40a_total_output_vat),
         Math.round(ct41),
@@ -118,28 +130,36 @@ export class TaxDeclarationEngine {
     const vat  = await this.vatService.calculateQuarter(companyId, quarter, year);
     const ct24 = await this.getCarryForwardQuarterly(companyId, quarter, year);
     const ct25 = vat.ct23_deductible_input_vat + ct24;
-    const ct41 = Math.max(0, vat.ct40a_total_output_vat - ct25);
-    const ct43 = Math.max(0, ct25 - vat.ct40a_total_output_vat);
+
+    // NQ142/NQ204: giảm thuế = 2% × doanh thu đầu ra 8%
+    const ct36_nq = Math.round(vat.ct34_revenue_8pct * 0.02);
+    const ct40a_adjusted = Math.round(vat.ct40a_total_output_vat) - ct36_nq;
+
+    const ct41 = Math.max(0, ct40a_adjusted - ct25);
+    const ct43 = Math.max(0, ct25 - ct40a_adjusted);
 
     const id = uuidv4();
     await pool.query(
       `INSERT INTO tax_declarations (
         id, company_id, period_month, period_year, form_type, period_type,
-        ct22_total_input_vat, ct23_deductible_input_vat, ct24_carried_over_vat, ct25_total_deductible,
+        ct22_total_input_vat, ct23_deductible_input_vat, ct23_input_subtotal,
+        ct24_carried_over_vat, ct25_total_deductible,
         ct29_total_revenue, ct30_exempt_revenue,
         ct32_revenue_5pct, ct33_vat_5pct,
         ct34_revenue_8pct, ct35_vat_8pct,
         ct36_revenue_10pct, ct37_vat_10pct,
+        ct36_nq_vat_reduction,
         ct40_total_output_revenue, ct40a_total_output_vat,
         ct41_payable_vat, ct43_carry_forward_vat,
         submission_status, updated_at
       ) VALUES (
-        $1,$2,$3,$4,'01/GTGT','quarterly',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,NOW()
+        $1,$2,$3,$4,'01/GTGT','quarterly',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,NOW()
       )
       ON CONFLICT (company_id, period_month, period_year, form_type, period_type)
       DO UPDATE SET
         ct22_total_input_vat = EXCLUDED.ct22_total_input_vat,
         ct23_deductible_input_vat = EXCLUDED.ct23_deductible_input_vat,
+        ct23_input_subtotal = EXCLUDED.ct23_input_subtotal,
         ct24_carried_over_vat = EXCLUDED.ct24_carried_over_vat,
         ct25_total_deductible = EXCLUDED.ct25_total_deductible,
         ct29_total_revenue = EXCLUDED.ct29_total_revenue,
@@ -150,6 +170,7 @@ export class TaxDeclarationEngine {
         ct35_vat_8pct = EXCLUDED.ct35_vat_8pct,
         ct36_revenue_10pct = EXCLUDED.ct36_revenue_10pct,
         ct37_vat_10pct = EXCLUDED.ct37_vat_10pct,
+        ct36_nq_vat_reduction = EXCLUDED.ct36_nq_vat_reduction,
         ct40_total_output_revenue = EXCLUDED.ct40_total_output_revenue,
         ct40a_total_output_vat = EXCLUDED.ct40a_total_output_vat,
         ct41_payable_vat = EXCLUDED.ct41_payable_vat,
@@ -162,11 +183,13 @@ export class TaxDeclarationEngine {
         id, companyId, quarter, year,
         Math.round(vat.ct22_total_input_vat),
         Math.round(vat.ct23_deductible_input_vat),
+        Math.round(vat.ct23_input_subtotal),
         Math.round(ct24), Math.round(ct25),
         Math.round(vat.ct29_total_revenue), Math.round(vat.ct30_exempt_revenue),
         Math.round(vat.ct32_revenue_5pct),  Math.round(vat.ct33_vat_5pct),
         Math.round(vat.ct34_revenue_8pct),  Math.round(vat.ct35_vat_8pct),
         Math.round(vat.ct36_revenue_10pct), Math.round(vat.ct37_vat_10pct),
+        ct36_nq,
         Math.round(vat.ct40_total_output_revenue),
         Math.round(vat.ct40a_total_output_vat),
         Math.round(ct41), Math.round(ct43),

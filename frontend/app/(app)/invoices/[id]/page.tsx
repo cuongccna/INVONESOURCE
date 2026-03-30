@@ -190,8 +190,15 @@ export default function InvoiceDetailPage() {
               const qty = Number(li.quantity) || 0;
               const price = Number(li.unit_price) || 0;
               const liSubtotal = Number(li.subtotal) || 0;
-              const liVat = Number(li.vat_amount) || 0;
-              const liTotal = Number(li.total) || 0;
+              const liVatRate  = Number(li.vat_rate) || 0;
+              // Fallback: if vat_amount is missing, compute from subtotal × vat_rate
+              const liVat = Number(li.vat_amount) > 0
+                ? Number(li.vat_amount)
+                : (liVatRate > 0 ? Math.round(liSubtotal * liVatRate / 100) : 0);
+              // Fallback: if total is missing, compute from subtotal + vat
+              const liTotal = Number(li.total) > 0
+                ? Number(li.total)
+                : liSubtotal + liVat;
               return (
                 <div key={li.id ?? idx} className="border border-gray-100 rounded-lg p-3">
                   <div className="flex justify-between items-start mb-1">

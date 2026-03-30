@@ -81,6 +81,15 @@ export default function CompaniesSettingsPage() {
     void loadCompanies();
   }, [loadCompanies]);
 
+  // Auto-open create modal when user has no companies (first login)
+  useEffect(() => {
+    if (!loading && companies.length === 0) {
+      openCreate();
+    }
+    // Run only after initial load
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading]);
+
   const openCreate = () => {
     setEditTarget(null);
     setForm(EMPTY_FORM);
@@ -289,9 +298,18 @@ export default function CompaniesSettingsPage() {
                     required
                     value={form.tax_code}
                     onChange={(e) => setForm({ ...form, tax_code: e.target.value })}
-                    className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary-300"
+                    className="w-full border border-amber-400 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-amber-400"
                     placeholder="0123456789"
                   />
+                  {!editTarget && (
+                    <div className="mt-1.5 flex items-start gap-1.5 bg-amber-50 border border-amber-300 rounded-lg px-3 py-2 text-xs text-amber-800">
+                      <span className="text-base leading-none mt-0.5">&#9888;&#xFE0F;</span>
+                      <span>
+                        <strong>Mã số thuế phải chính xác.</strong> Hệ thống dùng MST này để đăng nhập cổng thuế GDT
+                        tự động đồng bộ hóa đơn. Sai MST sẽ không kết nối được.
+                      </span>
+                    </div>
+                  )}
                 </div>
 
                 <div className="grid grid-cols-2 gap-3">

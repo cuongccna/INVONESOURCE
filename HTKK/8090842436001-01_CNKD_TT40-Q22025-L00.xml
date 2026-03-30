@@ -1,0 +1,295 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<HSoThueDTu xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://kekhaithue.gdt.gov.vn/TKhaiThue">
+  <HSoKhaiThue id="ID_1">
+    <TTinChung>
+      <TTinDVu>
+        <maDVu>HTKK</maDVu>
+        <tenDVu>HỖ TRỢ KÊ KHAI THUẾ</tenDVu>
+        <pbanDVu>5.3.9</pbanDVu>
+        <ttinNhaCCapDVu>FF8737ED65C80194B0BD443071801598</ttinNhaCCapDVu>
+      </TTinDVu>
+      <TTinTKhaiThue>
+        <TKhaiThue>
+          <maTKhai>473</maTKhai>
+          <tenTKhai>Tờ khai thuế đối với hộ kinh doanh, cá nhân kinh doanh</tenTKhai>
+          <moTaBMau>(Ban hành kèm theo Thông tư số 40/2021/TT-BTC ngày 01/6/2021 của Bộ trưởng Bộ Tài Chính)</moTaBMau>
+          <pbanTKhaiXML>2.8.3</pbanTKhaiXML>
+          <loaiTKhai>C</loaiTKhai>
+          <soLan>0</soLan>
+          <KyKKhaiThue>
+            <kieuKy>Q</kieuKy>
+            <kyKKhai>2/2025</kyKKhai>
+            <kyKKhaiTuNgay>01/04/2025</kyKKhaiTuNgay>
+            <kyKKhaiDenNgay>30/06/2025</kyKKhaiDenNgay>
+            <kyKKhaiTuThang>04/2025</kyKKhaiTuThang>
+            <kyKKhaiDenThang>06/2025</kyKKhaiDenThang>
+          </KyKKhaiThue>
+          <maCQTNoiNop>70917</maCQTNoiNop>
+          <tenCQTNoiNop>Thuế cơ sở 7 tỉnh Tây Ninh</tenCQTNoiNop>
+          <ngayLapTKhai>2025-07-31</ngayLapTKhai>
+          <GiaHan>
+            <maLyDoGiaHan />
+            <lyDoGiaHan />
+          </GiaHan>
+          <nguoiKy>TRẦN VĂN THÁI</nguoiKy>
+          <ngayKy>2025-07-31</ngayKy>
+          <nganhNgheKD />
+        </TKhaiThue>
+        <NNT>
+          <mst>072090001468</mst>
+          <tenNNT>Shop Thái Mi</tenNNT>
+          <dchiNNT>Khu phố lộc an</dchiNNT>
+          <phuongXa />
+          <maHuyenNNT />
+          <tenHuyenNNT />
+          <maTinhNNT>801</maTinhNNT>
+          <tenTinhNNT>Tỉnh Tây Ninh</tenTinhNNT>
+          <dthoaiNNT />
+          <faxNNT />
+          <emailNNT />
+        </NNT>
+      </TTinTKhaiThue>
+    </TTinChung>
+    <CTieuTKhaiChinh>
+      <mst_cu>8090842436-001</mst_cu>
+      <Header>
+        <hkdcnkdnopthuekhoan>0</hkdcnkdnopthuekhoan>
+        <cnkdnopps>0</cnkdnopps>
+        <tccnkhainopthay>0</tccnkhainopthay>
+        <hkdcnkdnopkekhai>1</hkdcnkdnopkekhai>
+        <hkdcnkdnnxddoanhthu>0</hkdcnkdnnxddoanhthu>
+        <hkdchuyendoipptinhthue>0</hkdchuyendoipptinhthue>
+        <ct05>Shop Thái Mi</ct05>
+        <ct06 />
+        <CT08>
+          <NNgheKDoanh id="ID_1">
+            <maNNgheKDoanh>G47711.</maNNgheKDoanh>
+            <tenNNgheKDoanh>G47711.-Bán lẻ hàng may mặc trong các cửa hàng chuyên doanh</tenNNgheKDoanh>
+          </NNgheKDoanh>
+        </CT08>
+        <ct08a>0</ct08a>
+        <ct09>30.00</ct09>
+        <ct09a>0</ct09a>
+        <ct10>0</ct10>
+        <CT11>
+          <tuGio>8</tuGio>
+          <tuPhut>0</tuPhut>
+          <denGio>17</denGio>
+          <denPhut>0</denPhut>
+        </CT11>
+        <CT12>
+          <ct12a_tdtt>0</ct12a_tdtt>
+          <ct12b_soNha>Khu phố lộc an</ct12b_soNha>
+          <ct12c_maPhuong>70917067</ct12c_maPhuong>
+          <ct12c_tenPhuong>Phường Trảng Bàng</ct12c_tenPhuong>
+          <ct12d_maQuan />
+          <ct12d_tenQuan />
+          <ct12d_maTinh>801</ct12d_maTinh>
+          <ct12d_tenTinh>Tỉnh Tây Ninh</ct12d_tenTinh>
+          <ct12e_kdbiengioi>0</ct12e_kdbiengioi>
+        </CT12>
+        <CT13>
+          <ct13a_soNha />
+          <ct13b_maPhuong />
+          <ct13b_tenPhuong />
+          <ct13c_maQuan />
+          <ct13c_tenQuan />
+          <ct13d_maTinh />
+          <ct13d_tenTinh />
+        </CT13>
+        <ct17 />
+        <ct17_ngay xsi:nil="true" />
+        <CNKDChuaDangKyThue>
+          <ct18a_ngaySinh xsi:nil="true" />
+          <ct18b_maQuocTich />
+          <ct18b_tenQuocTich />
+          <ct18c_ma />
+          <ct18c_ten />
+          <ct18c_soCMND_CCCD />
+          <ct18c_1_ngayCap xsi:nil="true" />
+          <ct18c_2_noiCap_loai>01</ct18c_2_noiCap_loai>
+          <ct18c_2_noiCap_ten />
+          <ct18c_2_noiCap_ma />
+        </CNKDChuaDangKyThue>
+        <CNKDKhongCoCMND_CCCD>
+          <ct18d_ma>1020</ct18d_ma>
+          <ct18d_ten>Hộ chiếu</ct18d_ten>
+          <ct18d_soHoChieu />
+          <ct18d_1_ngayCap xsi:nil="true" />
+          <ct18d_2_noiCap_loai>02</ct18d_2_noiCap_loai>
+          <ct18d_2_noiCap_ten />
+          <ct18d_2_noiCap_ma />
+          <ct18dd_ma>1040</ct18dd_ma>
+          <ct18dd_ten>Giấy thông hành</ct18dd_ten>
+          <ct18dd_soGiayThongHanh />
+          <ct18dd_1_ngayCap xsi:nil="true" />
+          <ct18dd_2_noiCap_loai>03</ct18dd_2_noiCap_loai>
+          <ct18dd_2_noiCap_ten />
+          <ct18dd_2_noiCap_ma />
+          <ct18e_ma>1070</ct18e_ma>
+          <ct18e_ten>CMT biên giới</ct18e_ten>
+          <ct18e_soCMNDBienGioi />
+          <ct18e_1_ngayCap xsi:nil="true" />
+          <ct18e_2_noiCap_loai>02</ct18e_2_noiCap_loai>
+          <ct18e_2_noiCap_ten />
+          <ct18e_2_noiCap_ma />
+          <ct18f_ma>3000</ct18f_ma>
+          <ct18f_ten>Giấy tờ khác</ct18f_ten>
+          <ct18f_soGiayToKhac />
+          <ct18f_1_ngayCap xsi:nil="true" />
+          <ct18f_2_noiCap_loai>03</ct18f_2_noiCap_loai>
+          <ct18f_2_noiCap_ten />
+          <ct18f_2_noiCap_ma />
+        </CNKDKhongCoCMND_CCCD>
+        <CT18g>
+          <ct18g_soNha />
+          <ct18g_maPhuong />
+          <ct18g_tenPhuong />
+          <ct18g_maQuan />
+          <ct18g_tenQuan />
+          <ct18g_maTinh />
+          <ct18g_tenTinh />
+        </CT18g>
+        <CT18h>
+          <ct18h_soNha />
+          <ct18h_maPhuong />
+          <ct18h_tenPhuong />
+          <ct18h_maQuan />
+          <ct18h_tenQuan />
+          <ct18h_maTinh />
+          <ct18h_tenTinh />
+        </CT18h>
+        <CT18i>
+          <ct18i_soGiayTo />
+          <ct18i_ngayCap xsi:nil="true" />
+          <ct18i_coQuanCap />
+        </CT18i>
+        <ct18k>0</ct18k>
+        <ToChucKThay>
+          <ct22 />
+          <ct23 xsi:nil="true" />
+          <ct24 />
+          <ct25 />
+          <ct26 />
+          <ct27 />
+        </ToChucKThay>
+      </Header>
+      <KKThueGTGT_TNCN>
+        <DoanhThuThueGTGT>
+          <ct28>237084000</ct28>
+          <ct29>0</ct29>
+          <ct30>0</ct30>
+          <ct31>0</ct31>
+          <ct32>237084000</ct32>
+        </DoanhThuThueGTGT>
+        <SoThueGTGT>
+          <ct28>2370840</ct28>
+          <ct29>0</ct29>
+          <ct30>0</ct30>
+          <ct31>0</ct31>
+          <ct32>2370840</ct32>
+        </SoThueGTGT>
+        <DoanhThuThueTNCN>
+          <ct28>237084000</ct28>
+          <ct29>0</ct29>
+          <ct30>0</ct30>
+          <ct31>0</ct31>
+          <ct32>237084000</ct32>
+        </DoanhThuThueTNCN>
+        <SoThueTNCN>
+          <ct28>1185420</ct28>
+          <ct29>0</ct29>
+          <ct30>0</ct30>
+          <ct31>0</ct31>
+          <ct32>1185420</ct32>
+        </SoThueTNCN>
+      </KKThueGTGT_TNCN>
+      <KKhaiThueTTDB>
+        <CTietKKhaiThueTTDB id="ID_1">
+          <ct2_ma />
+          <ct2_ten />
+          <ct3 />
+          <ct4 />
+          <ct5>0</ct5>
+          <ct6>0</ct6>
+          <ct7>0</ct7>
+        </CTietKKhaiThueTTDB>
+        <tong_ct5>0</tong_ct5>
+        <tong_ct7>0</tong_ct7>
+      </KKhaiThueTTDB>
+      <KKhaiTBVMT_TN>
+        <ThueTaiNguyen>
+          <CTietThueTaiNguyen id="ID_1">
+            <ct2_ma />
+            <ct2_ten />
+            <ct3 />
+            <ct4 />
+            <ct5>0</ct5>
+            <ct6>0</ct6>
+            <ct7>0</ct7>
+            <ct8>0</ct8>
+          </CTietThueTaiNguyen>
+          <tongCong>0</tongCong>
+        </ThueTaiNguyen>
+        <ThueBVMT>
+          <CTietThueBVMT id="ID_1">
+            <ct2_ma />
+            <ct2_ten />
+            <ct3 />
+            <ct4 />
+            <ct5>0</ct5>
+            <ct6>0</ct6>
+            <ct8>0</ct8>
+          </CTietThueBVMT>
+          <tongCong>0</tongCong>
+        </ThueBVMT>
+        <PhiBVMT>
+          <CTietPhiBVMT id="ID_1">
+            <ct2_ma />
+            <ct2_ten />
+            <ct3 />
+            <ct4 />
+            <ct5>0</ct5>
+            <ct6>0</ct6>
+            <ct8>0</ct8>
+          </CTietPhiBVMT>
+          <tongCong>0</tongCong>
+        </PhiBVMT>
+      </KKhaiTBVMT_TN>
+    </CTieuTKhaiChinh>
+    <PLuc>
+      <PLuc_01_2_BK_HDKD>
+        <VlieuDcuSPHH>
+          <BKeVLDCSPHH>
+            <CTietHKDCNKD id="ID_1">
+              <ct06>Quần áo, túi xách</ct06>
+              <ct07>Cái</ct07>
+              <ct08>0</ct08>
+              <ct09>0</ct09>
+              <ct10>992.000</ct10>
+              <ct11>211076500</ct11>
+              <ct12>824.000</ct12>
+              <ct13>175329673</ct13>
+              <ct14>168.000</ct14>
+              <ct15>35746827</ct15>
+            </CTietHKDCNKD>
+            <ct17>0</ct17>
+            <ct19>211076500</ct19>
+            <ct21>175329673</ct21>
+            <ct23>35746827</ct23>
+          </BKeVLDCSPHH>
+        </VlieuDcuSPHH>
+        <ChiPhiQL>
+          <ct24>0</ct24>
+          <ct25>0</ct25>
+          <ct26>0</ct26>
+          <ct27>2240000</ct27>
+          <ct28>0</ct28>
+          <ct29>0</ct29>
+          <ct30>0</ct30>
+          <ct31>2240000</ct31>
+        </ChiPhiQL>
+      </PLuc_01_2_BK_HDKD>
+    </PLuc>
+  </HSoKhaiThue>
+</HSoThueDTu>

@@ -43,3 +43,4 @@ bot/test-output/input-invoices.xlsx
 bot/test-output/invoice-36.xml
 bot/test-output/output-invoices.json
 bot/test-output/output-invoices.xlsx
+scripts/run-020.js

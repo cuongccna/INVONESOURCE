@@ -186,6 +186,25 @@ export class GdtXmlParser {
     return isNaN(n) ? null : n;
   }
 
+  /**
+   * Đọc giá trị từ cấu trúc <TTKhac><TTin><TTruong>fieldName</TTruong><DLieu>value</DLieu></TTin></TTKhac>.
+   * Một số hóa đơn GDT/Viettel ghi VATAmount và Amount per-line vào TTKhac thay vì tag trực tiếp.
+   */
+  private _ttkhacVal(r: Record<string, unknown>, fieldName: string): number | null {
+    const ttkhac = this._val(r, 'TTKhac', 'tTKhac', 'ttKhac');
+    if (!ttkhac || typeof ttkhac !== 'object') return null;
+    const ttinRaw = (ttkhac as Record<string, unknown>)['TTin'] ?? (ttkhac as Record<string, unknown>)['tTin'];
+    if (!ttinRaw) return null;
+    const ttinArr: unknown[] = Array.isArray(ttinRaw) ? ttinRaw : [ttinRaw];
+    for (const item of ttinArr) {
+      if (!item || typeof item !== 'object') continue;
+      const rec = item as Record<string, unknown>;
+      const truong = this._str(rec, 'TTruong', 'tTruong');
+      if (truong === fieldName) return this._num(rec, 'DLieu', 'dLieu');
+    }
+    return null;
+  }
+
   private _parseDate(raw: unknown): string | null {
     if (raw == null) return null;
     const s = String(raw).trim();
@@ -280,8 +299,9 @@ export class GdtXmlParser {
         unit_price:  this._num(r, 'DGia', 'dGia', 'don_gia'),
         subtotal:    this._num(r, 'ThTien', 'thTien', 'thanh_tien'),
         vat_rate:    vatRateNum,
-        vat_amount:  this._num(r, 'TienThue', 'tienThue', 'tien_thue'),
-        total:       this._num(r, 'TgTTTBSo', 'tgTTTBSo', 'TToan', 'tToan'),
+        vat_amount:  this._num(r, 'TienThue', 'tienThue', 'tien_thue') ?? this._ttkhacVal(r, 'VATAmount'),
+        // 'Amount' (TTKhac) = tổng tiền thanh toán per-line (subtotal + VAT)
+        total:       this._ttkhacVal(r, 'Amount') ?? this._num(r, 'TgTTTBSo', 'tgTTTBSo', 'TToan', 'tToan'),
       };
     }).filter(item => item.item_name != null);
   }

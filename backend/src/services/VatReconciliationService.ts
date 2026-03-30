@@ -15,6 +15,7 @@ export interface VatSummary {
   periodYear: number;
   ct22_total_input_vat: number;
   ct23_deductible_input_vat: number;
+  ct23_input_subtotal: number;
   ct29_total_revenue: number;
   ct30_exempt_revenue: number;
   ct32_revenue_5pct: number;
@@ -91,6 +92,7 @@ export class VatReconciliationService {
     );
 
     const ct23 = inputDeductible.reduce((sum, row) => sum + parseFloat(row.vat_sum || '0'), 0);
+    const ct23_input_subtotal = inputDeductible.reduce((sum, row) => sum + parseFloat(row.subtotal_sum || '0'), 0);
 
     // ============================================================
     // Output invoices — valid only
@@ -201,6 +203,7 @@ export class VatReconciliationService {
       companyId, periodMonth: month, periodYear: year,
       ct22_total_input_vat: ct22,
       ct23_deductible_input_vat: ct23,
+      ct23_input_subtotal,
       ct29_total_revenue: ct29,
       ct30_exempt_revenue: ct30,
       ct32_revenue_5pct: ct32,
@@ -261,6 +264,7 @@ export class VatReconciliationService {
     );
 
     const ct23 = inputDeductible.reduce((s, r) => s + parseFloat(r.vat_sum || '0'), 0);
+    const ct23_input_subtotal = inputDeductible.reduce((s, r) => s + parseFloat(r.subtotal_sum || '0'), 0);
 
     const { rows: outputByRate } = await pool.query<{ vat_rate: string; vat_sum: string; subtotal_sum: string }>(
       `SELECT vat_rate, SUM(vat_amount) AS vat_sum, SUM(subtotal) AS subtotal_sum
@@ -311,6 +315,7 @@ export class VatReconciliationService {
       companyId, periodMonth: quarter, periodYear: year,
       ct22_total_input_vat: ct22,
       ct23_deductible_input_vat: ct23,
+      ct23_input_subtotal,
       ct29_total_revenue: ct29, ct30_exempt_revenue: ct30,
       ct32_revenue_5pct: ct32,  ct33_vat_5pct: ct33,
       ct34_revenue_8pct: ct34,  ct35_vat_8pct: ct35,
