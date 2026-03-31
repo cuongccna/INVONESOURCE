@@ -6,7 +6,7 @@
 -- TAX_DECLARATIONS (Tờ khai 01/GTGT)
 -- ============================================================
 
-CREATE TABLE tax_declarations (
+CREATE TABLE IF NOT EXISTS tax_declarations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   period_month SMALLINT NOT NULL CHECK (period_month BETWEEN 1 AND 12),
@@ -48,15 +48,15 @@ CREATE TABLE tax_declarations (
   UNIQUE(company_id, period_month, period_year, form_type)
 );
 
-CREATE INDEX idx_tax_declarations_company ON tax_declarations(company_id);
-CREATE INDEX idx_tax_declarations_period ON tax_declarations(company_id, period_year, period_month);
-CREATE INDEX idx_tax_declarations_status ON tax_declarations(submission_status);
+CREATE INDEX IF NOT EXISTS idx_tax_declarations_company ON tax_declarations(company_id);
+CREATE INDEX IF NOT EXISTS idx_tax_declarations_period ON tax_declarations(company_id, period_year, period_month);
+CREATE INDEX IF NOT EXISTS idx_tax_declarations_status ON tax_declarations(submission_status);
 
 -- ============================================================
 -- DECLARATION_ATTACHMENTS
 -- ============================================================
 
-CREATE TABLE declaration_attachments (
+CREATE TABLE IF NOT EXISTS declaration_attachments (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   declaration_id UUID NOT NULL REFERENCES tax_declarations(id) ON DELETE CASCADE,
   attachment_type attachment_type NOT NULL,
@@ -66,13 +66,13 @@ CREATE TABLE declaration_attachments (
   generated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_declaration_attachments_decl ON declaration_attachments(declaration_id);
+CREATE INDEX IF NOT EXISTS idx_declaration_attachments_decl ON declaration_attachments(declaration_id);
 
 -- ============================================================
 -- GDT_VALIDATION_QUEUE (tracking GDT validation status)
 -- ============================================================
 
-CREATE TABLE gdt_validation_queue (
+CREATE TABLE IF NOT EXISTS gdt_validation_queue (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   invoice_id UUID NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
   status VARCHAR(20) DEFAULT 'pending',    -- pending | processing | done | failed | skipped
@@ -83,8 +83,8 @@ CREATE TABLE gdt_validation_queue (
   UNIQUE(invoice_id)
 );
 
-CREATE INDEX idx_gdt_queue_status ON gdt_validation_queue(status);
-CREATE INDEX idx_gdt_queue_invoice ON gdt_validation_queue(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_gdt_queue_status ON gdt_validation_queue(status);
+CREATE INDEX IF NOT EXISTS idx_gdt_queue_invoice ON gdt_validation_queue(invoice_id);
 
 -- ============================================================
 -- Trigger: update updated_at automatically
@@ -98,17 +98,22 @@ BEGIN
 END;
 $$ language 'plpgsql';
 
+DROP TRIGGER IF EXISTS update_companies_updated_at ON companies;
 CREATE TRIGGER update_companies_updated_at BEFORE UPDATE ON companies
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS update_users_updated_at ON users;
 CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS update_company_connectors_updated_at ON company_connectors;
 CREATE TRIGGER update_company_connectors_updated_at BEFORE UPDATE ON company_connectors
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS update_invoices_updated_at ON invoices;
 CREATE TRIGGER update_invoices_updated_at BEFORE UPDATE ON invoices
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS update_tax_declarations_updated_at ON tax_declarations;
 CREATE TRIGGER update_tax_declarations_updated_at BEFORE UPDATE ON tax_declarations
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();

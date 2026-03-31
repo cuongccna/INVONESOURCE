@@ -6,25 +6,25 @@
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- ============================================================
--- ENUMS
+-- ENUMS (idempotent — safe to re-run)
 -- ============================================================
 
-CREATE TYPE user_role AS ENUM ('OWNER', 'ADMIN', 'ACCOUNTANT', 'VIEWER');
-CREATE TYPE invoice_provider AS ENUM ('misa', 'viettel', 'bkav', 'gdt_intermediary', 'manual');
-CREATE TYPE invoice_direction AS ENUM ('output', 'input');
-CREATE TYPE invoice_status AS ENUM ('valid', 'cancelled', 'replaced', 'adjusted', 'invalid');
-CREATE TYPE circuit_state AS ENUM ('CLOSED', 'OPEN', 'HALF_OPEN');
-CREATE TYPE filing_frequency AS ENUM ('monthly', 'quarterly');
-CREATE TYPE declaration_method AS ENUM ('deduction', 'direct');
-CREATE TYPE submission_method AS ENUM ('manual', 'tvan', 'gdt_api');
-CREATE TYPE submission_status AS ENUM ('draft', 'ready', 'submitted', 'accepted', 'rejected');
-CREATE TYPE attachment_type AS ENUM ('PL01-1', 'PL01-2', 'PL01-3', 'PL01-4a', 'PL01-4b', 'OTHER');
+DO $$ BEGIN CREATE TYPE user_role AS ENUM ('OWNER', 'ADMIN', 'ACCOUNTANT', 'VIEWER'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN CREATE TYPE invoice_provider AS ENUM ('misa', 'viettel', 'bkav', 'gdt_intermediary', 'manual'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN CREATE TYPE invoice_direction AS ENUM ('output', 'input'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN CREATE TYPE invoice_status AS ENUM ('valid', 'cancelled', 'replaced', 'adjusted', 'invalid'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN CREATE TYPE circuit_state AS ENUM ('CLOSED', 'OPEN', 'HALF_OPEN'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN CREATE TYPE filing_frequency AS ENUM ('monthly', 'quarterly'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN CREATE TYPE declaration_method AS ENUM ('deduction', 'direct'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN CREATE TYPE submission_method AS ENUM ('manual', 'tvan', 'gdt_api'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN CREATE TYPE submission_status AS ENUM ('draft', 'ready', 'submitted', 'accepted', 'rejected'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN CREATE TYPE attachment_type AS ENUM ('PL01-1', 'PL01-2', 'PL01-3', 'PL01-4a', 'PL01-4b', 'OTHER'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- ============================================================
 -- COMPANIES
 -- ============================================================
 
-CREATE TABLE companies (
+CREATE TABLE IF NOT EXISTS companies (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name VARCHAR(255) NOT NULL,
   tax_code VARCHAR(20) NOT NULL UNIQUE,
@@ -35,13 +35,13 @@ CREATE TABLE companies (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_companies_tax_code ON companies(tax_code);
+CREATE INDEX IF NOT EXISTS idx_companies_tax_code ON companies(tax_code);
 
 -- ============================================================
 -- USERS
 -- ============================================================
 
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   email VARCHAR(255) NOT NULL UNIQUE,
   password_hash VARCHAR(255) NOT NULL,
@@ -51,13 +51,13 @@ CREATE TABLE users (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 
 -- ============================================================
 -- USER_COMPANIES (many-to-many with role)
 -- ============================================================
 
-CREATE TABLE user_companies (
+CREATE TABLE IF NOT EXISTS user_companies (
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   role user_role NOT NULL DEFAULT 'ACCOUNTANT',
@@ -65,14 +65,14 @@ CREATE TABLE user_companies (
   PRIMARY KEY (user_id, company_id)
 );
 
-CREATE INDEX idx_user_companies_company ON user_companies(company_id);
-CREATE INDEX idx_user_companies_user ON user_companies(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_companies_company ON user_companies(company_id);
+CREATE INDEX IF NOT EXISTS idx_user_companies_user ON user_companies(user_id);
 
 -- ============================================================
 -- COMPANY_CONNECTORS
 -- ============================================================
 
-CREATE TABLE company_connectors (
+CREATE TABLE IF NOT EXISTS company_connectors (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   provider invoice_provider NOT NULL,
@@ -88,14 +88,14 @@ CREATE TABLE company_connectors (
   UNIQUE(company_id, provider)
 );
 
-CREATE INDEX idx_connectors_company ON company_connectors(company_id);
-CREATE INDEX idx_connectors_provider ON company_connectors(provider);
+CREATE INDEX IF NOT EXISTS idx_connectors_company ON company_connectors(company_id);
+CREATE INDEX IF NOT EXISTS idx_connectors_provider ON company_connectors(provider);
 
 -- ============================================================
 -- INVOICES
 -- ============================================================
 
-CREATE TABLE invoices (
+CREATE TABLE IF NOT EXISTS invoices (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   provider invoice_provider NOT NULL,
@@ -126,20 +126,20 @@ CREATE TABLE invoices (
   UNIQUE(company_id, provider, invoice_number, seller_tax_code, invoice_date)
 );
 
-CREATE INDEX idx_invoices_company ON invoices(company_id);
-CREATE INDEX idx_invoices_date ON invoices(invoice_date);
-CREATE INDEX idx_invoices_direction_status ON invoices(direction, status);
-CREATE INDEX idx_invoices_seller_tax ON invoices(seller_tax_code);
-CREATE INDEX idx_invoices_buyer_tax ON invoices(buyer_tax_code);
-CREATE INDEX idx_invoices_provider ON invoices(provider);
-CREATE INDEX idx_invoices_gdt_validated ON invoices(gdt_validated);
-CREATE INDEX idx_invoices_deleted ON invoices(deleted_at) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_invoices_company ON invoices(company_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(invoice_date);
+CREATE INDEX IF NOT EXISTS idx_invoices_direction_status ON invoices(direction, status);
+CREATE INDEX IF NOT EXISTS idx_invoices_seller_tax ON invoices(seller_tax_code);
+CREATE INDEX IF NOT EXISTS idx_invoices_buyer_tax ON invoices(buyer_tax_code);
+CREATE INDEX IF NOT EXISTS idx_invoices_provider ON invoices(provider);
+CREATE INDEX IF NOT EXISTS idx_invoices_gdt_validated ON invoices(gdt_validated);
+CREATE INDEX IF NOT EXISTS idx_invoices_deleted ON invoices(deleted_at) WHERE deleted_at IS NULL;
 
 -- ============================================================
 -- VAT_RECONCILIATIONS
 -- ============================================================
 
-CREATE TABLE vat_reconciliations (
+CREATE TABLE IF NOT EXISTS vat_reconciliations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   period_month SMALLINT NOT NULL CHECK (period_month BETWEEN 1 AND 12),
@@ -152,14 +152,14 @@ CREATE TABLE vat_reconciliations (
   UNIQUE(company_id, period_month, period_year)
 );
 
-CREATE INDEX idx_vat_reconciliations_company ON vat_reconciliations(company_id);
-CREATE INDEX idx_vat_reconciliations_period ON vat_reconciliations(period_year, period_month);
+CREATE INDEX IF NOT EXISTS idx_vat_reconciliations_company ON vat_reconciliations(company_id);
+CREATE INDEX IF NOT EXISTS idx_vat_reconciliations_period ON vat_reconciliations(period_year, period_month);
 
 -- ============================================================
 -- NOTIFICATIONS
 -- ============================================================
 
-CREATE TABLE notifications (
+CREATE TABLE IF NOT EXISTS notifications (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -172,15 +172,15 @@ CREATE TABLE notifications (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_notifications_user ON notifications(user_id);
-CREATE INDEX idx_notifications_company ON notifications(company_id);
-CREATE INDEX idx_notifications_unread ON notifications(user_id, is_read) WHERE is_read = false;
+CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_company ON notifications(company_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications(user_id, is_read) WHERE is_read = false;
 
 -- ============================================================
 -- SYNC_LOGS
 -- ============================================================
 
-CREATE TABLE sync_logs (
+CREATE TABLE IF NOT EXISTS sync_logs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   provider VARCHAR(20) NOT NULL,
@@ -194,15 +194,15 @@ CREATE TABLE sync_logs (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_sync_logs_company ON sync_logs(company_id);
-CREATE INDEX idx_sync_logs_provider ON sync_logs(company_id, provider);
-CREATE INDEX idx_sync_logs_started ON sync_logs(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sync_logs_company ON sync_logs(company_id);
+CREATE INDEX IF NOT EXISTS idx_sync_logs_provider ON sync_logs(company_id, provider);
+CREATE INDEX IF NOT EXISTS idx_sync_logs_started ON sync_logs(started_at DESC);
 
 -- ============================================================
 -- PUSH_SUBSCRIPTIONS
 -- ============================================================
 
-CREATE TABLE push_subscriptions (
+CREATE TABLE IF NOT EXISTS push_subscriptions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   endpoint TEXT NOT NULL UNIQUE,
@@ -212,13 +212,13 @@ CREATE TABLE push_subscriptions (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_push_subscriptions_user ON push_subscriptions(user_id);
+CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(user_id);
 
 -- ============================================================
 -- REFRESH_TOKENS (for JWT refresh)
 -- ============================================================
 
-CREATE TABLE refresh_tokens (
+CREATE TABLE IF NOT EXISTS refresh_tokens (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   token_hash VARCHAR(255) NOT NULL UNIQUE,
@@ -227,14 +227,14 @@ CREATE TABLE refresh_tokens (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_refresh_tokens_user ON refresh_tokens(user_id);
-CREATE INDEX idx_refresh_tokens_hash ON refresh_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash ON refresh_tokens(token_hash);
 
 -- ============================================================
 -- AUDIT_LOGS
 -- ============================================================
 
-CREATE TABLE audit_logs (
+CREATE TABLE IF NOT EXISTS audit_logs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID REFERENCES users(id) ON DELETE SET NULL,
   company_id UUID REFERENCES companies(id) ON DELETE SET NULL,
@@ -247,6 +247,6 @@ CREATE TABLE audit_logs (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_audit_logs_user ON audit_logs(user_id);
-CREATE INDEX idx_audit_logs_company ON audit_logs(company_id);
-CREATE INDEX idx_audit_logs_created ON audit_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_user ON audit_logs(user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_company ON audit_logs(company_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC);
