@@ -95,9 +95,9 @@ if [[ "$SKIP_MIGRATE" == false ]]; then
   run_sql 012_groups_36_41.sql
   run_sql 013_soft_delete.sql
   run_sql 014_gdt_bot_provider.sql
-  run_js  015_fix_invoice_upsert_index.js
+  run_sql 015_fix_invoice_upsert_index.sql
   run_sql 016_quarterly_declarations.sql
-  run_js  017_proxy_session_autoblock.js
+  run_sql 017_proxy_session_autoblock.sql
   run_sql 018_fix_declaration_unique_constraint.sql
   run_sql 019_license_system.sql
   run_sql 020_normalize_declaration_fields.sql
