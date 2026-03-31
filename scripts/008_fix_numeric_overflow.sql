@@ -6,6 +6,9 @@
 -- NUMERIC(22,2) max = 9,999,999,999,999,999,999,999.99 (far beyond needed)
 -- ============================================================
 
+-- Drop views that depend on invoices columns (prevent "used by a view" error)
+DROP VIEW IF EXISTS active_invoices;
+
 -- invoices
 ALTER TABLE invoices
   ALTER COLUMN subtotal     TYPE NUMERIC(22,2),
@@ -41,3 +44,9 @@ SET consecutive_failures = 0,
     circuit_state        = 'CLOSED',
     last_error           = NULL
 WHERE provider = 'viettel';
+
+-- Recreate active_invoices view (dropped above to allow ALTER COLUMN)
+-- Full definition matches 013_soft_delete.sql — safe to run before 013 too
+CREATE OR REPLACE VIEW active_invoices AS
+  SELECT * FROM invoices
+  WHERE deleted_at IS NULL;
