@@ -153,7 +153,7 @@ export default function OrgDetailPage() {
   const allNodes = flattenTree(org.companies);
 
   return (
-    <div className="p-4 max-w-2xl mx-auto space-y-5">
+    <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto space-y-5">
       <div className="flex items-center gap-3">
         <button onClick={() => router.back()} className="text-gray-400 hover:text-gray-600 text-lg">←</button>
         <h1 className="text-2xl font-bold text-gray-900">{org.name}</h1>

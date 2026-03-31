@@ -228,6 +228,28 @@ router.post(
   }
 );
 
+// ── PATCH /api/bot/toggle ─────────────────────────────────────────────────────
+router.patch(
+  '/toggle',
+  requireRole('OWNER', 'ADMIN'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const companyId = req.user!.companyId;
+      const result = await pool.query(
+        `UPDATE gdt_bot_configs
+         SET is_active = NOT is_active, updated_at = NOW()
+         WHERE company_id = $1
+         RETURNING is_active`,
+        [companyId]
+      );
+      if (result.rows.length === 0) throw new NotFoundError('GDT Bot chưa được cấu hình');
+      sendSuccess(res, { is_active: result.rows[0].is_active });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
 // ── DELETE /api/bot/config ───────────────────────────────────────────────────
 router.delete(
   '/config',

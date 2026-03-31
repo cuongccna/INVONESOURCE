@@ -67,7 +67,9 @@ export class VatReconciliationService {
     const ct22 = inputAll.reduce((sum, row) => sum + parseFloat(row.vat_sum || '0'), 0);
 
     // ============================================================
-    // [23] Deductible input VAT — valid + gdt_validated + payment criteria
+    // [23] Deductible input VAT — valid + payment criteria
+    // GROUP 47: Group 5 requires gdt_validated=true; Group 6/8 do not require CQT code validation
+    // but still must meet 20M threshold / non-cash payment rules
     // ============================================================
     const { rows: inputDeductible } = await pool.query<{
       vat_rate: string;
@@ -79,10 +81,16 @@ export class VatReconciliationService {
        WHERE company_id = $1
          AND direction = 'input'
          AND status = 'valid'
-         AND gdt_validated = true
          AND deleted_at IS NULL
          AND EXTRACT(MONTH FROM invoice_date) = $2
          AND EXTRACT(YEAR FROM invoice_date) = $3
+         AND (
+           -- Group 5: requires GDT validation
+           (COALESCE(invoice_group, 5) = 5 AND gdt_validated = true)
+           OR
+           -- Group 6 & 8: no CQT code, deductible without gdt_validated
+           (invoice_group IN (6, 8))
+         )
          AND (
            total_amount <= 20000000
            OR payment_method IS DISTINCT FROM 'cash'
@@ -254,11 +262,14 @@ export class VatReconciliationService {
        WHERE company_id = $1
          AND direction = 'input'
          AND status = 'valid'
-         AND gdt_validated = true
          AND deleted_at IS NULL
          AND EXTRACT(YEAR FROM invoice_date) = $2
          AND EXTRACT(MONTH FROM invoice_date) = ANY($3::int[])
          AND (total_amount <= 20000000 OR payment_method IS DISTINCT FROM 'cash')
+         AND (
+           (COALESCE(invoice_group, 5) = 5 AND gdt_validated = true)
+           OR (invoice_group IN (6, 8))
+         )
        GROUP BY vat_rate`,
       [companyId, year, months],
     );

@@ -18,6 +18,14 @@ interface ParsedPreview {
   direction:     'input' | 'output' | 'both' | null;
   preview:       PreviewRow[];
   errors:        ParseError[];
+  zipFiles?:     ZipFileInfo[];
+}
+
+interface ZipFileInfo {
+  filename:     string;
+  invoiceCount: number;
+  errorCount:   number;
+  error:        string | null;
 }
 
 interface PreviewRow {
@@ -225,23 +233,74 @@ export default function ImportPage() {
     setImporting(true);
     setImportProgress(0);
 
-    // Simulate progress
-    const ticker = setInterval(() => setImportProgress(p => Math.min(90, p + 10)), 400);
-
     try {
-      const res = await apiClient.post<{ data: typeof result }>('/import/execute', {
-        fileId:          preview.fileId,
-        direction:       effectiveDirection,
-        duplicatePolicy: dupPolicy,
+      // Use SSE-based streaming endpoint for real-time progress
+      const res = await fetch('/api/import/execute-stream', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(typeof window !== 'undefined' && document.cookie
+            ? {} : {}),
+        },
+        credentials: 'include',
+        body: JSON.stringify({
+          fileId:          preview.fileId,
+          direction:       effectiveDirection,
+          duplicatePolicy: dupPolicy,
+        }),
       });
-      clearInterval(ticker);
-      setImportProgress(100);
-      setResult(res.data.data);
-      setPreview(null);
+
+      if (!res.ok || !res.body) {
+        throw new Error('Lỗi kết nối streaming');
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const data = JSON.parse(line.slice(6)) as Record<string, unknown>;
+
+            if (data.type === 'progress') {
+              setImportProgress(data.percent as number);
+            } else if (data.type === 'complete') {
+              setImportProgress(100);
+              setResult({
+                session_id:      data.session_id as string,
+                success_count:   data.success_count as number,
+                duplicate_count: data.duplicate_count as number,
+                error_count:     data.error_count as number,
+              });
+              setPreview(null);
+            }
+          } catch { /* skip malformed events */ }
+        }
+      }
     } catch (err: unknown) {
-      clearInterval(ticker);
-      const e = err as { response?: { data?: { error?: { message?: string } } } };
-      setError(e?.response?.data?.error?.message ?? 'Lỗi nhập hóa đơn.');
+      // Fallback: try regular endpoint if SSE fails
+      try {
+        const res2 = await apiClient.post<{ data: typeof result }>('/import/execute', {
+          fileId:          preview.fileId,
+          direction:       effectiveDirection,
+          duplicatePolicy: dupPolicy,
+        });
+        setImportProgress(100);
+        setResult(res2.data.data);
+        setPreview(null);
+      } catch (err2: unknown) {
+        const e = err2 as { response?: { data?: { error?: { message?: string } } } };
+        setError(e?.response?.data?.error?.message ?? 'Lỗi nhập hóa đơn.');
+      }
     } finally {
       setImporting(false);
     }
@@ -251,7 +310,7 @@ export default function ImportPage() {
   const statusColor = (s: string) => s === 'valid' ? 'text-green-700' : s === 'cancelled' ? 'text-red-500' : 'text-gray-500';
 
   return (
-    <div className="p-4 max-w-2xl mx-auto pb-24 space-y-5">
+    <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto pb-24 space-y-5">
       <BackButton fallbackHref="/dashboard" />
       <div className="flex items-center justify-between">
         <div>
@@ -314,7 +373,7 @@ export default function ImportPage() {
           onDrop={e => { e.preventDefault(); setDragging(false); handleFiles(e.dataTransfer.files); }}
         >
           <input ref={fileRef} type="file" className="hidden"
-            accept=".xml,.xlsx,.xls,.csv"
+            accept=".xml,.xlsx,.xls,.csv,.zip"
             onChange={e => handleFiles(e.target.files)} />
           {uploading ? (
             <div className="space-y-2">
@@ -325,7 +384,7 @@ export default function ImportPage() {
             <div className="space-y-2">
               <div className="text-4xl">☁️</div>
               <p className="font-medium text-gray-700">Kéo thả file hoặc click để chọn</p>
-              <p className="text-xs text-gray-400">XML · Excel (xlsx) · CSV · HTKK XML · Tối đa 50MB</p>
+              <p className="text-xs text-gray-400">XML · Excel (xlsx) · CSV · ZIP (chứa XML) · Tối đa 50MB</p>
             </div>
           )}
         </div>
@@ -401,6 +460,32 @@ export default function ImportPage() {
               </div>
             </div>
 
+            {/* ZIP file breakdown */}
+            {preview.zipFiles && preview.zipFiles.length > 0 && (
+              <div className="bg-white rounded-xl border border-gray-100 p-4">
+                <p className="text-xs font-semibold text-gray-500 uppercase mb-2">
+                  File trong ZIP ({preview.zipFiles.length} file XML)
+                </p>
+                <div className="space-y-1.5">
+                  {preview.zipFiles.map((f, i) => (
+                    <div key={i} className="flex items-center justify-between text-xs">
+                      <span className="text-gray-700 truncate max-w-[200px]" title={f.filename}>
+                        📄 {f.filename}
+                      </span>
+                      {f.error ? (
+                        <span className="text-red-500">❌ {f.error}</span>
+                      ) : (
+                        <span className="text-green-600">
+                          ✅ {f.invoiceCount} HĐ
+                          {f.errorCount > 0 && <span className="text-red-500 ml-1">({f.errorCount} lỗi)</span>}
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* Preview table */}
             <div className="bg-white rounded-xl border border-gray-100 overflow-x-auto">
               <p className="px-4 pt-3 text-xs font-semibold text-gray-500 uppercase">Xem trước ({Math.min(5, preview.preview.length)} dòng đầu)</p>
@@ -454,7 +539,12 @@ export default function ImportPage() {
                 <div className="w-full bg-gray-200 rounded-full h-2">
                   <div className="bg-blue-600 h-2 rounded-full transition-all" style={{ width: `${importProgress}%` }} />
                 </div>
-                <p className="text-xs text-center text-gray-500">Đang nhập... {importProgress}%</p>
+                <p className="text-xs text-center text-gray-500">
+                  Đang nhập... {importProgress}%
+                  {preview && importProgress > 0 && importProgress < 100 && (
+                    <span> ({Math.round((preview.validRows * importProgress) / 100)}/{preview.validRows} HĐ)</span>
+                  )}
+                </p>
               </div>
             )}
 

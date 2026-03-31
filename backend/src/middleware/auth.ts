@@ -28,11 +28,20 @@ declare global {
 }
 
 export const authenticate: RequestHandler = (req, _res, next) => {
+  let token: string | undefined;
+
   const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith('Bearer ')) {
+  if (authHeader?.startsWith('Bearer ')) {
+    token = authHeader.slice(7);
+  } else if (typeof req.query.token === 'string' && req.query.token) {
+    // Fallback for EventSource/SSE which cannot send custom headers
+    token = req.query.token;
+  }
+
+  if (!token) {
     throw new AuthError('Missing or invalid authorization header');
   }
-  const token = authHeader.slice(7);
+
   try {
     const payload = jwt.verify(token, env.JWT_SECRET) as JwtPayload;
     req.user = payload;

@@ -72,6 +72,9 @@ const envSchema = z.object({
 
   // Telegram bot — optional
   TELEGRAM_BOT_TOKEN: z.string().optional(),
+
+  // DB pool size — default 50 for production concurrency
+  DB_POOL_MAX: z.string().default('50').transform(Number),
 });
 
 type Env = z.infer<typeof envSchema>;

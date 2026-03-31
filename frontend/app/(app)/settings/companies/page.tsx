@@ -161,7 +161,7 @@ export default function CompaniesSettingsPage() {
   };
 
   return (
-    <div className="max-w-2xl mx-auto px-4 py-6">
+    <div className="max-w-2xl lg:max-w-5xl mx-auto px-4 py-6">
       <BackButton fallbackHref="/dashboard" className="mb-4" />
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-xl font-bold text-gray-900">Quản lý công ty</h1>

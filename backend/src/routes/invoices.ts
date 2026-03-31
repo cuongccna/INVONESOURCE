@@ -76,7 +76,8 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
       pool.query(
         `SELECT id, invoice_number, serial_number, invoice_date, direction, status,
                 seller_name, seller_tax_code, buyer_name, buyer_tax_code,
-                total_amount, vat_amount, vat_rate, gdt_validated, provider
+                total_amount, vat_amount, vat_rate, gdt_validated, provider,
+                invoice_group, serial_has_cqt, has_line_items
          FROM invoices WHERE ${where}
          ORDER BY invoice_date DESC
          LIMIT $${idx} OFFSET $${idx + 1}`,
@@ -221,6 +222,98 @@ router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
     );
 
     sendSuccess(res, { ...result.rows[0], line_items: lineItems.rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/invoices/:id/line-items — thêm thủ công 1 dòng hàng hóa cho HĐ header-only (Nhóm 6/8)
+router.post('/:id/line-items', requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const invoiceId = req.params.id;
+
+    // Validate body
+    const schema = z.object({
+      item_name: z.string().min(1).max(500).transform(s => s.trim()),
+    });
+    const body = schema.safeParse(req.body);
+    if (!body.success) throw new ValidationError(body.error.issues[0]?.message ?? 'Invalid body');
+
+    // Load invoice — must belong to this company
+    const { rows } = await pool.query(
+      `SELECT id, subtotal, vat_amount, total_amount FROM invoices
+       WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
+      [invoiceId, companyId]
+    );
+    if (!rows[0]) throw new NotFoundError('Invoice not found');
+    const inv = rows[0] as { id: string; subtotal: string; vat_amount: string; total_amount: string };
+
+    const subtotal    = parseFloat(inv.subtotal)    || 0;
+    const vatAmount   = parseFloat(inv.vat_amount)  || 0;
+    const totalAmount = parseFloat(inv.total_amount)|| 0;
+    // Compute effective VAT rate from amounts (round to nearest %)
+    const computedRate = subtotal > 0 ? Math.round(vatAmount * 100 / subtotal) : 0;
+
+    // Remove any previous manually-added line item (is_manual = true), then insert fresh
+    await pool.query(
+      `DELETE FROM invoice_line_items WHERE invoice_id = $1 AND company_id = $2 AND is_manual = true`,
+      [invoiceId, companyId]
+    );
+
+    await pool.query(
+      `INSERT INTO invoice_line_items
+         (invoice_id, company_id, line_number, item_name, quantity, unit_price, subtotal, vat_rate, vat_amount, total, is_manual)
+       VALUES ($1, $2, 1, $3, 1, $4, $4, $5, $6, $7, true)`,
+      [invoiceId, companyId, body.data.item_name, subtotal, computedRate, vatAmount, totalAmount]
+    );
+
+    // Mark invoice as having line items
+    await pool.query(
+      `UPDATE invoices SET has_line_items = true WHERE id = $1 AND company_id = $2`,
+      [invoiceId, companyId]
+    );
+
+    // Return updated invoice with line items
+    const updatedLineItems = await pool.query(
+      `SELECT id, line_number, item_code, item_name, unit, quantity, unit_price,
+              subtotal, vat_rate, vat_amount, total, is_manual
+       FROM invoice_line_items
+       WHERE invoice_id = $1 AND company_id = $2
+       ORDER BY line_number ASC NULLS LAST`,
+      [invoiceId, companyId]
+    );
+
+    sendSuccess(res, { line_items: updatedLineItems.rows }, 'Đã thêm chi tiết hàng hóa');
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/invoices/:id/line-items/manual — xóa dòng hàng nhập thủ công
+router.delete('/:id/line-items/manual', requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const invoiceId = req.params.id;
+
+    const { rowCount } = await pool.query(
+      `DELETE FROM invoice_line_items WHERE invoice_id = $1 AND company_id = $2 AND is_manual = true`,
+      [invoiceId, companyId]
+    );
+
+    // If no more line items remain, reset has_line_items
+    const { rows } = await pool.query(
+      `SELECT COUNT(*) FROM invoice_line_items WHERE invoice_id = $1 AND company_id = $2`,
+      [invoiceId, companyId]
+    );
+    if (Number(rows[0].count) === 0) {
+      await pool.query(
+        `UPDATE invoices SET has_line_items = false WHERE id = $1 AND company_id = $2`,
+        [invoiceId, companyId]
+      );
+    }
+
+    sendSuccess(res, { deleted: rowCount ?? 0 }, 'Đã xóa chi tiết thủ công');
   } catch (err) {
     next(err);
   }
@@ -425,6 +518,80 @@ router.post('/:id/restore', requireRole('OWNER', 'ADMIN'), async (req: Request, 
 
     await writeAuditLog(companyId, userId, 'restore', req.params.id, {});
     sendSuccess(res, null, 'Hóa đơn đã được khôi phục');
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/invoices/:id/line-items — bổ sung chi tiết hàng hóa cho HĐ nhóm 6/8
+const lineItemSchema = z.object({
+  items: z.array(z.object({
+    line_number: z.number().int().positive(),
+    item_name: z.string().min(1).max(500),
+    unit: z.string().max(50).optional(),
+    quantity: z.number().positive().optional(),
+    unit_price: z.number().min(0).optional(),
+    subtotal: z.number().min(0),
+    vat_rate: z.number().min(0).max(100),
+    vat_amount: z.number().min(0),
+    total: z.number().min(0),
+  })).min(1).max(200),
+});
+
+router.post('/:id/line-items', requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const userId = req.user!.userId;
+    const invoiceId = req.params.id;
+
+    // Verify invoice exists, belongs to company, and is Group 6 or 8
+    const inv = await pool.query(
+      `SELECT id, invoice_group FROM invoices WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
+      [invoiceId, companyId],
+    );
+    if (!inv.rows[0]) throw new NotFoundError('Invoice not found');
+    const group = inv.rows[0].invoice_group;
+    if (group !== 6 && group !== 8) {
+      throw new ValidationError('Chỉ cho phép bổ sung chi tiết cho hóa đơn nhóm 6 hoặc 8 (không có mã CQT).');
+    }
+
+    const body = lineItemSchema.safeParse(req.body);
+    if (!body.success) throw new ValidationError(body.error.issues[0]?.message ?? 'Invalid line items');
+    const { items } = body.data;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      // Remove existing manual line items for this invoice
+      await client.query(
+        `DELETE FROM invoice_line_items WHERE invoice_id = $1 AND company_id = $2`,
+        [invoiceId, companyId],
+      );
+      // Insert new line items
+      for (const item of items) {
+        await client.query(
+          `INSERT INTO invoice_line_items
+           (invoice_id, company_id, line_number, item_name, unit, quantity, unit_price, subtotal, vat_rate, vat_amount, total)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+          [invoiceId, companyId, item.line_number, item.item_name, item.unit ?? null,
+           item.quantity ?? null, item.unit_price ?? null, item.subtotal, item.vat_rate, item.vat_amount, item.total],
+        );
+      }
+      // Update has_line_items flag
+      await client.query(
+        `UPDATE invoices SET has_line_items = true WHERE id = $1 AND company_id = $2`,
+        [invoiceId, companyId],
+      );
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    await writeAuditLog(companyId, userId, 'add_line_items', invoiceId, { count: items.length });
+    sendSuccess(res, { count: items.length }, `Đã bổ sung ${items.length} dòng chi tiết.`);
   } catch (err) {
     next(err);
   }

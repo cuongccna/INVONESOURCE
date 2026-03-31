@@ -1,95 +1,21 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { useView } from '../contexts/ViewContext';
-
-const DRAWER_SECTIONS = [
-  {
-    title: '📊 Phân Tích',
-    items: [
-      { href: '/reports/trends', label: 'Báo cáo xu hướng' },
-      { href: '/reports/monthly', label: 'Báo cáo tháng' },
-      { href: '/compare', label: 'So sánh công ty' },
-      { href: '/reports/revenue-expense', label: 'Doanh thu & chi phí' },
-      { href: '/reports/profit-loss', label: 'Kết quả HĐKD (B02-DN)' },
-    ],
-  },
-  {
-    title: '📒 Kế Toán',
-    items: [
-      { href: '/reports/sales-journal', label: 'Bảng kê bán ra / mua vào' },
-      { href: '/reports/inventory', label: 'Xuất Nhập Tồn' },
-      { href: '/reports/cash-book', label: 'Sổ Quỹ Tiền' },
-      { href: '/declarations/hkd', label: 'Hộ kinh doanh (HKD)' },
-    ],
-  },
-  {
-    title: '🗂️ Danh Mục',
-    items: [
-      { href: '/catalogs/products', label: 'Hàng hóa & dịch vụ' },
-      { href: '/catalogs/customers', label: 'Khách hàng' },
-      { href: '/catalogs/suppliers', label: 'Nhà cung cấp' },
-    ],
-  },
-  {
-    title: '👥 Khách Hàng (CRM)',
-    items: [
-      { href: '/crm/customers', label: 'Danh sách & RFM' },
-      { href: '/crm/repurchase', label: 'Dự đoán mua lại' },
-      { href: '/crm/aging', label: 'Báo cáo nợ' },
-    ],
-  },
-  {
-    title: '🏭 Nhà Cung Cấp',
-    items: [
-      { href: '/vendors', label: 'Tổng quan NCC' },
-      { href: '/vendors/price-alerts', label: 'Cảnh báo giá' },
-    ],
-  },
-  {
-    title: '📦 Sản Phẩm',
-    items: [
-      { href: '/products/profitability', label: 'Lợi nhuận sản phẩm' },
-    ],
-  },
-  {
-    title: '💰 Dòng Tiền',
-    items: [
-      { href: '/cashflow', label: 'Dự báo 90 ngày' },
-    ],
-  },
-  {
-    title: '� Nhập Dữ Liệu',
-    items: [
-      { href: '/import', label: 'Import hóa đơn' },
-      { href: '/import/history', label: 'Lịch sử import' },
-      { href: '/settings/bot', label: 'GDT Bot' },
-    ],
-  },
-  {
-    title: '�🔍 Kiểm Toán AI',
-    items: [
-      { href: '/audit/anomalies', label: 'Phát hiện bất thường' },
-      { href: '/settings/audit-rules', label: 'Cấu hình quy tắc' },
-    ],
-  },
-  {
-    title: '🏢 Đa Công Ty',
-    items: [
-      { href: '/portfolio', label: 'Danh mục tổng' },
-    ],
-  },
-];
-
-const DRAWER_HREFS = DRAWER_SECTIONS.flatMap((s) => s.items.map((i) => i.href));
+import { DRAWER_SECTIONS, DRAWER_HREFS } from '../lib/navSections';
 
 export default function BottomNav() {
   const pathname = usePathname();
   const router = useRouter();
   const { mode, orgId } = useView();
   const [drawerOpen, setDrawerOpen] = useState(false);
+
+  // Close drawer on route change
+  useEffect(() => {
+    setDrawerOpen(false);
+  }, [pathname]);
 
   const homeHref = mode === 'portfolio'
     ? '/portfolio'
@@ -187,8 +113,8 @@ export default function BottomNav() {
         </div>
       </div>
 
-      {/* Bottom navigation bar */}
-      <nav className="fixed bottom-0 inset-x-0 bg-white border-t border-gray-200 z-40 pb-safe">
+      {/* Bottom navigation bar — hidden on desktop (nav is in Header) */}
+      <nav className="fixed bottom-0 inset-x-0 bg-white border-t border-gray-200 z-40 pb-safe lg:hidden">
         <div className="flex justify-around items-center h-16 max-w-lg mx-auto">
           {mainItems.map((item) => {
             const active = !!pathname && item.matchPrefix.some((p) =>

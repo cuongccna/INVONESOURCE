@@ -8,7 +8,7 @@
  * UnrecoverableError on invalid credentials (deactivates bot).
  * Exponential backoff: 1min → 2min → 4min.
  */
-import { Worker, Job, UnrecoverableError } from 'bullmq';
+import { Worker, Queue, Job, UnrecoverableError } from 'bullmq';
 import { v4 as uuidv4 } from 'uuid';
 import { randomBytes } from 'crypto';
 import { pool } from './db';
@@ -21,9 +21,23 @@ import type { LineItem } from './parsers/GdtXmlParser';
 
 const REDIS_URL    = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
 const CONCURRENCY  = parseInt(process.env['WORKER_CONCURRENCY'] ?? '2', 10);
+
+// Queue for notifying backend to send push notifications after sync
+const _notifQueue = new Queue('sync-notifications', {
+  connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
+});
+// Self-reference queue for sequential job chaining (quarter sync: job 0 → job 1 → job 2)
+const _botSyncQueue = new Queue('gdt-bot-sync', {
+  connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
+});
 const JITTER_EVERY = 10;
 const JITTER_MIN   = 3500;
 const JITTER_MAX   = 6500;
+// Longer "read pause" — simulates user stopping to examine an invoice
+const READ_PAUSE_EVERY_MIN = 25;
+const READ_PAUSE_EVERY_MAX = 40;
+const READ_PAUSE_MIN = 10_000;
+const READ_PAUSE_MAX = 30_000;
 
 const FREE_TIER_MONTHLY_QUOTA = 100;
 
@@ -110,12 +124,58 @@ async function _consumeQuota(companyId: string, invoiceCount: number): Promise<v
   }
 }
 
-// Per-company lock: prevents two jobs for the same company running concurrently.
-// One company's session is strictly sequential — avoids double-login and double traffic to GDT.
-const activeCompanies = new Set<string>();
+// Per-company lock via Redis SET NX EX — atomic, survives process restarts.
+// No TOCTOU race: if SET NX succeeds, we have exclusive access.
+import Redis from 'ioredis';
+const _lockRedis = new Redis(REDIS_URL, { maxRetriesPerRequest: 3 });
+const BOT_LOCK_PREFIX   = 'bot:sync:lock:';
+const BOT_LOCK_TTL      = 45 * 60; // 45 min — upper bound for any single sync run
+const BOT_CANCEL_PREFIX = 'bot:sync:cancel:';
+
+async function acquireCompanyLock(companyId: string): Promise<boolean> {
+  const result = await _lockRedis.set(`${BOT_LOCK_PREFIX}${companyId}`, Date.now().toString(), 'EX', BOT_LOCK_TTL, 'NX');
+  return result === 'OK';
+}
+async function releaseCompanyLock(companyId: string): Promise<void> {
+  await _lockRedis.del(`${BOT_LOCK_PREFIX}${companyId}`);
+}
+
+/** Flush ALL bot locks on startup — if the process restarted, no locks are legitimately held. */
+export async function flushStaleLocks(): Promise<void> {
+  const botKeys = await _lockRedis.keys(`${BOT_LOCK_PREFIX}*`);
+  const syncKeys = await _lockRedis.keys('sync:lock:*');
+  const allKeys = [...botKeys, ...syncKeys];
+  if (allKeys.length > 0) {
+    await _lockRedis.del(...allKeys);
+    logger.info('[SyncWorker] Flushed stale locks on startup', { count: allKeys.length, keys: allKeys });
+  }
+}
+
+/**
+ * Returns true if the user requested cancellation for this company.
+ * Deletes the cancel key atomically on first detection so it fires only once.
+ */
+async function checkCancellationRequested(companyId: string): Promise<boolean> {
+  const deleted = await _lockRedis.del(`${BOT_CANCEL_PREFIX}${companyId}`);
+  return deleted > 0;
+}
 
 function jitteredDelay(): Promise<void> {
   const ms = JITTER_MIN + Math.random() * (JITTER_MAX - JITTER_MIN);
+  return new Promise(r => setTimeout(r, ms));
+}
+
+/** Occasional longer pause to simulate reading/examining an invoice */
+let _nextReadPause = READ_PAUSE_EVERY_MIN + Math.floor(Math.random() * (READ_PAUSE_EVERY_MAX - READ_PAUSE_EVERY_MIN));
+function shouldReadPause(index: number): boolean {
+  if (index > 0 && index % _nextReadPause === 0) {
+    _nextReadPause = READ_PAUSE_EVERY_MIN + Math.floor(Math.random() * (READ_PAUSE_EVERY_MAX - READ_PAUSE_EVERY_MIN));
+    return true;
+  }
+  return false;
+}
+function readPause(): Promise<void> {
+  const ms = READ_PAUSE_MIN + Math.random() * (READ_PAUSE_MAX - READ_PAUSE_MIN);
   return new Promise(r => setTimeout(r, ms));
 }
 
@@ -129,10 +189,21 @@ function thinkTime(minMs: number, maxMs: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
 }
 
+interface SyncJobGroupItem {
+  fromDate: string;
+  toDate:   string;
+  label:    string;
+}
 interface SyncJobData {
   companyId: string;
   fromDate?: string; // YYYY-MM-DD, optional — job-specific override
   toDate?:   string; // YYYY-MM-DD, optional
+  label?:    string; // display label (e.g. 'Tháng 1')
+  // Sequential chaining fields (quarter sync)
+  groupId?:  string;
+  jobIndex?: number; // 0-based index in the group
+  jobTotal?: number; // total jobs in the group
+  allJobs?:  SyncJobGroupItem[]; // all jobs, so each job can enqueue the next
 }
 
 const xmlParser = new GdtXmlParser();
@@ -150,15 +221,33 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
   logger.info('[SyncWorker] Starting job', { jobId: job.id, companyId });
 
-  // Per-company mutex: if a job for this company is already running, skip this one.
-  // UnrecoverableError stops BullMQ from retrying — the scheduler re-evaluates on the
-  // next 30-min tick, so there is no value in rapid retries that trigger extra logins.
-  if (activeCompanies.has(companyId)) {
-    logger.warn('[SyncWorker] Company already syncing — skipping (scheduler will re-enqueue)', { jobId: job.id, companyId });
-    throw new UnrecoverableError(`[SyncWorker] Concurrent sync for company ${companyId} — skipped`);
+  // ── 0. Time-of-day awareness (BEFORE lock — don't hold lock while sleeping) ──
+  // Prefer running during Vietnam business hours (8am-6pm GMT+7).
+  // Skip in development — no need to wait 5-30 min while testing.
+  const isDev = process.env['NODE_ENV'] !== 'production';
+  if (!isDev) {
+    const vnHour = new Date(Date.now() + 7 * 3600_000).getUTCHours();
+    if (vnHour < 7 || vnHour >= 20) {
+      const delayMs = 5 * 60_000 + Math.floor(Math.random() * 25 * 60_000); // 5-30 min
+      logger.info('[SyncWorker] Off-hours delay (VN time)', { vnHour, delayMs });
+      await new Promise(r => setTimeout(r, delayMs));
+    } else if (vnHour === 7 || vnHour === 19) {
+      const delayMs = 60_000 + Math.floor(Math.random() * 4 * 60_000); // 1-5 min
+      await new Promise(r => setTimeout(r, delayMs));
+    }
   }
-  activeCompanies.add(companyId);
+
+  // Per-company mutex via Redis SET NX — atomic, no TOCTOU race.
+  // Throw regular Error → BullMQ retries with the job's configured backoff.
+  // (moveToDelayed requires Redis 6.2+; our Redis 5.0.14 doesn't support it.)
+  // This throw is BEFORE the inner try/catch, so _failRun() is NOT called.
+  const lockAcquired = await acquireCompanyLock(companyId);
+  if (!lockAcquired) {
+    logger.warn('[SyncWorker] Company already syncing — will retry via backoff', { jobId: job.id, companyId });
+    throw new Error(`LOCK_CONFLICT: company ${companyId} already syncing`);
+  }
   try {
+
     // ── 1. Load config ──────────────────────────────────────────────────────────
     const cfgRes = await pool.query(
       `SELECT encrypted_credentials, has_otp, otp_method, tax_code,
@@ -180,10 +269,10 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       last_run_at: string | null;
     };
 
-    // Check if blocked
+    // Check if blocked — skip _failRun (not a real failure, just a cooldown)
     if (cfg.blocked_until && new Date(cfg.blocked_until) > new Date()) {
       logger.warn('[SyncWorker] Company blocked until', { companyId, blocked_until: cfg.blocked_until });
-      throw new Error(`Bot blocked until ${cfg.blocked_until}`);
+      throw new Error(`COOLDOWN_SKIP: Bot blocked until ${cfg.blocked_until}`);
     }
 
     // ── 1b. Quota gate ─────────────────────────────────────────────────────────
@@ -201,10 +290,11 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
         logger.warn('[SyncWorker] Login cooldown active — too soon since last run', {
           companyId, elapsedMin, waitMin,
         });
-        // UnrecoverableError: no point retrying rapidly — user retriggers after cooldown expires.
-        // For scheduled jobs the scheduler will re-enqueue on the next 30-min tick.
-        throw new UnrecoverableError(
-          `[SyncWorker] Login cooldown: last run ${elapsedMin}m ago, wait ${waitMin}m more`,
+        // Regular Error (not UnrecoverableError) so BullMQ retries quarter jobs.
+        // With exponential backoff (1m, 2m, 4m, 8m, 16m), the 15-min cooldown
+        // will have expired by the 4th retry. COOLDOWN_SKIP prefix → catch skips _failRun.
+        throw new Error(
+          `COOLDOWN_SKIP: Login cooldown: last run ${elapsedMin}m ago, wait ${waitMin}m more`,
         );
       }
     }
@@ -297,14 +387,21 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       // Detect if the error is a pre-GDT network/proxy/TLS failure.
       // In that case GDT never received any login attempt — no need for the
       // 15-minute cooldown. BullMQ backoff + consecutive_failures block handles protection.
+      // Use lowercase (msgLc) for case-insensitive matching.
+      // 'Proxy CONNECT failed' has capital P — msg.includes('proxy') missed it.
+      // 'stream has been aborted' also wasn't detected.
       const isProxyOrNetworkError =
-        msg.includes('socket disconnected') ||
-        msg.includes('ECONNRESET') ||
-        msg.includes('ETIMEDOUT') ||
-        msg.includes('ECONNREFUSED') ||
-        msg.includes('TLS') ||
-        msg.includes('SSL') ||
-        msg.includes('proxy');
+        msgLc.includes('socket disconnected') ||
+        msgLc.includes('econnreset') ||
+        msgLc.includes('etimedout') ||
+        msgLc.includes('econnrefused') ||
+        msgLc.includes('tls') ||
+        msgLc.includes('ssl') ||
+        msgLc.includes('proxy') ||
+        msgLc.includes('stream') ||
+        msgLc.includes('aborted') ||
+        msgLc.includes('407') ||
+        msgLc.includes('connect failed');
       // _failRun increments consecutive_failures + clears proxy_session_id in DB
       await _failRun(runId, companyId, msg, false, isProxyOrNetworkError);
       throw new Error(`[SyncWorker] Login failed: ${msg}`);
@@ -345,6 +442,12 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
       // Output invoices
       const outputInvoices = await runner.fetchOutputInvoices(fromDate, toDate);
+
+      // Check cancellation after login (before any heavy work)
+      if (await checkCancellationRequested(companyId)) {
+        throw new Error('CANCEL_SKIP: sync cancelled by user');
+      }
+
       for (let i = 0; i < outputInvoices.length; i++) {
         const inv = outputInvoices[i]!;
         const invoiceId = await _upsertInvoice(inv, companyId, 'output');
@@ -353,6 +456,28 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
           xmlFetchCount += await _maybeInsertLineItems(runner, inv, invoiceId, companyId);
         }
         if (i > 0 && i % JITTER_EVERY === 0) await jitteredDelay();
+        if (shouldReadPause(i)) {
+          logger.info('[SyncWorker] Read pause (human-like)', { companyId, index: i });
+          await readPause();
+        }
+        // Cancellation check every JITTER_EVERY invoices (same cadence as jitter delay)
+        if (i > 0 && i % JITTER_EVERY === 0) {
+          if (await checkCancellationRequested(companyId)) {
+            logger.info('[SyncWorker] Cancellation requested mid-output-fetch', { companyId, processedSoFar: i });
+            throw new Error('CANCEL_SKIP: sync cancelled by user');
+          }
+        }
+        // Progress update
+        if (i % 5 === 0 || i === outputInvoices.length - 1) {
+          const pct = Math.round(((i + 1) / (outputInvoices.length * 2)) * 50);
+          await job.updateProgress({
+            percent: pct,
+            invoicesFetched: outputCount + inputCount,
+            statusMessage: `Đang xử lý HĐ đầu ra ${i + 1}/${outputInvoices.length}...`,
+            currentPage: i + 1,
+            totalPages: outputInvoices.length,
+          } as Record<string, unknown>);
+        }
       }
 
       // Human-like pause between output and input fetch (2–8s)
@@ -367,9 +492,38 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
           xmlFetchCount += await _maybeInsertLineItems(runner, inv, invoiceId, companyId);
         }
         if (i > 0 && i % JITTER_EVERY === 0) await jitteredDelay();
+        if (shouldReadPause(i)) {
+          logger.info('[SyncWorker] Read pause (human-like)', { companyId, index: i });
+          await readPause();
+        }
+        // Cancellation check every JITTER_EVERY invoices
+        if (i > 0 && i % JITTER_EVERY === 0) {
+          if (await checkCancellationRequested(companyId)) {
+            logger.info('[SyncWorker] Cancellation requested mid-input-fetch', { companyId, processedSoFar: i });
+            throw new Error('CANCEL_SKIP: sync cancelled by user');
+          }
+        }
+        // Progress update
+        if (i % 5 === 0 || i === inputInvoices.length - 1) {
+          const pct = 50 + Math.round(((i + 1) / inputInvoices.length) * 50);
+          await job.updateProgress({
+            percent: pct,
+            invoicesFetched: outputCount + inputCount,
+            statusMessage: `Đang xử lý HĐ đầu vào ${i + 1}/${inputInvoices.length}...`,
+            currentPage: i + 1,
+            totalPages: inputInvoices.length,
+          } as Record<string, unknown>);
+        }
       }
 
       if (proxyUrl) proxyManager.markHealthy(proxyUrl);
+
+      // Final progress update
+      await job.updateProgress({
+        percent: 100,
+        invoicesFetched: outputCount + inputCount,
+        statusMessage: `Hoàn thành — ${outputCount} HĐ đầu ra, ${inputCount} HĐ đầu vào`,
+      } as Record<string, unknown>);
 
       const durationMs = Date.now() - startedAt;
       await pool.query(
@@ -393,18 +547,69 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       await _consumeQuota(companyId, totalSynced);
 
       logger.info('[SyncWorker] Done', { companyId, outputCount, inputCount, durationMs });
+
+      // ── Push notification via backend queue ─────────────────────────────────────
+      if (totalSynced > 0) {
+        try {
+          await _notifQueue.add('sync-complete', {
+            companyId,
+            provider: 'GDT Bot',
+            count: totalSynced,
+          });
+        } catch (notifErr) {
+          logger.warn('[SyncWorker] Failed to enqueue notification (non-fatal)', { companyId, err: notifErr });
+        }
+      }
+
+      // ── Sequential chaining: enqueue next job in the group ──────────────────────
+      // Quarter sync: job 0 (Jan) → job 1 (Feb) → job 2 (Mar), each started after
+      // the previous completes. This avoids LOCK_CONFLICT from parallel execution.
+      const jobIndex = job.data.jobIndex ?? 0;
+      const jobTotal = job.data.jobTotal ?? 1;
+      if (job.data.allJobs && jobIndex + 1 < jobTotal) {
+        const nextIndex = jobIndex + 1;
+        const nextJobData = job.data.allJobs[nextIndex];
+        if (nextJobData) {
+          const nextJobId = `${job.data.groupId}-${nextIndex}`;
+          try {
+            await _botSyncQueue.add('sync', {
+              companyId,
+              fromDate: nextJobData.fromDate,
+              toDate:   nextJobData.toDate,
+              label:    nextJobData.label,
+              groupId:  job.data.groupId,
+              jobIndex: nextIndex,
+              jobTotal,
+              allJobs:  job.data.allJobs,
+            }, {
+              jobId:    nextJobId,
+              delay:    5_000, // 5s gap before next month starts
+              attempts: 6,
+              backoff:  { type: 'exponential', delay: 60_000 },
+              removeOnComplete: { count: 100 },
+              removeOnFail:     { count: 50 },
+            });
+            logger.info('[SyncWorker] Chained next job in group', { nextJobId, nextIndex, jobTotal });
+          } catch (chainErr) {
+            logger.error('[SyncWorker] Failed to chain next job (non-fatal)', { companyId, err: chainErr });
+          }
+        }
+      }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      // Don't call _failRun for the concurrent-defer error (no runId created yet in that path,
-      // and it's not a real failure — BullMQ will retry cleanly)
-      if (!msg.includes('Concurrent sync for company')) {
+      // COOLDOWN_SKIP / CANCEL_SKIP: not real failures — don't touch consecutive_failures.
+      const isSkip = msg.startsWith('COOLDOWN_SKIP:') || msg.startsWith('CANCEL_SKIP:');
+      if (!isSkip) {
         await _failRun(runId, companyId, msg, false);
       }
       throw err;
     }
   } finally {
-    // Always release the per-company lock, including pre-flight failures like cooldown/no-proxy.
-    activeCompanies.delete(companyId);
+    // Release both locks:
+    // 1. Bot worker lock (bot:sync:lock:) — prevents concurrent bot jobs
+    // 2. HTTP route lock (sync:lock:) — prevents double-click from UI
+    await releaseCompanyLock(companyId);
+    await _lockRedis.del(`sync:lock:${companyId}`);
   }
 }
 
@@ -418,12 +623,31 @@ async function _upsertInvoice(
   // so we derive it here. For KCT/zero-VAT invoices this equals total_amount.
   const computedSubtotal = ((inv.total_amount ?? 0) - (inv.vat_amount ?? 0));
 
+  // GROUP 47: Classify invoice by serial number (TT78/2021)
+  const serial = (inv.serial_number ?? '').toUpperCase().trim();
+  let invoiceGroup: number | null = null;
+  let serialHasCqt: boolean | null = null;
+  let hasLineItems = false;
+  if (serial.length >= 4) {
+    const firstChar = serial[0];
+    serialHasCqt = firstChar === 'C';
+    if (firstChar === 'C') {
+      invoiceGroup = 5;
+      hasLineItems = true;
+    } else if (firstChar === 'K') {
+      invoiceGroup = serial[3] === 'M' ? 8 : 6;
+      hasLineItems = false;
+    }
+  }
+
   const res = await pool.query(
     `INSERT INTO invoices
      (id, company_id, invoice_number, serial_number, invoice_date, direction, status,
       seller_name, seller_tax_code, buyer_name, buyer_tax_code,
-      subtotal, total_amount, vat_amount, vat_rate, gdt_validated, source, provider, created_at)
-     VALUES ($1,$2,$3,$4,COALESCE($5, CURRENT_DATE),$6,$7,$8,COALESCE($9,''),$10,$11,$12,$13,$14,$15,true,'gdt_bot','gdt_bot',NOW())
+      subtotal, total_amount, vat_amount, vat_rate, gdt_validated, source, provider,
+      invoice_group, serial_has_cqt, has_line_items, created_at)
+     VALUES ($1,$2,$3,$4,COALESCE($5, CURRENT_DATE),$6,$7,$8,COALESCE($9,''),$10,$11,$12,$13,$14,$15,true,'gdt_bot','gdt_bot',
+      $16,$17,$18,NOW())
      ON CONFLICT (company_id, provider, invoice_number, COALESCE(seller_tax_code, ''), invoice_date) DO UPDATE SET
        direction       = EXCLUDED.direction,
        status          = EXCLUDED.status,
@@ -436,6 +660,9 @@ async function _upsertInvoice(
        vat_amount      = EXCLUDED.vat_amount,
        vat_rate        = EXCLUDED.vat_rate,
        gdt_validated   = true,
+       invoice_group   = COALESCE(EXCLUDED.invoice_group, invoices.invoice_group),
+       serial_has_cqt  = COALESCE(EXCLUDED.serial_has_cqt, invoices.serial_has_cqt),
+       has_line_items  = COALESCE(EXCLUDED.has_line_items, invoices.has_line_items),
        updated_at      = NOW()
      RETURNING id`,
     [
@@ -446,6 +673,7 @@ async function _upsertInvoice(
       inv.seller_name, inv.seller_tax_code,
       inv.buyer_name, inv.buyer_tax_code,
       computedSubtotal, inv.total_amount, inv.vat_amount, inv.vat_rate,
+      invoiceGroup, serialHasCqt, hasLineItems,
     ]
   );
   return res.rows[0].id as string;

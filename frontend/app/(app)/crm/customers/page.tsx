@@ -132,7 +132,7 @@ export default function CrmCustomersPage() {
   const totalRevenue = summary.reduce((s, r) => s + Number(r.total_revenue), 0);
 
   return (
-    <div className="p-4 max-w-2xl mx-auto space-y-5">
+    <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto space-y-5">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold text-gray-900">Phân Tích Khách Hàng</h1>
         <button onClick={recalculate} disabled={recalculating}

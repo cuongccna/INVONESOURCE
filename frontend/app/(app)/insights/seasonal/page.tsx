@@ -56,7 +56,7 @@ export default function SeasonalInsightsPage() {
 
   if (loading) {
     return (
-      <div className="p-4 max-w-2xl mx-auto">
+      <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto">
         <div className="flex justify-center py-14">
           <div className="animate-spin rounded-full h-7 w-7 border-b-2 border-primary-600" />
         </div>
@@ -65,7 +65,7 @@ export default function SeasonalInsightsPage() {
   }
 
   return (
-    <div className="p-4 max-w-2xl mx-auto space-y-5">
+    <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto space-y-5">
       <div>
         <h1 className="text-2xl font-bold text-gray-900">Insight Mua Theo Mùa</h1>
         <p className="text-sm text-gray-500 mt-1">Phân tích 24 tháng doanh thu, chi phí và tính mùa vụ</p>

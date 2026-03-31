@@ -6,11 +6,30 @@ import axios from 'axios';
 import { setAccessToken } from '../lib/apiClient';
 import { CompanyProvider } from '../contexts/CompanyContext';
 import { ViewProvider } from '../contexts/ViewContext';
+import { SyncProvider, useSyncContext } from '../contexts/SyncContext';
 import Header from './Header';
 import BottomNav from './BottomNav';
+import SyncProgressPanel from './SyncProgressPanel';
 import { useCompany } from '../contexts/CompanyContext';
+import { usePushSubscription } from '../lib/usePushSubscription';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
+
+/** Renders the floating sync progress panel, persists across all page navigations. */
+function SyncOverlay() {
+  const { syncJobIds, syncCompanyId, clearSync } = useSyncContext();
+  if (syncJobIds.length === 0) return null;
+  return (
+    <div className="fixed bottom-20 lg:bottom-6 inset-x-0 z-40 px-4" style={{ maxWidth: '42rem', left: '50%', transform: 'translateX(-50%)' }}>
+      <SyncProgressPanel
+        jobIds={syncJobIds}
+        companyId={syncCompanyId}
+        onClose={clearSync}
+        onDone={clearSync}
+      />
+    </div>
+  );
+}
 
 /** Redirects to company creation when user has no companies yet, except on the settings page itself. */
 function NoCompanyGuard() {
@@ -31,6 +50,9 @@ function NoCompanyGuard() {
 export default function ClientLayout({ children }: { children: React.ReactNode }) {
   const [ready, setReady] = useState(false);
   const router = useRouter();
+
+  // Register push subscription once user is authenticated
+  usePushSubscription(ready);
 
   useEffect(() => {
     // On every page load, silently refresh the access token using the
@@ -63,15 +85,18 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
   }
 
   return (
-    <CompanyProvider>
-      <ViewProvider>
-        <div className="min-h-screen bg-gray-50">
-          <NoCompanyGuard />
-          <Header />
-          <main className="pb-20 pt-14 safe-bottom">{children}</main>
-          <BottomNav />
-        </div>
-      </ViewProvider>
-    </CompanyProvider>
+    <SyncProvider>
+      <CompanyProvider>
+        <ViewProvider>
+          <div className="min-h-screen bg-gray-50">
+            <NoCompanyGuard />
+            <Header />
+            <main className="pb-20 lg:pb-6 pt-14 safe-bottom">{children}</main>
+            <SyncOverlay />
+            <BottomNav />
+          </div>
+        </ViewProvider>
+      </CompanyProvider>
+    </SyncProvider>
   );
 }

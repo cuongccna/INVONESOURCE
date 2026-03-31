@@ -49,7 +49,7 @@ export default function AuditRulesSettingsPage() {
   };
 
   return (
-    <div className="p-4 max-w-2xl mx-auto space-y-5">
+    <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto space-y-5">
       <div>
         <h1 className="text-2xl font-bold text-gray-900">Cấu Hình Luật Kiểm Toán</h1>
         <p className="text-sm text-gray-500 mt-1">Điều chỉnh ngưỡng cảnh báo cho audit tự động</p>

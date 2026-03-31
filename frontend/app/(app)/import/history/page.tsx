@@ -74,7 +74,7 @@ export default function ImportHistoryPage() {
   );
 
   return (
-    <div className="p-4 max-w-2xl mx-auto pb-24 space-y-4">
+    <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto pb-24 space-y-4">
       <BackButton fallbackHref="/import" />
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-bold text-gray-900">Lịch sử Import</h1>

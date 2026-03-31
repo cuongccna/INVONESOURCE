@@ -1,12 +1,15 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { format } from 'date-fns';
 import { vi } from 'date-fns/locale';
 import apiClient from '../../../lib/apiClient';
 import { useCompany } from '../../../contexts/CompanyContext';
 import { useToast } from '../../../components/ToastProvider';
+import { useSyncContext } from '../../../contexts/SyncContext';
+import SyncDatePicker from '../../../components/SyncDatePicker';
+import type { SyncJob } from '../../../components/SyncDatePicker';
 
 interface Invoice {
   id: string;
@@ -22,6 +25,9 @@ interface Invoice {
   vat_rate: number;
   gdt_validated: boolean;
   provider: string;
+  invoice_group: number | null;
+  serial_has_cqt: boolean | null;
+  has_line_items: boolean | null;
 }
 
 interface PaginatedResponse {
@@ -41,6 +47,14 @@ const PROVIDER_LABELS: Record<string, string> = {
   viettel: 'Viettel',
   bkav: 'BKAV',
   gdt_intermediary: 'GDT',
+  gdt_bot: 'GDT Bot',
+  manual: 'Nhập tay',
+};
+
+const GROUP_LABELS: Record<number, { label: string; color: string }> = {
+  5: { label: 'Nhóm 5', color: 'bg-emerald-50 text-emerald-700' },
+  6: { label: 'Nhóm 6', color: 'bg-orange-50 text-orange-700' },
+  8: { label: 'Nhóm 8', color: 'bg-orange-50 text-orange-700' },
 };
 
 export default function InvoicesPage() {
@@ -119,49 +133,30 @@ export default function InvoicesPage() {
   const [showBotSetup, setShowBotSetup] = useState(false);
   const [botPassword, setBotPassword] = useState('');
   const [botSetupLoading, setBotSetupLoading] = useState(false);
-  // Date picker for sync
   const [showSyncPicker, setShowSyncPicker] = useState(false);
-  const [syncFrom, setSyncFrom]   = useState('');
-  const [syncTo, setSyncTo]       = useState('');
-  const [syncDateErr, setSyncDateErr] = useState('');
+  const { syncJobIds, isSyncing, startSync } = useSyncContext();
 
   const openSyncPicker = () => {
-    const today = new Date();
-    setSyncFrom(new Date(today.getFullYear(), today.getMonth(), 1).toISOString().slice(0, 10));
-    setSyncTo(today.toISOString().slice(0, 10));
-    setSyncDateErr('');
+    if (isSyncing) {
+      toast.info('Đang có đồng bộ đang chạy. Nhấn Hủy đồng bộ nếu muốn dừng lại.');
+      return;
+    }
     setShowSyncPicker(true);
   };
 
-  const onSyncFromChange = (val: string) => {
-    setSyncFrom(val);
-    setSyncDateErr('');
-    if (!val || !syncTo) return;
-    const diff = new Date(syncTo).getTime() - new Date(val).getTime();
-    if (diff < 0) { setSyncDateErr('Từ ngày phải nhỏ hơn Đến ngày'); return; }
-    if (diff > 31 * 86400000) setSyncTo(new Date(new Date(val).getTime() + 31 * 86400000).toISOString().slice(0, 10));
-  };
-  const onSyncToChange = (val: string) => {
-    setSyncTo(val);
-    setSyncDateErr('');
-    if (!val || !syncFrom) return;
-    const diff = new Date(val).getTime() - new Date(syncFrom).getTime();
-    if (diff < 0) { setSyncDateErr('Đến ngày phải lớn hơn Từ ngày'); return; }
-    if (diff > 31 * 86400000) setSyncFrom(new Date(new Date(val).getTime() - 31 * 86400000).toISOString().slice(0, 10));
-  };
-
-  const triggerSync = async (fromDate: string, toDate: string) => {
+  const handleSyncConfirm = async (jobs: SyncJob[]) => {
     if (syncing) return;
     setShowSyncPicker(false);
     setSyncing(true);
     try {
-      await apiClient.post('/invoices/sync', { from_date: fromDate, to_date: toDate });
-      toast.success(`Đã kích hoạt đồng bộ từ ${fromDate} → ${toDate}. Hóa đơn sẽ cập nhật sau ít phút.`);
-      setTimeout(() => void load(1), 3000);
+      const res = await apiClient.post<{ data: { jobIds: string[] } }>('/sync/start', { jobs });
+      const ids = res.data.data.jobIds;
+      startSync(ids, activeCompanyId ?? '');
+      toast.success(`Đã kích hoạt đồng bộ ${jobs.length} kỳ. Theo dõi tiến trình bên dưới.`);
     } catch (err: unknown) {
       const status = (err as { response?: { status?: number } })?.response?.status;
       if (status === 409) {
-        toast.error('⚠️ Đang có đồng bộ đang chạy. Vui lòng đợi hoàn tất rồi thử lại.');
+        toast.error('⚠️ Đang có đồng bộ đang chạy. Nhấn nút Hủy đồng bộ trên thanh tiến trình để dừng lại.');
       } else if (status === 428) {
         setShowBotSetup(true);
       } else {
@@ -171,6 +166,13 @@ export default function InvoicesPage() {
       setSyncing(false);
     }
   };
+
+  // Reload invoice list when sync finishes (panel closes)
+  const prevSyncing = useRef(false);
+  useEffect(() => {
+    if (prevSyncing.current && !isSyncing) void load(1);
+    prevSyncing.current = isSyncing;
+  }, [isSyncing, load]);
 
   const handleBotSetup = async () => {
     if (!botPassword.trim()) {
@@ -194,7 +196,7 @@ export default function InvoicesPage() {
   };
 
   return (
-    <div className="p-4 max-w-2xl mx-auto">
+    <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto">
       {/* Header */}
       <div className="flex items-center justify-between mb-4">
         <div>
@@ -279,7 +281,7 @@ export default function InvoicesPage() {
           <p className="text-sm mt-1">Nhấn &quot;Đồng Bộ&quot; để tải hóa đơn</p>
         </div>
       ) : (
-        <div className="space-y-3">
+        <div className="space-y-3 lg:grid lg:grid-cols-2 lg:gap-4 lg:space-y-0">
           {invoices.map((inv) => {
             const statusInfo = STATUS_LABELS[inv.status] ?? { label: inv.status, color: 'bg-gray-100 text-gray-700' };
             return (
@@ -324,7 +326,17 @@ export default function InvoicesPage() {
                     <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${statusInfo.color}`}>
                       {statusInfo.label}
                     </span>
-                    {!inv.gdt_validated && inv.status === 'valid' && (
+                    {inv.invoice_group && inv.invoice_group !== 5 && (
+                      <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${GROUP_LABELS[inv.invoice_group]?.color ?? 'bg-gray-100 text-gray-600'}`}>
+                        {GROUP_LABELS[inv.invoice_group]?.label ?? `Nhóm ${inv.invoice_group}`}
+                      </span>
+                    )}
+                    {inv.has_line_items === false && (
+                      <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-500">
+                        Thiếu chi tiết
+                      </span>
+                    )}
+                    {!inv.gdt_validated && inv.status === 'valid' && inv.invoice_group !== 6 && inv.invoice_group !== 8 && (
                       <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-yellow-100 text-yellow-700">
                         Chờ GDT
                       </span>
@@ -417,59 +429,11 @@ export default function InvoicesPage() {
 
       {/* Sync date picker modal */}
       {showSyncPicker && (
-        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 p-4">
-          <div className="bg-white rounded-2xl w-full max-w-sm p-5 shadow-xl space-y-4">
-            <div className="flex items-center justify-between">
-              <h3 className="font-bold text-gray-900">Chọn khoảng thời gian</h3>
-              <button onClick={() => setShowSyncPicker(false)} className="text-gray-400 hover:text-gray-700 text-xl">✕</button>
-            </div>
-            <p className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-              ⚠️ Quy định GDT: tối đa <strong>31 ngày</strong> mỗi lần đồng bộ.
-            </p>
-            <div className="space-y-3">
-              <div>
-                <label className="text-xs font-medium text-gray-600 block mb-1">Từ ngày</label>
-                <input
-                  type="date"
-                  value={syncFrom}
-                  max={syncTo || new Date().toISOString().slice(0, 10)}
-                  onChange={e => onSyncFromChange(e.target.value)}
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
-                />
-              </div>
-              <div>
-                <label className="text-xs font-medium text-gray-600 block mb-1">Đến ngày</label>
-                <input
-                  type="date"
-                  value={syncTo}
-                  min={syncFrom}
-                  max={new Date().toISOString().slice(0, 10)}
-                  onChange={e => onSyncToChange(e.target.value)}
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
-                />
-              </div>
-              {syncDateErr && <p className="text-xs text-red-600">{syncDateErr}</p>}
-              {syncFrom && syncTo && !syncDateErr && (
-                <p className="text-xs text-green-600">
-                  ✓ {Math.round((new Date(syncTo).getTime() - new Date(syncFrom).getTime()) / 86400000)} ngày
-                </p>
-              )}
-            </div>
-            <div className="flex gap-3">
-              <button onClick={() => setShowSyncPicker(false)}
-                className="flex-1 border border-gray-300 rounded-xl py-2.5 text-sm text-gray-700">
-                Hủy
-              </button>
-              <button
-                onClick={() => { if (syncFrom && syncTo && !syncDateErr) void triggerSync(syncFrom, syncTo); }}
-                disabled={!syncFrom || !syncTo || !!syncDateErr || syncing}
-                className="flex-1 bg-primary-600 text-white rounded-xl py-2.5 text-sm font-medium disabled:opacity-50"
-              >
-                Đồng bộ
-              </button>
-            </div>
-          </div>
-        </div>
+        <SyncDatePicker
+          onConfirm={(jobs) => void handleSyncConfirm(jobs)}
+          onCancel={() => setShowSyncPicker(false)}
+          syncing={syncing}
+        />
       )}
 
       {/* GDT Bot setup modal — shown when bot not yet configured */}

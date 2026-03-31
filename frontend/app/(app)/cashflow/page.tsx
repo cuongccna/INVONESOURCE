@@ -91,7 +91,7 @@ export default function CashflowPage() {
     .slice(0, 8);
 
   return (
-    <div className="p-4 max-w-2xl mx-auto space-y-5">
+    <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto space-y-5">
       <div className="flex items-center justify-between flex-wrap gap-2">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Dự Báo Dòng Tiền</h1>

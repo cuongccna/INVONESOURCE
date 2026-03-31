@@ -8,6 +8,7 @@ import { NormalizedInvoice } from 'shared';
 import { v4 as uuidv4 } from 'uuid';
 import { enqueueGdtValidation } from './GdtValidatorWorker';
 import { priceAnomalyDetector } from '../services/PriceAnomalyDetector';
+import { notificationService, pushService } from '../services/NotificationService';
 
 export interface SyncJobPayload {
   companyId: string;
@@ -104,6 +105,23 @@ async function syncPlugin(
     errors.push(errorMsg);
     console.error(`[SyncWorker][${plugin.id}] sync failed:`, errorMsg);
 
+    // Detect authentication failures — cannot recover by retrying, must disable connector
+    const isAuthError = /username|password|m\u1eadt kh\u1ea9u|sai.*kh\u1ea9u|unauthorized|invalid.*credential|401|403/i.test(errorMsg);
+    if (isAuthError) {
+      // Disable the connector so it stops spamming failed attempts
+      await pool.query(
+        `UPDATE company_connectors
+         SET enabled = false, consecutive_failures = consecutive_failures + 1,
+             circuit_state = 'OPEN', circuit_opened_at = NOW(), last_error = $3
+         WHERE company_id = $1 AND provider = $2`,
+        [companyId, plugin.id, errorMsg]
+      );
+      registry.recordAuthFailure(plugin.id);
+      console.error(`[SyncWorker][${plugin.id}] Auth failure — connector auto-disabled for company ${companyId}`);
+      await notificationService.onConnectorError(companyId, plugin.id);
+      return { recordsFetched: 0, errors };
+    }
+
     const circuitOpened = registry.recordFailure(plugin.id);
 
     // Update circuit state in DB
@@ -118,13 +136,7 @@ async function syncPlugin(
     );
 
     if (circuitOpened) {
-      // Trigger notification when circuit opens
-      await createNotification(
-        companyId,
-        'CONNECTOR_ERROR',
-        `Mất kết nối ${plugin.name}`,
-        `🔴 Mất kết nối ${plugin.name} — cần xác thực lại`
-      );
+      await notificationService.onConnectorError(companyId, plugin.id);
     }
   }
 
@@ -210,30 +222,6 @@ async function upsertInvoices(
   return { created, updated, skipped };
 }
 
-async function createNotification(
-  companyId: string,
-  type: string,
-  title: string,
-  body: string
-): Promise<void> {
-  try {
-    // Get all users for this company
-    const { rows } = await pool.query(
-      'SELECT user_id FROM user_companies WHERE company_id = $1',
-      [companyId]
-    );
-    for (const row of rows) {
-      await pool.query(
-        `INSERT INTO notifications (id, company_id, user_id, type, title, body)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [uuidv4(), companyId, row.user_id, type, title, body]
-      );
-    }
-  } catch (err) {
-    console.error('[SyncWorker] Failed to create notification:', err);
-  }
-}
-
 // ============================================================
 // BullMQ Worker
 // ============================================================
@@ -304,12 +292,7 @@ export const syncWorker = new Worker<SyncJobPayload>(
 
     // Send summary notification if invoices were fetched
     if (totalFetched > 0) {
-      await createNotification(
-        companyId,
-        'SYNC_COMPLETE',
-        'Đồng bộ hoàn tất',
-        `Đồng bộ xong ${totalFetched} hóa đơn`
-      );
+      await notificationService.onSyncComplete(companyId, 'connector', totalFetched);
 
       // Auto-run price anomaly detection after each sync — isolated, never throws
       try {
@@ -346,9 +329,10 @@ export async function scheduleSyncCron(): Promise<void> {
     await syncQueue.removeRepeatableByKey(job.key);
   }
 
-  // Load all companies and schedule sync
+  // Only schedule for companies that have at least one enabled connector
   const { rows: companies } = await pool.query(
-    'SELECT id FROM companies'
+    `SELECT DISTINCT c.id FROM companies c
+     INNER JOIN company_connectors cc ON cc.company_id = c.id AND cc.enabled = true`
   );
 
   for (const company of companies) {

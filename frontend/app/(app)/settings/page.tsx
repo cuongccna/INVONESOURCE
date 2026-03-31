@@ -27,7 +27,7 @@ const SETTINGS_SECTIONS = [
 
 export default function SettingsIndexPage() {
   return (
-    <div className="p-4 max-w-2xl mx-auto space-y-5">
+    <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto space-y-5">
       <h1 className="text-2xl font-bold text-gray-900">Cài Đặt</h1>
       {SETTINGS_SECTIONS.map((section) => (
         <div key={section.title}>

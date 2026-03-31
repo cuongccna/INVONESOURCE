@@ -86,7 +86,7 @@ export default function PortfolioPage() {
   const years = [year - 1, year, year + 1];
 
   return (
-    <div className="p-4 max-w-2xl mx-auto space-y-5">
+    <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto space-y-5">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
@@ -125,7 +125,7 @@ export default function PortfolioPage() {
       ) : kpi ? (
         <>
           {/* KPI Cards */}
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
             {[
               { label: 'Tổng Doanh Thu', value: `${compact(kpi.total_output)} ₫`, sub: `${kpi.total_companies} công ty`, color: 'text-gray-900' },
               { label: 'Tổng Chi Phí', value: `${compact(kpi.total_input)} ₫`, sub: 'Hóa đơn đầu vào', color: 'text-gray-900' },

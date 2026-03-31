@@ -1,7 +1,8 @@
 import { ConnectorPlugin, CircuitBreakerState } from './types';
 
 const CIRCUIT_OPEN_THRESHOLD = 3;        // 3 consecutive failures → OPEN
-const CIRCUIT_COOLDOWN_MS = 60_000;      // 60 seconds before HALF_OPEN
+const CIRCUIT_COOLDOWN_MS    = 60_000;   // 60 seconds before HALF_OPEN (transient errors)
+const CIRCUIT_AUTH_COOLDOWN  = 24 * 60 * 60_000; // 24 hours for auth failures
 
 /**
  * ConnectorRegistry — manages all provider plugins with per-plugin circuit breakers.
@@ -119,6 +120,21 @@ export class ConnectorRegistry {
     }
 
     return false;
+  }
+
+  /**
+   * Record an authentication failure — opens circuit for 24 hours.
+   * Auth errors cannot self-recover; the connector needs manual credential update.
+   */
+  recordAuthFailure(id: string): void {
+    const cb = this.circuitBreakers.get(id);
+    if (!cb) return;
+    cb.state = 'OPEN';
+    cb.consecutiveFailures += 1;
+    // Set openedAt 24h in the past so canCall() requires a manual resetCircuit() call
+    // (or the connector being re-enabled in DB) before retrying.
+    const farFuture = new Date(Date.now() - CIRCUIT_AUTH_COOLDOWN);
+    cb.openedAt = farFuture;
   }
 
   /**

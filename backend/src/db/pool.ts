@@ -4,7 +4,7 @@ import { env } from '../config/env';
 const pool = new Pool({
   connectionString: env.DATABASE_URL,
   ssl: false,
-  max: 20,
+  max: env.DB_POOL_MAX,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 10000,
 });

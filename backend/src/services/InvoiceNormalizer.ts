@@ -1,4 +1,5 @@
 import { NormalizedInvoice, InvoiceStatus } from 'shared';
+import { parseInvoiceSerial } from '../utils/InvoiceSerialParser';
 
 /**
  * InvoiceNormalizer — normalizes raw invoice data from different providers
@@ -9,13 +10,15 @@ import { NormalizedInvoice, InvoiceStatus } from 'shared';
  * - MISA: invoiceDate (ISO string)
  * - Viettel: arisingDate (milliseconds!)
  * - VAT rate: 0.1 / 10 / "10%" → normalize to number (10)
+ *
+ * GROUP 47: Also parses serial number to set invoice_group, serial_has_cqt, has_line_items.
  */
 export class InvoiceNormalizer {
   /**
    * Normalize from MISA meInvoice raw JSON
    */
   static fromMisa(raw: Record<string, unknown>, direction: 'output' | 'input'): NormalizedInvoice {
-    return {
+    return InvoiceNormalizer.enrichWithSerialInfo({
       externalId: InvoiceNormalizer.str(raw['invoiceId'] ?? raw['id']),
       invoiceNumber: InvoiceNormalizer.str(raw['invoiceNumber'] ?? raw['refId']),
       serialNumber: InvoiceNormalizer.str(raw['serialNumber'] ?? raw['symbol']),
@@ -33,7 +36,7 @@ export class InvoiceNormalizer {
       direction,
       rawXml: typeof raw['xmlContent'] === 'string' ? raw['xmlContent'] : undefined,
       source: 'misa',
-    };
+    });
   }
 
   /**
@@ -41,7 +44,7 @@ export class InvoiceNormalizer {
    * ⚠️ Viettel dates are in MILLISECONDS
    */
   static fromViettel(raw: Record<string, unknown>, direction: 'output' | 'input'): NormalizedInvoice {
-    return {
+    return InvoiceNormalizer.enrichWithSerialInfo({
       externalId: InvoiceNormalizer.str(raw['invoiceNo'] ?? raw['transactionID']),
       invoiceNumber: InvoiceNormalizer.str(raw['invoiceNo'] ?? raw['transactionID']),
       serialNumber: InvoiceNormalizer.str(raw['serialNo'] ?? raw['templateCode']),
@@ -59,7 +62,7 @@ export class InvoiceNormalizer {
       status: InvoiceNormalizer.viettelStatus(InvoiceNormalizer.str(raw['invoiceStatus'] ?? '')),
       direction,
       source: 'viettel',
-    };
+    });
   }
 
   /**
@@ -67,7 +70,7 @@ export class InvoiceNormalizer {
    * GDT validation is handled internally — gdt_validated defaults true
    */
   static fromBkav(raw: Record<string, unknown>, direction: 'output' | 'input'): NormalizedInvoice {
-    return {
+    return InvoiceNormalizer.enrichWithSerialInfo({
       externalId: InvoiceNormalizer.str(raw['id'] ?? raw['invoiceId']),
       invoiceNumber: InvoiceNormalizer.str(raw['invoiceNumber'] ?? raw['soHoaDon']),
       serialNumber: InvoiceNormalizer.str(raw['serialNumber'] ?? raw['kyHieu']),
@@ -84,7 +87,7 @@ export class InvoiceNormalizer {
       status: InvoiceNormalizer.bkavStatus(InvoiceNormalizer.str(raw['status'] ?? raw['trangThai'] ?? '')),
       direction,
       source: 'bkav',
-    };
+    });
   }
 
   // ============================================================
@@ -166,5 +169,17 @@ export class InvoiceNormalizer {
       '4': 'adjusted', 'adjusted': 'adjusted', 'dieuchinH': 'adjusted',
     };
     return map[status.toLowerCase()] ?? 'valid';
+  }
+
+  /**
+   * GROUP 47: Enrich a normalized invoice with serial number classification.
+   * Parses serial_number to determine invoice_group (5/6/8), serial_has_cqt, has_line_items.
+   */
+  static enrichWithSerialInfo(inv: NormalizedInvoice): NormalizedInvoice {
+    const parsed = parseInvoiceSerial(inv.serialNumber);
+    inv.invoiceGroup = parsed.invoiceGroup;
+    inv.serialHasCqt = parsed.hasCqtCode;
+    inv.hasLineItems = parsed.isDetailAvailable;
+    return inv;
   }
 }

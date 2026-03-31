@@ -16,7 +16,7 @@ interface Notification {
 
 const TYPE_ICONS: Record<string, string> = {
   SYNC_COMPLETE: '✅',
-  INVALID_INVOICE: '⚠️',
+  INVALID_INVOICES: '⚠️',
   TAX_DEADLINE: '📅',
   CONNECTOR_ERROR: '🔴',
   VAT_ANOMALY: '🔍',
@@ -24,7 +24,7 @@ const TYPE_ICONS: Record<string, string> = {
 
 const TYPE_URLS: Record<string, string> = {
   SYNC_COMPLETE: '/invoices',
-  INVALID_INVOICE: '/invoices',
+  INVALID_INVOICES: '/invoices',
   TAX_DEADLINE: '/declarations',
   CONNECTOR_ERROR: '/settings/connectors',
   VAT_ANOMALY: '/dashboard',
@@ -95,7 +95,7 @@ export default function NotificationPanel({ onClose, onMarkAllRead }: Props) {
   const unreadCount = notifications.filter((n) => !n.is_read).length;
 
   return (
-    <div className="absolute top-full right-0 mt-2 w-80 bg-white rounded-xl shadow-lg border border-gray-100 overflow-hidden z-50">
+    <div className="absolute top-full right-0 mt-2 w-[calc(100vw-2rem)] sm:w-80 bg-white rounded-xl shadow-lg border border-gray-100 overflow-hidden z-50">
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
         <span className="text-sm font-semibold text-gray-900">

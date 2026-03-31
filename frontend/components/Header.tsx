@@ -2,11 +2,12 @@
 
 import { useState, useEffect, useRef } from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
+import { useRouter, usePathname } from 'next/navigation';
 import { useCompany } from '../contexts/CompanyContext';
 import { useView } from '../contexts/ViewContext';
 import NotificationPanel from './NotificationPanel';
 import apiClient from '../lib/apiClient';
+import { DRAWER_SECTIONS, DRAWER_HREFS } from '../lib/navSections';
 
 interface UnreadCount {
   count: number;
@@ -16,13 +17,16 @@ export default function Header() {
   const { companies, activeCompany, setActiveCompanyId, loading } = useCompany();
   const { mode, orgId, setSingleCompany, setPortfolio, setGroup } = useView();
   const router = useRouter();
+  const pathname = usePathname();
   const [showSwitcher, setShowSwitcher] = useState(false);
   const [showNotif, setShowNotif] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showMore, setShowMore] = useState(false);
   const [unreadCount, setUnreadCount] = useState(0);
   const switcherRef = useRef<HTMLDivElement>(null);
   const notifRef = useRef<HTMLDivElement>(null);
   const settingsRef = useRef<HTMLDivElement>(null);
+  const moreRef = useRef<HTMLDivElement>(null);
 
   // Fetch unread count on mount + every 30s
   useEffect(() => {
@@ -51,10 +55,16 @@ export default function Header() {
       if (settingsRef.current && !settingsRef.current.contains(e.target as Node)) {
         setShowSettings(false);
       }
+      if (moreRef.current && !moreRef.current.contains(e.target as Node)) {
+        setShowMore(false);
+      }
     };
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, []);
+
+  // Close "Thêm" dropdown on route change
+  useEffect(() => { setShowMore(false); }, [pathname]);
 
   const handleMarkAllRead = () => setUnreadCount(0);
 
@@ -75,9 +85,15 @@ export default function Header() {
       ? `Tổ chức: ${activeOrgId ?? 'Chưa xác định'}`
       : `${companies.length} công ty trong danh mục`;
 
+  const homeHref = mode === 'portfolio'
+    ? '/portfolio'
+    : mode === 'group' && activeOrgId
+      ? `/group/${activeOrgId}`
+      : '/dashboard';
+
   return (
     <header className="fixed top-0 left-0 right-0 z-40 bg-white border-b border-gray-100 shadow-sm">
-      <div className="max-w-2xl mx-auto flex items-center justify-between px-4 h-14">
+      <div className="max-w-2xl lg:max-w-5xl mx-auto flex items-center justify-between px-4 h-14">
         {/* Company Switcher */}
         <div ref={switcherRef} className="relative flex-1 min-w-0 mr-2">
           <button
@@ -120,7 +136,7 @@ export default function Header() {
           </button>
 
           {showSwitcher && companies.length > 0 && (
-            <div className="absolute top-full left-0 mt-1 w-72 bg-white rounded-xl shadow-lg border border-gray-100 overflow-hidden z-50">
+            <div className="absolute top-full left-0 mt-1 w-72 max-w-[calc(100vw-2rem)] bg-white rounded-xl shadow-lg border border-gray-100 overflow-hidden z-50">
               <div className="border-b border-gray-100 p-2 space-y-1.5">
                 <p className="px-2 text-[11px] font-semibold uppercase tracking-wide text-gray-500">Chế độ xem</p>
                 <button
@@ -210,6 +226,78 @@ export default function Header() {
             </div>
           )}
         </div>
+
+        {/* Desktop navigation links — hidden on mobile */}
+        <nav className="hidden lg:flex items-center gap-1 mx-4">
+          {[
+            { href: homeHref, label: 'Tổng Quan', matchPrefix: ['/dashboard', '/portfolio', '/group/'] },
+            { href: '/invoices', label: 'Hóa Đơn', matchPrefix: ['/invoices'] },
+            { href: '/declarations', label: 'Tờ Khai', matchPrefix: ['/declarations'] },
+            { href: '/import', label: 'Nhập Liệu', matchPrefix: ['/import'] },
+            { href: '/settings/connectors', label: 'Kết Nối', matchPrefix: ['/settings/connectors', '/settings/bot'] },
+          ].map((item) => {
+            const active = item.matchPrefix.some((p) => pathname.startsWith(p));
+            return (
+              <Link
+                key={item.href}
+                href={item.href}
+                className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                  active ? 'bg-primary-50 text-primary-700' : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
+                }`}
+              >
+                {item.label}
+              </Link>
+            );
+          })}
+
+          {/* Thêm dropdown — mirrors mobile drawer */}
+          <div ref={moreRef} className="relative">
+            <button
+              onClick={() => setShowMore((v) => !v)}
+              className={`flex items-center gap-1 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                (!!pathname && DRAWER_HREFS.some((h) => pathname.startsWith(h))) || showMore
+                  ? 'bg-primary-50 text-primary-700'
+                  : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
+              }`}
+            >
+              Thêm
+              <svg className={`w-3.5 h-3.5 transition-transform ${showMore ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </button>
+
+            {showMore && (
+              <div className="absolute top-full right-0 mt-1 w-[640px] max-w-[calc(100vw-1rem)] bg-white rounded-2xl shadow-xl border border-gray-100 z-50 max-h-[80vh] overflow-y-auto">
+                <div className="p-4 grid grid-cols-2 gap-x-6 gap-y-4">
+                  {DRAWER_SECTIONS.map((section) => (
+                    <div key={section.title}>
+                      <p className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">
+                        {section.title}
+                      </p>
+                      <div className="space-y-0.5">
+                        {section.items.map((item) => {
+                          const active = !!pathname && pathname.startsWith(item.href);
+                          return (
+                            <Link
+                              key={item.href}
+                              href={item.href}
+                              onClick={() => setShowMore(false)}
+                              className={`block px-3 py-1.5 rounded-lg text-sm transition-colors ${
+                                active ? 'bg-primary-50 text-primary-700 font-medium' : 'text-gray-700 hover:bg-gray-50'
+                              }`}
+                            >
+                              {item.label}
+                            </Link>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </nav>
 
         {/* Right: Settings + Notification bell */}
         <div className="flex items-center gap-1">

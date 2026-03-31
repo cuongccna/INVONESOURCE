@@ -4,6 +4,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { z } from 'zod';
 import * as XLSX from 'xlsx';
 import { XMLParser } from 'fast-xml-parser';
+import AdmZip from 'adm-zip';
 import { pool } from '../db/pool';
 import { authenticate, requireRole } from '../middleware/auth';
 import { requireCompany } from '../middleware/company';
@@ -17,7 +18,7 @@ router.use(requireCompany);
 // ── Multer: memory storage, 10 MB max ────────────────────────────────────────
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 },
+  limits: { fileSize: 50 * 1024 * 1024 },
   fileFilter(_req, file, cb) {
     const allowed = [
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -25,6 +26,8 @@ const upload = multer({
       'text/xml',
       'application/xml',
       'text/csv',
+      'application/zip',
+      'application/x-zip-compressed',
     ];
     const ext = file.originalname.toLowerCase();
     if (
@@ -32,11 +35,12 @@ const upload = multer({
       ext.endsWith('.xlsx') ||
       ext.endsWith('.xls') ||
       ext.endsWith('.xml') ||
-      ext.endsWith('.csv')
+      ext.endsWith('.csv') ||
+      ext.endsWith('.zip')
     ) {
       cb(null, true);
     } else {
-      cb(new Error('Chỉ chấp nhận file .xlsx / .xls / .xml / .csv'));
+      cb(new Error('Chỉ chấp nhận file .xlsx / .xls / .xml / .csv / .zip'));
     }
   },
 });
@@ -78,8 +82,9 @@ interface PreviewRow {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /** Detect file format from buffer + filename */
-function detectFormat(filename: string, buffer: Buffer): 'gdt_xml' | 'gdt_excel' | 'gdt_list_excel' | 'hkd_excel' | 'csv' | 'unknown' {
+function detectFormat(filename: string, buffer: Buffer): 'gdt_xml' | 'gdt_excel' | 'gdt_list_excel' | 'hkd_excel' | 'csv' | 'zip' | 'unknown' {
   const ext = filename.toLowerCase();
+  if (ext.endsWith('.zip')) return 'zip';
   if (ext.endsWith('.xml')) {
     // Peek for GDT XML signature
     const head = buffer.toString('utf-8', 0, 400);
@@ -494,6 +499,62 @@ function parseGdtListExcel(buffer: Buffer): PreviewRow[] {
   return rows;
 }
 
+// ── ZIP File Processor ────────────────────────────────────────────────────────
+interface ZipFileResult {
+  filename: string;
+  rows: PreviewRow[];
+  error: string | null;
+}
+
+function parseZipFile(buffer: Buffer): { files: ZipFileResult[]; totalRows: number } {
+  const zip = new AdmZip(buffer);
+  const entries = zip.getEntries();
+
+  // Security: max 100 XML files, max 200MB uncompressed total
+  const xmlEntries = entries.filter(e =>
+    !e.isDirectory && e.entryName.toLowerCase().endsWith('.xml')
+  );
+
+  if (xmlEntries.length === 0) {
+    return { files: [{ filename: '(zip)', rows: [], error: 'ZIP không chứa file XML nào' }], totalRows: 0 };
+  }
+  if (xmlEntries.length > 100) {
+    return { files: [{ filename: '(zip)', rows: [], error: 'ZIP chứa quá nhiều file (tối đa 100 file XML)' }], totalRows: 0 };
+  }
+
+  let totalUncompressed = 0;
+  for (const entry of xmlEntries) {
+    totalUncompressed += entry.header.size;
+    if (totalUncompressed > 200 * 1024 * 1024) {
+      return { files: [{ filename: '(zip)', rows: [], error: 'Tổng dung lượng giải nén vượt 200MB' }], totalRows: 0 };
+    }
+  }
+
+  const files: ZipFileResult[] = [];
+  let totalRows = 0;
+
+  for (const entry of xmlEntries) {
+    try {
+      const xmlBuffer = entry.getData();
+      const rows = parseGdtXml(xmlBuffer);
+      totalRows += rows.length;
+      files.push({
+        filename: entry.entryName.split('/').pop() ?? entry.entryName,
+        rows,
+        error: rows.length === 0 ? 'Không tìm thấy hóa đơn trong file' : null,
+      });
+    } catch (err) {
+      files.push({
+        filename: entry.entryName.split('/').pop() ?? entry.entryName,
+        rows: [],
+        error: `Lỗi đọc file: ${err instanceof Error ? err.message : 'unknown'}`,
+      });
+    }
+  }
+
+  return { files, totalRows };
+}
+
 // ── POST /api/import/preview ──────────────────────────────────────────────────
 router.post(
   '/preview',
@@ -505,10 +566,16 @@ router.post(
       const { direction } = req.body as { direction?: string };
 
       const format = detectFormat(req.file.originalname, req.file.buffer);
-      if (format === 'unknown') throw new ValidationError('Định dạng file không được hỗ trợ. Dùng .xml .xlsx .xls .csv');
+      if (format === 'unknown') throw new ValidationError('Định dạng file không được hỗ trợ. Dùng .xml .xlsx .xls .csv .zip');
 
       let rows: PreviewRow[];
-      if (format === 'gdt_xml') {
+      let zipFiles: ZipFileResult[] | undefined;
+
+      if (format === 'zip') {
+        const zipResult = parseZipFile(req.file.buffer);
+        zipFiles = zipResult.files;
+        rows = zipResult.files.flatMap(f => f.rows);
+      } else if (format === 'gdt_xml') {
         rows = parseGdtXml(req.file.buffer);
       } else if (format === 'gdt_list_excel') {
         rows = parseGdtListExcel(req.file.buffer);
@@ -554,6 +621,7 @@ router.post(
         gdt_list_excel:   'Danh sách HĐ từ cổng GDT (.xlsx)',
         csv:              'CSV',
         hkd_excel:        'Excel HKD',
+        zip:              'ZIP (chứa XML)',
       };
 
       // Determine effective direction from rows (override may have been applied)
@@ -571,6 +639,14 @@ router.post(
         direction: detectedDirection,
         preview,
         errors: rows.filter(r => !!r.error).slice(0, 20),
+        ...(zipFiles ? {
+          zipFiles: zipFiles.map(f => ({
+            filename: f.filename,
+            invoiceCount: f.rows.filter(r => !r.error).length,
+            errorCount: f.rows.filter(r => !!r.error).length,
+            error: f.error,
+          })),
+        } : {}),
       });
     } catch (err) {
       next(err);
@@ -607,7 +683,10 @@ router.post(
 
       // Parse again
       let rows: PreviewRow[];
-      if (format === 'gdt_xml') {
+      if (format === 'zip') {
+        const zipResult = parseZipFile(buffer);
+        rows = zipResult.files.flatMap(f => f.rows);
+      } else if (format === 'gdt_xml') {
         rows = parseGdtXml(buffer);
       } else if (format === 'gdt_list_excel') {
         rows = parseGdtListExcel(buffer);
@@ -740,6 +819,198 @@ router.post(
       await pool.query(`DELETE FROM import_temp_files WHERE id = $1`, [fileId]);
 
       sendSuccess(res, { session_id: sessionId, success_count: successCount, duplicate_count: dupCount, error_count: errCount });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// ── POST /api/import/execute-stream — SSE progress during import ──────────────
+router.post(
+  '/execute-stream',
+  requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const parsed = executeSchema.safeParse(req.body);
+      if (!parsed.success) throw new ValidationError(parsed.error.issues[0]?.message ?? 'Invalid input');
+
+      const { fileId, direction, duplicatePolicy } = parsed.data;
+      const companyId = req.user!.companyId;
+
+      // Retrieve temp file
+      const fileRes = await pool.query(
+        `SELECT filename, buffer, format FROM import_temp_files WHERE id = $1 AND company_id = $2`,
+        [fileId, companyId]
+      );
+      if (fileRes.rows.length === 0) throw new NotFoundError('File tạm không tìm thấy — vui lòng upload lại');
+
+      const { filename, buffer, format } = fileRes.rows[0] as { filename: string; buffer: Buffer; format: string };
+
+      // Parse
+      let rows: PreviewRow[];
+      if (format === 'zip') {
+        const zipResult = parseZipFile(buffer);
+        rows = zipResult.files.flatMap(f => f.rows);
+      } else if (format === 'gdt_xml') {
+        rows = parseGdtXml(buffer);
+      } else if (format === 'gdt_list_excel') {
+        rows = parseGdtListExcel(buffer);
+      } else if (format === 'csv') {
+        rows = parseExcelOrCsv(buffer, true);
+      } else {
+        rows = parseExcelOrCsv(buffer, false);
+      }
+      rows = rows.map(r => ({ ...r, direction }));
+
+      // Set SSE headers
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+
+      const sendEvent = (data: Record<string, unknown>) => {
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+      };
+
+      const sessionId = uuidv4();
+      const validRows = rows.filter(r => !r.error);
+      const totalValid = validRows.length;
+
+      await pool.query(
+        `INSERT INTO import_sessions
+         (id, company_id, filename, format, direction, total_rows, success_count, duplicate_count, error_count, imported_by, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,0,0,0,$7,NOW())`,
+        [sessionId, companyId, filename, format, direction, rows.length, req.user!.userId]
+      );
+
+      sendEvent({ type: 'start', totalRows: rows.length, validRows: totalValid });
+
+      let successCount = 0;
+      let dupCount = 0;
+      let errCount = rows.filter(r => !!r.error).length;
+      let processed = 0;
+
+      for (const row of validRows) {
+        try {
+          const invoiceId = uuidv4();
+          const rowDirection = row.direction ?? direction;
+          const vatRate = row.vat_rate !== '' ? row.vat_rate : null;
+
+          const dupRes = await pool.query(
+            `SELECT id, is_permanently_ignored FROM invoices
+             WHERE company_id = $1 AND invoice_number = $2 AND direction = $3
+             LIMIT 1`,
+            [companyId, row.invoice_number, rowDirection]
+          );
+          const existingRow = dupRes.rows[0] ?? null;
+          const existingId: string | null = existingRow?.id ?? null;
+
+          if (existingRow?.is_permanently_ignored) {
+            dupCount++;
+          } else if (existingId && duplicatePolicy === 'skip') {
+            dupCount++;
+          } else if (existingId && duplicatePolicy === 'overwrite') {
+            const rowSubtotalOvr = row.subtotal ?? ((row.total_amount ?? 0) - (row.vat_amount ?? 0));
+            await pool.query(
+              `UPDATE invoices SET
+                 serial_number = $1, invoice_date = $2, status = $3,
+                 seller_name = $4, seller_tax_code = $5,
+                 buyer_name = $6, buyer_tax_code = $7,
+                 subtotal = $8, total_amount = $9, vat_amount = $10, vat_rate = $11,
+                 payment_method = $12, import_session_id = $13, updated_at = NOW()
+               WHERE id = $14`,
+              [
+                row.serial_number,
+                row.invoice_date, row.status ?? 'valid',
+                row.seller_name, row.seller_tax_code,
+                row.buyer_name, row.buyer_tax_code,
+                rowSubtotalOvr, row.total_amount, row.vat_amount, vatRate,
+                row.payment_method, sessionId, existingId,
+              ]
+            );
+            if (row.line_items.length > 0) {
+              await pool.query(`DELETE FROM invoice_line_items WHERE invoice_id = $1`, [existingId]);
+              for (const li of row.line_items) {
+                await pool.query(
+                  `INSERT INTO invoice_line_items
+                   (id, invoice_id, company_id, line_number, item_code, item_name, unit, quantity, unit_price, subtotal, vat_rate, vat_amount, total, created_at)
+                   VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())`,
+                  [existingId, companyId, li.line_number, li.item_code, li.item_name, li.unit, li.quantity, li.unit_price, li.subtotal, li.vat_rate, li.vat_amount, li.total]
+                );
+              }
+            }
+            successCount++;
+          } else {
+            const rowSubtotal = row.subtotal ?? ((row.total_amount ?? 0) - (row.vat_amount ?? 0));
+            await pool.query(
+              `INSERT INTO invoices
+               (id, company_id, invoice_number, serial_number, invoice_date, direction, status,
+                seller_name, seller_tax_code, buyer_name, buyer_tax_code,
+                subtotal, total_amount, vat_amount, vat_rate, payment_method,
+                gdt_validated, source, import_session_id, provider, created_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,true,'manual_import',$17,'manual',NOW())`,
+              [
+                invoiceId, companyId,
+                row.invoice_number, row.serial_number,
+                row.invoice_date, rowDirection,
+                row.status ?? 'valid',
+                row.seller_name, row.seller_tax_code,
+                row.buyer_name, row.buyer_tax_code,
+                rowSubtotal, row.total_amount, row.vat_amount, vatRate,
+                row.payment_method,
+                sessionId,
+              ]
+            );
+            for (const li of row.line_items) {
+              await pool.query(
+                `INSERT INTO invoice_line_items
+                 (id, invoice_id, company_id, line_number, item_code, item_name, unit, quantity, unit_price, subtotal, vat_rate, vat_amount, total, created_at)
+                 VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())`,
+                [invoiceId, companyId, li.line_number, li.item_code, li.item_name, li.unit, li.quantity, li.unit_price, li.subtotal, li.vat_rate, li.vat_amount, li.total]
+              );
+            }
+            successCount++;
+          }
+        } catch (rowErr) {
+          console.error('[import/execute-stream] row insert failed:', rowErr);
+          errCount++;
+        }
+
+        processed++;
+        // Emit progress every 5 rows or on last row
+        if (processed % 5 === 0 || processed === totalValid) {
+          sendEvent({
+            type: 'progress',
+            processed,
+            total: totalValid,
+            percent: Math.round((processed / totalValid) * 100),
+            successCount,
+            dupCount,
+            errCount,
+          });
+        }
+      }
+
+      await pool.query(
+        `UPDATE import_sessions
+         SET success_count = $1, duplicate_count = $2, error_count = $3
+         WHERE id = $4`,
+        [successCount, dupCount, errCount, sessionId]
+      );
+
+      await pool.query(`DELETE FROM import_temp_files WHERE id = $1`, [fileId]);
+
+      sendEvent({
+        type: 'complete',
+        session_id: sessionId,
+        success_count: successCount,
+        duplicate_count: dupCount,
+        error_count: errCount,
+      });
+
+      res.end();
     } catch (err) {
       next(err);
     }

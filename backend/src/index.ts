@@ -36,6 +36,7 @@ import botRouter from './routes/bot';
 import catalogsRouter from './routes/catalogs';
 import inventoryRouter from './routes/inventory';
 import cashBookRouter from './routes/cash-book';
+import syncRouter from './routes/sync';
 import journalsRouter from './routes/journals';
 import profitLossRouter from './routes/profit-loss';
 import hkdRouter from './routes/hkd';
@@ -50,6 +51,7 @@ import { scheduleTaxDeadlineReminder } from './jobs/TaxDeadlineReminderJob';
 import { scheduleRepurchaseAlertJob } from './jobs/RepurchaseAlertJob';
 import { scheduleGdtBotSync, gdtBotSchedulerWorker } from './jobs/GdtBotSchedulerJob';
 import { scheduleQuotaReset } from './jobs/QuotaResetJob';
+import { syncNotificationWorker } from './jobs/SyncNotificationWorker';
 import adminRouter from './routes/admin';
 
 const app = express();
@@ -118,6 +120,7 @@ app.use('/api/bot', botRouter);
 app.use('/api/catalogs', catalogsRouter);
 app.use('/api/inventory', inventoryRouter);
 app.use('/api/cash-book', cashBookRouter);
+app.use('/api/sync', syncRouter);
 app.use('/api/journals', journalsRouter);
 app.use('/api/reports/profit-loss', profitLossRouter);
 app.use('/api/hkd', hkdRouter);
@@ -155,6 +158,8 @@ async function start(): Promise<void> {
   void gdtValidateWorker;
   // GDT Bot per-company periodic scheduler (checks every 30min, enqueues due companies)
   void gdtBotSchedulerWorker;   // auto-started on import
+  // Notification bridge: processes push notifications enqueued by bot worker
+  void syncNotificationWorker;  // auto-started on import
   await scheduleGdtBotSync();
   await scheduleTaxDeadlineReminder();
   await scheduleRepurchaseAlertJob();

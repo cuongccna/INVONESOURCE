@@ -135,7 +135,7 @@ export default function MonthlyReportPage() {
         }
       `}</style>
 
-      <div className="p-4 max-w-2xl mx-auto space-y-5">
+      <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto space-y-5">
         <div className="no-print">
           <BackButton fallbackHref="/reports" />
         </div>

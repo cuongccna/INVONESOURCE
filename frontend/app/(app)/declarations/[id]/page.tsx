@@ -241,7 +241,7 @@ export default function DeclarationDetailPage() {
   const statusCfg = STATUS_CONFIG[decl.submission_status] ?? { label: decl.submission_status, color: 'bg-gray-100 text-gray-700' };
 
   return (
-    <div className="max-w-2xl mx-auto px-4 py-6 space-y-4">
+    <div className="max-w-2xl lg:max-w-5xl mx-auto px-4 py-6 space-y-4">
       {/* ── Header ── */}
       <div className="flex items-center gap-3 mb-2">
         <BackButton fallbackHref="/declarations" />
@@ -408,6 +408,15 @@ export default function DeclarationDetailPage() {
                 </td>
                 <td className="py-2 pr-3 text-sm font-semibold text-gray-700">Tổng thuế đầu vào được khấu trừ = [22]+[24]</td>
                 <td className="py-2 pr-4 text-right text-sm tabular-nums font-bold text-gray-900">{vnd(decl.ct25_total_deductible)}</td>
+              </tr>
+              {/* Group 6/8 info note */}
+              <tr>
+                <td colSpan={3} className="px-4 py-2">
+                  <div className="bg-orange-50 border border-orange-200 rounded-lg px-3 py-2 text-xs text-orange-700">
+                    <strong>Lưu ý:</strong> Hóa đơn nhóm 6 (không có mã CQT — tiêu thức Header) và nhóm 8 (máy tính tiền) được
+                    khấu trừ thuế đầu vào mà không cần xác minh GDT. Vui lòng kiểm tra kỹ các hóa đơn này trước khi nộp tờ khai.
+                  </div>
+                </td>
               </tr>
 
               {/* ─ Section II: Doanh thu & Thuế đầu ra ─ */}

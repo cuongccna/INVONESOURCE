@@ -83,6 +83,10 @@ export interface Invoice {
   pdf_path: string | null;
   external_id: string | null;
   sync_at: Date | null;
+  // GROUP 47: Invoice type classification
+  invoice_group: 5 | 6 | 8 | null;
+  serial_has_cqt: boolean | null;
+  has_line_items: boolean;
   created_at: Date;
 }
 
@@ -223,4 +227,40 @@ export interface NormalizedInvoice {
   direction: InvoiceDirection;
   rawXml?: string;
   source: InvoiceProvider;
+  // GROUP 47: Invoice type classification (TT78/2021)
+  invoiceGroup?: 5 | 6 | 8 | null;
+  serialHasCqt?: boolean;
+  hasLineItems?: boolean;
+}
+
+// GROUP 47: Parsed serial number structure (TT78/2021)
+export interface ParsedSerial {
+  raw: string;
+  hasCqtCode: boolean;       // true = C (có mã CQT), false = K (không mã)
+  invoiceYear: number;       // 26 → 2026
+  invoiceType: string;       // 'T'|'M'|'D'|'N'|'V'|'X'
+  invoiceTypeLabel: string;  // "Hóa đơn thường" | "Máy tính tiền" ...
+  companyCode: string;       // DN tự đặt (e.g. 'DL', 'ABC')
+  invoiceGroup: 5 | 6 | 8 | null;
+  isDetailAvailable: boolean; // false for groups 6 & 8
+}
+
+// GROUP 48: Sync job for month/quarter scheduling
+export interface SyncJob {
+  fromDate: string;  // YYYY-MM-DD
+  toDate: string;    // YYYY-MM-DD
+  label: string;     // "Tháng 1" | "Tháng 2" etc.
+}
+
+// GROUP 48: SSE sync progress event
+export interface SyncProgressEvent {
+  jobId: string;
+  state: 'waiting' | 'active' | 'completed' | 'failed';
+  progress: number;               // 0-100
+  invoicesFetched: number;
+  currentPage: number;
+  totalPages: number | null;
+  currentMonth: string;            // for quarter sync
+  message: string;
+  error: string | null;
 }

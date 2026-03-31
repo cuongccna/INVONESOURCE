@@ -1,194 +1,92 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
+import { useRouter } from 'next/navigation';
 import apiClient from '../../../../lib/apiClient';
 import { useToast } from '../../../../components/ToastProvider';
+import { useCompany } from '../../../../contexts/CompanyContext';
+import { useSyncContext } from '../../../../contexts/SyncContext';
 import BackButton from '../../../../components/BackButton';
+import SyncDatePicker from '../../../../components/SyncDatePicker';
+import type { SyncJob } from '../../../../components/SyncDatePicker';
 
-interface Connector {
+interface BotConfig {
   id: string;
-  provider_id: string;
-  is_enabled: boolean;
-  circuit_breaker_state: string;
-  last_sync_at: string | null;
+  tax_code: string;
+  has_otp: boolean;
+  otp_method: string | null;
+  is_active: boolean;
+  sync_frequency_hours: number;
+  last_run_at: string | null;
+  last_run_status: string | null;
+  last_run_output_count: number | null;
+  last_run_input_count: number | null;
   last_error: string | null;
-  sync_frequency_minutes: number;
+  blocked_until: string | null;
 }
 
-type Provider = 'misa' | 'viettel' | 'bkav';
-
-interface MisaForm   { env: 'test' | 'production'; appid: string; username: string; password: string; taxCode: string; hasInputInvoice: boolean }
-interface ViettelForm{ username: string; password: string }
-interface BkavForm   { partnerGUID: string; partnerToken: string; taxCode: string }
-
-type ConnectorForm = MisaForm | ViettelForm | BkavForm;
-
-const PROVIDER_META: Record<Provider, { name: string; icon: string; colorClass: string }> = {
-  misa:    { name: 'MISA meInvoice',  icon: '🔵', colorClass: 'blue'  },
-  viettel: { name: 'Viettel VInvoice', icon: '🔴', colorClass: 'red'   },
-  bkav:    { name: 'BKAV eInvoice',   icon: '🟢', colorClass: 'green' },
-};
-
-const CB_BADGE: Record<string, string> = {
-  CLOSED:    'bg-green-100 text-green-700',
-  OPEN:      'bg-red-100 text-red-700',
-  HALF_OPEN: 'bg-yellow-100 text-yellow-700',
-};
-
-function defaultForm(provider: Provider): ConnectorForm {
-  if (provider === 'misa')    return { env: 'production', appid: '', username: '', password: '', taxCode: '', hasInputInvoice: false };
-  if (provider === 'viettel') return { username: '', password: '' };
-  return { partnerGUID: '', partnerToken: '', taxCode: '' };
+interface BotRun {
+  id: string;
+  started_at: string;
+  finished_at: string | null;
+  status: string;
+  output_count: number;
+  input_count: number;
+  duration_ms: number | null;
+  error_detail: string | null;
 }
-
-function formToCredentials(provider: Provider, form: ConnectorForm): Record<string, string> {
-  if (provider === 'misa') {
-    const f = form as MisaForm;
-    return { appid: f.appid, username: f.username, password: f.password, taxCode: f.taxCode };
-  }
-  if (provider === 'viettel') {
-    const f = form as ViettelForm;
-    return { username: f.username, password: f.password };
-  }
-  const f = form as BkavForm;
-  return { partnerGUID: f.partnerGUID, partnerToken: f.partnerToken, taxCode: f.taxCode };
-}
-
-// ─── Sub-forms ──────────────────────────────────────────────────────────────
-
-function MisaFormFields({ form, onChange }: { form: MisaForm; onChange: (f: MisaForm) => void }) {
-  const set = <K extends keyof MisaForm>(k: K, v: MisaForm[K]) => onChange({ ...form, [k]: v });
-  return (
-    <div className="space-y-3">
-      <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-xs text-blue-800">
-        <strong>ℹ️ appid</strong> được MISA cấp khi đăng ký tích hợp (không thể tự tạo).<br />
-        Liên hệ: <strong>support@misa.com.vn</strong> hoặc hotline <strong>1900 1518</strong>.
-      </div>
-      <Field label="Môi trường">
-        <select value={form.env} onChange={e => set('env', e.target.value as MisaForm['env'])} className={INPUT}>
-          <option value="production">Production — api.meinvoice.vn</option>
-          <option value="test">Test — testapi.meinvoice.vn</option>
-        </select>
-      </Field>
-      <Field label="App ID (appid)">
-        <input type="text" value={form.appid} onChange={e => set('appid', e.target.value)}
-          placeholder="appid do MISA cấp" className={INPUT} autoComplete="off" />
-      </Field>
-      <Field label="Tên đăng nhập">
-        <input type="text" value={form.username} onChange={e => set('username', e.target.value)}
-          placeholder="email@congty.vn" className={INPUT} autoComplete="username" />
-      </Field>
-      <Field label="Mật khẩu">
-        <input type="password" value={form.password} onChange={e => set('password', e.target.value)}
-          className={INPUT} autoComplete="current-password" />
-      </Field>
-      <Field label="Mã số thuế">
-        <input type="text" value={form.taxCode} onChange={e => set('taxCode', e.target.value)}
-          placeholder="0123456789" className={INPUT} />
-      </Field>
-      <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
-        <input type="checkbox" checked={form.hasInputInvoice}
-          onChange={e => set('hasInputInvoice', e.target.checked)}
-          className="w-4 h-4 rounded border-gray-300 text-primary-600" />
-        Đã đăng ký dịch vụ <strong>Hóa đơn đầu vào</strong> (phí thêm)
-      </label>
-    </div>
-  );
-}
-
-function ViettelFormFields({ form, onChange }: { form: ViettelForm; onChange: (f: ViettelForm) => void }) {
-  const set = <K extends keyof ViettelForm>(k: K, v: ViettelForm[K]) => onChange({ ...form, [k]: v });
-  return (
-    <div className="space-y-3">
-      <div className="bg-orange-50 border border-orange-300 rounded-lg p-3 text-xs text-orange-900">
-        <strong>⚠️ Lưu ý IP Whitelist:</strong> IP server phải được đăng ký trên cổng quản trị Viettel VInvoice trước khi đi live.<br />
-        Lỗi 500 không rõ nguyên nhân = IP chưa được whitelist hoặc sai mật khẩu.<br />
-        <span className="text-orange-700">API: <code className="font-mono bg-orange-100 px-1 rounded">api-vinvoice.viettel.vn</code></span>
-      </div>
-      <Field label="Tên đăng nhập" hint="Mã số thuế dùng làm username, vd: 0100109106-509">
-        <input type="text" value={form.username} onChange={e => set('username', e.target.value)}
-          placeholder="0100109106-509" className={INPUT} autoComplete="username" />
-      </Field>
-      <Field label="Mật khẩu">
-        <input type="password" value={form.password} onChange={e => set('password', e.target.value)}
-          className={INPUT} autoComplete="current-password" />
-      </Field>
-    </div>
-  );
-}
-
-function BkavFormFields({ form, onChange }: { form: BkavForm; onChange: (f: BkavForm) => void }) {
-  const set = <K extends keyof BkavForm>(k: K, v: BkavForm[K]) => onChange({ ...form, [k]: v });
-  return (
-    <div className="space-y-3">
-      <div className="bg-green-50 border border-green-200 rounded-lg p-3 text-xs text-green-800">
-        ℹ️ Lấy <strong>PartnerGUID</strong> và <strong>PartnerToken</strong> từ tài khoản doanh nghiệp trên portal BKAV.
-        BKAV tự động xác nhận hóa đơn với GDT.
-      </div>
-      <Field label="Partner GUID">
-        <input type="text" value={form.partnerGUID} onChange={e => set('partnerGUID', e.target.value)}
-          placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" className={INPUT} autoComplete="off" />
-      </Field>
-      <Field label="Partner Token">
-        <PasswordField value={form.partnerToken} onChange={v => set('partnerToken', v)}
-          placeholder="Token từ portal BKAV" />
-      </Field>
-      <Field label="Mã số thuế">
-        <input type="text" value={form.taxCode} onChange={e => set('taxCode', e.target.value)}
-          placeholder="0123456789" className={INPUT} />
-      </Field>
-    </div>
-  );
-}
-
-// ─── Shared UI atoms ─────────────────────────────────────────────────────────
 
 const INPUT = 'w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 bg-white';
 
-function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
-  return (
-    <div>
-      <label className="block text-xs font-medium text-gray-600 mb-1">{label}</label>
-      {children}
-      {hint && <p className="text-xs text-gray-400 mt-0.5">{hint}</p>}
-    </div>
-  );
-}
-
-function PasswordField({ value, onChange, placeholder }: { value: string; onChange: (v: string) => void; placeholder?: string }) {
-  const [show, setShow] = useState(false);
-  return (
-    <div className="relative">
-      <input type={show ? 'text' : 'password'} value={value} onChange={e => onChange(e.target.value)}
-        placeholder={placeholder} className={INPUT + ' pr-16'} autoComplete="off" />
-      <button type="button" onClick={() => setShow(s => !s)}
-        className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-gray-500 hover:text-gray-800 px-1">
-        {show ? 'Ẩn' : 'Hiện'}
-      </button>
-    </div>
-  );
-}
-
-// ─── Main page ───────────────────────────────────────────────────────────────
+const FREQ_OPTIONS = [
+  { value: 0, label: 'Tắt tự động' },
+  { value: 6, label: 'Mỗi 6 giờ' },
+  { value: 12, label: 'Mỗi 12 giờ' },
+  { value: 24, label: 'Mỗi 24 giờ' },
+];
 
 export default function ConnectorsPage() {
   const toast = useToast();
-  const [connectors, setConnectors] = useState<Connector[]>([]);
+  const router = useRouter();
+  const { activeCompany, activeCompanyId } = useCompany();
   const [loading, setLoading] = useState(true);
-  const [activeForm, setActiveForm] = useState<Provider | null>(null);
-  const [forms, setForms] = useState<Record<Provider, ConnectorForm>>({
-    misa:    defaultForm('misa'),
-    viettel: defaultForm('viettel'),
-    bkav:    defaultForm('bkav'),
-  });
-  const [testing, setTesting]   = useState<string | null>(null);
-  const [saving,  setSaving]    = useState<Provider | null>(null);
-  const [syncing, setSyncing]   = useState<string | null>(null);
+  const [botConfig, setBotConfig] = useState<BotConfig | null>(null);
+  const [lastRuns, setLastRuns] = useState<BotRun[]>([]);
+
+  // Setup form
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [syncFreq, setSyncFreq] = useState(6);
+  const [tosAccepted, setTosAccepted] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  // Change password
+  const [changingPassword, setChangingPassword] = useState(false);
+  const [newPassword, setNewPassword] = useState('');
+
+  // Sync
+  const [showSyncPicker, setShowSyncPicker] = useState(false);
+  const { isSyncing, startSync } = useSyncContext();
+  const [syncing, setSyncing] = useState(false);
+
+  // Delete
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+
+  // Import stats
+  const [importStats, setImportStats] = useState<{ total: number; lastDate: string | null } | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const res = await apiClient.get<{ data: Connector[] }>('/connectors');
-      setConnectors(res.data.data);
+      const [botRes, importRes] = await Promise.all([
+        apiClient.get<{ data: { config: BotConfig | null; lastRuns: BotRun[] } }>('/bot/status'),
+        apiClient.get<{ meta: { total: number } }>('/invoices', { params: { provider: 'manual', pageSize: 1 } }).catch(() => null),
+      ]);
+      setBotConfig(botRes.data.data.config);
+      setLastRuns(botRes.data.data.lastRuns);
+      if (importRes) {
+        setImportStats({ total: importRes.data.meta?.total ?? 0, lastDate: null });
+      }
     } catch { /* silent */ } finally {
       setLoading(false);
     }
@@ -196,133 +94,106 @@ export default function ConnectorsPage() {
 
   useEffect(() => { void load(); }, [load]);
 
-  const connectorFor = (p: Provider) =>
-    connectors.find(c => c.provider_id === p) ?? null;
-
-  // Test credentials before saving (no DB write)
-  const testNewCredentials = async (provider: Provider) => {
-    const form = forms[provider];
-    const credentials = formToCredentials(provider, form);
-    setTesting(`new-${provider}`);
+  const handleSetup = async () => {
+    if (!password.trim() || !tosAccepted) return;
+    setSaving(true);
     try {
-      const res = await apiClient.post<{
-        success: boolean;
-        data?: { healthy: boolean; environment?: string };
-        error?: { message: string };
-      }>('/connectors/test-credentials', { providerId: provider, credentials });
-      if (res.data.success && res.data.data?.healthy) {
-        toast.success(`✅ Kết nối ${PROVIDER_META[provider].name} thành công!`);
-      } else {
-        const msg = res.data.error?.message ?? 'Kết nối thất bại';
-        const ipHint = provider === 'viettel' && msg.includes('500')
-          ? ' — Kiểm tra IP whitelist tại Viettel!' : '';
-        toast.error(`❌ ${msg}${ipHint}`);
-      }
-    } catch (err) {
-      const msg = (err as { response?: { data?: { error?: { message?: string } } } })?.response?.data?.error?.message ?? 'Lỗi kết nối';
-      toast.error(msg);
+      await apiClient.post('/bot/setup', {
+        password,
+        sync_frequency_hours: syncFreq,
+      });
+      toast.success('Đã cấu hình GDT Bot thành công!');
+      setPassword('');
+      setTosAccepted(false);
+      await load();
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { error?: { message?: string } } } })?.response?.data?.error?.message;
+      toast.error(msg ?? 'Lỗi cấu hình. Vui lòng thử lại.');
     } finally {
-      setTesting(null);
+      setSaving(false);
     }
   };
 
-  // Save connector + trigger initial sync
-  const saveConnector = async (provider: Provider) => {
-    const form = forms[provider];
-    const credentials = formToCredentials(provider, form);
-
-    // Inject MISA_ENV into credentials so backend can read it
-    if (provider === 'misa')    credentials['env'] = (form as MisaForm).env;
-
-    setSaving(provider);
+  const handleChangePassword = async () => {
+    if (!newPassword.trim()) return;
+    setSaving(true);
     try {
-      await apiClient.post('/connectors', { providerId: provider, credentials });
-      toast.success(`Đã lưu kết nối ${PROVIDER_META[provider].name}`);
-      setActiveForm(null);
+      await apiClient.post('/bot/setup', {
+        password: newPassword,
+        sync_frequency_hours: botConfig?.sync_frequency_hours ?? 6,
+      });
+      toast.success('Đã cập nhật mật khẩu');
+      setNewPassword('');
+      setChangingPassword(false);
       await load();
     } catch {
-      toast.error('Lỗi lưu kết nối. Vui lòng thử lại.');
+      toast.error('Lỗi cập nhật mật khẩu.');
     } finally {
-      setSaving(null);
+      setSaving(false);
     }
   };
 
-  // Test existing saved connector health
-  const testExisting = async (id: string, name: string) => {
-    setTesting(id);
+  const handleDelete = async () => {
+    setDeleting(true);
     try {
-      const res = await apiClient.post<{ data: { healthy: boolean } }>(`/connectors/${id}/test`);
-      if (res.data.data.healthy) {
-        toast.success(`✅ ${name} đang hoạt động tốt`);
-        // Reload to clear stale last_error banner
-        await load();
-      } else {
-        toast.warning(`⚠️ ${name} trả về không khỏe mạnh`);
-      }
-    } catch {
-      toast.error(`Không thể kiểm tra ${name}`);
-    } finally {
-      setTesting(null);
-    }
-  };
-
-  const triggerSync = async (id: string) => {
-    setSyncing(id);
-    try {
-      await apiClient.post(`/connectors/${id}/sync`);
-      toast.success('Đã thêm vào hàng đợi đồng bộ');
-    } catch {
-      toast.error('Lỗi kích hoạt đồng bộ');
-    } finally {
-      setSyncing(null);
-    }
-  };
-
-  const toggleConnector = async (id: string) => {
-    try {
-      await apiClient.patch(`/connectors/${id}/toggle`);
+      await apiClient.delete('/bot/config');
+      toast.success('Đã xóa cấu hình GDT Bot. Dữ liệu hóa đơn vẫn được giữ lại.');
+      setShowDeleteConfirm(false);
       await load();
     } catch {
-      toast.error('Lỗi thay đổi trạng thái');
+      toast.error('Lỗi xóa cấu hình.');
+    } finally {
+      setDeleting(false);
     }
   };
 
-  const [showLegacy, setShowLegacy] = useState(false);
+  const handleSyncConfirm = async (jobs: SyncJob[]) => {
+    setShowSyncPicker(false);
+    setSyncing(true);
+    try {
+      const res = await apiClient.post<{ data: { jobIds: string[] } }>('/sync/start', { jobs });
+      startSync(res.data.data.jobIds, activeCompanyId ?? '');
+      toast.success(`Đã kích hoạt đồng bộ ${jobs.length} kỳ.`);
+    } catch (err: unknown) {
+      const status = (err as { response?: { status?: number } })?.response?.status;
+      if (status === 409) toast.error('Đang có đồng bộ đang chạy.');
+      else toast.error('Lỗi kích hoạt đồng bộ.');
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  // Reload config when sync finishes (panel closes)
+  const prevSyncing = useRef(false);
+  useEffect(() => {
+    if (prevSyncing.current && !isSyncing) void load();
+    prevSyncing.current = isSyncing;
+  }, [isSyncing, load]);
+
+  const toggleActive = async () => {
+    try {
+      await apiClient.patch('/bot/toggle');
+      await load();
+    } catch {
+      toast.error('Lỗi thay đổi trạng thái.');
+    }
+  };
+
+  const maskedUsername = botConfig?.tax_code
+    ? botConfig.tax_code.slice(0, 3) + '***' + botConfig.tax_code.slice(-3)
+    : '';
+
+  const nextAutoSync = botConfig?.last_run_at && botConfig.sync_frequency_hours > 0
+    ? new Date(new Date(botConfig.last_run_at).getTime() + botConfig.sync_frequency_hours * 3600_000)
+    : null;
 
   return (
-    <div className="p-4 max-w-2xl mx-auto pb-24">
-      <BackButton fallbackHref="/dashboard" className="mb-4" />
-      <h1 className="text-2xl font-bold text-gray-900 mb-1">Nguồn Dữ Liệu Hóa Đơn</h1>
-      <p className="text-sm text-gray-500 mb-6">Quản lý cách hệ thống thu thập hóa đơn đầu vào &amp; đầu ra</p>
-
-      {/* ── Kiến trúc mới banner ── */}
-      <div className="mb-5 bg-blue-50 border border-blue-200 rounded-xl p-4 space-y-2">
-        <p className="font-semibold text-blue-900 text-sm">🏗️ Kiến trúc nguồn dữ liệu mới</p>
-        <p className="text-xs text-blue-800 leading-relaxed">
-          <strong>GDT (hoadondientu.gdt.gov.vn)</strong> là nguồn duy nhất lưu toàn bộ hóa đơn
-          của mọi doanh nghiệp — cả <strong>đầu ra</strong> (bán hàng) lẫn <strong>đầu vào</strong> (mua hàng).
-          MISA/Viettel/BKAV chỉ lưu HĐ do <em>họ</em> phát hành. HĐ mua vào từ nhà cung cấp khác
-          nằm trên hệ thống nhà mạng khác — không lấy được.
-        </p>
-        <div className="flex gap-2 pt-1">
-          <a href="/settings/bot"
-            className="bg-blue-700 text-white text-xs px-3 py-1.5 rounded-lg font-medium hover:bg-blue-800">
-            🤖 Thiết lập GDT Bot
-          </a>
-          <a href="/import"
-            className="border border-blue-400 text-blue-700 text-xs px-3 py-1.5 rounded-lg font-medium hover:bg-blue-100">
-            📁 Import thủ công
-          </a>
-        </div>
+    <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto pb-24 space-y-6">
+      <BackButton fallbackHref="/dashboard" className="mb-2" />
+      <div>
+        <h1 className="text-2xl font-bold text-gray-900">Nguồn Dữ Liệu Hóa Đơn</h1>
+        <p className="text-sm text-gray-500">Quản lý cách hệ thống thu thập hóa đơn</p>
       </div>
-
-      {/* ── Cảnh báo chỉ có đầu ra ── */}
-      {!loading && connectors.some(c => c.is_enabled) && (
-        <div className="mb-5 bg-amber-50 border border-amber-200 rounded-xl p-4 text-xs text-amber-800">
-          ⚠️ <strong>Dữ liệu chưa đầy đủ:</strong> Bạn đang dùng kết nối nhà mạng — chỉ có HĐ đầu ra.
-          Thiết lập <strong>GDT Bot</strong> hoặc <strong>Import thủ công</strong> để có báo cáo thuế GTGT chính xác.
-        </div>
-      )}
 
       {loading ? (
         <div className="flex justify-center py-12">
@@ -330,160 +201,312 @@ export default function ConnectorsPage() {
         </div>
       ) : (
         <>
-        {/* ── Legacy connectors — collapsed ── */}
-        <div className="border border-gray-200 rounded-xl overflow-hidden">
-          <button
-            className="w-full flex items-center justify-between px-4 py-3 bg-gray-50 text-sm font-medium text-gray-600 hover:bg-gray-100"
-            onClick={() => setShowLegacy(v => !v)}
-          >
-            <span>🔌 Kết nối nhà mạng (Hạn chế — chỉ HĐ đầu ra)</span>
-            <span className="text-gray-400 text-xs">{showLegacy ? '▲ Thu gọn' : '▼ Mở rộng'}</span>
-          </button>
-          {showLegacy && (
-            <div className="bg-gray-50 border-t border-gray-200 px-4 py-3">
-              <div className="bg-orange-50 border border-orange-200 rounded-lg p-3 text-xs text-orange-800 mb-4">
-                ℹ️ Các nhà mạng chỉ cung cấp <strong>HĐ đầu ra</strong> của doanh nghiệp đó.
-                Để có đầy đủ HĐ đầu vào + đầu ra, sử dụng <strong>GDT Bot</strong> hoặc <strong>Import thủ công</strong> từ cổng thuế.
-                Giữ kết nối này để kiểm tra chéo hoặc nếu bạn muốn dữ liệu một phần.
+          {/* ── SECTION 1: GDT BOT ── */}
+          <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+            <div className="p-5 border-b border-gray-50">
+              <div className="flex items-center gap-3 mb-2">
+                <span className="text-2xl">🤖</span>
+                <div>
+                  <h2 className="font-bold text-gray-900">GDT Bot — Đồng bộ tự động từ Cổng Thuế</h2>
+                  <p className="text-xs text-gray-500">
+                    Bot tự động đăng nhập vào hoadondientu.gdt.gov.vn và tải về toàn bộ hóa đơn.
+                  </p>
+                </div>
               </div>
-        <div className="space-y-4">
-          {(['misa', 'viettel', 'bkav'] as Provider[]).map(provider => {
-            const meta   = PROVIDER_META[provider];
-            const conn   = connectorFor(provider);
-            const isOpen = activeForm === provider;
+            </div>
 
-            return (
-              <div key={provider} className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
-                {/* Header */}
-                <div className="flex items-center justify-between p-4">
-                  <div className="flex items-center gap-3">
-                    <span className="text-2xl">{meta.icon}</span>
-                    <div>
-                      <p className="font-semibold text-gray-900">{meta.name}</p>
-                      {conn ? (
-                        <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${CB_BADGE[conn.circuit_breaker_state] ?? 'bg-gray-100 text-gray-600'}`}>
-                          {conn.circuit_breaker_state === 'CLOSED' ? '● Đã kết nối' : conn.circuit_breaker_state}
-                        </span>
-                      ) : (
-                        <span className="text-xs text-gray-400">Chưa kết nối</span>
-                      )}
-                    </div>
+            {!botConfig ? (
+              /* ── Setup form ── */
+              <div className="p-5 space-y-4">
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Tên đăng nhập cổng thuế</label>
+                  <input
+                    type="text"
+                    disabled
+                    value={activeCompany?.tax_code ?? ''}
+                    className={INPUT + ' bg-gray-50 text-gray-400 cursor-not-allowed'}
+                    placeholder="Thường là MST hoặc email đăng ký"
+                  />
+                  <p className="text-xs text-gray-400 mt-0.5">Tự động sử dụng MST của công ty</p>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Mật khẩu cổng thuế điện tử</label>
+                  <div className="relative">
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      placeholder="Nhập mật khẩu..."
+                      className={INPUT + ' pr-16'}
+                      autoComplete="off"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword((s) => !s)}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-gray-500 hover:text-gray-800 px-1"
+                    >
+                      {showPassword ? 'Ẩn' : 'Hiện'}
+                    </button>
                   </div>
+                  <p className="text-xs text-gray-400 mt-1">
+                    🔒 Mật khẩu được mã hóa AES-256 trước khi lưu. Chúng tôi không lưu mật khẩu dạng văn bản thô.
+                  </p>
+                </div>
 
-                  <div className="flex items-center gap-2">
-                    {conn ? (
-                      <>
-                        {/* Toggle switch */}
-                        <div
-                          className={`w-11 h-6 rounded-full cursor-pointer transition-colors ${conn.is_enabled ? 'bg-primary-600' : 'bg-gray-300'}`}
-                          onClick={() => toggleConnector(conn.id)}
-                          title={conn.is_enabled ? 'Tắt' : 'Bật'}
-                        >
-                          <div className={`w-5 h-5 m-0.5 bg-white rounded-full shadow transition-transform ${conn.is_enabled ? 'translate-x-5' : 'translate-x-0'}`} />
-                        </div>
-                        <button
-                          onClick={() => setActiveForm(isOpen ? null : provider)}
-                          className="text-xs text-primary-600 font-medium hover:underline"
-                        >
-                          Sửa
-                        </button>
-                      </>
-                    ) : (
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-2">Tần suất đồng bộ tự động</label>
+                  <div className="flex flex-wrap gap-2">
+                    {FREQ_OPTIONS.map((opt) => (
                       <button
-                        onClick={() => setActiveForm(isOpen ? null : provider)}
-                        className="bg-primary-600 text-white text-sm px-3 py-1.5 rounded-lg font-medium"
+                        key={opt.value}
+                        onClick={() => setSyncFreq(opt.value)}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                          syncFreq === opt.value
+                            ? 'bg-primary-600 text-white border-primary-600'
+                            : 'border-gray-300 text-gray-600 hover:border-primary-300'
+                        }`}
                       >
-                        Kết nối
+                        {opt.label}
                       </button>
-                    )}
+                    ))}
+                  </div>
+                </div>
+
+                <label className="flex items-start gap-2 text-xs text-gray-600 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={tosAccepted}
+                    onChange={(e) => setTosAccepted(e.target.checked)}
+                    className="w-4 h-4 mt-0.5 rounded border-gray-300 text-primary-600"
+                  />
+                  <span>
+                    Tôi đồng ý với điều khoản sử dụng dịch vụ và xác nhận rằng mật khẩu
+                    cổng thuế được cung cấp cho mục đích đồng bộ dữ liệu hóa đơn của doanh nghiệp tôi.
+                  </span>
+                </label>
+
+                <button
+                  onClick={() => void handleSetup()}
+                  disabled={!password.trim() || !tosAccepted || saving}
+                  className="w-full bg-primary-600 text-white rounded-xl py-2.5 text-sm font-medium disabled:opacity-50"
+                >
+                  {saving ? 'Đang lưu...' : 'Lưu & Kích hoạt Bot'}
+                </button>
+              </div>
+            ) : (
+              /* ── Status display ── */
+              <div className="p-5 space-y-4">
+                {/* Status badge */}
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <span className={`inline-block w-2.5 h-2.5 rounded-full ${
+                      botConfig.is_active && botConfig.last_run_status !== 'error' ? 'bg-green-500' :
+                      botConfig.last_run_status === 'error' ? 'bg-red-500' : 'bg-gray-400'
+                    }`} />
+                    <span className="text-sm font-medium text-gray-900">
+                      {botConfig.is_active
+                        ? botConfig.last_run_status === 'error' ? 'Lỗi' : 'Đang hoạt động'
+                        : 'Đã tạm dừng'}
+                    </span>
+                  </div>
+                  <div
+                    className={`w-11 h-6 rounded-full cursor-pointer transition-colors ${
+                      botConfig.is_active ? 'bg-primary-600' : 'bg-gray-300'
+                    }`}
+                    onClick={() => void toggleActive()}
+                  >
+                    <div className={`w-5 h-5 m-0.5 bg-white rounded-full shadow transition-transform ${
+                      botConfig.is_active ? 'translate-x-5' : 'translate-x-0'
+                    }`} />
                   </div>
                 </div>
 
                 {/* Last sync info */}
-                {conn?.last_sync_at && (
-                  <div className="px-4 pb-2 text-xs text-gray-400 flex items-center gap-4">
-                    <span>Đồng bộ: {new Date(conn.last_sync_at).toLocaleString('vi-VN')}</span>
-                    <span>Mỗi {conn.sync_frequency_minutes} phút</span>
-                  </div>
-                )}
-
-                {/* Error message */}
-                {conn?.last_error && (
-                  <div className="mx-4 mb-3 text-xs text-red-700 bg-red-50 rounded-lg px-3 py-2 break-all">
-                    ⚠️ {conn.last_error}
-                    {provider === 'viettel' && conn.last_error.includes('500') && (
-                      <span className="block mt-1 font-medium">→ Kiểm tra IP server đã được đăng ký whitelist tại Viettel chưa?</span>
+                {botConfig.last_run_at && (
+                  <div className="text-xs text-gray-500 space-y-1">
+                    <p>
+                      Lần đồng bộ gần nhất: {new Date(botConfig.last_run_at).toLocaleString('vi-VN')}
+                      {botConfig.last_run_output_count != null && (
+                        <span> — {botConfig.last_run_output_count} HĐ đầu ra, {botConfig.last_run_input_count ?? 0} HĐ đầu vào</span>
+                      )}
+                    </p>
+                    {nextAutoSync && botConfig.is_active && (
+                      <p>Đồng bộ tự động tiếp theo: {nextAutoSync.toLocaleString('vi-VN')}</p>
                     )}
                   </div>
                 )}
 
-                {/* Action buttons for existing connector */}
-                {conn && !isOpen && (
-                  <div className="px-4 pb-4 flex gap-2">
-                    <button
-                      onClick={() => testExisting(conn.id, meta.name)}
-                      disabled={testing === conn.id}
-                      className="flex-1 border border-gray-300 rounded-lg py-1.5 text-sm text-gray-700 disabled:opacity-50"
-                    >
-                      {testing === conn.id ? 'Đang kiểm tra...' : '🔍 Kiểm tra'}
-                    </button>
-                    <button
-                      onClick={() => triggerSync(conn.id)}
-                      disabled={syncing === conn.id || !conn.is_enabled}
-                      className="flex-1 border border-primary-300 text-primary-700 rounded-lg py-1.5 text-sm disabled:opacity-50"
-                    >
-                      {syncing === conn.id ? 'Đang xử lý...' : '🔄 Đồng bộ ngay'}
-                    </button>
+                {/* Error */}
+                {botConfig.last_error && (
+                  <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+                    ⚠️ {botConfig.last_error}
                   </div>
                 )}
 
-                {/* Expand: form */}
-                {isOpen && (
-                  <div className="border-t border-gray-100 p-4 bg-gray-50 space-y-4">
-                    {provider === 'misa' && (
-                      <MisaFormFields form={forms.misa as MisaForm} onChange={f => setForms(prev => ({ ...prev, misa: f }))} />
-                    )}
-                    {provider === 'viettel' && (
-                      <ViettelFormFields form={forms.viettel as ViettelForm} onChange={f => setForms(prev => ({ ...prev, viettel: f }))} />
-                    )}
-                    {provider === 'bkav' && (
-                      <BkavFormFields form={forms.bkav as BkavForm} onChange={f => setForms(prev => ({ ...prev, bkav: f }))} />
-                    )}
+                {/* Blocked */}
+                {botConfig.blocked_until && new Date(botConfig.blocked_until) > new Date() && (
+                  <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                    🚫 Bot tạm khóa đến {new Date(botConfig.blocked_until).toLocaleString('vi-VN')} do lỗi liên tiếp.
+                  </div>
+                )}
 
-                    <p className="text-xs text-gray-400">🔒 Thông tin được mã hóa AES-256-GCM trước khi lưu</p>
+                {/* Username */}
+                <div className="text-xs text-gray-500">
+                  Tài khoản: <span className="font-mono">{maskedUsername}</span>
+                </div>
 
-                    <div className="flex gap-2 pt-1">
+                {/* Actions */}
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => { if (isSyncing) { toast.info('Đang có đồng bộ đang chạy. Nhấn Hủy đồng bộ để dừng lại.'); return; } setShowSyncPicker(true); }}
+                    disabled={!botConfig.is_active}
+                    className="flex-1 bg-primary-600 text-white rounded-xl py-2 text-sm font-medium disabled:opacity-50"
+                  >
+                    {isSyncing ? '⏳ Đang đồng bộ...' : 'Đồng bộ ngay'}
+                  </button>
+                  <button
+                    onClick={() => setChangingPassword(true)}
+                    className="flex-1 border border-gray-300 rounded-xl py-2 text-sm text-gray-700"
+                  >
+                    Đổi mật khẩu
+                  </button>
+                </div>
+
+                <button
+                  onClick={() => setShowDeleteConfirm(true)}
+                  className="text-xs text-red-500 hover:text-red-700 underline"
+                >
+                  Xóa cấu hình
+                </button>
+
+                {/* Change password form */}
+                {changingPassword && (
+                  <div className="border border-primary-200 bg-primary-50/30 rounded-xl p-4 space-y-3">
+                    <label className="block text-xs font-medium text-gray-600">Mật khẩu mới</label>
+                    <input
+                      type="password"
+                      value={newPassword}
+                      onChange={(e) => setNewPassword(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === 'Enter') void handleChangePassword(); }}
+                      className={INPUT}
+                      autoFocus
+                      autoComplete="off"
+                    />
+                    <div className="flex gap-2">
                       <button
-                        onClick={() => testNewCredentials(provider)}
-                        disabled={testing === `new-${provider}`}
-                        className="flex-1 border border-gray-300 rounded-lg py-2 text-sm text-gray-700 font-medium disabled:opacity-50"
+                        onClick={() => void handleChangePassword()}
+                        disabled={!newPassword.trim() || saving}
+                        className="flex-1 bg-primary-600 text-white rounded-lg py-2 text-xs font-medium disabled:opacity-50"
                       >
-                        {testing === `new-${provider}` ? 'Đang kiểm tra...' : '🔍 Kiểm tra kết nối'}
+                        {saving ? 'Đang lưu...' : 'Lưu'}
                       </button>
                       <button
-                        onClick={() => saveConnector(provider)}
-                        disabled={saving === provider}
-                        className="flex-1 bg-primary-600 text-white rounded-lg py-2 text-sm font-medium disabled:opacity-50"
+                        onClick={() => { setChangingPassword(false); setNewPassword(''); }}
+                        className="flex-1 border border-gray-300 rounded-lg py-2 text-xs text-gray-600"
                       >
-                        {saving === provider ? 'Đang lưu...' : '💾 Lưu & Kết nối'}
+                        Hủy
                       </button>
                     </div>
-                    <button
-                      onClick={() => setActiveForm(null)}
-                      className="w-full text-xs text-gray-400 hover:text-gray-600 py-1"
-                    >
-                      Hủy
-                    </button>
+                  </div>
+                )}
+
+                {/* Recent runs */}
+                {lastRuns.length > 0 && (
+                  <div>
+                    <p className="text-xs font-medium text-gray-500 mb-2">Lịch sử đồng bộ gần đây</p>
+                    <div className="space-y-1.5">
+                      {lastRuns.slice(0, 5).map((run) => (
+                        <div key={run.id} className="flex items-center justify-between text-xs">
+                          <span className="text-gray-500">
+                            {new Date(run.started_at).toLocaleString('vi-VN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}
+                          </span>
+                          <span className={
+                            run.status === 'success' ? 'text-green-600' :
+                            run.status === 'error' ? 'text-red-600' : 'text-amber-600'
+                          }>
+                            {run.status === 'success'
+                              ? `✅ ${run.output_count + run.input_count} HĐ`
+                              : run.status === 'error'
+                              ? `❌ ${run.error_detail?.slice(0, 40) ?? 'Lỗi'}`
+                              : '⏳ Đang chạy'}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 )}
               </div>
-            );
-          })}
-        </div>
+            )}
+          </div>
+
+          {/* ── SECTION 2: IMPORT THỦ CÔNG ── */}
+          <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+            <div className="p-5">
+              <div className="flex items-center gap-3 mb-3">
+                <span className="text-2xl">📁</span>
+                <div>
+                  <h2 className="font-bold text-gray-900">Import Hóa Đơn Thủ Công</h2>
+                  <p className="text-xs text-gray-500">
+                    Tải file từ hoadondientu.gdt.gov.vn và import vào hệ thống.
+                    Hỗ trợ: XML (chi tiết), ZIP (chứa nhiều file XML).
+                  </p>
+                </div>
+              </div>
+
+              {importStats && importStats.total > 0 && (
+                <p className="text-xs text-gray-500 mb-3">
+                  Đã import {importStats.total.toLocaleString('vi-VN')} hóa đơn qua import thủ công.
+                </p>
+              )}
+
+              <div className="flex gap-2">
+                <button
+                  onClick={() => router.push('/import')}
+                  className="flex-1 bg-primary-600 text-white rounded-xl py-2.5 text-sm font-medium"
+                >
+                  Đi đến trang Import
+                </button>
+              </div>
             </div>
-          )}
-        </div>
+          </div>
         </>
+      )}
+
+      {/* ── Modals ── */}
+      {showSyncPicker && (
+        <SyncDatePicker
+          onConfirm={(jobs) => void handleSyncConfirm(jobs)}
+          onCancel={() => setShowSyncPicker(false)}
+          syncing={syncing}
+        />
+      )}
+
+
+      {showDeleteConfirm && (
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-4">
+          <div className="bg-white rounded-2xl w-full max-w-sm p-5 shadow-xl">
+            <h3 className="text-base font-bold text-gray-900 mb-1">Xóa cấu hình GDT Bot?</h3>
+            <p className="text-sm text-gray-500 mb-4">
+              Sẽ xóa thông tin đăng nhập cổng thuế. Dữ liệu hóa đơn đã đồng bộ vẫn được giữ lại.
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setShowDeleteConfirm(false)}
+                className="flex-1 py-2.5 border border-gray-300 rounded-xl text-sm text-gray-700"
+              >
+                Hủy
+              </button>
+              <button
+                onClick={() => void handleDelete()}
+                disabled={deleting}
+                className="flex-1 py-2.5 bg-red-500 text-white rounded-xl text-sm font-medium disabled:opacity-50"
+              >
+                {deleting ? 'Đang xóa...' : 'Xác nhận xóa'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

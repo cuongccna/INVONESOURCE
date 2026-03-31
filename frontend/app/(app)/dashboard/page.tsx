@@ -253,7 +253,7 @@ export default function DashboardPage() {
   }
 
   return (
-    <div className="p-4 max-w-2xl mx-auto space-y-5">
+    <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto space-y-5">
       {/* ── Header ── */}
       <div className="flex items-center justify-between">
         <div>
@@ -303,7 +303,7 @@ export default function DashboardPage() {
 
       {/* ── KPI Cards ── */}
       {kpi && (
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
           <KCard
             label="Tổng Hóa Đơn"
             value={full(kpi.invoices.total)}
@@ -330,6 +330,8 @@ export default function DashboardPage() {
         </div>
       )}
 
+      {/* ── Charts grid — side by side on desktop ── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
       {/* ── VAT Trend ── */}
       {vatChartData.length > 0 && (
         <div className="bg-white rounded-xl shadow-sm p-4">
@@ -378,6 +380,7 @@ export default function DashboardPage() {
           </ResponsiveContainer>
         </div>
       )}
+      </div>{/* end charts grid */}
 
       {/* ── Analytics period selector ── */}
       <div className="flex items-center justify-between">
@@ -399,7 +402,7 @@ export default function DashboardPage() {
 
       {/* ── Top Customers & Suppliers ── */}
       {analytics && (
-        <div className="grid grid-cols-1 gap-4">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <div className="bg-white rounded-xl shadow-sm p-4">
             <TopTable rows={analytics.topCustomers} caption="Top 5 khách hàng (đầu ra)" />
           </div>
@@ -644,7 +647,7 @@ export default function DashboardPage() {
       {/* ── Quick Actions ── */}
       <div className="bg-white rounded-xl shadow-sm p-4">
         <h2 className="text-sm font-semibold text-gray-700 mb-3">Thao Tác Nhanh</h2>
-        <div className="grid grid-cols-2 gap-2">
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
           {(quickActions.length > 0
             ? quickActions
             : [

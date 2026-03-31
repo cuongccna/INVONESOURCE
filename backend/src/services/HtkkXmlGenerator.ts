@@ -264,7 +264,10 @@ async function _fetchDeductibleInputSubtotal(
      WHERE company_id = $1
        AND direction = 'input'
        AND status = 'valid'
-       AND gdt_validated = true
+       AND (
+         (COALESCE(invoice_group, 5) = 5 AND gdt_validated = true)
+         OR (invoice_group IN (6, 8))
+       )
        AND deleted_at IS NULL
        AND (total_amount <= 20000000 OR payment_method IS DISTINCT FROM 'cash')
        AND ${dateFilter}`,
@@ -361,7 +364,14 @@ async function _fetchPluc8InputItems(
      FROM invoices
      WHERE company_id = $1
        AND direction = 'input'
-       AND vat_rate = 8
+       AND (
+         vat_rate = 8
+         OR (
+           (vat_rate IS NULL OR vat_rate = 0)
+           AND subtotal > 0
+           AND ROUND(vat_amount * 100.0 / subtotal) = 8
+         )
+       )
        AND status = 'valid'
        AND deleted_at IS NULL
        AND ${pf2.clause}
@@ -425,7 +435,14 @@ async function _fetchPluc8OutputItems(
      FROM invoices
      WHERE company_id = $1
        AND direction = 'output'
-       AND vat_rate = 8
+       AND (
+         vat_rate = 8
+         OR (
+           (vat_rate IS NULL OR vat_rate = 0)
+           AND subtotal > 0
+           AND ROUND(vat_amount * 100.0 / subtotal) = 8
+         )
+       )
        AND status = 'valid'
        AND deleted_at IS NULL
        AND ${pf2.clause}

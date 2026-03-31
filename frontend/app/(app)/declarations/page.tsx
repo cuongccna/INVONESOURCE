@@ -100,7 +100,7 @@ export default function DeclarationsPage() {
   };
 
   return (
-    <div className="p-4 max-w-2xl mx-auto">
+    <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto">
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Tờ Khai Thuế</h1>
@@ -125,7 +125,7 @@ export default function DeclarationsPage() {
           <p className="text-sm">Nhấn &quot;+ Tính Mới&quot; để tính toán</p>
         </div>
       ) : (
-        <div className="space-y-3">
+        <div className="space-y-3 lg:grid lg:grid-cols-2 lg:gap-4 lg:space-y-0">
           {declarations.map((decl) => {
             const statusInfo = STATUS_LABELS[decl.status] ?? { label: decl.status, color: 'bg-gray-100 text-gray-700' };
             const payable = Number(decl.ct41);

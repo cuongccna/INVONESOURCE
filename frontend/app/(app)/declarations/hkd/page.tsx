@@ -97,7 +97,7 @@ export default function HkdPage() {
   const isHkd = ['HKD', 'HND', 'CA_NHAN'].includes(settings.business_type);
 
   return (
-    <div className="p-4 max-w-2xl mx-auto space-y-5">
+    <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto space-y-5">
       <div>
         <h1 className="text-2xl font-bold text-gray-900">Hộ Kinh Doanh / Cá Nhân KD</h1>
         <p className="text-sm text-gray-500">Tính thuế khoán VAT & TNCN theo doanh thu</p>

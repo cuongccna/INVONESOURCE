@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { format } from 'date-fns';
 import { vi } from 'date-fns/locale';
@@ -18,6 +18,7 @@ interface LineItem {
   vat_rate: string | null;
   vat_amount: string | null;
   total: string | null;
+  is_manual?: boolean;
 }
 
 interface Invoice {
@@ -46,6 +47,8 @@ interface Invoice {
   payment_due_date: string | null;
   created_at: string;
   line_items: LineItem[];
+  invoice_group: number | null;
+  has_line_items: boolean | null;
 }
 
 const STATUS_LABELS: Record<string, { label: string; color: string }> = {
@@ -83,13 +86,58 @@ export default function InvoiceDetailPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
-  useEffect(() => {
+  // Manual line item form state
+  const [itemName, setItemName] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [formMsg, setFormMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
+  const reload = useCallback(() => {
     if (!id) return;
     apiClient.get<Invoice>(`/invoices/${id}`)
-      .then((r: { data: { data?: Invoice } | Invoice }) => setInvoice((r.data as { data?: Invoice }).data ?? (r.data as Invoice)))
+      .then((r: { data: { data?: Invoice } | Invoice }) => {
+        const inv = (r.data as { data?: Invoice }).data ?? (r.data as Invoice);
+        setInvoice(inv);
+        // Pre-fill input if a manual item already exists
+        const manual = inv.line_items?.find(li => li.is_manual);
+        if (manual?.item_name) setItemName(manual.item_name);
+      })
       .catch(() => setError('Không tìm thấy hóa đơn'))
       .finally(() => setLoading(false));
   }, [id]);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  const handleSaveItemName = async () => {
+    if (!itemName.trim() || !id) return;
+    setSaving(true);
+    setFormMsg(null);
+    try {
+      await apiClient.post(`/invoices/${id}/line-items`, { item_name: itemName.trim() });
+      setFormMsg({ type: 'ok', text: 'Đã lưu. Hóa đơn sẽ xuất hiện trong phụ lục NQ142 khi xuất XML.' });
+      reload();
+    } catch {
+      setFormMsg({ type: 'err', text: 'Lỗi lưu. Vui lòng thử lại.' });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDeleteManual = async () => {
+    if (!id) return;
+    setDeleting(true);
+    setFormMsg(null);
+    try {
+      await apiClient.delete(`/invoices/${id}/line-items/manual`);
+      setItemName('');
+      setFormMsg({ type: 'ok', text: 'Đã xóa tên sản phẩm thủ công.' });
+      reload();
+    } catch {
+      setFormMsg({ type: 'err', text: 'Lỗi xóa. Vui lòng thử lại.' });
+    } finally {
+      setDeleting(false);
+    }
+  };
 
   if (loading) {
     return (
@@ -113,6 +161,16 @@ export default function InvoiceDetailPage() {
   const subtotal = Number(invoice.subtotal);
   const vatAmt = Number(invoice.vat_amount);
   const total = Number(invoice.total_amount);
+  // Effective VAT rate: use stored value or compute from amounts
+  const vatRate = invoice.vat_rate != null
+    ? Number(invoice.vat_rate)
+    : (subtotal > 0 ? Math.round(vatAmt * 100 / subtotal) : 0);
+
+  // Show manual entry form for header-only invoices (Nhóm 6/8 or no line items + computed rate = 8%)
+  const hasManualItem = invoice.line_items?.some(li => li.is_manual);
+  const isHeaderOnly  = !invoice.has_line_items || invoice.line_items.length === 0 || hasManualItem;
+  const isNq142Eligible = vatRate === 8 || invoice.invoice_group === 6 || invoice.invoice_group === 8;
+  const showManualForm = isHeaderOnly && isNq142Eligible;
 
   return (
     <div className="px-4 py-6 max-w-lg mx-auto">
@@ -179,7 +237,77 @@ export default function InvoiceDetailPage() {
         )}
       </div>
 
-      {/* Line Items */}
+      {/* Manual line item entry — for header-only Nhóm 6/8 or 8% invoices without line details */}
+      {showManualForm && (
+        <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 mb-3">
+          <div className="flex items-start gap-2 mb-3">
+            <span className="text-amber-500 text-lg mt-0.5">⚠️</span>
+            <div>
+              <p className="text-sm font-semibold text-amber-800">Hóa đơn tiêu thức Header — chưa có tên sản phẩm</p>
+              <p className="text-xs text-amber-700 mt-0.5">
+                Để hóa đơn này xuất hiện trong phụ lục NQ142 của XML tờ khai,
+                vui lòng nhập tên hàng hóa / dịch vụ. Giá trị và thuế được lấy tự động.
+              </p>
+            </div>
+          </div>
+
+          {/* Auto-filled values display */}
+          <div className="grid grid-cols-3 gap-2 mb-3 text-center">
+            <div className="bg-white rounded-lg p-2 border border-amber-100">
+              <p className="text-xs text-gray-400 mb-0.5">Số lượng</p>
+              <p className="text-sm font-semibold text-gray-700">1</p>
+            </div>
+            <div className="bg-white rounded-lg p-2 border border-amber-100">
+              <p className="text-xs text-gray-400 mb-0.5">Giá trị HH</p>
+              <p className="text-sm font-semibold text-gray-700">{subtotal.toLocaleString('vi-VN')}đ</p>
+            </div>
+            <div className="bg-white rounded-lg p-2 border border-amber-100">
+              <p className="text-xs text-gray-400 mb-0.5">Thuế {vatRate}%</p>
+              <p className="text-sm font-semibold text-gray-700">{vatAmt.toLocaleString('vi-VN')}đ</p>
+            </div>
+          </div>
+
+          {/* Item name input */}
+          <div className="mb-3">
+            <label className="block text-xs font-medium text-amber-800 mb-1">
+              Tên hàng hóa / dịch vụ <span className="text-red-500">*</span>
+            </label>
+            <input
+              type="text"
+              value={itemName}
+              onChange={(e) => setItemName(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') void handleSaveItemName(); }}
+              placeholder="VD: Cước viễn thông tháng 3/2026"
+              className="w-full border border-amber-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-400 bg-white"
+            />
+          </div>
+
+          {formMsg && (
+            <p className={`text-xs mb-2 ${formMsg.type === 'ok' ? 'text-green-700' : 'text-red-600'}`}>
+              {formMsg.type === 'ok' ? '✅' : '❌'} {formMsg.text}
+            </p>
+          )}
+
+          <div className="flex gap-2">
+            <button
+              onClick={() => void handleSaveItemName()}
+              disabled={saving || !itemName.trim()}
+              className="flex-1 bg-amber-600 text-white rounded-lg py-2 text-sm font-medium hover:bg-amber-700 disabled:opacity-50 transition-colors"
+            >
+              {saving ? 'Đang lưu...' : hasManualItem ? 'Cập nhật tên' : 'Lưu tên sản phẩm'}
+            </button>
+            {hasManualItem && (
+              <button
+                onClick={() => void handleDeleteManual()}
+                disabled={deleting}
+                className="px-4 border border-red-200 text-red-600 rounded-lg py-2 text-sm hover:bg-red-50 disabled:opacity-50 transition-colors"
+              >
+                {deleting ? '...' : 'Xóa'}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
       {invoice.line_items && invoice.line_items.length > 0 && (
         <div className="bg-white rounded-xl shadow-sm p-4 mb-3">
           <p className="text-xs font-semibold text-gray-400 uppercase mb-3">
@@ -200,12 +328,19 @@ export default function InvoiceDetailPage() {
                 ? Number(li.total)
                 : liSubtotal + liVat;
               return (
-                <div key={li.id ?? idx} className="border border-gray-100 rounded-lg p-3">
+                <div key={li.id ?? idx} className={`border rounded-lg p-3 ${
+                  li.is_manual ? 'border-amber-200 bg-amber-50/50' : 'border-gray-100'
+                }`}>
                   <div className="flex justify-between items-start mb-1">
                     <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-gray-900 truncate">
-                        {li.line_number ? `${li.line_number}. ` : ''}{li.item_name || 'Không tên'}
-                      </p>
+                      <div className="flex items-center gap-1.5">
+                        {li.is_manual && (
+                          <span className="text-xs bg-amber-100 text-amber-700 rounded px-1 py-0.5 font-medium shrink-0">Thủ công</span>
+                        )}
+                        <p className="text-sm font-medium text-gray-900 truncate">
+                          {li.line_number ? `${li.line_number}. ` : ''}{li.item_name || 'Không tên'}
+                        </p>
+                      </div>
                       {li.item_code && (
                         <p className="text-xs text-gray-400">Mã: {li.item_code}</p>
                       )}

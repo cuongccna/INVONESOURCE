@@ -18,3 +18,10 @@ body {
     padding-bottom: calc(4rem + env(safe-area-inset-bottom));
   }
 }
+
+/* On desktop (lg:), bottom nav is hidden — reduce safe area padding */
+@media (min-width: 1024px) {
+  .safe-bottom {
+    padding-bottom: 0 !important;
+  }
+}
