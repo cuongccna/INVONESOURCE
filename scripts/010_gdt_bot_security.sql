@@ -2,8 +2,8 @@
 -- Run after 009_gdt_viettel_validated.sql
 
 -- ── 1. New connector provider values ──────────────────────────────────────
-ALTER TYPE connector_provider ADD VALUE IF NOT EXISTS 'gdt_bot';
-ALTER TYPE connector_provider ADD VALUE IF NOT EXISTS 'manual_import';
+ALTER TYPE invoice_provider ADD VALUE IF NOT EXISTS 'gdt_bot';
+ALTER TYPE invoice_provider ADD VALUE IF NOT EXISTS 'manual_import';
 
 -- Disable existing provider connectors (soft-disable, not delete)
 UPDATE company_connectors

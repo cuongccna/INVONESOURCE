@@ -43,10 +43,6 @@ else
   info "bot/.env symlink already exists"
 fi
 
-# ── Git pull ──────────────────────────────────────────────────────────────────
-info "Pulling latest code..."
-git pull --ff-only
-
 # ── Install dependencies ──────────────────────────────────────────────────────
 info "Installing workspace dependencies (backend + frontend + shared)..."
 npm install --workspaces --include-workspace-root
@@ -60,6 +56,15 @@ if [[ "$SKIP_MIGRATE" == false ]]; then
 
   # Load DB connection from .env
   set -a; source "$SCRIPT_DIR/.env"; set +a
+
+  # Extract DB name from DATABASE_URL for schema grant
+  DB_NAME="$(echo "$DATABASE_URL" | sed 's|.*\/||')"
+  DB_USER="$(echo "$DATABASE_URL" | sed 's|postgresql://||;s|:.*||')"
+
+  # Grant schema permissions (PostgreSQL 15+ requires explicit GRANT on public schema)
+  info "Granting schema privileges to $DB_USER on $DB_NAME..."
+  sudo -u postgres psql -d "$DB_NAME" -c "GRANT ALL ON SCHEMA public TO \"$DB_USER\";" 2>/dev/null || \
+    warn "Could not grant schema privileges (may need manual: sudo -u postgres psql -d $DB_NAME -c 'GRANT ALL ON SCHEMA public TO $DB_USER;')"
 
   run_sql() {
     local file="$1"
