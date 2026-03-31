@@ -6,11 +6,24 @@ ALTER TYPE invoice_provider ADD VALUE IF NOT EXISTS 'gdt_bot';
 ALTER TYPE invoice_provider ADD VALUE IF NOT EXISTS 'manual_import';
 
 -- Disable existing provider connectors (soft-disable, not delete)
-UPDATE company_connectors
-SET enabled = false,
-    notes = 'Disabled: provider only stores outgoing invoices. Use GDT Bot instead.'
-WHERE provider IN ('misa', 'viettel', 'bkav')
-  AND (notes IS NULL OR notes NOT LIKE '%Disabled%');
+-- Only runs if 'notes' column exists (added in a later migration)
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'company_connectors' AND column_name = 'notes'
+  ) THEN
+    UPDATE company_connectors
+    SET enabled = false,
+        notes = 'Disabled: provider only stores outgoing invoices. Use GDT Bot instead.'
+    WHERE provider IN ('misa', 'viettel', 'bkav')
+      AND (notes IS NULL OR notes NOT LIKE '%Disabled%');
+  ELSE
+    UPDATE company_connectors
+    SET enabled = false
+    WHERE provider IN ('misa', 'viettel', 'bkav');
+  END IF;
+END $$;
 
 -- ── 2. GDT Bot configs table (one per company) ────────────────────────────
 CREATE TABLE IF NOT EXISTS gdt_bot_configs (
