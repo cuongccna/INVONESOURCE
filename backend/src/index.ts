@@ -58,15 +58,30 @@ import toolsRouter from './routes/tools';
 
 const app = express();
 
+function normalizeOrigin(value: string): string {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return value.trim().replace(/\/$/, '');
+  }
+}
+
+
+
 const fallbackOrigins = ['http://localhost:3000', 'http://127.0.0.1:3000'];
 const configuredOrigins = [
+  env.APP_URL,
   ...(env.FRONTEND_URL ? [env.FRONTEND_URL] : []),
   ...(env.FRONTEND_URLS
     ? env.FRONTEND_URLS.split(',').map((o) => o.trim()).filter(Boolean)
     : []),
   ...fallbackOrigins,
 ];
-const allowOriginSet = new Set(configuredOrigins);
+const allowOriginSet = new Set(
+  configuredOrigins
+    .map((origin) => normalizeOrigin(origin))
+    .filter(Boolean)
+);
 
 // ─── Security middleware ────────────────────────────────────────────────────
 app.use(helmet());
