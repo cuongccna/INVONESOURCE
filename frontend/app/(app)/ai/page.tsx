@@ -121,7 +121,7 @@ export default function AiChatPage() {
   ];
 
   return (
-    <div className="flex flex-col h-screen max-h-screen bg-gray-50">
+    <div className="flex flex-col h-[100dvh] max-h-[100dvh] bg-gray-50">
       {/* Header */}
       <div className="bg-white border-b border-gray-200 px-4 py-3">
         <h1 className="text-lg font-bold text-gray-900">🤖 Trợ Lý AI Thuế</h1>

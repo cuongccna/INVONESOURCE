@@ -1,6 +1,7 @@
 'use client';
 
-import { useRouter } from 'next/navigation';
+import { usePathname, useRouter, useSearchParams } from 'next/navigation';
+import { buildRouteKey, getPreviousRoute } from '../lib/navigationHistory';
 
 interface BackButtonProps {
   fallbackHref: string;
@@ -14,9 +15,18 @@ export default function BackButton({
   className = '',
 }: BackButtonProps) {
   const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
 
   const handleBack = () => {
     if (typeof window !== 'undefined') {
+      const currentRoute = buildRouteKey(pathname || '/', searchParams);
+      const previousRoute = getPreviousRoute(currentRoute);
+      if (previousRoute && previousRoute !== currentRoute) {
+        router.push(previousRoute);
+        return;
+      }
+
       const referrer = document.referrer;
       const sameOrigin = referrer.startsWith(window.location.origin);
       if (sameOrigin && window.history.length > 1) {

@@ -1,17 +1,19 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { useRouter, usePathname } from 'next/navigation';
+import { useRouter, usePathname, useSearchParams } from 'next/navigation';
 import axios from 'axios';
 import { setAccessToken } from '../lib/apiClient';
 import { CompanyProvider } from '../contexts/CompanyContext';
-import { ViewProvider } from '../contexts/ViewContext';
+import { ViewProvider, useView } from '../contexts/ViewContext';
 import { SyncProvider, useSyncContext } from '../contexts/SyncContext';
 import Header from './Header';
 import BottomNav from './BottomNav';
 import SyncProgressPanel from './SyncProgressPanel';
 import { useCompany } from '../contexts/CompanyContext';
 import { usePushSubscription } from '../lib/usePushSubscription';
+import BackButton from './BackButton';
+import { buildRouteKey, pushNavigationEntry } from '../lib/navigationHistory';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 
@@ -45,6 +47,61 @@ function NoCompanyGuard() {
   }, [loading, companies.length, pathname, router]);
 
   return null;
+}
+
+function NavigationHistoryTracker() {
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+
+  useEffect(() => {
+    if (!pathname) return;
+    const routeKey = buildRouteKey(pathname, searchParams);
+    pushNavigationEntry(routeKey);
+  }, [pathname, searchParams]);
+
+  return null;
+}
+
+function GlobalBackStrip() {
+  const pathname = usePathname();
+  const { mode, orgId } = useView();
+
+  const homeHref = mode === 'portfolio'
+    ? '/portfolio'
+    : mode === 'group' && orgId
+      ? `/group/${orgId}`
+      : '/dashboard';
+
+  const isHomeRoute = pathname === '/dashboard'
+    || pathname === '/portfolio'
+    || (pathname?.startsWith('/group/') && pathname.split('/').length === 3);
+
+  const hasLocalBackControl = !!pathname && [
+    '/import',
+    '/import/history',
+    '/settings/bot',
+    '/settings/profile',
+    '/settings/connectors',
+    '/settings/companies',
+    '/settings/sync-logs',
+    '/reports/invoices',
+  ].some((p) => pathname === p || pathname.startsWith(`${p}/`));
+
+  const hasRouteSpecificBack = !!pathname && (
+    pathname.startsWith('/declarations/')
+    || pathname.startsWith('/reports/monthly/')
+    || pathname.startsWith('/invoices/')
+    || pathname.startsWith('/admin/users/')
+    || pathname.startsWith('/settings/organizations/')
+  );
+
+  if (isHomeRoute || hasLocalBackControl || hasRouteSpecificBack) return null;
+
+  return (
+    <div className="max-w-2xl lg:max-w-5xl mx-auto px-4 pt-3">
+      <BackButton fallbackHref={homeHref} className="mb-1" />
+    </div>
+  );
 }
 
 export default function ClientLayout({ children }: { children: React.ReactNode }) {
@@ -90,8 +147,12 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
         <ViewProvider>
           <div className="min-h-screen bg-gray-50">
             <NoCompanyGuard />
+            <NavigationHistoryTracker />
             <Header />
-            <main className="pb-20 lg:pb-6 pt-14 safe-bottom">{children}</main>
+            <main className="pb-20 lg:pb-6 pt-14 safe-bottom">
+              <GlobalBackStrip />
+              {children}
+            </main>
             <SyncOverlay />
             <BottomNav />
           </div>
