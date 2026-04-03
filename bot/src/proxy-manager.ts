@@ -49,6 +49,10 @@ export class ProxyManager extends EventEmitter {
   private failed:  Set<string>;
   private index:   number;
 
+  // ── BOT-ENT-04: Per-tenant proxy affinity map ────────────────────────────
+  // tenantId → last assigned proxy URL (persists across sessions)
+  private tenantProxyMap = new Map<string, string>();
+
   constructor(proxyList?: string[]) {
     super();
     const raw = proxyList ?? (process.env['PROXY_LIST'] ?? '').split(',').map(s => s.trim()).filter(Boolean);
@@ -150,6 +154,42 @@ export class ProxyManager extends EventEmitter {
       return this.proxies[0] ?? null;
     }
     return available[this._hashToIndex(sessionSuffix, available.length)]!;
+  }
+
+  /**
+   * Return the proxy URL pinned to this session ID.
+   * Alias for nextForCompany() — used by verification.worker.ts and tracuunnt-crawler.ts.
+   */
+  nextForSession(sessionId: string): string | null {
+    return this.nextForCompany(sessionId);
+  }
+
+  /**
+   * BOT-ENT-04: Per-tenant proxy affinity.
+   * Prefer re-using the same proxy for the same tenant across sessions,
+   * so GDT sees a consistent IP per company rather than random rotation.
+   * Falls back to nextForCompany() if the previously assigned proxy is unhealthy.
+   */
+  nextForTenant(tenantId: string): string | null {
+    // Check if tenant has a healthy assigned proxy
+    const assigned = this.tenantProxyMap.get(tenantId);
+    if (assigned) {
+      const isHealthy = this.slots.length > 0
+        ? this.slots.some(s => s.currentUrl === assigned)
+        : !this.failed.has(assigned) && this.proxies.includes(assigned);
+      if (isHealthy) return assigned;
+      // Assigned proxy degraded — clear and pick a new one
+      this.tenantProxyMap.delete(tenantId);
+    }
+
+    const newProxy = this.nextForCompany(tenantId);
+    if (newProxy) this.tenantProxyMap.set(tenantId, newProxy);
+    return newProxy;
+  }
+
+  /** Clear a tenant's proxy assignment — called when proxy fails for that tenant. */
+  clearTenantProxy(tenantId: string): void {
+    this.tenantProxyMap.delete(tenantId);
   }
 
   /**

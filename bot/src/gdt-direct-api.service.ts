@@ -23,6 +23,7 @@ import { createTunnelAgent, createSocks5TunnelAgent } from './proxy-tunnel';
 import { CaptchaService } from './captcha.service';
 import { logger } from './logger';
 import type { RawInvoice } from './parsers/GdtXmlParser';
+import type { CrawlerRecipe, RecipeFields } from './types/recipe.types';
 
 // ── Human-like browser simulation ───────────────────────────────────────────
 // Realistic Chrome User-Agents observed on Vietnamese ISPs (Viettel / VNPT / FPT).
@@ -213,49 +214,67 @@ function splitIntoMonths(from: Date, to: Date): Array<{ from: Date; to: Date }> 
 
 // ── Map GDT JSON row → RawInvoice ─────────────────────────────────────────────
 
-function mapInvoice(row: GdtInvoiceRaw, direction: 'output' | 'input', ttxlyFilter?: string): RawInvoice {
+interface MapInvoiceOpts {
+  ttxlyFilter?:     string;
+  fields?:          RecipeFields;
+  statusMap?:       Record<string, string>;
+  xmlAvailableTtxly?: Set<number>;
+}
+
+function mapInvoice(
+  row:       GdtInvoiceRaw,
+  direction: 'output' | 'input',
+  opts:      MapInvoiceOpts = {},
+): RawInvoice {
+  const { ttxlyFilter, fields, statusMap: recipeStatusMap, xmlAvailableTtxly: recipeXmlSet } = opts;
   const r = row as Record<string, unknown>;
 
   // tthai = trạng thái hóa đơn (1=valid, 3=cancelled, 5=replaced, 6=adjusted)
   // ttxly = trạng thái xử lý by GDT (5=accepted) — NOT the invoice status
-  const statusCode = num(pick(r, 'tthai', 'ttxly', 'tthdon', 'trangThai', 'status')) ?? 1;
-  const status     = STATUS_MAP[statusCode] ?? 'valid';
+  const statusCode = num(pick(r, ...(fields?.status ?? ['tthai', 'ttxly', 'tthdon', 'trangThai', 'status']))) ?? 1;
+  const status: RawInvoice['status'] =
+    (recipeStatusMap?.[String(statusCode)] as RawInvoice['status'] | undefined)
+    ?? STATUS_MAP[statusCode]
+    ?? 'valid';
 
   // Seller: nb = người bán
   const sellerTax = String(pick(r,
-    'nbmst', 'msttcgpbh', 'mst_ban', 'msttcgp_ban', 'mstNguoiBan',
+    ...(fields?.sellerTax ?? ['nbmst', 'msttcgpbh', 'mst_ban', 'msttcgp_ban', 'mstNguoiBan']),
   ) ?? '').trim() || null;
 
   const sellerName = String(pick(r,
-    'nbten', 'tenbh', 'ten_ban', 'tenNguoiBan', 'nguoiBanHang',
+    ...(fields?.sellerName ?? ['nbten', 'tenbh', 'ten_ban', 'tenNguoiBan', 'nguoiBanHang']),
   ) ?? '').trim() || null;
 
   // Buyer: mn/nm = người mua
   const buyerTax = String(pick(r,
-    'nmmst', 'mnmst', 'mst_mua', 'mstnmua', 'mstNguoiMua',
+    ...(fields?.buyerTax ?? ['nmmst', 'mnmst', 'mst_mua', 'mstnmua', 'mstNguoiMua']),
   ) ?? '').trim() || null;
 
   const buyerName = String(pick(r,
-    'nmten', 'tenn', 'ten_mua', 'tenNguoiMua', 'nguoiMuaHang',
+    ...(fields?.buyerName ?? ['nmten', 'tenn', 'ten_mua', 'tenNguoiMua', 'nguoiMuaHang']),
   ) ?? '').trim() || null;
 
-  const invoiceNum = String(pick(r, 'shdon', 'soHoaDon', 'so_hd', 'ma_hd') ?? '').trim() || null;
-  const serial     = String(pick(r, 'khhdon', 'kyHieuHoaDon', 'ky_hieu_hd') ?? '').trim() || null;
-  const dateRaw    = pick(r, 'tdlap', 'ngayLap', 'ngay_lap');
+  const invoiceNum = String(pick(r, ...(fields?.invoiceNum ?? ['shdon', 'soHoaDon', 'so_hd', 'ma_hd'])) ?? '').trim() || null;
+  const serial     = String(pick(r, ...(fields?.serial    ?? ['khhdon', 'kyHieuHoaDon', 'ky_hieu_hd'])) ?? '').trim() || null;
+  const dateRaw    = pick(r, ...(fields?.date             ?? ['tdlap', 'ngayLap', 'ngay_lap']));
 
-  const subtotal   = num(pick(r, 'tgtcthue', 'tien_chua_thue', 'tienHangChuaThue'));
-  const vatAmount  = num(pick(r, 'tgtthue', 'tien_thue', 'tienThue'));
-  const total      = num(pick(r, 'tgtttbso', 'thanh_toan', 'tongThanhToan', 'tongTien')) ??
+  const subtotal   = num(pick(r, ...(fields?.subtotal  ?? ['tgtcthue', 'tien_chua_thue', 'tienHangChuaThue'])));
+  const vatAmount  = num(pick(r, ...(fields?.vatAmount  ?? ['tgtthue', 'tien_thue', 'tienThue'])));
+  const total      = num(pick(r, ...(fields?.total      ?? ['tgtttbso', 'thanh_toan', 'tongThanhToan', 'tongTien']))) ??
                      (subtotal != null && vatAmount != null ? subtotal + vatAmount : null);
 
-  // VAT rate is nested in thttltsuat[0].tsuat
+  // VAT rate is nested in thttltsuat[0].tsuat (path configurable via recipe)
+  const vatNestedPath = fields?.vatRateNestedPath ?? 'thttltsuat';
   let vatRate: string | null = null;
-  const thttltsuat = r['thttltsuat'];
-  if (Array.isArray(thttltsuat) && thttltsuat.length > 0) {
-    vatRate = parseVatRate((thttltsuat[0] as Record<string, unknown>)['tsuat']);
+  const nestedArr = r[vatNestedPath];
+  if (Array.isArray(nestedArr) && nestedArr.length > 0) {
+    vatRate = parseVatRate((nestedArr[0] as Record<string, unknown>)['tsuat']);
   }
   // fallback to top-level tsuat
-  if (!vatRate) vatRate = parseVatRate(pick(r, 'tsuat', 'thueSuat', 'thue_suat'));
+  if (!vatRate) vatRate = parseVatRate(pick(r, ...(fields?.vatRate ?? ['tsuat', 'thueSuat', 'thue_suat'])));
+
+  const xmlSet = recipeXmlSet ?? XML_AVAILABLE_TTXLY;
 
   return {
     invoice_number:  invoiceNum,
@@ -270,14 +289,14 @@ function mapInvoice(row: GdtInvoiceRaw, direction: 'output' | 'input', ttxlyFilt
     total_amount:    total,
     vat_amount:      vatAmount,
     vat_rate:        vatRate,
-    invoice_type:    String(pick(r, 'thdon', 'loaiHD', 'loai_hd', 'la') ?? '').trim() || null,
+    invoice_type:    String(pick(r, ...(fields?.invoiceType ?? ['thdon', 'loaiHD', 'loai_hd', 'la'])) ?? '').trim() || null,
     source:          'gdt_bot',
     gdt_validated:   true,
     // XML is only available for coded invoices (ttxly==5).
     // For purchase: check the filter we used; for output: always has XML.
     xml_available:   direction === 'output'
       ? true
-      : XML_AVAILABLE_TTXLY.has(parseInt((ttxlyFilter ?? '').replace('ttxly==', ''), 10)),
+      : xmlSet.has(parseInt((ttxlyFilter ?? '').replace('ttxly==', ''), 10)),
   };
 }
 
@@ -295,8 +314,10 @@ export class GdtDirectApiService {
    * Falls back to this.http (HTTP CONNECT) when socks5ProxyUrl is null.
    */
   private binaryHttp:     AxiosInstance | null = null;
+  private recipe:         CrawlerRecipe | null = null;
 
-  constructor(proxyUrl?: string | null, socks5ProxyUrl?: string | null) {
+  constructor(proxyUrl?: string | null, socks5ProxyUrl?: string | null, recipe?: CrawlerRecipe) {
+    this.recipe = recipe ?? null;
     this.captchaService = new CaptchaService();
     const httpAgent = proxyUrl ? createTunnelAgent({ proxyUrl }) : undefined;
     // Pick a random User-Agent per session — rotates on every GdtDirectApiService
@@ -320,7 +341,9 @@ export class GdtDirectApiService {
       // With proxy: use http:// so axios uses http.request + our httpAgent
       // (our httpAgent.createConnection does tunnel+TLS, so HTTP goes over TLS).
       // Without proxy: use https:// for a normal direct TLS connection.
-      baseURL: httpAgent ? GDT_API_HTTP : GDT_API_HTTPS,
+      baseURL: httpAgent
+        ? (this.recipe?.api.baseUrlHttp ?? GDT_API_HTTP)
+        : (this.recipe?.api.baseUrl    ?? GDT_API_HTTPS),
       timeout: REQUEST_TIMEOUT,
       headers: commonHeaders,
       ...(httpAgent ? { httpAgent } : {}),
@@ -331,12 +354,17 @@ export class GdtDirectApiService {
     if (socks5ProxyUrl) {
       const socks5Agent = createSocks5TunnelAgent({ proxyUrl: socks5ProxyUrl });
       this.binaryHttp = axios.create({
-        baseURL:   GDT_API_HTTP,   // http:// so axios uses httpAgent (our SOCKS5 tunnel does TLS)
+        baseURL:   this.recipe?.api.baseUrlHttp ?? GDT_API_HTTP,   // http:// so axios uses httpAgent (our SOCKS5 tunnel does TLS)
         timeout:   REQUEST_TIMEOUT * 2,
         headers:   commonHeaders,
         httpAgent: socks5Agent,
       });
     }
+  }
+
+  /** Returns the recipe currently active in this service instance (or null if using built-in defaults). */
+  get activeRecipe(): CrawlerRecipe | null {
+    return this.recipe;
   }
 
   // ── Auth ───────────────────────────────────────────────────────────────────
@@ -348,10 +376,14 @@ export class GdtDirectApiService {
   async login(username: string, password: string): Promise<void> {
     let attempts = 0;
     let lastCaptchaId: string | null = null;
+    const maxRetries   = this.recipe?.timing.maxRetries    ?? MAX_RETRIES;
+    const retryDelayMs = this.recipe?.timing.retryDelayMs  ?? RETRY_DELAY;
+    const captchaPath  = this.recipe?.api.endpoints.captcha ?? '/captcha';
+    const authPath     = this.recipe?.api.endpoints.auth    ?? '/security-taxpayer/authenticate';
 
-    while (attempts < MAX_RETRIES) {
+    while (attempts < maxRetries) {
       // Step 1: Get fresh captcha
-      const captchaRes = await this.http.get<CaptchaResponse>('/captcha');
+      const captchaRes = await this.http.get<CaptchaResponse>(captchaPath);
       const { key: ckey, content: svgContent } = captchaRes.data;
 
       // Step 2: SVG → PNG → base64 → 2captcha
@@ -367,14 +399,14 @@ export class GdtDirectApiService {
       } catch (err) {
         logger.warn('[GdtDirect] Captcha error', { attempts, err });
         attempts++;
-        await sleep(RETRY_DELAY);
+        await sleep(retryDelayMs);
         continue;
       }
 
       // Step 3: Authenticate
       try {
         const authRes = await this.http.post<AuthResponse>(
-          '/security-taxpayer/authenticate',
+          authPath,
           { username, password, cvalue, ckey },
         );
         this.token = authRes.data.token;
@@ -404,7 +436,7 @@ export class GdtDirectApiService {
             logger.warn('[GdtDirect] Wrong captcha, retrying', { attempts, cvalue, msg });
             attempts++;
             lastCaptchaId = null;
-            await sleep(RETRY_DELAY);
+            await sleep(retryDelayMs);
             continue;
           }
 
@@ -417,7 +449,7 @@ export class GdtDirectApiService {
       }
     }
 
-    throw new Error(`GDT login failed after ${MAX_RETRIES} captcha attempts`);
+    throw new Error(`GDT login failed after ${maxRetries} captcha attempts`);
   }
 
   // ── Invoice fetching ───────────────────────────────────────────────────────
@@ -438,11 +470,13 @@ export class GdtDirectApiService {
    */
   async fetchInputInvoices(fromDate: Date, toDate: Date): Promise<RawInvoice[]> {
     // Fetch all three types sequentially (not parallel — avoids GDT rate-limit spike)
-    const type5 = await this._fetchRangeByMonth('purchase', fromDate, toDate, 'ttxly==5');
+    const filters = this.recipe?.api.query.purchaseFilters ?? ['ttxly==5', 'ttxly==6', 'ttxly==8'];
+    const [f5 = 'ttxly==5', f6 = 'ttxly==6', f8 = 'ttxly==8'] = filters;
+    const type5 = await this._fetchRangeByMonth('purchase', fromDate, toDate, f5);
     await humanDelay(1_500, 3_000);
-    const type6 = await this._fetchRangeByMonth('purchase', fromDate, toDate, 'ttxly==6');
+    const type6 = await this._fetchRangeByMonth('purchase', fromDate, toDate, f6);
     await humanDelay(1_500, 3_000);
-    const type8 = await this._fetchRangeByMonth('purchase', fromDate, toDate, 'ttxly==8');
+    const type8 = await this._fetchRangeByMonth('purchase', fromDate, toDate, f8);
 
     // Merge & deduplicate across all three types.
     // Dedup key: invoice_number + seller_tax_code + invoice_date
@@ -512,7 +546,7 @@ export class GdtDirectApiService {
     if (!this.token) throw new Error('Not authenticated — call login() first');
     const { nbmst, khhdon, shdon, khmshdon = 1 } = params;
     logger.debug('[GdtDirect] exportInvoiceXml', { nbmst, khhdon, shdon });
-    return this._getBinaryWithRetry('/query/invoices/export-xml', {
+    return this._getBinaryWithRetry(this.recipe?.api.endpoints.exportXml ?? '/query/invoices/export-xml', {
       nbmst, khhdon, shdon, khmshdon,
     });
   }
@@ -535,7 +569,7 @@ export class GdtDirectApiService {
     const toStr   = formatGdtDate(to);
     const search  = `tdlap=ge=${fromStr};tdlap=le=${toStr}`;
     logger.info('[GdtDirect] exportOutputExcel', { from: fromStr, to: toStr });
-    return this._getBinaryWithRetry('/query/invoices/export-excel', {
+    return this._getBinaryWithRetry(this.recipe?.api.endpoints.exportExcel ?? '/query/invoices/export-excel', {
       sort: 'tdlap:desc',
       search,
     });
@@ -558,7 +592,7 @@ export class GdtDirectApiService {
     const toStr   = formatGdtDate(to);
     const search  = `tdlap=ge=${fromStr};tdlap=le=${toStr};ttxly==${ttxlyType}`;
     logger.info('[GdtDirect] exportInputExcel', { from: fromStr, to: toStr, ttxlyType });
-    return this._getBinaryWithRetry('/query/invoices/export-excel-sold', {
+    return this._getBinaryWithRetry(this.recipe?.api.endpoints.exportExcelPurchase ?? '/query/invoices/export-excel-sold', {
       sort:   'tdlap:desc',
       search,
       type:   'purchase',
@@ -576,6 +610,11 @@ export class GdtDirectApiService {
     if (!this.token) throw new Error('Not authenticated — call login() first');
 
     const direction: 'output' | 'input' = endpoint === 'sold' ? 'output' : 'input';
+    const pageSize  = this.recipe?.api.pagination.pageSize ?? PAGE_SIZE;
+    // Resolve the actual API path for this endpoint type from recipe (with fallback)
+    const endpointPath = endpoint === 'sold'
+      ? (this.recipe?.api.endpoints.sold     ?? '/query/invoices/sold')
+      : (this.recipe?.api.endpoints.purchase ?? '/query/invoices/purchase');
     const from   = formatGdtDate(fromDate);
     const to     = formatGdtDate(toDate);
     // Build FIQL search string.
@@ -592,8 +631,8 @@ export class GdtDirectApiService {
 
     while (all.length < total) {
       const res = await this._getWithRetry<GdtPagedResponse>(
-        `/query/invoices/${endpoint}`,
-        { sort: 'tdlap:desc', size: PAGE_SIZE, page, search },
+        endpointPath,
+        { sort: 'tdlap:desc', size: pageSize, page, search },
       );
 
       const rows = res.data.datas ?? res.data.data ?? [];
@@ -605,7 +644,14 @@ export class GdtDirectApiService {
 
       if (rows.length === 0) break;
 
-      const mapped = rows.map(r => mapInvoice(r, direction, extraFilter));
+      const mapped = rows.map(r => mapInvoice(r, direction, {
+        ttxlyFilter:      extraFilter,
+        fields:           this.recipe?.fields,
+        statusMap:        this.recipe?.statusMap,
+        xmlAvailableTtxly: this.recipe
+          ? new Set(this.recipe.api.query.xmlAvailableTtxly)
+          : undefined,
+      }));
       all.push(...mapped);
 
       logger.debug('[GdtDirect] Page fetched', {
@@ -625,8 +671,10 @@ export class GdtDirectApiService {
 
   /** GET JSON with auto-retry on transient errors (5xx, timeout) */
   private async _getWithRetry<T>(url: string, params: Record<string, unknown>) {
+    const maxRetries   = this.recipe?.timing.maxRetries   ?? MAX_RETRIES;
+    const retryDelayMs = this.recipe?.timing.retryDelayMs ?? RETRY_DELAY;
     let lastErr: Error | null = null;
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
         return await this.http.get<T>(url, {
           params,
@@ -646,7 +694,7 @@ export class GdtDirectApiService {
             lastErr = err as Error;
             logger.warn('[GdtDirect] Retrying after error', { url, attempt, status });
             // Jittered exponential back-off: base * (attempt+1) ± 20%
-            const base = RETRY_DELAY * (attempt + 1);
+            const base = retryDelayMs * (attempt + 1);
             await humanDelay(base * 0.8, base * 1.2);
             continue;
           }
@@ -654,7 +702,7 @@ export class GdtDirectApiService {
         throw err;
       }
     }
-    throw lastErr ?? new Error(`Failed to GET ${url} after ${MAX_RETRIES} retries`);
+    throw lastErr ?? new Error(`Failed to GET ${url} after ${maxRetries} retries`);
   }
 
   /**
@@ -668,16 +716,20 @@ export class GdtDirectApiService {
   ): Promise<Buffer> {
     // Prefer SOCKS5 client for binary downloads — pure TCP relay, no content filtering.
     // Falls back to main HTTP CONNECT client if SOCKS5 not configured.
-    const client = this.binaryHttp ?? this.http;
+    const primaryClient = this.binaryHttp ?? this.http;
+    const client = primaryClient;
+    const maxRetries   = this.recipe?.timing.maxRetries    ?? MAX_RETRIES;
+    const retryDelayMs = this.recipe?.timing.retryDelayMs  ?? RETRY_DELAY;
+    const binaryTimeout = this.recipe?.timing.binaryTimeoutMs ?? REQUEST_TIMEOUT * 2;
     let lastErr: Error | null = null;
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
         const res = await client.get<ArrayBuffer>(url, {
           params,
           headers: { Authorization: `Bearer ${this.token}` },
           responseType: 'arraybuffer',
           // Binary downloads can be large — allow more time
-          timeout: REQUEST_TIMEOUT * 2,
+          timeout: binaryTimeout,
         });
         return Buffer.from(res.data);
       } catch (err) {
@@ -694,13 +746,36 @@ export class GdtDirectApiService {
             }
             lastErr = err as Error;
             logger.warn('[GdtDirect] Binary retry', { url, attempt, status });
-            await sleep(RETRY_DELAY * (attempt + 1));
+            await sleep(retryDelayMs * (attempt + 1));
             continue;
           }
         }
         throw err;
       }
     }
-    throw lastErr ?? new Error(`Failed binary GET ${url} after ${MAX_RETRIES} retries`);
+
+    // SOCKS5 failed on all retries — try once more with the regular HTTP CONNECT proxy.
+    // "stream has been aborted" / status:0 = TCP dropped mid-stream by TMProxy SOCKS5.
+    // HTTP CONNECT proxy is more stable for long-lived binary downloads.
+    if (this.binaryHttp && lastErr != null) {
+      logger.warn('[GdtDirect] SOCKS5 binary all retries failed — falling back to HTTP proxy', { url });
+      try {
+        const res = await this.http.get<ArrayBuffer>(url, {
+          params,
+          headers: { Authorization: `Bearer ${this.token}` },
+          responseType: 'arraybuffer',
+          timeout: binaryTimeout,
+        });
+        return Buffer.from(res.data);
+      } catch (fallbackErr) {
+        logger.warn('[GdtDirect] HTTP proxy fallback also failed', {
+          url,
+          msg: fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr),
+        });
+        // Fall through to throw original SOCKS5 error
+      }
+    }
+
+    throw lastErr ?? new Error(`Failed binary GET ${url} after ${maxRetries} retries`);
   }
 }

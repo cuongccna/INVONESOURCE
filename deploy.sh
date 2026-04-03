@@ -102,6 +102,8 @@ if [[ "$SKIP_MIGRATE" == false ]]; then
   run_sql 019_license_system.sql
   run_sql 020_normalize_declaration_fields.sql
   run_sql 021_line_items_manual.sql
+  run_sql 022_crawler_recipes.sql
+  run_sql 023_bypassrls_service_account.sql
 
   cd "$SCRIPT_DIR"
   info "All migrations applied."

@@ -72,6 +72,7 @@ export default function InvoicesPage() {
   const [direction, setDirection] = useState<'output' | 'input' | ''>(
     initialDirection === 'output' || initialDirection === 'input' ? initialDirection : ''
   );
+  const [invoiceGroup, setInvoiceGroup] = useState<number | ''>('');
   const [trashCount, setTrashCount] = useState(0);
   // Delete modal state
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
@@ -95,6 +96,7 @@ export default function InvoicesPage() {
       if (direction) params.direction = direction;
       if (debouncedSearch) params.search = debouncedSearch;
       if (importSessionId) params.importSessionId = importSessionId;
+      if (invoiceGroup !== '') params.invoiceGroup = invoiceGroup;
 
       const [res, trashRes] = await Promise.all([
         apiClient.get<PaginatedResponse>('/invoices', { params }),
@@ -108,7 +110,7 @@ export default function InvoicesPage() {
     } finally {
       setLoading(false);
     }
-  }, [activeCompanyId, direction, debouncedSearch, importSessionId]);
+  }, [activeCompanyId, direction, debouncedSearch, importSessionId, invoiceGroup]);
 
   const handleDelete = async () => {
     if (!deleteTarget) return;
@@ -251,23 +253,61 @@ export default function InvoicesPage() {
       )}
 
       {/* Filters */}
-      <div className="flex gap-2 mb-4">
+      <div className="space-y-2 mb-4">
+        {/* Search bar */}
         <input
           type="text"
           placeholder="Tìm số HĐ, tên..."
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+          className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
         />
-        <select
-          value={direction}
-          onChange={(e) => setDirection(e.target.value as 'output' | 'input' | '')}
-          className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
-        >
-          <option value="">Tất cả</option>
-          <option value="output">Bán ra</option>
-          <option value="input">Mua vào</option>
-        </select>
+        {/* Direction + Type filter tabs */}
+        <div className="flex gap-1.5 flex-wrap">
+          {/* Direction group */}
+          {([
+            { v: '',       label: 'Tất cả' },
+            { v: 'input',  label: 'Mua vào' },
+            { v: 'output', label: 'Bán ra' },
+          ] as { v: '' | 'output' | 'input'; label: string }[]).map((opt) => (
+            <button
+              key={opt.v}
+              onClick={() => { setDirection(opt.v); setInvoiceGroup(''); }}
+              className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors border ${
+                direction === opt.v && invoiceGroup === ''
+                  ? 'bg-gray-900 text-white border-gray-900'
+                  : 'bg-white text-gray-600 border-gray-300 hover:border-gray-500'
+              }`}
+            >
+              {opt.label}
+            </button>
+          ))}
+          {/* Separator */}
+          <span className="self-center text-gray-300">|</span>
+          {/* Invoice type group (5 / 6 / 8) */}
+          {([
+            { g: 5, label: 'Đã cấp mã',      color: 'emerald' },
+            { g: 6, label: 'CQT nhận không mã', color: 'orange' },
+            { g: 8, label: 'Máy tính tiền',   color: 'orange' },
+          ] as { g: number; label: string; color: string }[]).map((opt) => (
+            <button
+              key={opt.g}
+              onClick={() => { setInvoiceGroup(invoiceGroup === opt.g ? '' : opt.g); setDirection(''); }}
+              title={opt.g === 5 ? 'Đã cấp mã hóa đơn' : opt.g === 6 ? 'Cục Thuế đã nhận không mã' : 'Cục Thuế đã nhận hóa đơn có mã khởi tạo từ máy tính tiền'}
+              className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors border ${
+                invoiceGroup === opt.g
+                  ? opt.color === 'emerald'
+                    ? 'bg-emerald-600 text-white border-emerald-600'
+                    : 'bg-orange-500 text-white border-orange-500'
+                  : opt.color === 'emerald'
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:border-emerald-400'
+                    : 'bg-orange-50 text-orange-700 border-orange-200 hover:border-orange-400'
+              }`}
+            >
+              Loại {opt.g} · {opt.label}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* Invoice List */}

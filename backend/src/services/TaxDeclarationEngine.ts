@@ -259,4 +259,79 @@ export class TaxDeclarationEngine {
     if (!monthly.length) return 0;
     return parseFloat(monthly[0].ct43_carry_forward_vat) || 0;
   }
+
+  /**
+   * Returns audit gate warnings that should be shown to the user before finalising a declaration.
+   *
+   * Checks:
+   *  1. Cash payment risk: input invoices ≥5M with unknown payment method
+   *     → if flagged, CT23 may be overstated (Điều 26 NĐ181/2013)
+   *  2. Ghost company risk: critical/high risk sellers with unacknowledged flags
+   *     → input VAT from those sellers is at risk of being disallowed by GDT
+   *  3. Amendment pending: amended/replacement invoices not yet routed cross-period
+   *     → declaration may need a supplemental for prior period
+   */
+  async getCT23Warnings(
+    companyId: string,
+    month: number,
+    year: number,
+  ): Promise<{
+    cashRiskCount:        number;
+    cashRiskVat:          number;
+    ghostRiskCount:       number;
+    ghostRiskVat:         number;
+    amendmentPending:     number;
+    hasBlockingWarning:   boolean;
+  }> {
+    const [cashRes, ghostRes, amendRes] = await Promise.all([
+      // Cash risk: input invoices flagged but not acknowledged in this period
+      pool.query<{ cnt: string; vat_sum: string }>(
+        `SELECT COUNT(*) AS cnt, COALESCE(SUM(vat_amount), 0) AS vat_sum
+         FROM active_invoices
+         WHERE company_id = $1
+           AND direction = 'input'
+           AND is_cash_payment_risk = true
+           AND cash_risk_acknowledged = false
+           AND EXTRACT(MONTH FROM invoice_date) = $2
+           AND EXTRACT(YEAR  FROM invoice_date) = $3`,
+        [companyId, month, year],
+      ),
+      // Ghost risk: unacknowledged critical/high risk flags for this company's sellers
+      pool.query<{ cnt: string; vat_sum: string }>(
+        `SELECT COUNT(*) AS cnt, COALESCE(SUM(total_vat_at_risk), 0) AS vat_sum
+         FROM company_risk_flags
+         WHERE company_id = $1
+           AND risk_level IN ('critical', 'high')
+           AND acknowledged_at IS NULL`,
+        [companyId],
+      ),
+      // Amendment pending: invoices from this period with unresolved cross-period routing
+      pool.query<{ cnt: string }>(
+        `SELECT COUNT(*) AS cnt
+         FROM active_invoices
+         WHERE company_id = $1
+           AND invoice_relation_type IN ('replacement', 'adjustment')
+           AND cross_period_flag = true
+           AND (routing_decision IS NULL OR routing_decision = 'pending')
+           AND EXTRACT(MONTH FROM invoice_date) = $2
+           AND EXTRACT(YEAR  FROM invoice_date) = $3`,
+        [companyId, month, year],
+      ),
+    ]);
+
+    const cashRiskCount  = parseInt(cashRes.rows[0]!.cnt,  10);
+    const cashRiskVat    = parseFloat(cashRes.rows[0]!.vat_sum);
+    const ghostRiskCount = parseInt(ghostRes.rows[0]!.cnt, 10);
+    const ghostRiskVat   = parseFloat(ghostRes.rows[0]!.vat_sum);
+    const amendmentPending = parseInt(amendRes.rows[0]!.cnt, 10);
+
+    return {
+      cashRiskCount,
+      cashRiskVat,
+      ghostRiskCount,
+      ghostRiskVat,
+      amendmentPending,
+      hasBlockingWarning: cashRiskCount > 0 || ghostRiskCount > 0,
+    };
+  }
 }

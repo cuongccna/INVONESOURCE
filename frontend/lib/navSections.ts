@@ -64,8 +64,24 @@ export const DRAWER_SECTIONS = [
   {
     title: '🔍 Kiểm Toán AI',
     items: [
-      { href: '/audit/anomalies', label: 'Phát hiện bất thường' },
+      { href: '/audit/anomalies',      label: 'Phát hiện bất thường' },
+      { href: '/audit/ghost-companies', label: 'Công ty ma' },
+      { href: '/audit/tax-rates',      label: 'Thuế suất bất thường' },
+      { href: '/audit/cash-payment',   label: 'Hóa đơn tiền mặt' },
       { href: '/settings/audit-rules', label: 'Cấu hình quy tắc' },
+    ],
+  },
+  {
+    title: '⚠️ Rủi Ro Hóa Đơn',
+    items: [
+      { href: '/invoices/amended', label: 'Hóa đơn điều chỉnh/thay thế' },
+      { href: '/invoices/missing', label: 'Hóa đơn đầu vào thiếu' },
+    ],
+  },
+  {
+    title: '🧮 Công Cụ Thuế',
+    items: [
+      { href: '/tools/penalty-calculator', label: 'Tính tiền phạt nộp chậm' },
     ],
   },
   {

@@ -44,3 +44,14 @@ bot/test-output/invoice-36.xml
 bot/test-output/output-invoices.json
 bot/test-output/output-invoices.xlsx
 scripts/run-020.js
+frontend/.env.production
+scripts/027_run_migration_026_columns.js
+scripts/028_run_migration_025.js
+scripts/029_run_migration_024.js
+scripts/030_refresh_active_invoices_view.js
+scripts/check_missing_tables.js
+scripts/check_p50_tables.js
+scripts/check_view_columns.js
+scripts/check_view_def.js
+scripts/run-remaining-migs.js
+scripts/seed-admin.js

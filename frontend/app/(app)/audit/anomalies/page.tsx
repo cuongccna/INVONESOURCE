@@ -70,7 +70,12 @@ export default function AuditAnomaliesPage() {
     try {
       const q = sev ? `?severity=${sev}&unacknowledged=true` : '?unacknowledged=true';
       const res = await apiClient.get<AnomalyResponse>(`/audit/anomalies${q}`);
-      setRows(res.data.data.data);
+      setRows((res.data.data.data ?? []).map(r => ({
+        ...r,
+        pct_deviation:  Number(r.pct_deviation),
+        unit_price:     Number(r.unit_price),
+        baseline_price: Number(r.baseline_price),
+      })));
       setSummary(res.data.data.summary);
     } catch {
       // silent

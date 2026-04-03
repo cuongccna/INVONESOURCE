@@ -103,6 +103,12 @@ export class GdtBotRunner {
                + '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       locale: 'vi-VN',
       timezoneId: 'Asia/Ho_Chi_Minh',
+      // Tell GDT server we support compression → responses ~80% smaller,
+      // reduces bandwidth on proxy and VPS, and compression-aware traffic
+      // is far less likely to be rate-limited or blocked by GDT network engineers.
+      extraHTTPHeaders: {
+        'Accept-Encoding': 'gzip, deflate, br',
+      },
     });
   }
 

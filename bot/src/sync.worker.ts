@@ -22,12 +22,55 @@ import type { LineItem } from './parsers/GdtXmlParser';
 const REDIS_URL    = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
 const CONCURRENCY  = parseInt(process.env['WORKER_CONCURRENCY'] ?? '2', 10);
 
+// ── BOT-ENT-03: GdtStructuralError ────────────────────────────────────────────
+/**
+ * Thrown when GDT page structure changes (selector not found, unexpected HTML).
+ * Distinct from credential/network errors — triggers Global Circuit Breaker.
+ * Should NOT increment company consecutive_failures (not tenant's fault).
+ */
+export class GdtStructuralError extends Error {
+  constructor(message: string, public readonly selector?: string) {
+    super(message);
+    this.name = 'GdtStructuralError';
+  }
+}
+
+// ── BOT-ENT-03: Global Circuit Breaker constants ─────────────────────────────
+const CIRCUIT_BREAKER_ERRORS_KEY  = 'gdt:circuit_breaker:errors';
+const CIRCUIT_BREAKER_STATUS_KEY  = 'gdt:circuit_breaker:status';
+const CIRCUIT_BREAKER_TRIP_COUNT  = 20;   // trip after 20 structural errors in 1 hour
+const CIRCUIT_BREAKER_TTL_SEC     = 3600; // 1-hour window
+
 // Queue for notifying backend to send push notifications after sync
 const _notifQueue = new Queue('sync-notifications', {
   connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
 });
 // Self-reference queue for sequential job chaining (quarter sync: job 0 → job 1 → job 2)
 const _botSyncQueue = new Queue('gdt-bot-sync', {
+  connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
+});
+
+// ── Manual/Auto split queues (BOT-ENT-01) ────────────────────────────────────
+export const manualQueue = new Queue('gdt-sync-manual', {
+  connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
+  defaultJobOptions: {
+    attempts:          5,
+    backoff:           { type: 'exponential', delay: 60_000 },
+    removeOnComplete:  200,
+    removeOnFail:      100,
+  },
+});
+export const autoQueue = new Queue('gdt-sync-auto', {
+  connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
+  defaultJobOptions: {
+    attempts:          3,
+    backoff:           { type: 'exponential', delay: 120_000 },
+    removeOnComplete:  100,
+    removeOnFail:      50,
+  },
+});
+// Dead-letter queue — unrecoverable jobs land here for manual triage
+const _dlqQueue = new Queue('gdt-sync-dlq', {
   connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
 });
 const JITTER_EVERY = 10;
@@ -222,10 +265,11 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
   logger.info('[SyncWorker] Starting job', { jobId: job.id, companyId });
 
   // ── 0. Time-of-day awareness (BEFORE lock — don't hold lock while sleeping) ──
-  // Prefer running during Vietnam business hours (8am-6pm GMT+7).
-  // Skip in development — no need to wait 5-30 min while testing.
+  // Prefer running during Vietnam business hours (8am-8pm GMT+7).
+  // Skip delay for: development, first-run jobs triggered manually by user setup.
   const isDev = process.env['NODE_ENV'] !== 'production';
-  if (!isDev) {
+  const isFirstRun = (job.id ?? '').startsWith('gdt-bot-first-');
+  if (!isDev && !isFirstRun) {
     const vnHour = new Date(Date.now() + 7 * 3600_000).getUTCHours();
     if (vnHour < 7 || vnHour >= 20) {
       const delayMs = 5 * 60_000 + Math.floor(Math.random() * 25 * 60_000); // 5-30 min
@@ -413,10 +457,27 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     let inputCount  = 0;
 
     try {
-      // Date range: use job-specific override if provided, else current month start → today
-      const toDate   = jobToDate   ? new Date(`${jobToDate}T23:59:59`)   : new Date();
-      const defaultFrom = new Date(toDate.getFullYear(), toDate.getMonth(), 1); // đầu tháng hiện tại
-      let fromDate = jobFromDate ? new Date(`${jobFromDate}T00:00:00`) : defaultFrom;
+      // Date range priority:
+      // 1. Explicit jobFromDate/jobToDate (manual sync, quarter sync) — use as-is
+      // 2. No explicit dates (GdtBotScheduler jobs): compute at EXECUTION time from last_run_at
+      //    → avoids stale dates when jobs sit in queue for hours (e.g. off-hours delay)
+      // 3. First run ever: start of current month
+      const toDate = jobToDate ? new Date(`${jobToDate}T23:59:59`) : new Date();
+
+      let fromDate: Date;
+      if (jobFromDate) {
+        fromDate = new Date(`${jobFromDate}T00:00:00`);
+      } else if (cfg.last_run_at) {
+        // Anchor to last successful run with 5-min overlap to cover boundary invoices.
+        // Computed at run-time so the range is always fresh, regardless of when the job was enqueued.
+        const lastRunMs = new Date(cfg.last_run_at).getTime() - 5 * 60_000;
+        // Never exceed GDT 31-day limit
+        const maxBackMs = toDate.getTime() - 31 * 24 * 60 * 60_000;
+        fromDate = new Date(Math.max(lastRunMs, maxBackMs));
+      } else {
+        // First run: start of current month
+        fromDate = new Date(toDate.getFullYear(), toDate.getMonth(), 1);
+      }
 
       // Enforce GDT max 31-day rule: nếu range vượt quá, co lại từ toDate về đủ 31 ngày.
       // Normalize về 00:00:00 đầu ngày để tránh kiệu T23:59:59 bị kế thừa từ toDate.
@@ -545,6 +606,24 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       // ── Quota consumption ───────────────────────────────────────────────────────
       const totalSynced = outputCount + inputCount;
       await _consumeQuota(companyId, totalSynced);
+
+      // ── Schedule next auto-sync with jitter (BOT-ENT-01) ────────────────────────
+      // Non-fatal: wrap in try/catch — column may not exist until migration 026 is applied.
+      // Invoices are already saved; a missing schedule update must NEVER fail the job.
+      try {
+        await pool.query(
+          `UPDATE gdt_bot_configs
+           SET next_auto_sync_at = NOW() + INTERVAL '5 hours'
+             + (FLOOR(RANDOM() * 180) || ' minutes')::INTERVAL
+           WHERE company_id = $1`,
+          [companyId],
+        );
+      } catch (schedErr) {
+        logger.warn('[SyncWorker] next_auto_sync_at update skipped (migration 026 not applied?)', {
+          companyId,
+          err: schedErr instanceof Error ? schedErr.message : String(schedErr),
+        });
+      }
 
       logger.info('[SyncWorker] Done', { companyId, outputCount, inputCount, durationMs });
 
@@ -807,6 +886,14 @@ async function _failRun(
        WHERE company_id = $2`,
       [errorMsg.slice(0, 500), companyId]
     );
+    // Push to DLQ for manual triage
+    await _dlqQueue.add('failed-job', {
+      companyId,
+      runId,
+      errorMsg,
+      errorType: 'credential_failure',
+      failedAt:  new Date().toISOString(),
+    }).catch(e => logger.warn('[SyncWorker] DLQ push failed (non-fatal)', { e }));
     return;
   }
 
@@ -845,6 +932,86 @@ async function _failRun(
   }
 }
 
+// ── BOT-ENT-03: Global Circuit Breaker handler ───────────────────────────────
+/**
+ * Called from both manualWorker and autoWorker `failed` events.
+ * - GdtStructuralError: increments global circuit breaker counter; trips (pauses all workers)
+ *   at threshold. Does NOT update company consecutive_failures.
+ * - Regular errors: update company consecutive_failures via _failRun (already done in processGdtSync).
+ */
+async function handleJobFailure(job: Job<SyncJobData> | undefined, error: Error): Promise<void> {
+  if (!(error instanceof GdtStructuralError)) return; // regular errors handled inside processGdtSync
+
+  const count = await _lockRedis.incr(CIRCUIT_BREAKER_ERRORS_KEY);
+  await _lockRedis.expire(CIRCUIT_BREAKER_ERRORS_KEY, CIRCUIT_BREAKER_TTL_SEC);
+
+  logger.error(
+    `[CircuitBreaker] GdtStructuralError count: ${count}/${CIRCUIT_BREAKER_TRIP_COUNT}`,
+    { error: error.message, selector: error.selector, jobId: job?.id },
+  );
+
+  if (count >= CIRCUIT_BREAKER_TRIP_COUNT) {
+    await manualWorker.pause();
+    await autoWorker.pause();
+
+    await _lockRedis.set(CIRCUIT_BREAKER_STATUS_KEY, JSON.stringify({
+      tripped:    true,
+      trippedAt:  new Date().toISOString(),
+      errorCount: count,
+      lastError:  error.message,
+      selector:   error.selector ?? null,
+    }));
+
+    logger.error(
+      '[CIRCUIT BREAKER TRIPPED] GDT system structure changed — ALL workers paused.',
+      { errorCount: count, threshold: CIRCUIT_BREAKER_TRIP_COUNT },
+    );
+
+    // Notify via sync-notifications queue (backend picks up + sends push to admin)
+    await _notifQueue.add('admin-alert', {
+      level:   'CRITICAL',
+      title:   'GDT Bot Circuit Breaker Tripped',
+      message: `${count} lỗi cấu trúc trong 1 giờ. Tất cả worker đã tạm dừng. GDT có thể đã thay đổi cấu trúc trang. Cần kiểm tra thủ công.`,
+      data:    { errorCount: count, selector: error.selector, jobId: job?.id },
+    }).catch(() => undefined); // non-fatal
+  }
+}
+
+// ── BOT-ENT-06: Metrics recorder ─────────────────────────────────────────────
+/**
+ * Records hourly bucket counters in Redis for the admin metrics dashboard.
+ * Expires after 7 days. Entirely non-fatal — never throws.
+ */
+async function recordMetrics(
+  job: Job<SyncJobData>,
+  result: 'success' | 'failed',
+  durationMs: number,
+): Promise<void> {
+  try {
+    const hourKey = `bot:metrics:${new Date().toISOString().slice(0, 13)}`; // e.g. 2026-04-02T14
+    const pipeline = _lockRedis.pipeline();
+
+    pipeline.hincrby(hourKey, 'total',  1);
+    pipeline.hincrby(hourKey, result,   1);
+    pipeline.expire(hourKey, 7 * 24 * 3600);
+
+    // Track duration (rolling last 100)
+    pipeline.lpush('bot:metrics:durations', durationMs);
+    pipeline.ltrim('bot:metrics:durations', 0, 99);
+
+    // Captcha attempts from job returnvalue
+    const rv = (job.returnvalue ?? {}) as Record<string, number>;
+    if (rv['captchaAttempts']) {
+      pipeline.hincrby(hourKey, 'captcha_attempts', rv['captchaAttempts']);
+      pipeline.hincrby(hourKey, 'captcha_fails',    rv['captchaFails'] ?? 0);
+    }
+
+    await pipeline.exec();
+  } catch (e) {
+    logger.warn('[SyncWorker] recordMetrics failed (non-fatal)', { error: (e as Error).message });
+  }
+}
+
 // ── Create and export worker ──────────────────────────────────────────────────
 export const worker = new Worker<SyncJobData>(
   'gdt-bot-sync',
@@ -853,6 +1020,28 @@ export const worker = new Worker<SyncJobData>(
     connection:  { url: REDIS_URL } as import('bullmq').ConnectionOptions,
     concurrency: CONCURRENCY,
     limiter:     { max: 3, duration: 60_000 }, // max 3 jobs/min
+  }
+);
+
+// ── Manual worker (concurrency 10 — user-triggered syncs) ────────────────────
+export const manualWorker = new Worker<SyncJobData>(
+  'gdt-sync-manual',
+  processGdtSync,
+  {
+    connection:  { url: REDIS_URL } as import('bullmq').ConnectionOptions,
+    concurrency: 10,
+    limiter:     { max: 10, duration: 60_000 },
+  }
+);
+
+// ── Auto worker (concurrency 2 — background scheduled syncs) ─────────────────
+export const autoWorker = new Worker<SyncJobData>(
+  'gdt-sync-auto',
+  processGdtSync,
+  {
+    connection:  { url: REDIS_URL } as import('bullmq').ConnectionOptions,
+    concurrency: 2,
+    limiter:     { max: 2, duration: 60_000 },
   }
 );
 
@@ -867,3 +1056,17 @@ worker.on('failed', (job, err) => {
 worker.on('error', err => {
   logger.error('[SyncWorker] Worker error', { error: err.message });
 });
+
+for (const [name, w] of [['manualWorker', manualWorker], ['autoWorker', autoWorker]] as const) {
+  w.on('completed', (job) => {
+    logger.info(`[SyncWorker/${name}] Job completed`, { jobId: job.id });
+    const dur = (job.finishedOn ?? Date.now()) - (job.processedOn ?? Date.now());
+    void recordMetrics(job, 'success', dur);
+  });
+  w.on('failed', (job, err) => {
+    logger.error(`[SyncWorker/${name}] Job failed`, { jobId: job?.id, error: err.message });
+    if (job) void recordMetrics(job, 'failed', Date.now() - (job.processedOn ?? Date.now()));
+    void handleJobFailure(job, err);
+  });
+  w.on('error', err => logger.error(`[SyncWorker/${name}] Worker error`, { error: err.message }));
+}

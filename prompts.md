@@ -7972,3 +7972,1828 @@ CHANGES TO IMPORT UI:
    Validate XML before processing (check for valid HĐ structure)
 ```
 
+
+---
+
+## GROUP 50 — PAIN POINT SOLVERS: 5 KILLER FEATURES
+
+> Dựa trên research thực tế các vấn đề kế toán SME Việt Nam đang gặp phải.
+> Thứ tự ưu tiên: P50.1 → P50.2 → P50.3 → P50.4 → P50.5
+> Mỗi tính năng giải quyết 1 pain point cụ thể có thể gây thiệt hại tài chính thực.
+
+---
+
+### P50.1 — Cash Payment Detector: Tự động flag HĐ tiền mặt >5 triệu bị mất khấu trừ
+
+```
+[Respond in Vietnamese]
+BUSINESS CONTEXT:
+Theo Điều 26 Nghị định 181/2025/NĐ-CP, hóa đơn đầu vào từ 5.000.000đ trở lên phải có
+chứng từ thanh toán KHÔNG dùng tiền mặt thì mới được khấu trừ VAT.
+Nếu thanh toán tiền mặt → bị loại toàn bộ VAT đầu vào → truy thu + phạt 20%.
+Đây là lỗi phổ biến nhất mà kế toán SME thường không biết cho đến khi bị thanh tra.
+
+TASK: Implement CashPaymentDetector as a new service and integrate into VAT reconciliation.
+
+STEP 1 — DB Schema /scripts/015_payment_method.sql:
+
+ALTER TABLE invoices
+  ADD COLUMN IF NOT EXISTS payment_method VARCHAR(30) DEFAULT NULL,
+  -- 'cash' | 'bank_transfer' | 'cheque' | 'card' | 'mixed' | null (unknown)
+  ADD COLUMN IF NOT EXISTS payment_method_source VARCHAR(20) DEFAULT NULL,
+  -- 'user_input' | 'inferred_from_amount' | 'gdt_data'
+  ADD COLUMN IF NOT EXISTS is_cash_payment_risk BOOLEAN DEFAULT false,
+  -- true = total_amount > 5M AND payment_method = 'cash' OR payment_method IS NULL
+  ADD COLUMN IF NOT EXISTS cash_risk_acknowledged BOOLEAN DEFAULT false,
+  ADD COLUMN IF NOT EXISTS cash_risk_note TEXT;
+
+CREATE INDEX idx_invoices_cash_risk
+  ON invoices(company_id, is_cash_payment_risk)
+  WHERE direction = 'input' AND is_cash_payment_risk = true AND deleted_at IS NULL;
+
+STEP 2 — Service /backend/src/services/CashPaymentDetector.ts:
+
+const CASH_THRESHOLD = 5_000_000  // 5 triệu VND per NĐ181/2025
+
+export class CashPaymentDetector {
+
+  // Run after every sync — flag risky invoices
+  async scanCompany(companyId: string, month?: number, year?: number): Promise<ScanResult> {
+    const query = `
+      SELECT id, invoice_number, seller_name, seller_tax_code,
+             total_amount, vat_amount, payment_method, invoice_date
+      FROM invoices
+      WHERE company_id = $1
+        AND direction = 'input'
+        AND status = 'valid'
+        AND deleted_at IS NULL
+        AND total_amount >= $2
+        AND (payment_method = 'cash' OR payment_method IS NULL)
+        ${month ? 'AND EXTRACT(MONTH FROM invoice_date) = $3' : ''}
+        ${year  ? `AND EXTRACT(YEAR FROM invoice_date) = $${month ? 4 : 3}` : ''}
+    `
+    const params: any[] = [companyId, CASH_THRESHOLD]
+    if (month) params.push(month)
+    if (year)  params.push(year)
+
+    const result = await db.query(query, params)
+    const riskyInvoices = result.rows
+
+    // Mark them in DB
+    if (riskyInvoices.length > 0) {
+      await db.query(`
+        UPDATE invoices SET is_cash_payment_risk = true
+        WHERE id = ANY($1::uuid[])
+      `, [riskyInvoices.map(i => i.id)])
+    }
+
+    const totalVatAtRisk = riskyInvoices.reduce((sum, i) => sum + parseFloat(i.vat_amount || 0), 0)
+
+    return {
+      riskyCount: riskyInvoices.length,
+      totalVatAtRisk,
+      invoices: riskyInvoices,
+      breakdown: {
+        cash: riskyInvoices.filter(i => i.payment_method === 'cash').length,
+        unknown: riskyInvoices.filter(i => i.payment_method === null).length
+      }
+    }
+  }
+
+  // User declares payment method for an invoice
+  async setPaymentMethod(
+    invoiceId: string,
+    method: 'cash' | 'bank_transfer' | 'cheque' | 'card',
+    userId: string
+  ): Promise<void> {
+    const isRisk = method === 'cash'
+    await db.query(`
+      UPDATE invoices SET
+        payment_method = $1,
+        payment_method_source = 'user_input',
+        is_cash_payment_risk = $2,
+        updated_at = NOW()
+      WHERE id = $3
+    `, [method, isRisk, invoiceId])
+
+    // Log to audit_logs
+    await db.query(`
+      INSERT INTO audit_logs (user_id, entity_type, entity_id, action, new_values)
+      VALUES ($1, 'invoice', $3, 'SET_PAYMENT_METHOD', $2)
+    `, [userId, JSON.stringify({ payment_method: method, is_cash_payment_risk: isRisk }), invoiceId])
+  }
+
+  // Bulk set payment method for multiple invoices
+  async bulkSetPaymentMethod(
+    invoiceIds: string[],
+    method: string,
+    userId: string
+  ): Promise<void> {
+    const isRisk = method === 'cash'
+    await db.query(`
+      UPDATE invoices SET
+        payment_method = $1, payment_method_source = 'user_input',
+        is_cash_payment_risk = $2, updated_at = NOW()
+      WHERE id = ANY($3::uuid[])
+    `, [method, isRisk, invoiceIds])
+  }
+}
+
+STEP 3 — Integration into TaxFormEngine (chỉ tiêu [23]):
+In calculateDeductibleInputVat() for field [23]:
+  Default behavior: EXCLUDE invoices where is_cash_payment_risk = true
+  Unless: cash_risk_acknowledged = true (user explicitly confirmed they accept the risk)
+
+  SQL for [23]:
+  WHERE direction='input' AND status='valid' AND gdt_validated=true
+    AND (is_cash_payment_risk = false OR cash_risk_acknowledged = true)
+    -- Only include cash risk invoices if user explicitly acknowledged
+
+  Show in declaration review:
+  "Đã loại [N] hóa đơn (tổng VAT: [amount]) do nghi ngờ thanh toán tiền mặt >5 triệu.
+   Kiểm tra và khai báo phương thức thanh toán để đưa vào khấu trừ."
+
+STEP 4 — VAT Reconciliation page — cash risk section:
+
+Add a dedicated section in /declarations/[id]/review:
+  Card title: "⚠️ Hóa đơn nguy cơ mất khấu trừ (thanh toán tiền mặt)"
+  
+  Only show if riskyCount > 0:
+  "Phát hiện [N] hóa đơn đầu vào ≥ 5 triệu chưa xác nhận phương thức thanh toán.
+  Tổng VAT có thể mất khấu trừ: [totalVatAtRisk]"
+  
+  Table with columns: Số HĐ | NCC | Giá trị | VAT | Ngày | Phương thức | Hành động
+  
+  "Phương thức" column: dropdown per row:
+    [Chuyển khoản ✓] [Tiền mặt ✗] [Séc] [Thẻ]
+  
+  Batch action bar:
+    Select all → [Tất cả chuyển khoản] [Tất cả tiền mặt]
+  
+  After user sets method:
+    Bank transfer → row turns green, VAT re-included in [23]
+    Cash → row turns red, VAT stays excluded, show loss amount
+    "Đã xác nhận: [N] HĐ chuyển khoản (+[VAT vào khấu trừ]) | [M] HĐ tiền mặt (-[VAT bị mất])"
+  
+  Note at bottom:
+  "Căn cứ Điều 26 NĐ181/2025: HĐ ≥5 triệu thanh toán tiền mặt không được khấu trừ VAT."
+
+STEP 5 — Invoice list badge:
+  In /invoices page, add badge "⚠️ Chưa xác nhận TT" (orange) on risky input invoices
+  Filter option: "Chưa khai báo thanh toán" in filter dropdown
+  Click badge → opens payment method modal for that invoice
+
+APIs:
+  GET  /api/invoices/cash-risk-summary?companyId=&month=&year=
+  PATCH /api/invoices/:id/payment-method  { method: string }
+  POST  /api/invoices/bulk-payment-method { ids: string[], method: string }
+  POST  /api/invoices/cash-risk/acknowledge/:id { note?: string }
+```
+
+---
+
+### P50.2 — Amended Invoice Router: Tự động xử lý HĐ điều chỉnh/thay thế khác kỳ
+
+```
+[Respond in Vietnamese]
+BUSINESS CONTEXT:
+Theo NĐ70/2025 và hướng dẫn thuế: Khi HĐ gốc và HĐ điều chỉnh/thay thế thuộc 2 kỳ khác nhau:
+  - HĐ thay thế: kê khai BỔ SUNG kỳ của HĐ gốc (không kê lên kỳ HĐ thay thế)
+  - HĐ điều chỉnh: kê phần chênh lệch vào kỳ của HĐ điều chỉnh
+
+Đây là rule phức tạp nhất, gây ra 80% tờ khai bổ sung của SME.
+App phải tự phát hiện và hướng dẫn rõ ràng, không để user tự đoán.
+
+TASK: Implement AmendedInvoiceRouter service + UI workflow.
+
+STEP 1 — DB enhancement:
+
+ALTER TABLE invoices
+  ADD COLUMN IF NOT EXISTS invoice_relation_type VARCHAR(20) DEFAULT NULL,
+  -- 'original' | 'replacement' | 'adjustment' | null
+  ADD COLUMN IF NOT EXISTS related_invoice_id UUID REFERENCES invoices(id),
+  -- for replacement/adjustment: points to the original invoice
+  ADD COLUMN IF NOT EXISTS related_invoice_number VARCHAR(50),
+  -- original invoice number (may not be in our DB)
+  ADD COLUMN IF NOT EXISTS related_invoice_period VARCHAR(7),
+  -- 'YYYY-MM' of the original invoice
+  ADD COLUMN IF NOT EXISTS cross_period_flag BOOLEAN DEFAULT false,
+  -- true = this invoice and its related original are in DIFFERENT months
+  ADD COLUMN IF NOT EXISTS supplemental_declaration_needed BOOLEAN DEFAULT false,
+  -- true = user must file a supplemental declaration for the original period
+  ADD COLUMN IF NOT EXISTS routing_decision VARCHAR(20) DEFAULT NULL;
+  -- 'current_period' | 'supplemental_required' | 'user_confirmed'
+
+STEP 2 — Service /backend/src/services/AmendedInvoiceRouter.ts:
+
+export class AmendedInvoiceRouter {
+
+  // Run after sync to detect cross-period amended invoices
+  async analyzeAmendments(companyId: string): Promise<AmendmentAnalysis[]> {
+    
+    // Find invoices marked as replacement or adjustment (from GDT data)
+    // GDT provides: hd_lien_quan (related invoice number) and loai_dieu_chinh
+    const amended = await db.query(`
+      SELECT i.*,
+        related.invoice_date AS related_date,
+        related.id AS related_db_id
+      FROM invoices i
+      LEFT JOIN invoices related
+        ON related.invoice_number = i.related_invoice_number
+        AND related.company_id = i.company_id
+      WHERE i.company_id = $1
+        AND i.invoice_relation_type IN ('replacement', 'adjustment')
+        AND i.deleted_at IS NULL
+        AND i.routing_decision IS NULL  -- not yet processed
+      ORDER BY i.invoice_date DESC
+    `, [companyId])
+
+    const analyses: AmendmentAnalysis[] = []
+
+    for (const inv of amended.rows) {
+      // Determine if cross-period
+      const invPeriod  = this.getPeriod(inv.invoice_date)
+      const origPeriod = inv.related_date
+        ? this.getPeriod(inv.related_date)
+        : inv.related_invoice_period  // fallback to stored period string
+
+      const isCrossPeriod = origPeriod && origPeriod !== invPeriod
+
+      // Determine routing rule
+      let rule: RoutingRule
+      if (!isCrossPeriod) {
+        rule = {
+          type: 'same_period',
+          action: 'Kê khai bình thường trên tờ khai kỳ ' + invPeriod,
+          declarationPeriod: invPeriod,
+          requiresSupplemental: false
+        }
+      } else if (inv.invoice_relation_type === 'replacement') {
+        rule = {
+          type: 'cross_period_replacement',
+          action: `HĐ thay thế phải kê trên tờ khai BỔ SUNG kỳ ${origPeriod}`,
+          declarationPeriod: origPeriod!,
+          requiresSupplemental: true,
+          supplementalInstructions: [
+            `Bước 1: Lập tờ khai bổ sung cho kỳ ${origPeriod}`,
+            `Bước 2: Xóa HĐ gốc ${inv.related_invoice_number} khỏi bảng kê kỳ ${origPeriod}`,
+            `Bước 3: Thêm HĐ thay thế ${inv.invoice_number} vào bảng kê kỳ ${origPeriod}`,
+            `Bước 4: KHÔNG kê HĐ thay thế trên tờ khai kỳ ${invPeriod}`
+          ]
+        }
+      } else {  // adjustment
+        rule = {
+          type: 'cross_period_adjustment',
+          action: `HĐ điều chỉnh kê phần chênh lệch trên tờ khai kỳ ${invPeriod} (kỳ phát sinh HĐ điều chỉnh)`,
+          declarationPeriod: invPeriod,
+          requiresSupplemental: false,
+          adjustmentNote: 'Chỉ kê phần chênh lệch tăng/giảm, không kê toàn bộ giá trị HĐ điều chỉnh'
+        }
+      }
+
+      // Update invoice with analysis result
+      await db.query(`
+        UPDATE invoices SET
+          cross_period_flag = $1,
+          supplemental_declaration_needed = $2,
+          routing_decision = $3,
+          related_invoice_period = $4
+        WHERE id = $5
+      `, [isCrossPeriod, rule.requiresSupplemental, rule.type, origPeriod, inv.id])
+
+      analyses.push({ invoice: inv, rule, isCrossPeriod })
+    }
+
+    return analyses
+  }
+
+  private getPeriod(date: Date | string): string {
+    const d = new Date(date)
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+  }
+
+  // Generate supplemental declaration draft
+  async createSupplementalDraft(
+    companyId: string,
+    originalPeriod: string,  // 'YYYY-MM'
+    amendedInvoiceId: string
+  ): Promise<TaxDeclarationDraft> {
+    const [year, month] = originalPeriod.split('-').map(Number)
+
+    // Check if supplemental already exists for this period
+    const existing = await db.query(`
+      SELECT id FROM tax_declarations
+      WHERE company_id=$1 AND period_month=$2 AND period_year=$3
+        AND declaration_type='supplemental'
+    `, [companyId, month, year])
+
+    if (existing.rowCount === 0) {
+      // Create new supplemental declaration based on the original
+      const original = await db.query(`
+        SELECT * FROM tax_declarations
+        WHERE company_id=$1 AND period_month=$2 AND period_year=$3
+          AND declaration_type='initial'
+        ORDER BY created_at DESC LIMIT 1
+      `, [companyId, month, year])
+
+      await db.query(`
+        INSERT INTO tax_declarations
+          (company_id, form_version_id, period_month, period_year,
+           declaration_type, status, field_values, base_declaration_id)
+        VALUES ($1, $2, $3, $4, 'supplemental', 'draft', $5, $6)
+      `, [companyId, original.rows[0]?.form_version_id,
+          month, year,
+          original.rows[0]?.field_values || '{}',
+          original.rows[0]?.id])
+    }
+
+    return { period: originalPeriod, type: 'supplemental', status: 'draft' }
+  }
+}
+
+STEP 3 — Invoice list UI: cross-period flag indicator
+
+In /invoices invoice cards, when invoice has cross_period_flag=true:
+  Show badge: "🔄 HĐ thay thế/điều chỉnh" (blue)
+  Clicking badge opens AmendmentGuideModal:
+
+  AmendmentGuideModal layout:
+    Header: "Hướng dẫn kê khai HĐ điều chỉnh/thay thế"
+    
+    Info box (blue):
+      Type: [Hóa đơn thay thế | Hóa đơn điều chỉnh]
+      HĐ gốc: [related_invoice_number] — Kỳ: [origPeriod]
+      HĐ này: [invoice_number] — Kỳ: [invPeriod]
+      Tình huống: [Cùng kỳ | Khác kỳ]
+    
+    IF cross_period AND replacement:
+      Red warning box:
+      "⚠️ HĐ thay thế khác kỳ — CẦN LẬP TỜ KHAI BỔ SUNG"
+      
+      Step-by-step instructions (numbered list):
+        1. Lập tờ khai bổ sung cho kỳ [origPeriod]
+        2. Xóa HĐ gốc [related_invoice_number] khỏi bảng kê kỳ [origPeriod]
+        3. Thêm HĐ thay thế này vào bảng kê kỳ [origPeriod]
+        4. HĐ thay thế này KHÔNG kê trên tờ khai kỳ [invPeriod]
+      
+      [Tạo nháp tờ khai bổ sung kỳ {origPeriod}] button (green)
+        → calls createSupplementalDraft() → navigates to /declarations/new?type=supplemental&period={origPeriod}
+      
+      [Đã hiểu — đánh dấu đã xử lý] button
+        → SET routing_decision='user_confirmed'
+    
+    IF cross_period AND adjustment:
+      Orange info box:
+      "ℹ️ HĐ điều chỉnh khác kỳ — kê PHẦN CHÊNH LỆCH trên kỳ [invPeriod]"
+      
+      Instruction:
+      "Chỉ kê phần giá trị chênh lệch tăng/giảm lên tờ khai kỳ [invPeriod],
+      KHÔNG kê toàn bộ giá trị của HĐ điều chỉnh."
+      
+      If we have original in DB: show delta calculation:
+        HĐ gốc: [originalAmount] | HĐ điều chỉnh: [thisAmount]
+        Chênh lệch cần kê: [delta] (tăng/giảm)
+    
+    IF same_period:
+      Green box: "✅ Cùng kỳ — kê bình thường trên tờ khai kỳ [invPeriod]"
+
+STEP 4 — Declaration alerts for amended invoices:
+
+In /declarations/[id]/review validation section:
+  Auto-check: are there any cross_period_flag=true invoices that have NOT been routed?
+  
+  If yes — show ERROR (block declaration):
+  "🚫 Có [N] hóa đơn điều chỉnh/thay thế chưa được xử lý đúng kỳ.
+  Kê khai sai kỳ có thể dẫn đến tờ khai sai và phải nộp bổ sung.
+  Xem và xử lý trước khi hoàn tất tờ khai."
+  
+  [Xem hóa đơn cần xử lý →] link to /invoices?filter=cross_period_unrouted
+
+STEP 5 — Supplemental declaration support:
+
+In /declarations page, add tab: "Tờ khai bổ sung"
+  List all supplemental declarations (declaration_type='supplemental')
+  Status: Draft | Completed | Submitted
+  
+  Supplemental declaration form:
+    Header shows: "TỜ KHAI BỔ SUNG — Tháng [M]/[Y]"
+    Pre-populated from original declaration values
+    User edits affected chỉ tiêu only
+    Show comparison: Original value vs Corrected value vs Difference
+    
+    After submit: calculate late payment interest (tiền chậm nộp):
+      0.03% per day × days_since_deadline × tax_difference
+      Show: "Tiền chậm nộp ước tính: [amount] (từ ngày 20/[M+1]/[Y] đến hôm nay)"
+
+APIs:
+  GET  /api/invoices/amendments?companyId=&status=unrouted
+  POST /api/invoices/:id/route-amendment { decision: string }
+  POST /api/declarations/supplemental { companyId, period, baseDeclarationId }
+  GET  /api/declarations/:id/amendment-delta  → returns diff vs original
+```
+
+---
+
+### P50.3 — Late Filing Penalty Calculator: Tính tiền chậm nộp + hỗ trợ quyết định
+
+```
+[Respond in Vietnamese]
+BUSINESS CONTEXT:
+Khi phát hiện sai sót sau khi đã nộp tờ khai, doanh nghiệp phải quyết định:
+  1. Có nên kê khai bổ sung không?
+  2. Nếu có, tiền chậm nộp sẽ là bao nhiêu?
+  3. Hạn chót để tránh bị xử phạt thêm là khi nào?
+Hiện tại user không có tool để tính toán điều này → thường trì hoãn → lãi phạt tăng thêm.
+
+TASK: Create PenaltyCalculator service + interactive UI widget.
+
+STEP 1 — Service /backend/src/services/PenaltyCalculator.ts:
+
+const DAILY_RATE = 0.0003  // 0.03% per day
+
+export class PenaltyCalculator {
+
+  calculate(params: {
+    taxAmount: number        // số thuế sai lệch phải nộp thêm
+    originalDeadline: Date   // ngày 20 của tháng sau kỳ khai
+    paymentDate: Date        // ngày dự kiến nộp bổ sung
+    hasPriorVoluntary: boolean  // true = tự phát hiện trước thanh tra (miễn xử phạt hành chính)
+  }): PenaltyResult {
+
+    const daysLate = Math.max(0, Math.floor(
+      (params.paymentDate.getTime() - params.originalDeadline.getTime()) / (1000 * 60 * 60 * 24)
+    ))
+
+    const lateInterest = params.taxAmount * DAILY_RATE * daysLate
+
+    // Late filing penalty (phạt chậm nộp hồ sơ) — separate from interest
+    let filingPenalty = 0
+    if (daysLate > 0 && daysLate <= 30)  filingPenalty = 2_000_000
+    else if (daysLate <= 60)              filingPenalty = 3_000_000
+    else if (daysLate <= 90)             filingPenalty = 4_000_000
+    else                                  filingPenalty = 5_000_000
+
+    // If voluntary self-disclosure before tax audit: no admin penalty (Điều 125 Luật QLTT)
+    const adminPenalty = params.hasPriorVoluntary ? 0 : filingPenalty
+
+    const totalPayable = params.taxAmount + lateInterest + adminPenalty
+
+    return {
+      taxAmount: params.taxAmount,
+      daysLate,
+      lateInterest: Math.round(lateInterest),
+      adminPenalty,
+      totalPayable: Math.round(totalPayable),
+      breakdown: {
+        dailyRate: `${(DAILY_RATE * 100).toFixed(2)}%/ngày`,
+        formula: `${params.taxAmount.toLocaleString('vi-VN')} × 0.03% × ${daysLate} ngày = ${Math.round(lateInterest).toLocaleString('vi-VN')}đ`
+      },
+      recommendation: this.buildRecommendation(daysLate, params.taxAmount, lateInterest, params.hasPriorVoluntary)
+    }
+  }
+
+  private buildRecommendation(days: number, tax: number, interest: number, voluntary: boolean): string {
+    if (days === 0) return '✅ Chưa quá hạn — nộp bổ sung ngay để tránh phát sinh lãi'
+    if (days <= 30 && voluntary) {
+      return `⚡ Nộp ngay: tiền lãi chỉ ${interest.toLocaleString('vi-VN')}đ, không bị phạt hành chính vì tự phát hiện`
+    }
+    if (days > 90) {
+      return `⚠️ Đã quá 90 ngày: tiền phạt đang tích lũy. Nộp bổ sung ngay để dừng tính lãi.`
+    }
+    return `Nộp bổ sung sớm nhất có thể để giảm thiểu lãi phạt`
+  }
+
+  // Calculate break-even: if tax difference is small, is it worth filing?
+  costBenefitAnalysis(params: {
+    taxDifference: number    // số tiền thuế sai lệch (có thể âm = thuế giảm)
+    daysLate: number
+    estimatedAuditRisk: 'low' | 'medium' | 'high'  // risk of being audited
+  }): CostBenefitResult {
+    // If tax difference is negative (overpaid), filing supplemental = get refund
+    // If positive (underpaid), weigh penalty vs audit risk
+
+    const currentInterest = params.taxDifference * DAILY_RATE * params.daysLate
+    const auditRiskMultiplier = { low: 1, medium: 3, high: 10 }[params.estimatedAuditRisk]
+    const expectedAuditPenalty = params.taxDifference * 0.20 * auditRiskMultiplier  // 20% penalty if caught
+
+    return {
+      shouldFile: params.taxDifference > 0 || currentInterest > 500_000,
+      costIfFileNow: currentInterest,
+      expectedCostIfCaught: params.taxDifference + expectedAuditPenalty,
+      savingsByFilingNow: Math.max(0, expectedAuditPenalty - currentInterest),
+      recommendation: params.taxDifference < 0
+        ? 'Nộp bổ sung để nhận lại tiền thuế nộp thừa'
+        : `Nên nộp bổ sung ngay: tiết kiệm ~${Math.round(expectedAuditPenalty - currentInterest).toLocaleString('vi-VN')}đ so với rủi ro bị thanh tra`
+    }
+  }
+}
+
+STEP 2 — Interactive UI component: PenaltyCalculatorWidget
+
+Create a dedicated interactive calculator embedded in /declarations page
+and accessible from /audit/anomalies.
+
+Widget layout (React component with live calculation):
+
+Title: "🧮 Tính Tiền Chậm Nộp & Hỗ Trợ Quyết Định"
+
+Input section:
+  Số thuế phải nộp thêm: currency input (large, auto-formatted VND)
+  Kỳ khai báo gốc: month/year picker (auto-calculates deadline = 20th of next month)
+  Hạn nộp gốc: [auto-display: "20/MM/YYYY"] (read-only)
+  Ngày dự kiến nộp bổ sung: date picker (default: today)
+  Tự phát hiện (chưa bị thanh tra): toggle YES/NO (affects admin penalty)
+
+Live result section (updates as user types):
+  
+  Breakdown cards (3 inline cards):
+    [Số thuế chênh lệch]   [Tiền lãi chậm nộp]   [Phạt hành chính]
+    [amount]               [amount]               [amount or MIỄN]
+  
+  TOTAL payable: large number, red color
+  "Mỗi ngày tiếp tục chậm nộp thêm: +[daily_amount]đ" (orange, update live)
+  
+  Formula breakdown (expandable):
+    "Tiền lãi = [taxAmount] × 0.03%/ngày × [daysLate] ngày = [interest]"
+  
+  Cost-benefit analysis box:
+    "Nếu bị thanh tra phát hiện: phạt thêm 20% = [penaltyIfCaught]đ"
+    "Nộp bổ sung ngay tiết kiệm: ~[savings]đ"
+    [Verdict badge]: "✅ NÊN NỘP BỔ SUNG NGAY" or "ℹ️ CÂN NHẮC"
+  
+  [Bắt đầu lập tờ khai bổ sung] button → /declarations/new?type=supplemental
+
+Legal reference (collapsible):
+  "Căn cứ pháp lý: Điều 59 Luật QLT, Điều 13 NĐ125/2020"
+  "Tỷ lệ lãi: 0.03%/ngày từ ngày kế tiếp ngày hết hạn"
+  "Miễn phạt hành chính: Người nộp thuế tự phát hiện và nộp trước khi CQT kiểm tra"
+
+STEP 3 — Embed in declaration workflow:
+
+In /declarations/[id]/review, if there's any error or warning found:
+  Add collapsible section: "Ước tính hậu quả nếu nộp sai"
+  Show mini version of calculator pre-filled with:
+    taxAmount = estimated_difference (if declaration has errors)
+    deadline  = 20th of next month from period
+    paymentDate = today
+  
+  This motivates users to fix issues BEFORE submitting.
+
+STEP 4 — Standalone page /tools/penalty-calculator:
+  Full page version of the widget
+  Share URL: can share pre-filled link with params
+  Print button: "In kết quả để lưu hồ sơ"
+
+API:
+  POST /api/tools/penalty-calculate
+    Body: { taxAmount, originalDeadline, paymentDate, hasPriorVoluntary }
+    Returns: PenaltyResult
+  
+  POST /api/tools/cost-benefit
+    Body: { taxDifference, originalDeadline, estimatedAuditRisk }
+    Returns: CostBenefitResult
+```
+
+---
+
+### P50.4 — Missing Invoice Finder: Phát hiện HĐ đầu vào bị thiếu
+
+```
+[Respond in Vietnamese]
+BUSINESS CONTEXT:
+Khi DN A mua hàng từ DN B: DN B phát HĐ đầu ra → DN A có HĐ đầu vào.
+GDT lưu HĐ này từ 2 phía. Nếu DN A thiếu HĐ đầu vào (chưa đồng bộ hoặc bị lọt),
+DN A đang đóng thuế thừa mà không hay.
+
+LOGIC: Khi sync đầu ra của DN A → hệ thống thấy DN B đã bán cho DN A (buyer_tax_code).
+Nếu DN A là user của hệ thống → kiểm tra xem DN A có HĐ đầu vào tương ứng từ DN B không.
+Nếu không có → flag là "HĐ đầu vào bị thiếu".
+
+NOTE: This only works when BOTH buyer and seller are companies managed in the system,
+OR when GDT bot has synced input invoices for the company.
+
+TASK: Create MissingInvoiceFinder service + alert UI.
+
+STEP 1 — DB Schema:
+
+CREATE TABLE missing_invoice_alerts (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  company_id      UUID NOT NULL REFERENCES companies(id),  -- the BUYER company
+  seller_tax_code VARCHAR(20) NOT NULL,
+  seller_name     VARCHAR(255),
+  expected_invoice_number VARCHAR(50),  -- if known from seller's output data
+  expected_invoice_date DATE,
+  expected_amount   NUMERIC(22,2),
+  expected_vat      NUMERIC(22,2),
+  detection_source  VARCHAR(20),  -- 'cross_company' | 'gdt_mismatch' | 'seller_reported'
+  status            VARCHAR(20) DEFAULT 'open',
+  -- 'open' | 'found' | 'not_applicable' | 'acknowledged'
+  found_invoice_id  UUID REFERENCES invoices(id),  -- set when matched
+  acknowledged_note TEXT,
+  created_at        TIMESTAMPTZ DEFAULT NOW(),
+  updated_at        TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(company_id, seller_tax_code, expected_invoice_number)
+);
+
+CREATE INDEX idx_missing_inv_company ON missing_invoice_alerts(company_id, status);
+
+STEP 2 — Service /backend/src/services/MissingInvoiceFinder.ts:
+
+export class MissingInvoiceFinder {
+
+  // Strategy 1: Cross-company detection (both companies in system)
+  async scanCrossCompany(userId: string, month: number, year: number): Promise<void> {
+    // Get all companies this user manages
+    const userCompanies = await db.query(`
+      SELECT c.id, c.tax_code FROM companies c
+      JOIN user_companies uc ON c.id = uc.company_id
+      WHERE uc.user_id = $1
+    `, [userId])
+
+    const taxCodes = userCompanies.rows.map(c => c.tax_code)
+    if (taxCodes.length < 2) return  // need at least 2 companies
+
+    // Find output invoices where buyer is one of user's other companies
+    for (const company of userCompanies.rows) {
+      const outputToOwnCompanies = await db.query(`
+        SELECT i.invoice_number, i.invoice_date, i.buyer_tax_code,
+               i.buyer_name, i.total_amount, i.vat_amount, i.seller_tax_code
+        FROM invoices i
+        WHERE i.company_id = $1
+          AND i.direction = 'output'
+          AND i.status = 'valid'
+          AND i.buyer_tax_code = ANY($2::text[])
+          AND i.buyer_tax_code != i.seller_tax_code  -- exclude self-invoices
+          AND EXTRACT(MONTH FROM i.invoice_date) = $3
+          AND EXTRACT(YEAR FROM i.invoice_date) = $4
+          AND i.deleted_at IS NULL
+      `, [company.id, taxCodes.filter(tc => tc !== company.tax_code), month, year])
+
+      for (const outInv of outputToOwnCompanies.rows) {
+        // Find the buyer company in our system
+        const buyerCompany = userCompanies.rows.find(c => c.tax_code === outInv.buyer_tax_code)
+        if (!buyerCompany) continue
+
+        // Check if buyer has corresponding input invoice
+        const inputExists = await db.query(`
+          SELECT id FROM invoices
+          WHERE company_id = $1
+            AND direction = 'input'
+            AND seller_tax_code = $2
+            AND invoice_number = $3
+            AND deleted_at IS NULL
+        `, [buyerCompany.id, company.tax_code, outInv.invoice_number])
+
+        if (inputExists.rowCount === 0) {
+          // Missing! Create alert
+          await db.query(`
+            INSERT INTO missing_invoice_alerts
+              (company_id, seller_tax_code, seller_name, expected_invoice_number,
+               expected_invoice_date, expected_amount, expected_vat, detection_source)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'cross_company')
+            ON CONFLICT (company_id, seller_tax_code, expected_invoice_number) DO NOTHING
+          `, [buyerCompany.id, company.tax_code, /* seller name */ '',
+              outInv.invoice_number, outInv.invoice_date,
+              outInv.total_amount, outInv.vat_amount])
+        }
+      }
+    }
+  }
+
+  // Strategy 2: GDT mismatch (compare GDT validation count vs our DB count)
+  async scanGdtMismatch(companyId: string, month: number, year: number): Promise<MismatchResult> {
+    // After GDT validation, GDT tells us how many invoices are in the system
+    // If GDT says there are 150 input invoices but we only have 120 → 30 missing
+    // NOTE: This requires GDT to return total count in their API response
+
+    const dbCount = await db.query(`
+      SELECT COUNT(*) as count FROM invoices
+      WHERE company_id=$1 AND direction='input'
+        AND EXTRACT(MONTH FROM invoice_date)=$2
+        AND EXTRACT(YEAR FROM invoice_date)=$3
+        AND deleted_at IS NULL
+    `, [companyId, month, year])
+
+    // GDT total count from last bot run (stored in gdt_bot_runs)
+    const gdtRun = await db.query(`
+      SELECT input_count FROM gdt_bot_runs
+      WHERE company_id=$1
+        AND status='success'
+      ORDER BY finished_at DESC LIMIT 1
+    `, [companyId])
+
+    const dbTotal  = parseInt(dbCount.rows[0].count)
+    const gdtTotal = gdtRun.rows[0]?.input_count || 0
+
+    return {
+      dbCount: dbTotal,
+      gdtCount: gdtTotal,
+      missingCount: Math.max(0, gdtTotal - dbTotal),
+      hasMismatch: gdtTotal > dbTotal
+    }
+  }
+
+  // Try to auto-match found invoices to existing alerts
+  async matchFoundInvoices(companyId: string): Promise<number> {
+    const alerts = await db.query(`
+      SELECT id, seller_tax_code, expected_invoice_number
+      FROM missing_invoice_alerts
+      WHERE company_id=$1 AND status='open'
+    `, [companyId])
+
+    let matched = 0
+    for (const alert of alerts.rows) {
+      const found = await db.query(`
+        SELECT id FROM invoices
+        WHERE company_id=$1 AND direction='input'
+          AND seller_tax_code=$2 AND invoice_number=$3
+          AND deleted_at IS NULL
+      `, [companyId, alert.seller_tax_code, alert.expected_invoice_number])
+
+      if (found.rowCount > 0) {
+        await db.query(`
+          UPDATE missing_invoice_alerts SET status='found', found_invoice_id=$1
+          WHERE id=$2
+        `, [found.rows[0].id, alert.id])
+        matched++
+      }
+    }
+    return matched
+  }
+}
+
+STEP 3 — Missing Invoice Alert UI:
+
+Add to /dashboard: "Hóa Đơn Đầu Vào Bị Thiếu" widget
+  Show only if missing_invoice_alerts.status='open' count > 0
+  
+  Widget:
+    "🔍 Phát hiện [N] hóa đơn đầu vào có thể bị thiếu"
+    "Tổng VAT ước tính bị thiếu: [total_vat]"
+    [Xem chi tiết →] → /invoices/missing
+
+/invoices/missing page:
+  
+  Header: "Hóa Đơn Đầu Vào Bị Thiếu" + info tooltip explaining detection method
+  
+  Filter tabs: Tất cả | Nội bộ (từ công ty khác của bạn) | GDT mismatch
+  
+  Alert cards:
+    [Icon: Invoice with question mark]
+    NCC: [seller_name] — MST: [seller_tax_code]
+    Số HĐ dự kiến: [expected_invoice_number] (if known)
+    Ngày: [expected_invoice_date] | Giá trị: [amount] | VAT: [vat]
+    Nguồn phát hiện: [Đối chiếu nội bộ | GDT không khớp]
+    
+    Action buttons:
+      [Đồng bộ lại ngay] → trigger bot sync for this seller's invoices
+      [Nhập thủ công] → open manual import for this invoice
+      [Không áp dụng] → mark as not_applicable with note (e.g., "HĐ này chúng tôi không mua")
+      [Đã tìm thấy] → mark as found, select which invoice matches
+
+  Summary box:
+    "Nếu tìm được đủ [N] HĐ này, VAT đầu vào tăng thêm: [total_vat]
+     Thuế GTGT phải nộp giảm: ~[potential_saving]đ"
+
+API:
+  GET  /api/invoices/missing?companyId=&status=open
+  GET  /api/invoices/missing/summary?companyId=
+  POST /api/invoices/missing/scan  → trigger MissingInvoiceFinder.scan()
+  PATCH /api/invoices/missing/:id/status  { status, note }
+```
+
+---
+
+### P50.5 — Tax Rate Anomaly Alert: Cảnh báo áp sai thuế suất (8% vs 10%)
+
+```
+[Respond in Vietnamese]
+BUSINESS CONTEXT:
+Theo NQ204/2025/QH15: Từ 01/07/2025 đến 31/12/2026, một số nhóm hàng hóa giảm từ 10% → 8%.
+NHƯNG: Một số ngành KHÔNG được giảm (viễn thông, ngân hàng, bất động sản, kim loại...).
+Nhiều DN vô tình:
+  1. Xuất HĐ 10% cho hàng đáng lẽ được hưởng 8% → thu thừa VAT của khách, vi phạm quy định
+  2. Xuất HĐ 8% cho hàng KHÔNG được giảm → thiếu VAT, rủi ro bị truy thu
+  3. Cùng 1 mặt hàng xuất lúc 8% lúc 10% → không nhất quán → bị nghi ngờ khi thanh tra
+
+TASK: TaxRateAnomalyDetector — phát hiện và cảnh báo sai thuế suất.
+
+STEP 1 — DB: Tax rate rules table
+
+CREATE TABLE vat_rate_rules (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  rule_name       VARCHAR(100) NOT NULL,
+  decree_ref      VARCHAR(100),           -- 'NQ204/2025/QH15', 'NĐ174/2025/NĐ-CP'
+  effective_from  DATE NOT NULL,
+  effective_to    DATE,                   -- NULL = still active
+  standard_rate   NUMERIC(4,1),           -- 10
+  reduced_rate    NUMERIC(4,1),           -- 8
+  applies_to      TEXT[],                 -- industry codes or keywords ['thực phẩm', 'dịch vụ ăn uống']
+  excluded_from   TEXT[],                 -- ['viễn thông', 'ngân hàng', 'bất động sản', 'kim loại']
+  is_active       BOOLEAN DEFAULT true
+);
+
+-- Seed current rule (Jul 2025 - Dec 2026)
+INSERT INTO vat_rate_rules (rule_name, decree_ref, effective_from, effective_to,
+  standard_rate, reduced_rate, excluded_from)
+VALUES (
+  'Giảm 2% VAT 2025-2026',
+  'NQ204/2025/QH15 + NĐ174/2025/NĐ-CP',
+  '2025-07-01', '2026-12-31',
+  10, 8,
+  ARRAY['viễn thông', 'công nghệ thông tin', 'tài chính', 'ngân hàng', 'chứng khoán',
+        'bảo hiểm', 'bất động sản', 'kim loại', 'khai khoáng', 'than cốc',
+        'dầu mỏ tinh chế', 'hóa chất', 'thuốc lá', 'bia rượu', 'ô tô']
+);
+
+STEP 2 — Service /backend/src/services/TaxRateAnomalyDetector.ts:
+
+export class TaxRateAnomalyDetector {
+
+  async scan(companyId: string, month: number, year: number): Promise<TaxRateAnomaly[]> {
+    const anomalies: TaxRateAnomaly[] = []
+    const periodDate = new Date(year, month - 1, 1)
+
+    // ANOMALY TYPE 1: Same item appearing with multiple different VAT rates
+    const inconsistentRates = await db.query(`
+      SELECT
+        ili.normalized_item_name,
+        ARRAY_AGG(DISTINCT ili.vat_rate ORDER BY ili.vat_rate) AS vat_rates,
+        COUNT(DISTINCT ili.vat_rate) AS rate_count,
+        COUNT(ili.id) AS invoice_count,
+        SUM(ili.vat_amount) AS total_vat
+      FROM invoice_line_items ili
+      JOIN invoices i ON ili.invoice_id = i.id
+      WHERE i.company_id = $1
+        AND i.direction = 'output'
+        AND i.status = 'valid'
+        AND EXTRACT(MONTH FROM i.invoice_date) = $2
+        AND EXTRACT(YEAR FROM i.invoice_date) = $3
+        AND ili.deleted_at IS NULL
+        AND ili.normalized_item_name IS NOT NULL
+      GROUP BY ili.normalized_item_name
+      HAVING COUNT(DISTINCT ili.vat_rate) > 1
+      ORDER BY SUM(ili.vat_amount) DESC
+    `, [companyId, month, year])
+
+    for (const item of inconsistentRates.rows) {
+      anomalies.push({
+        type: 'INCONSISTENT_RATE',
+        severity: 'warning',
+        itemName: item.normalized_item_name,
+        vatRates: item.vat_rates,
+        invoiceCount: item.invoice_count,
+        totalVat: item.total_vat,
+        message: `Mặt hàng "${item.normalized_item_name}" được kê khai với ${item.rate_count} mức thuế suất khác nhau: ${item.vat_rates.join('%, ')}%`,
+        suggestion: 'Kiểm tra lại: cùng 1 mặt hàng phải áp cùng 1 thuế suất trong cùng kỳ. Không nhất quán có thể bị nghi ngờ khi thanh tra.'
+      })
+    }
+
+    // ANOMALY TYPE 2: Items using 10% during reduced-rate period (Jul 2025 - Dec 2026)
+    // when they should potentially be 8%
+    if (periodDate >= new Date('2025-07-01') && periodDate <= new Date('2026-12-31')) {
+      const highRateItems = await db.query(`
+        SELECT
+          ili.normalized_item_name,
+          COUNT(ili.id) AS invoice_count,
+          SUM(ili.subtotal) AS total_subtotal,
+          SUM(ili.vat_amount) AS vat_collected,
+          (SUM(ili.subtotal) * 0.02) AS potential_overcharge
+        FROM invoice_line_items ili
+        JOIN invoices i ON ili.invoice_id = i.id
+        WHERE i.company_id = $1
+          AND i.direction = 'output'
+          AND i.status = 'valid'
+          AND ili.vat_rate = 10
+          AND EXTRACT(MONTH FROM i.invoice_date) = $2
+          AND EXTRACT(YEAR FROM i.invoice_date) = $3
+          AND ili.deleted_at IS NULL
+        GROUP BY ili.normalized_item_name
+        ORDER BY SUM(ili.subtotal) DESC
+        LIMIT 20
+      `, [companyId, month, year])
+
+      // Use Gemini to classify which items might qualify for 8% rate
+      if (highRateItems.rows.length > 0) {
+        const itemNames = highRateItems.rows.map(i => i.normalized_item_name)
+        const classification = await this.classifyItemsWithAI(itemNames, periodDate)
+
+        for (const item of highRateItems.rows) {
+          const cls = classification[item.normalized_item_name]
+          if (cls === 'likely_eligible_for_8pct') {
+            anomalies.push({
+              type: 'POSSIBLE_WRONG_RATE_10_SHOULD_BE_8',
+              severity: 'info',
+              itemName: item.normalized_item_name,
+              vatRates: [10],
+              invoiceCount: item.invoice_count,
+              totalVat: item.vat_collected,
+              potentialDifference: parseFloat(item.potential_overcharge),
+              message: `Mặt hàng "${item.normalized_item_name}" đang áp thuế 10% trong giai đoạn giảm thuế (Jul 2025 - Dec 2026) — có thể đủ điều kiện áp 8%`,
+              suggestion: 'Xác nhận với kế toán trưởng: nếu hàng hóa này không thuộc nhóm loại trừ (viễn thông, ngân hàng, bất động sản...), nên áp 8%.'
+            })
+          }
+          if (cls === 'excluded_no_reduction') {
+            // Item is in excluded list but being charged 8% — risk
+            if (highRateItems.rows.find(i => i.normalized_item_name === item.normalized_item_name && i.vat_rate === 8)) {
+              anomalies.push({
+                type: 'POSSIBLE_WRONG_RATE_8_SHOULD_BE_10',
+                severity: 'warning',
+                message: `"${item.normalized_item_name}" thuộc nhóm KHÔNG được giảm thuế, nhưng đang áp 8%. Nguy cơ truy thu phần thuế còn thiếu.`
+              })
+            }
+          }
+        }
+      }
+    }
+
+    // Save anomalies to price_anomalies table (reuse existing infrastructure)
+    // OR save to a new tax_rate_anomalies table
+    return anomalies
+  }
+
+  private async classifyItemsWithAI(itemNames: string[], periodDate: Date): Promise<Record<string, string>> {
+    const excluded = ['viễn thông', 'ngân hàng', 'bất động sản', 'kim loại', 'khai khoáng', 'chứng khoán', 'bảo hiểm', 'thuốc lá', 'bia', 'rượu']
+
+    const prompt = `Các mặt hàng sau đây có thuộc nhóm được GIẢM thuế GTGT từ 10% xuống 8% theo NQ204/2025/QH15 không?
+Nhóm KHÔNG được giảm: ${excluded.join(', ')} và sản phẩm chịu thuế tiêu thụ đặc biệt.
+Các nhóm khác: CÓ THỂ được giảm nếu đang chịu mức 10%.
+
+Danh sách cần phân loại:
+${itemNames.map((n, i) => `${i+1}. ${n}`).join('\n')}
+
+Trả về JSON: {"tên_mặt_hàng": "likely_eligible_for_8pct" | "excluded_no_reduction" | "uncertain"}
+Chỉ JSON, không giải thích.`
+
+    try {
+      const response = await callGemini(prompt, 500)
+      return JSON.parse(response.replace(/```json|```/g, '').trim())
+    } catch {
+      return {}
+    }
+  }
+}
+
+STEP 3 — UI Integration:
+
+1. Dashboard widget "Kiểm tra Thuế Suất":
+   Run scan after each sync
+   If anomalies > 0:
+     "⚠️ [N] mặt hàng có thuế suất bất thường — xem chi tiết"
+   [→ /audit/tax-rates]
+
+2. /audit/tax-rates page:
+   
+   Header: "Kiểm tra Thuế Suất Hóa Đơn" + period selector
+   
+   Filter tabs: Tất cả | Không nhất quán | Sai mức giảm | Cần xác nhận
+   
+   Anomaly cards:
+     [SEVERITY BADGE] [TYPE]
+     Mặt hàng: [name] (bold)
+     Thuế suất phát hiện: [rates] (e.g., "8% và 10%")
+     Số HĐ liên quan: [count] | VAT liên quan: [amount]
+     AI nhận xét: [classification + suggestion]
+     
+     Actions:
+       [Xem HĐ liên quan] → filter invoices by item name
+       [Đúng rồi, bỏ qua] → acknowledge anomaly
+       [Cần điều chỉnh] → redirect to /invoices to make corrections
+
+3. In declaration review (pre-submission check):
+   Add validation rule for tax rate anomalies:
+   If inconsistent_rate anomalies exist for output invoices → WARNING
+   "Phát hiện [N] mặt hàng với thuế suất không nhất quán trong kỳ này.
+   Kiểm tra tại /audit/tax-rates trước khi nộp."
+
+API:
+  POST /api/audit/tax-rates/scan?companyId=&month=&year=
+  GET  /api/audit/tax-rates?companyId=&month=&year=
+  PATCH /api/audit/tax-rates/:id/acknowledge
+```
+
+
+---
+
+## GROUP 51 — GDT BOT: ENTERPRISE SCALE (1000 USERS, ANTI-DETECTION)
+
+> Mục tiêu: Scale từ vài chục lên 1000 user đồng thời mà GDT không phát hiện.
+> Thứ tự thực hiện bắt buộc: BOT-ENT-01 → 02 → 03 → 04 → 05 → 06
+
+### BOT-ENT-01 — Dedicated Queues + Sticky Sessions (Fast/Slow Path)
+```
+[Respond in Vietnamese]
+CRITICAL CONTEXT: GDT uses Session Binding WAF. If the IP address or User-Agent changes
+between Login and subsequent Data Fetch requests within the same session, GDT immediately
+invalidates the token and blocks the account. Therefore:
+  1 Job = 1 Proxy IP = 1 User-Agent = 1 Session (throughout entire job lifetime)
+  NEVER rotate proxy or UA per HTTP request — only rotate at JOB level.
+
+TASK 1: Split Queues in /bot/src/sync.worker.ts
+
+Refactor to export two separate BullMQ Workers sharing the same GdtBotRunner logic:
+
+import { Worker, Queue } from 'bullmq'
+import IORedis from 'ioredis'
+
+const redis = new IORedis(process.env.REDIS_URL!, { maxRetriesPerRequest: null })
+
+// Fast Path: Manual syncs triggered by user — high priority, high concurrency
+export const manualWorker = new Worker('gdt-sync-manual', processGdtSync, {
+  connection: redis,
+  concurrency: 10,
+  limiter: { max: 30, duration: 60_000 },  // 30 jobs per minute max
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 60_000 },
+    timeout: 300_000
+  }
+})
+
+// Slow Path: Auto cron syncs — low concurrency to avoid GDT detection
+export const autoWorker = new Worker('gdt-sync-auto', processGdtSync, {
+  connection: redis,
+  concurrency: 2,
+  limiter: { max: 5, duration: 60_000 },   // only 5 jobs per minute — very conservative
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 120_000 },  // longer backoff for auto
+    timeout: 300_000
+  }
+})
+
+// Shared queues (for pushing jobs)
+export const manualQueue = new Queue('gdt-sync-manual', { connection: redis })
+export const autoQueue   = new Queue('gdt-sync-auto',   { connection: redis })
+
+TASK 2: Enforce Sticky Sessions in /bot/src/GdtBotRunner.ts
+
+At the VERY START of each job execution, generate session-level constants:
+
+import { v4 as uuidv4 } from 'uuid'
+
+async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
+  // === SESSION BINDING — DO NOT CHANGE WITHIN THIS JOB ===
+  const proxySessionId = uuidv4()  // unique ID for this job's proxy slot
+  const sessionUA = pickUserAgent() // ONE UA for entire job — see BOT-ENT-04
+  // ========================================================
+
+  // Get dedicated proxy for this session
+  const proxyUrl = proxyManager.nextForSession(proxySessionId)
+  
+  // Create axios instance locked to this session's proxy + UA
+  const sessionAxios = axios.create({
+    timeout: 30_000,
+    headers: {
+      'User-Agent': sessionUA,
+      'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Accept': 'application/json, text/plain, */*',
+    },
+    ...(proxyUrl ? { proxy: parseProxyForAxios(proxyUrl) } : {})
+  })
+
+  // Pass sessionAxios to ALL downstream calls
+  // GdtAuthService.login(credentials, sessionAxios)
+  // GdtApiService.fetchInvoices(session, sessionAxios)
+  // CaptchaService.fetchImage(url, sessionAxios)  ← captcha image must use SAME IP
+  
+  job.log(`[Session] proxySessionId=${proxySessionId}, UA=${sessionUA.substring(0, 30)}...`)
+}
+
+TASK 3: API Controller — Manual Sync endpoint with cooldown + block reset
+
+In /backend/src/routes/bot.ts, POST /api/bot/sync-now:
+
+async function triggerManualSync(req: Request, res: Response): Promise<void> {
+  const { companyId } = req.body
+  const userId = req.user.id
+
+  // Step 1: Cooldown check — prevent queue spam
+  const cooldownKey = `bot:manual:cooldown:${companyId}`
+  const inCooldown = await redis.get(cooldownKey)
+  if (inCooldown) {
+    const ttl = await redis.ttl(cooldownKey)
+    return res.status(429).json({
+      error: 'TOO_MANY_REQUESTS',
+      message: `Vui lòng chờ ${ttl} giây trước khi đồng bộ lại`,
+      retryAfter: ttl
+    })
+  }
+
+  // Step 2: Verify company belongs to user
+  const company = await db.query(
+    'SELECT id, tax_code FROM companies WHERE id=$1 AND id IN (SELECT company_id FROM user_companies WHERE user_id=$2)',
+    [companyId, userId]
+  )
+  if (!company.rows[0]) return res.status(403).json({ error: 'FORBIDDEN' })
+
+  // Step 3: Reset block state (manual sync = user explicitly wants this)
+  await db.query(`
+    UPDATE gdt_bot_configs
+    SET consecutive_failures = 0,
+        blocked_until = NULL,
+        last_manual_sync = NOW()
+    WHERE company_id = $1
+  `, [companyId])
+
+  // Step 4: Get encrypted credentials
+  const config = await db.query(
+    'SELECT encrypted_creds FROM gdt_bot_configs WHERE company_id=$1 AND is_active=true',
+    [companyId]
+  )
+  if (!config.rows[0]) {
+    return res.status(404).json({ error: 'BOT_NOT_CONFIGURED', message: 'GDT Bot chưa được thiết lập' })
+  }
+
+  // Step 5: Push to manual queue (high priority)
+  const job = await manualQueue.add('manual-sync', {
+    jobId: uuidv4(),
+    encryptedCredentials: config.rows[0].encrypted_creds,
+    direction: 'both',
+    fromDate: req.body.fromDate,
+    toDate:   req.body.toDate,
+    tenantId: companyId,
+    triggeredBy: 'user_manual'
+  }, { priority: 1 })  // priority 1 = highest
+
+  // Step 6: Set cooldown (5 minutes)
+  await redis.set(cooldownKey, '1', 'EX', 300)
+
+  res.json({ jobId: job.id, message: 'Đã thêm vào hàng chờ đồng bộ', queueName: 'gdt-sync-manual' })
+}
+
+TASK 4: Cronjob — Auto Sync (Slow Path)
+
+Create /bot/src/cron/auto-sync.ts:
+
+import { CronJob } from 'cron'
+import { autoQueue } from '../sync.worker'
+
+// Run every 5 minutes — but only push to slow queue
+export const autoSyncCron = new CronJob('*/5 * * * *', async () => {
+  // Night sleep: 23:00 - 06:00 Vietnam time (UTC+7)
+  const vnHour = new Date(Date.now() + 7 * 3600_000).getUTCHours()
+  if (vnHour >= 23 || vnHour < 6) {
+    console.log('[AutoSync] Night mode — skipping (23:00-06:00 VN time)')
+    return
+  }
+
+  // Query companies due for auto-sync (use next_auto_sync_at — see BOT-ENT-02)
+  const due = await db.query(`
+    SELECT c.id as company_id, b.encrypted_creds
+    FROM gdt_bot_configs b
+    JOIN companies c ON b.company_id = c.id
+    WHERE b.is_active = true
+      AND (b.next_auto_sync_at IS NULL OR b.next_auto_sync_at <= NOW())
+      AND (b.blocked_until IS NULL OR b.blocked_until < NOW())
+      AND b.consecutive_failures < 3
+    ORDER BY b.next_auto_sync_at ASC NULLS FIRST
+    LIMIT 15
+  `)
+
+  for (const row of due.rows) {
+    await autoQueue.add('auto-sync', {
+      jobId: uuidv4(),
+      encryptedCredentials: row.encrypted_creds,
+      direction: 'both',
+      fromDate: null,  // auto-sync: use last sync date as reference
+      toDate: null,
+      tenantId: row.company_id,
+      triggeredBy: 'auto_cron'
+    })
+    console.log(`[AutoSync] Queued company ${row.company_id}`)
+  }
+}, null, true)
+```
+
+### BOT-ENT-02 — Cron Jitter + Night Sleep (Anti-Pattern Detection)
+```
+[Respond in Vietnamese]
+CONTEXT: Running background jobs at exact 6-hour intervals creates a perfect periodic footprint
+that WAFs detect as bot behavior. Solution: randomize next sync time at the database level.
+
+TASK 1: DB migration for jitter column
+
+ALTER TABLE gdt_bot_configs
+  ADD COLUMN IF NOT EXISTS next_auto_sync_at TIMESTAMPTZ DEFAULT NULL;
+
+-- Backfill for existing rows
+UPDATE gdt_bot_configs SET next_auto_sync_at = NOW() + INTERVAL '1 hour' WHERE next_auto_sync_at IS NULL;
+
+CREATE INDEX idx_bot_configs_next_sync ON gdt_bot_configs(next_auto_sync_at, is_active, blocked_until)
+  WHERE is_active = true;
+
+TASK 2: Update next_auto_sync_at after successful sync
+
+In sync.worker.ts, after a successful job completion:
+
+await db.query(`
+  UPDATE gdt_bot_configs
+  SET
+    last_run_at = NOW(),
+    last_run_status = 'success',
+    consecutive_failures = 0,
+    last_error = NULL,
+    -- Jitter: random interval between 5 hours and 8 hours (300-480 minutes)
+    -- RANDOM() returns 0.0 to 1.0, so RANDOM() * 180 = 0 to 180 extra minutes
+    next_auto_sync_at = NOW() + INTERVAL '5 hours' + (RANDOM() * 180 || ' minutes')::INTERVAL
+  WHERE company_id = $1
+`, [tenantId])
+
+-- The result: next sync is scheduled at a random time between 5h and 8h from now
+-- Example outputs: 5h 12m, 6h 47m, 7h 3m — never the same interval twice
+-- This makes timing analysis by WAF much harder
+
+TASK 3: Update after FAILED sync (longer jitter to give GDT time to cool down)
+
+await db.query(`
+  UPDATE gdt_bot_configs
+  SET
+    consecutive_failures = consecutive_failures + 1,
+    last_error = $2,
+    -- Failed: wait longer + more randomness (2-4 hours extra)
+    next_auto_sync_at = CASE
+      WHEN consecutive_failures >= 2 THEN
+        NOW() + INTERVAL '24 hours'  -- too many failures: back off a full day
+      ELSE
+        NOW() + INTERVAL '2 hours' + (RANDOM() * 120 || ' minutes')::INTERVAL
+    END,
+    -- Block if too many failures
+    blocked_until = CASE
+      WHEN consecutive_failures + 1 >= 3 THEN NOW() + INTERVAL '2 hours'
+      ELSE blocked_until
+    END
+  WHERE company_id = $1
+`, [tenantId, errorMessage])
+
+TASK 4: Night Sleep logic in cron
+
+In /bot/src/cron/auto-sync.ts, enhance night detection:
+
+function isVietnamNightTime(): boolean {
+  // Vietnam is UTC+7
+  const vnNow = new Date(Date.now() + 7 * 3600_000)
+  const vnHour = vnNow.getUTCHours()
+  // Sleep 11 PM to 6 AM Vietnam time
+  return vnHour >= 23 || vnHour < 6
+}
+
+function getSlowdownFactor(): number {
+  const vnNow = new Date(Date.now() + 7 * 3600_000)
+  const vnHour = vnNow.getUTCHours()
+  // Peak hours (9am-5pm): normal speed
+  // Evening (6pm-10pm): slow down
+  // Near night (10pm-11pm): very slow
+  if (vnHour >= 9 && vnHour < 17)  return 1.0   // normal
+  if (vnHour >= 6  && vnHour < 9)  return 0.7   // morning ramp-up
+  if (vnHour >= 17 && vnHour < 22) return 0.5   // evening slowdown
+  return 0.2  // late evening — minimal activity
+}
+
+// In cron: limit jobs based on time of day
+const LIMIT_BASE = 15
+const limit = Math.floor(LIMIT_BASE * getSlowdownFactor())
+// Query: LIMIT $1 → pass limit variable
+
+TASK 5: Add to DB migration: working hours preference per tenant
+
+ALTER TABLE gdt_bot_configs
+  ADD COLUMN IF NOT EXISTS preferred_sync_hour_start SMALLINT DEFAULT 8,   -- 8 AM VN time
+  ADD COLUMN IF NOT EXISTS preferred_sync_hour_end   SMALLINT DEFAULT 18;  -- 6 PM VN time
+
+-- Tenant-level preferred hours: some businesses want sync outside their working hours
+-- Include in cronjob query:
+-- AND (preferred_sync_hour_start IS NULL
+--      OR EXTRACT(HOUR FROM (NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')) 
+--         BETWEEN preferred_sync_hour_start AND preferred_sync_hour_end)
+```
+
+### BOT-ENT-03 — Raw Data Lake + Global Circuit Breaker
+```
+[Respond in Vietnamese]
+CONTEXT: Two enterprise patterns to survive GDT system changes:
+1. Raw Data Lake: save raw HTML/XML BEFORE parsing so if parser breaks due to GDT changes,
+   raw data is safe and can be re-parsed when parser is fixed.
+2. Global Circuit Breaker: if GDT structure changes (not credential errors), pause ALL workers
+   to prevent hammering GDT with broken requests across all tenants.
+
+TASK 1: Raw Data Lake schema
+
+CREATE TABLE raw_invoice_data (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  company_id      UUID NOT NULL REFERENCES companies(id),
+  invoice_number  VARCHAR(100) NOT NULL,
+  serial_number   VARCHAR(50),
+  data_type       VARCHAR(10) DEFAULT 'xml',   -- 'xml' | 'html' | 'json'
+  raw_content     TEXT NOT NULL,               -- full XML/HTML/JSON string from GDT
+  fetched_at      TIMESTAMPTZ DEFAULT NOW(),
+  parsed_at       TIMESTAMPTZ,                 -- set when successfully parsed
+  parse_status    VARCHAR(20) DEFAULT 'pending',  -- 'pending' | 'success' | 'failed'
+  parse_error     TEXT,
+  UNIQUE(company_id, invoice_number)
+);
+
+CREATE INDEX idx_raw_invoices_parse_status ON raw_invoice_data(parse_status, company_id);
+CREATE INDEX idx_raw_invoices_fetched ON raw_invoice_data(company_id, fetched_at DESC);
+
+TASK 2: Implement in GdtBotRunner.ts — Save-before-Parse pattern
+
+// Custom error for GDT structural changes (not credential errors)
+export class GdtStructuralError extends Error {
+  constructor(message: string, public readonly selector?: string) {
+    super(message)
+    this.name = 'GdtStructuralError'
+  }
+}
+
+// In processInvoice() method:
+async processInvoice(
+  invoiceNumber: string,
+  rawXml: string,
+  companyId: string
+): Promise<'saved' | 'parsed' | 'failed'> {
+  
+  // Step 1: ALWAYS save raw data first (before parsing)
+  await db.query(`
+    INSERT INTO raw_invoice_data (company_id, invoice_number, data_type, raw_content)
+    VALUES ($1, $2, 'xml', $3)
+    ON CONFLICT (company_id, invoice_number)
+    DO UPDATE SET
+      raw_content = EXCLUDED.raw_content,
+      fetched_at = NOW(),
+      parse_status = 'pending'
+  `, [companyId, invoiceNumber, rawXml])
+  
+  // Step 2: Try to parse (if this fails, raw data is still safe)
+  try {
+    const normalized = GdtXmlParser.parse(rawXml, companyId)
+    await bulkUpsertInvoices([normalized])
+    
+    // Mark as parsed
+    await db.query(`
+      UPDATE raw_invoice_data
+      SET parse_status='success', parsed_at=NOW()
+      WHERE company_id=$1 AND invoice_number=$2
+    `, [companyId, invoiceNumber])
+    
+    return 'parsed'
+  } catch (parseError: any) {
+    // Log warning but DON'T stop the job — data is safe in raw_invoice_data
+    logger.warn(`[GdtBot] Parse failed for ${invoiceNumber} — raw data saved for later reparse`, {
+      error: parseError.message,
+      invoiceNumber,
+      companyId
+    })
+    
+    await db.query(`
+      UPDATE raw_invoice_data
+      SET parse_status='failed', parse_error=$1
+      WHERE company_id=$2 AND invoice_number=$3
+    `, [parseError.message, companyId, invoiceNumber])
+    
+    return 'saved'  // data safe, parsing failed
+  }
+}
+
+// Login failure detection → GdtStructuralError
+async login(credentials: any): Promise<GdtSession> {
+  const page = await this.browser.newPage()
+  await page.goto(GDT_BASE + '/login', { waitUntil: 'networkidle' })
+  
+  // Check for login form selector
+  const loginForm = await page.$('input[name="username"], #username, .login-form input')
+  if (!loginForm) {
+    throw new GdtStructuralError(
+      'Login form selector not found — GDT may have changed page structure',
+      'input[name="username"]'
+    )
+  }
+  // ... rest of login logic
+}
+
+TASK 3: Global Circuit Breaker in sync.worker.ts
+
+const CIRCUIT_BREAKER_KEY  = 'gdt:circuit_breaker:errors'
+const CIRCUIT_BREAKER_TRIP  = 20   // trip after 20 structural errors in 1 hour
+const CIRCUIT_BREAKER_TTL   = 3600 // 1 hour window
+
+// In worker's failed event:
+async function handleJobFailure(job: Job, error: Error): Promise<void> {
+  
+  if (error instanceof GdtStructuralError) {
+    // Structural error: GDT changed — not the tenant's fault
+    // DO NOT increment consecutive_failures for the company
+    
+    const errorCount = await redis.incr(CIRCUIT_BREAKER_KEY)
+    await redis.expire(CIRCUIT_BREAKER_KEY, CIRCUIT_BREAKER_TTL)
+    
+    logger.error(`[CircuitBreaker] GdtStructuralError count: ${errorCount}/${CIRCUIT_BREAKER_TRIP}`, {
+      error: error.message,
+      selector: error.selector,
+      jobId: job.id
+    })
+    
+    if (errorCount >= CIRCUIT_BREAKER_TRIP) {
+      // TRIP: pause all workers
+      await manualWorker.pause()
+      await autoWorker.pause()
+      
+      logger.error('[CIRCUIT BREAKER TRIPPED] GDT system structure changed. ALL workers paused.', {
+        errorCount,
+        threshold: CIRCUIT_BREAKER_TRIP
+      })
+      
+      // Notify admin (push notification + Telegram)
+      await sendAdminAlert({
+        level: 'CRITICAL',
+        title: '🚨 GDT Bot Circuit Breaker Tripped',
+        message: `${errorCount} structural errors in 1 hour. All workers paused. GDT may have changed page structure. Manual investigation needed.`,
+        data: { errorCount, selector: error.selector, jobId: job.id }
+      })
+      
+      // Set circuit breaker status in Redis for admin UI
+      await redis.set('gdt:circuit_breaker:status', JSON.stringify({
+        tripped: true,
+        trippedAt: new Date().toISOString(),
+        errorCount,
+        lastError: error.message
+      }))
+    }
+    return  // Do NOT update company consecutive_failures
+  }
+
+  // Regular errors (credentials, network, etc.) → update company failure count
+  await db.query(`
+    UPDATE gdt_bot_configs
+    SET consecutive_failures = consecutive_failures + 1,
+        last_error = $1,
+        last_run_status = 'error'
+    WHERE company_id = $2
+  `, [error.message, job.data.tenantId])
+}
+
+// Admin endpoint to reset circuit breaker:
+// POST /admin/bot/circuit-breaker/reset
+async function resetCircuitBreaker(req: Request, res: Response): Promise<void> {
+  await redis.del(CIRCUIT_BREAKER_KEY)
+  await redis.set('gdt:circuit_breaker:status', JSON.stringify({ tripped: false }))
+  
+  // Resume workers
+  await manualWorker.resume()
+  await autoWorker.resume()
+  
+  logger.info('[CircuitBreaker] Manually reset by admin', { adminId: req.user.id })
+  res.json({ message: 'Circuit breaker reset — workers resumed' })
+}
+
+TASK 4: Re-parse endpoint (for failed parses after parser is fixed)
+
+POST /admin/bot/reparse-failed
+  Body: { companyId?: string }  // null = reparse all companies
+  
+  Logic:
+    SELECT id, company_id, invoice_number, raw_content
+    FROM raw_invoice_data
+    WHERE parse_status = 'failed'
+      AND ($1::uuid IS NULL OR company_id = $1)
+    LIMIT 1000
+  
+  For each: run GdtXmlParser.parse() → update invoices table → set parse_status='success'
+  Return: { reparsed: N, stillFailed: M }
+  
+  This allows recovering all data without re-crawling GDT after fixing the parser.
+```
+
+### BOT-ENT-04 — Browser Fingerprint Pool + Per-Tenant Proxy
+```
+[Respond in Vietnamese]
+CONTEXT: Two remaining gaps to reach true 1000-user scale:
+1. UA alone is insufficient — GDT WAF checks TLS fingerprint, Accept headers, viewport size.
+   Need matching browser profile (UA + headers + timing) for each session.
+2. Shared proxy pool creates cross-tenant correlation — GDT can link tenants using same IPs.
+   Need dedicated IP ranges or proxy affinity per tenant.
+
+TASK 1: Browser Profile Pool (fingerprint consistency)
+
+Create /bot/src/fingerprint-pool.ts:
+
+interface BrowserProfile {
+  id: string
+  userAgent: string
+  acceptLanguage: string
+  accept: string
+  secChUa: string
+  secChUaPlatform: string
+  secChUaMobile: string
+  viewportWidth: number
+  viewportHeight: number
+  timezone: string
+}
+
+// Real browser profiles — extracted from actual Chrome/Firefox on Windows/Mac
+const BROWSER_PROFILES: BrowserProfile[] = [
+  {
+    id: 'chrome-120-win',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    acceptLanguage: 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+    accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    secChUa: '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    secChUaPlatform: '"Windows"',
+    secChUaMobile: '?0',
+    viewportWidth: 1920, viewportHeight: 1080,
+    timezone: 'Asia/Ho_Chi_Minh'
+  },
+  {
+    id: 'chrome-119-mac',
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    acceptLanguage: 'vi-VN,vi;q=0.9,en;q=0.8',
+    accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    secChUa: '"Google Chrome";v="119", "Chromium";v="119", "Not?A_Brand";v="24"',
+    secChUaPlatform: '"macOS"',
+    secChUaMobile: '?0',
+    viewportWidth: 1440, viewportHeight: 900,
+    timezone: 'Asia/Ho_Chi_Minh'
+  },
+  {
+    id: 'firefox-121-win',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+    acceptLanguage: 'vi-VN,vi;q=0.8,en-US;q=0.5,en;q=0.3',
+    accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    secChUa: '',  // Firefox doesn't send sec-ch-ua
+    secChUaPlatform: '',
+    secChUaMobile: '',
+    viewportWidth: 1366, viewportHeight: 768,
+    timezone: 'Asia/Ho_Chi_Minh'
+  },
+  // Add 5-10 more real profiles
+]
+
+// Get consistent profile for a given session (deterministic but distributed)
+export function getProfileForSession(proxySessionId: string): BrowserProfile {
+  // Hash the session ID to consistently pick a profile
+  const hash = proxySessionId.split('').reduce((acc, ch) => acc + ch.charCodeAt(0), 0)
+  return BROWSER_PROFILES[hash % BROWSER_PROFILES.length]
+}
+
+// Get full headers for a session
+export function getSessionHeaders(profile: BrowserProfile): Record<string, string> {
+  const headers: Record<string, string> = {
+    'User-Agent': profile.userAgent,
+    'Accept': profile.accept,
+    'Accept-Language': profile.acceptLanguage,
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Referer': 'https://hoadondientu.gdt.gov.vn/',
+    'Origin': 'https://hoadondientu.gdt.gov.vn',
+  }
+  // Only add Chrome-specific headers for Chrome profiles
+  if (profile.secChUa) {
+    headers['sec-ch-ua'] = profile.secChUa
+    headers['sec-ch-ua-platform'] = profile.secChUaPlatform
+    headers['sec-ch-ua-mobile'] = profile.secChUaMobile
+    headers['Sec-Fetch-Dest'] = 'document'
+    headers['Sec-Fetch-Mode'] = 'navigate'
+    headers['Sec-Fetch-Site'] = 'same-origin'
+  }
+  return headers
+}
+
+-- Update GdtBotRunner to use profiles:
+const profile = getProfileForSession(proxySessionId)
+const sessionAxios = axios.create({
+  headers: getSessionHeaders(profile)
+  // proxy config...
+})
+
+TASK 2: Per-Tenant Proxy Affinity
+
+Update proxy-manager.ts with tenant-affinity support:
+
+class ProxyManager extends EventEmitter {
+  private tenantProxyMap = new Map<string, string>()  // tenantId → assigned proxy URL
+
+  // Get same proxy for same tenant (within session)
+  nextForSession(proxySessionId: string): string | null {
+    const available = this.proxies.filter(p => !p.failed)
+    if (available.length === 0) return null
+    
+    // Round-robin by session (not random) for even distribution
+    const idx = this.hashString(proxySessionId) % available.length
+    return available[idx].url
+  }
+
+  // Prefer same proxy for same tenant across sessions (if proxy is healthy)
+  nextForTenant(tenantId: string): string | null {
+    // Check if tenant has an assigned proxy that's still healthy
+    const assigned = this.tenantProxyMap.get(tenantId)
+    if (assigned) {
+      const proxy = this.proxies.find(p => p.url === assigned && !p.failed)
+      if (proxy) return proxy.url
+    }
+    
+    // Assign new proxy to tenant
+    const available = this.proxies.filter(p => !p.failed)
+    if (available.length === 0) return null
+    
+    const idx = this.hashString(tenantId) % available.length
+    const assigned_url = available[idx].url
+    this.tenantProxyMap.set(tenantId, assigned_url)
+    return assigned_url
+  }
+
+  // Clear tenant assignment (after proxy fails or rotation requested)
+  clearTenantProxy(tenantId: string): void {
+    this.tenantProxyMap.delete(tenantId)
+  }
+
+  private hashString(s: string): number {
+    return s.split('').reduce((acc, ch) => (acc * 31 + ch.charCodeAt(0)) & 0xFFFFFFFF, 0)
+  }
+}
+
+-- In sync.worker.ts: use nextForTenant() instead of next()
+const proxyUrl = proxyManager.nextForTenant(job.data.tenantId)
+```
+
+### BOT-ENT-05 — Dead Letter Queue + Admin Recovery UI
+```
+[Respond in Vietnamese]
+CONTEXT: At 1000 users scale, some jobs will fail permanently (invalid credentials,
+blocked accounts, parser errors). Need a Dead Letter Queue to capture these for admin review,
+and an admin UI to investigate and retry.
+
+TASK 1: Configure DLQ in BullMQ
+
+// In sync.worker.ts, configure both workers to move failed jobs to DLQ:
+const DLQ_NAME = 'gdt-sync-dlq'
+const dlqQueue = new Queue(DLQ_NAME, { connection: redis })
+
+// In processGdtSync catch block:
+async function handlePermanentFailure(job: Job, error: Error): Promise<void> {
+  // Move to DLQ with enriched metadata
+  await dlqQueue.add('failed-job', {
+    originalJob:  job.data,
+    originalQueue: job.queueName,
+    failedAt:     new Date().toISOString(),
+    errorMessage: error.message,
+    errorStack:   error.stack,
+    errorType:    error.name,  // 'GdtStructuralError' | 'UnrecoverableError' | 'Error'
+    attempts:     job.attemptsMade,
+    jobId:        job.id
+  })
+}
+
+// In BullMQ worker config, after maxAttempts exhausted:
+worker.on('failed', async (job, error) => {
+  if (job && job.attemptsMade >= (job.opts.attempts || 3)) {
+    await handlePermanentFailure(job, error)
+  }
+  await handleJobFailure(job!, error)
+})
+
+TASK 2: DLQ DB table for persistence
+
+CREATE TABLE bot_failed_jobs (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  original_job_id VARCHAR(100),
+  company_id      UUID REFERENCES companies(id),
+  queue_name      VARCHAR(50),
+  job_data        JSONB,
+  error_message   TEXT,
+  error_type      VARCHAR(50),
+  attempts        SMALLINT,
+  failed_at       TIMESTAMPTZ DEFAULT NOW(),
+  admin_reviewed  BOOLEAN DEFAULT false,
+  retry_count     SMALLINT DEFAULT 0,
+  resolution      VARCHAR(50),  -- 'retried' | 'dismissed' | 'credential_issue' | 'gdt_change'
+  resolved_at     TIMESTAMPTZ,
+  resolved_by     UUID REFERENCES users(id)  -- admin who reviewed
+);
+
+-- Worker: save to DB when moving to DLQ
+await db.query(`
+  INSERT INTO bot_failed_jobs
+    (original_job_id, company_id, queue_name, job_data, error_message, error_type, attempts)
+  VALUES ($1, $2, $3, $4, $5, $6, $7)
+`, [job.id, job.data.tenantId, job.queueName, JSON.stringify(job.data),
+    error.message, error.name, job.attemptsMade])
+
+TASK 3: Admin UI for DLQ review
+
+Page: /admin/bot/failed-jobs
+
+Table columns:
+  Công ty | Loại lỗi | Thời gian | Số lần thử | Đã xem | Hành động
+
+Error type badges:
+  GdtStructuralError: RED "GDT thay đổi cấu trúc"
+  UnrecoverableError: ORANGE "Sai thông tin đăng nhập"
+  Error (generic):    GRAY "Lỗi thông thường"
+
+Filters: By error type | By company | Unreviewed only | Date range
+
+Per-job actions:
+  [Xem chi tiết] → modal with full error + job data
+  [Thử lại ngay] → POST /admin/bot/retry-job/:id → push to manual queue
+  [Bỏ qua] → mark as dismissed
+  [Cập nhật thông tin đăng nhập] → link to /admin/users/:id with GDT config
+
+Bulk actions:
+  [Thử lại tất cả loại X] → retry all jobs of same error type
+  [Xóa cũ hơn 7 ngày] → cleanup
+
+Summary cards at top:
+  Tổng failed: [N] | GDT structural: [N] (circuit breaker indicator) | Sai thông tin: [N] | Khác: [N]
+
+API:
+  GET  /admin/bot/failed-jobs?errorType=&reviewed=&page=
+  POST /admin/bot/retry-job/:id
+  POST /admin/bot/retry-bulk { errorType: string }
+  PATCH /admin/bot/failed-jobs/:id/review { resolution: string }
+  DELETE /admin/bot/failed-jobs/cleanup { olderThanDays: number }
+```
+
+### BOT-ENT-06 — Bot Metrics & Observability Dashboard
+```
+[Respond in Vietnamese]
+CONTEXT: At 1000 users, you need real-time visibility into bot health to detect issues
+before they affect many users. Build a metrics pipeline from BullMQ events → Redis counters → Admin dashboard.
+
+TASK 1: Metrics collector in sync.worker.ts
+
+// Track metrics after each job (success or fail)
+async function recordMetrics(job: Job, result: 'success' | 'failed', durationMs: number): Promise<void> {
+  const now = Date.now()
+  const hourKey = `bot:metrics:${new Date().toISOString().slice(0, 13)}`  // hourly bucket
+
+  const pipeline = redis.pipeline()
+
+  // Increment counters in hourly bucket (expire after 7 days)
+  pipeline.hincrby(hourKey, 'total', 1)
+  pipeline.hincrby(hourKey, result, 1)
+  pipeline.hincrby(hourKey, 'invoices_' + result, job.returnvalue?.count || 0)
+  pipeline.expire(hourKey, 7 * 24 * 3600)
+
+  // Track queue depth
+  pipeline.set('bot:metrics:manual_depth', await manualQueue.getWaitingCount())
+  pipeline.set('bot:metrics:auto_depth',   await autoQueue.getWaitingCount())
+
+  // Track circuit breaker
+  const cbErrors = await redis.get(CIRCUIT_BREAKER_KEY)
+  pipeline.set('bot:metrics:circuit_errors', cbErrors || '0')
+
+  // Track avg duration (rolling)
+  pipeline.lpush('bot:metrics:durations', durationMs)
+  pipeline.ltrim('bot:metrics:durations', 0, 99)  // keep last 100
+
+  // Captcha metrics (from job data)
+  if (job.data.captchaAttempts) {
+    pipeline.hincrby(hourKey, 'captcha_attempts', job.data.captchaAttempts)
+    pipeline.hincrby(hourKey, 'captcha_fails',    job.data.captchaFails || 0)
+  }
+
+  await pipeline.exec()
+}
+
+-- Add to both worker 'completed' and 'failed' events:
+manualWorker.on('completed', (job) => recordMetrics(job, 'success', job.finishedOn! - job.processedOn!))
+manualWorker.on('failed',    (job, err) => recordMetrics(job!, 'failed', Date.now() - (job?.processedOn || Date.now())))
+
+TASK 2: Admin Bot Dashboard page /admin/bot
+
+Header: "Bot GDT — Trạng thái hệ thống" + [Dừng tất cả] [Tiếp tục tất cả] toggle
+
+Row 1 — Status cards (4 cards):
+  Manual queue: [N] đang chờ | [M] đang chạy
+  Auto queue:   [N] đang chờ | [M] đang chạy
+  Circuit Breaker: ✅ Bình thường (0/20) | 🚨 Đã kích hoạt (TRIPPED)
+  Failed jobs 24h: [N] (click → /admin/bot/failed-jobs)
+
+Row 2 — Real-time charts (last 24 hours):
+  Line chart: Success/Failed jobs per hour (Recharts)
+  Line chart: Queue depth over time (manual vs auto)
+
+Row 3 — Performance metrics:
+  Avg job duration: [Xms] (from rolling average)
+  Success rate 24h: [X%]
+  Captcha success rate: [X%]
+  Invoices synced today: [N]
+
+Row 4 — Per-company breakdown (top 20 by last activity):
+  Company | Status | Last sync | Invoices today | Consecutive failures | Next sync
+  Status badges: ✅ OK | ⚠️ Warning | 🔴 Blocked | ⏸ Paused
+  [Force sync] [View logs] per row
+
+Row 5 — Circuit Breaker panel:
+  Error count: [N]/20 (progress bar, red when >15)
+  Last error: [message + timestamp]
+  If tripped: [Reset Circuit Breaker] button (prominent red)
+  Recent structural errors list (last 10)
+
+API: GET /admin/bot/metrics
+  Returns: all metrics from Redis in one call
+  Cache: 30 second TTL
+
+Auto-refresh: page polls every 30 seconds (use SWR or polling)
+```
+

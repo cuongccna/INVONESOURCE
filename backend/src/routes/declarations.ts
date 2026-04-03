@@ -77,6 +77,7 @@ router.post(
 
       const engine = new TaxDeclarationEngine();
       let declaration;
+      const month = parsed.data.quarter !== undefined ? parsed.data.quarter * 3 : parsed.data.month!;
       if (parsed.data.quarter !== undefined) {
         declaration = await engine.calculateQuarterlyDeclaration(
           req.user!.companyId!, parsed.data.quarter, parsed.data.year
@@ -86,7 +87,11 @@ router.post(
           req.user!.companyId!, parsed.data.month!, parsed.data.year
         );
       }
-      sendSuccess(res, declaration);
+      // Attach audit gate warnings (non-blocking — UI shows them as informational alerts)
+      const warnings = await engine.getCT23Warnings(
+        req.user!.companyId!, month, parsed.data.year
+      ).catch(() => null);
+      sendSuccess(res, { ...declaration, _warnings: warnings });
     } catch (err) {
       next(err);
     }

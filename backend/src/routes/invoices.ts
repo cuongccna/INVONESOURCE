@@ -5,6 +5,9 @@ import { authenticate, requireRole } from '../middleware/auth';
 import { requireCompany } from '../middleware/company';
 import { ValidationError, NotFoundError, ForbiddenError } from '../utils/AppError';
 import { sendSuccess, sendPaginated } from '../utils/response';
+import { cashPaymentDetector } from '../services/CashPaymentDetector';
+import { amendedInvoiceRouter } from '../services/AmendedInvoiceRouter';
+import { missingInvoiceFinder } from '../services/MissingInvoiceFinder';
 
 // Hợp lệ lý do ẩn hóa đơn
 const DELETE_REASONS = ['duplicate', 'invalid', 'test_data', 'other'] as const;
@@ -42,6 +45,7 @@ const listSchema = z.object({
   toDate: z.string().optional(),
   search: z.string().optional(),
   importSessionId: z.string().uuid().optional(),
+  invoiceGroup: z.coerce.number().int().optional(),
 });
 
 // GET /api/invoices
@@ -50,7 +54,7 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
     const query = listSchema.safeParse(req.query);
     if (!query.success) throw new ValidationError(query.error.issues[0]?.message ?? 'Invalid query');
 
-    const { page, pageSize, direction, status, fromDate, toDate, search, importSessionId } = query.data;
+    const { page, pageSize, direction, status, fromDate, toDate, search, importSessionId, invoiceGroup } = query.data;
     const companyId = req.user!.companyId;
     const offset = (page - 1) * pageSize;
 
@@ -63,6 +67,7 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
     if (fromDate) { conditions.push(`invoice_date >= $${idx++}`); params.push(fromDate); }
     if (toDate) { conditions.push(`invoice_date <= $${idx++}`); params.push(toDate); }
     if (importSessionId) { conditions.push(`import_session_id = $${idx++}`); params.push(importSessionId); }
+    if (invoiceGroup != null) { conditions.push(`invoice_group = $${idx++}`); params.push(invoiceGroup); }
     if (search) {
       conditions.push(`(invoice_number ILIKE $${idx} OR seller_name ILIKE $${idx} OR buyer_name ILIKE $${idx})`);
       params.push(`%${search}%`);
@@ -199,6 +204,90 @@ router.post('/bulk-permanent-ignore', requireRole('OWNER', 'ADMIN'), async (req:
   } catch (err) {
     next(err);
   }
+});
+
+// ── Amended Invoice Routing (P50.2) ───────────────────────────────────────────
+
+// POST /api/invoices/analyze-amendments
+router.post('/analyze-amendments', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const result = await amendedInvoiceRouter.analyzeAmendments(companyId);
+    sendSuccess(res, { processed: result.length, data: result });
+  } catch (err) { next(err); }
+});
+
+// GET /api/invoices/amendments?month=&year=
+router.get('/amendments', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const { month, year, page, pageSize } = req.query as Record<string, string>;
+    const now  = new Date();
+    const pg   = Number(page ?? 1);
+    const pgSz = Number(pageSize ?? 50);
+    const offset = (pg - 1) * pgSz;
+    const m = Number(month ?? now.getMonth() + 1);
+    const y = Number(year  ?? now.getFullYear());
+    const res2 = await pool.query(
+      `SELECT id, invoice_number, invoice_date, invoice_relation_type, related_invoice_number,
+              cross_period_flag, routing_decision, supplemental_declaration_needed,
+              seller_name, total_amount
+       FROM active_invoices
+       WHERE company_id = $1
+         AND EXTRACT(MONTH FROM invoice_date) = $2
+         AND EXTRACT(YEAR  FROM invoice_date) = $3
+         AND invoice_relation_type IN ('replacement','adjustment')
+       ORDER BY invoice_date DESC
+       LIMIT $4 OFFSET $5`,
+      [companyId, m, y, pgSz, offset],
+    );
+    sendSuccess(res, { data: res2.rows, meta: { page: pg, pageSize: pgSz } });
+  } catch (err) { next(err); }
+});
+
+// ── Missing Invoice Finder (P50.3) ────────────────────────────────────────────
+
+// GET /api/invoices/missing
+router.get('/missing', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const { month, year, page, pageSize } = req.query as Record<string, string>;
+    const now  = new Date();
+    const pg   = Number(page ?? 1);
+    const pgSz = Number(pageSize ?? 50);
+    const result = await missingInvoiceFinder.getAlerts(
+      companyId, 'open', pg, pgSz,
+    );
+    sendSuccess(res, result);
+  } catch (err) { next(err); }
+});
+
+// POST /api/invoices/missing/scan
+router.post('/missing/scan', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const userId    = req.user!.userId;
+    const { month, year } = req.body as { month?: number; year?: number };
+    const now = new Date();
+    const results1 = await missingInvoiceFinder.scanCrossCompany(userId, month ?? now.getMonth() + 1, year ?? now.getFullYear());
+    const results2 = await missingInvoiceFinder.scanGdtMismatch(companyId, month ?? now.getMonth() + 1, year ?? now.getFullYear());
+    sendSuccess(res, {
+      crossCompany: results1,
+      gdtMismatch:  results2.missingCount,
+      total:        results1 + results2.missingCount,
+    });
+  } catch (err) { next(err); }
+});
+
+// PATCH /api/invoices/missing/:id
+router.patch('/missing/:id', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const { status, note } = req.body as { status: string; note?: string };
+    if (!status) throw new ValidationError('status is required');
+    await missingInvoiceFinder.updateStatus(req.params.id!, companyId, status as 'found' | 'not_applicable' | 'acknowledged', note);
+    sendSuccess(res, { ok: true });
+  } catch (err) { next(err); }
 });
 
 // ─── PARAMETERIZED ROUTES — sau cùng để không bắt nhầm static paths ─────────
@@ -595,6 +684,69 @@ router.post('/:id/line-items', requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'), asyn
   } catch (err) {
     next(err);
   }
+});
+
+// ── Cash Payment Risk (P50.1) ─────────────────────────────────────────────────
+
+// GET /api/invoices/cash-risk-summary
+router.get('/cash-risk-summary', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const { month, year } = req.query as Record<string, string>;
+    const now = new Date();
+    const summary = await cashPaymentDetector.getSummary(
+      companyId,
+      month ? Number(month) : now.getMonth() + 1,
+      year  ? Number(year)  : now.getFullYear(),
+    );
+    sendSuccess(res, summary);
+  } catch (err) { next(err); }
+});
+
+// POST /api/invoices/cash-risk-scan
+router.post('/cash-risk-scan', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const { month, year } = req.body as { month?: number; year?: number };
+    const result = await cashPaymentDetector.scanCompany(companyId, month, year);
+    sendSuccess(res, result);
+  } catch (err) { next(err); }
+});
+
+// PATCH /api/invoices/:id/payment-method
+router.patch('/:id/payment-method', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const userId    = req.user!.userId;
+    const { method, note } = req.body as { method: 'cash' | 'bank_transfer' | 'cheque' | 'card' | 'mixed'; note?: string };
+    if (!method) throw new ValidationError('method is required');
+    await cashPaymentDetector.setPaymentMethod(req.params.id!, method, userId, companyId);
+    sendSuccess(res, { ok: true });
+  } catch (err) { next(err); }
+});
+
+// POST /api/invoices/bulk-payment-method
+router.post('/bulk-payment-method', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const userId    = req.user!.userId;
+    const { invoiceIds, method } = req.body as { invoiceIds: string[]; method: 'cash' | 'bank_transfer' | 'cheque' | 'card' | 'mixed' };
+    if (!Array.isArray(invoiceIds) || invoiceIds.length === 0) throw new ValidationError('invoiceIds required');
+    if (!method) throw new ValidationError('method is required');
+    const count = await cashPaymentDetector.bulkSetPaymentMethod(invoiceIds, method, userId, companyId);
+    sendSuccess(res, { updated: count });
+  } catch (err) { next(err); }
+});
+
+// PATCH /api/invoices/:id/cash-risk-acknowledge
+router.patch('/:id/cash-risk-acknowledge', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const userId    = req.user!.userId;
+    const { note } = req.body as { note?: string };
+    await cashPaymentDetector.acknowledge(req.params.id!, userId, companyId, note);
+    sendSuccess(res, { ok: true });
+  } catch (err) { next(err); }
 });
 
 export default router;

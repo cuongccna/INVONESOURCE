@@ -8,12 +8,20 @@ export interface SyncJob {
   label: string;
 }
 
+/** Format Date → YYYY-MM-DD dùng giờ địa phương (không bị lệch UTC). */
+function toLocalDateStr(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
 function getMonthRange(year: number, month: number): { from: string; to: string } {
   const from = new Date(year, month - 1, 1);
   const to = new Date(year, month, 0); // last day of month
   return {
-    from: from.toISOString().slice(0, 10),
-    to: to.toISOString().slice(0, 10),
+    from: toLocalDateStr(from),
+    to:   toLocalDateStr(to),
   };
 }
 

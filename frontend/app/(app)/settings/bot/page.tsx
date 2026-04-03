@@ -62,19 +62,41 @@ export default function BotSettingsPage() {
   const [showOtp, setShowOtp]     = useState(false);
   const [running, setRunning]         = useState(false);
   const [showDatePicker, setShowDatePicker] = useState(false);
+  const [selectedMonth, setSelectedMonth] = useState('');
   const [runFrom, setRunFrom]         = useState('');
   const [runTo, setRunTo]             = useState('');
   const [dateError, setDateError]     = useState('');
 
-  /** Khi người dùng chọn Từ ngày, tự động điền Đến ngày = cuối tháng đó (giới hạn hôm nay). */
-  const validateAndSetFrom = (val: string) => {
-    setRunFrom(val);
+  /** Format Date → YYYY-MM-DD dùng giờ địa phương (không bị lệch múi giờ UTC). */
+  const toLocalDateStr = (d: Date): string => {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  };
+
+  /** Khi người dùng chọn tháng từ month-picker, auto điền từ ngày 1 đến cuối tháng (giới hạn hôm nay). */
+  const handleMonthSelect = (val: string) => {
+    setSelectedMonth(val);
     setDateError('');
     if (!val) return;
-    const today = new Date().toISOString().slice(0, 10);
-    // Auto-fill to end of the selected month, capped at today
-    const d = new Date(val + 'T00:00:00');
-    const endOfMonth = new Date(d.getFullYear(), d.getMonth() + 1, 0).toISOString().slice(0, 10);
+    const [y, mo] = val.split('-').map(Number);
+    const first = toLocalDateStr(new Date(y, mo - 1, 1));
+    const last  = toLocalDateStr(new Date(y, mo, 0));          // ngày 0 của tháng kế = cuối tháng
+    const today = toLocalDateStr(new Date());
+    setRunFrom(first);
+    setRunTo(last > today ? today : last);
+  };
+
+  /** Khi người dùng chọn Từ ngày thủ công, tự động điền Đến ngày = cuối tháng đó (giới hạn hôm nay). */
+  const validateAndSetFrom = (val: string) => {
+    setRunFrom(val);
+    setSelectedMonth('');   // clear month picker khi chọn ngày thủ công
+    setDateError('');
+    if (!val) return;
+    const today = toLocalDateStr(new Date());
+    const d = new Date(val + 'T00:00:00');                     // local time
+    const endOfMonth = toLocalDateStr(new Date(d.getFullYear(), d.getMonth() + 1, 0));
     const autoTo = endOfMonth > today ? today : endOfMonth;
     setRunTo(autoTo);
   };
@@ -82,12 +104,12 @@ export default function BotSettingsPage() {
     setRunTo(val);
     setDateError('');
     if (!val || !runFrom) return;
-    const diffMs = new Date(val).getTime() - new Date(runFrom).getTime();
+    const diffMs = new Date(val + 'T00:00:00').getTime() - new Date(runFrom + 'T00:00:00').getTime();
     if (diffMs < 0) { setDateError('Đến ngày phải lớn hơn Từ ngày'); return; }
     if (diffMs > 31 * 24 * 60 * 60 * 1000) {
-      // Cap fromDate = toDate - 31 days
-      const capped = new Date(new Date(val).getTime() - 31 * 24 * 60 * 60 * 1000);
-      setRunFrom(capped.toISOString().slice(0, 10));
+      // Cap fromDate = toDate - 31 days (dùng local time)
+      const capped = new Date(new Date(val + 'T00:00:00').getTime() - 31 * 24 * 60 * 60 * 1000);
+      setRunFrom(toLocalDateStr(capped));
       setDateError('');
     }
   };
@@ -274,8 +296,11 @@ export default function BotSettingsPage() {
             <button
               onClick={() => {
                 const today = new Date();
-                const todayStr = today.toISOString().slice(0, 10);
-                const firstOfMonth = new Date(today.getFullYear(), today.getMonth(), 1).toISOString().slice(0, 10);
+                const todayStr = toLocalDateStr(today);
+                const firstOfMonth = toLocalDateStr(new Date(today.getFullYear(), today.getMonth(), 1));
+                // Pre-select current month in month-picker
+                const ym = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}`;
+                setSelectedMonth(ym);
                 setRunFrom(firstOfMonth);
                 setRunTo(todayStr);
                 setDateError('');
@@ -414,6 +439,22 @@ export default function BotSettingsPage() {
               ⚠️ Quy định GDT: chỉ được phép tra cứu tối đa <strong>31 ngày</strong> mỗi lần.
             </p>
             <div className="space-y-3">
+              {/* Chọn nhanh theo tháng */}
+              <div>
+                <label className="text-xs font-medium text-gray-600 block mb-1">📅 Chọn nhanh theo tháng</label>
+                <input
+                  type="month"
+                  value={selectedMonth}
+                  max={`${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`}
+                  onChange={e => handleMonthSelect(e.target.value)}
+                  className="w-full border border-blue-300 bg-blue-50 rounded-lg px-3 py-2 text-sm"
+                />
+              </div>
+              <div className="flex items-center gap-2 text-xs text-gray-400">
+                <div className="flex-1 border-t border-gray-200" />
+                <span>hoặc nhập ngày cụ thể</span>
+                <div className="flex-1 border-t border-gray-200" />
+              </div>
               <div>
                 <label className="text-xs font-medium text-gray-600 block mb-1">Từ ngày</label>
                 <input

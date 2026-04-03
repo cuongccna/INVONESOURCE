@@ -33,6 +33,7 @@ import auditRouter from './routes/audit';
 import insightsRouter from './routes/insights';
 import importRouter from './routes/import';
 import botRouter from './routes/bot';
+import crawlerRecipesRouter from './routes/crawler-recipes';
 import catalogsRouter from './routes/catalogs';
 import inventoryRouter from './routes/inventory';
 import cashBookRouter from './routes/cash-book';
@@ -53,6 +54,7 @@ import { scheduleGdtBotSync, gdtBotSchedulerWorker } from './jobs/GdtBotSchedule
 import { scheduleQuotaReset } from './jobs/QuotaResetJob';
 import { syncNotificationWorker } from './jobs/SyncNotificationWorker';
 import adminRouter from './routes/admin';
+import toolsRouter from './routes/tools';
 
 const app = express();
 
@@ -117,6 +119,7 @@ app.use('/api/audit', auditRouter);
 app.use('/api/insights', insightsRouter);
 app.use('/api/import', importRouter);
 app.use('/api/bot', botRouter);
+app.use('/api/crawler-recipes', crawlerRecipesRouter);
 app.use('/api/catalogs', catalogsRouter);
 app.use('/api/inventory', inventoryRouter);
 app.use('/api/cash-book', cashBookRouter);
@@ -125,6 +128,7 @@ app.use('/api/journals', journalsRouter);
 app.use('/api/reports/profit-loss', profitLossRouter);
 app.use('/api/hkd', hkdRouter);
 app.use('/api/admin', adminRouter);
+app.use('/api/tools', toolsRouter);
 
 // Health check (unauthenticated)
 app.get('/health', (_req, res) => {

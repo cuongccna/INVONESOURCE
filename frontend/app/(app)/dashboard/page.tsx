@@ -129,6 +129,15 @@ interface EsgWidgetData {
   by_category: Array<{ category_name: string; tco2e: number }>;
 }
 
+interface GhostSummary {
+  critical: number;
+  high: number;
+  medium: number;
+  total_vat_at_risk: number;
+  acknowledged: number;
+  total: number;
+}
+
 interface QuickAction {
   key: string;
   icon: string;
@@ -147,6 +156,7 @@ export default function DashboardPage() {
   const [loadingAnomalies, setLoadingAnomalies] = useState(false);
   const [forecast, setForecast] = useState<VatForecast | null>(null);
   const [esg, setEsg] = useState<EsgWidgetData | null>(null);
+  const [ghostSummary, setGhostSummary] = useState<GhostSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [analyticsPeriod, setAnalyticsPeriod] = useState(3);
   const [quickActions, setQuickActions] = useState<QuickAction[]>([]);
@@ -204,6 +214,13 @@ export default function DashboardPage() {
       .get<{ data: EsgWidgetData }>(`/esg/estimate?year=${year}`)
       .then((res) => setEsg(res.data.data))
       .catch(() => setEsg(null));
+  }, [activeCompanyId]);
+
+  useEffect(() => {
+    apiClient
+      .get<{ data: GhostSummary }>('/audit/ghost-companies/summary')
+      .then((res) => setGhostSummary(res.data.data))
+      .catch(() => setGhostSummary(null));
   }, [activeCompanyId]);
 
   const handlePeriodChange = (p: number) => {
@@ -543,6 +560,84 @@ export default function DashboardPage() {
           </div>
         )}
       </div>
+
+      {/* ── Ghost Company Widget (GHOST-05) ── */}
+      {ghostSummary !== null && (
+        <div className={`rounded-xl shadow-sm p-4 ${
+          ghostSummary.critical > 0
+            ? 'bg-red-50 border border-red-200'
+            : ghostSummary.high > 0
+            ? 'bg-orange-50 border border-orange-200'
+            : 'bg-green-50 border border-green-200'
+        }`}>
+          <div className="flex items-center justify-between">
+            <div className="flex items-start gap-3">
+              <span className="text-2xl mt-0.5">
+                {ghostSummary.critical > 0 ? '🚨' : ghostSummary.high > 0 ? '⚠️' : '✅'}
+              </span>
+              <div>
+                <h2 className={`text-sm font-semibold ${
+                  ghostSummary.critical > 0 ? 'text-red-800'
+                  : ghostSummary.high > 0 ? 'text-orange-800'
+                  : 'text-green-800'
+                }`}>
+                  {ghostSummary.critical > 0
+                    ? `Phát hiện ${ghostSummary.critical} nhà cung cấp nghiêm trọng`
+                    : ghostSummary.high > 0
+                    ? `${ghostSummary.high} nhà cung cấp cần kiểm tra`
+                    : 'Không phát hiện công ty ma'}
+                </h2>
+                {ghostSummary.total_vat_at_risk > 0 && (
+                  <p className="text-xs mt-0.5 text-red-700">
+                    VAT có thể bị loại:&nbsp;
+                    <strong>{Math.round(Number(ghostSummary.total_vat_at_risk) / 1_000_000).toLocaleString('vi-VN')}M₫</strong>
+                  </p>
+                )}
+                {ghostSummary.total === 0 && (
+                  <p className="text-xs text-green-600 mt-0.5">Tất cả nhà cung cấp đều hợp lệ</p>
+                )}
+              </div>
+            </div>
+            <Link
+              href="/audit/ghost-companies"
+              className={`text-xs font-medium px-3 py-1.5 rounded-lg whitespace-nowrap ${
+                ghostSummary.critical > 0
+                  ? 'bg-red-100 text-red-700 hover:bg-red-200'
+                  : ghostSummary.high > 0
+                  ? 'bg-orange-100 text-orange-700 hover:bg-orange-200'
+                  : 'bg-green-100 text-green-700 hover:bg-green-200'
+              }`}
+            >
+              Xem chi tiết →
+            </Link>
+          </div>
+          {(ghostSummary.critical > 0 || ghostSummary.high > 0) && (
+            <div className="mt-3 flex items-center gap-4 text-xs">
+              {ghostSummary.critical > 0 && (
+                <span className="flex items-center gap-1 text-red-700">
+                  <span className="w-2 h-2 rounded-full bg-red-500 inline-block" />
+                  {ghostSummary.critical} nghiêm trọng
+                </span>
+              )}
+              {ghostSummary.high > 0 && (
+                <span className="flex items-center gap-1 text-orange-700">
+                  <span className="w-2 h-2 rounded-full bg-orange-400 inline-block" />
+                  {ghostSummary.high} cảnh báo
+                </span>
+              )}
+              {ghostSummary.medium > 0 && (
+                <span className="flex items-center gap-1 text-amber-700">
+                  <span className="w-2 h-2 rounded-full bg-amber-400 inline-block" />
+                  {ghostSummary.medium} lưu ý
+                </span>
+              )}
+              {ghostSummary.acknowledged > 0 && (
+                <span className="text-gray-400">{ghostSummary.acknowledged} đã kiểm tra</span>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* ── VAT Forecast + Tax Calendar ── */}
       {forecast && forecast.periods_used > 0 && (() => {

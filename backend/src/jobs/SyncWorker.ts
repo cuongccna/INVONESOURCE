@@ -9,6 +9,9 @@ import { v4 as uuidv4 } from 'uuid';
 import { enqueueGdtValidation } from './GdtValidatorWorker';
 import { priceAnomalyDetector } from '../services/PriceAnomalyDetector';
 import { notificationService, pushService } from '../services/NotificationService';
+import { cashPaymentDetector } from '../services/CashPaymentDetector';
+import { amendedInvoiceRouter } from '../services/AmendedInvoiceRouter';
+import { missingInvoiceFinder } from '../services/MissingInvoiceFinder';
 
 export interface SyncJobPayload {
   companyId: string;
@@ -302,6 +305,26 @@ export const syncWorker = new Worker<SyncJobPayload>(
         }
       } catch (err) {
         console.warn(`[SyncWorker] Anomaly auto-detect failed (non-critical):`, (err as Error).message);
+      }
+
+      // Post-sync hooks — each isolated in try/catch (P43/P50 integration)
+      try {
+        const now = new Date();
+        await cashPaymentDetector.scanCompany(companyId, now.getMonth() + 1, now.getFullYear());
+      } catch (err) {
+        console.warn(`[SyncWorker] CashPaymentDetector post-sync failed (non-critical):`, (err as Error).message);
+      }
+      try {
+        await amendedInvoiceRouter.analyzeAmendments(companyId);
+      } catch (err) {
+        console.warn(`[SyncWorker] AmendedInvoiceRouter post-sync failed (non-critical):`, (err as Error).message);
+      }
+      try {
+        const now = new Date();
+        await missingInvoiceFinder.matchFoundInvoices(companyId);
+        await missingInvoiceFinder.scanGdtMismatch(companyId, now.getMonth() + 1, now.getFullYear());
+      } catch (err) {
+        console.warn(`[SyncWorker] MissingInvoiceFinder post-sync failed (non-critical):`, (err as Error).message);
       }
     }
 
