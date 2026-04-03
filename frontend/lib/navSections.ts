@@ -65,7 +65,7 @@ export const DRAWER_SECTIONS = [
     title: '🔍 Kiểm Toán AI',
     items: [
       { href: '/audit/anomalies',      label: 'Phát hiện bất thường' },
-      { href: '/audit/ghost-companies', label: 'Công ty ma' },
+      { href: '/audit/ghost-companies', label: 'Đánh giá rủi ro' },
       { href: '/audit/tax-rates',      label: 'Thuế suất bất thường' },
       { href: '/audit/cash-payment',   label: 'Hóa đơn tiền mặt' },
       { href: '/settings/audit-rules', label: 'Cấu hình quy tắc' },

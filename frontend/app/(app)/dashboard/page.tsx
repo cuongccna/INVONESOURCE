@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, Legend, LineChart, Line, PieChart, Pie, Cell,
+  ResponsiveContainer, Legend, Line, ComposedChart, Cell,
 } from 'recharts';
 import Link from 'next/link';
 import apiClient from '../../../lib/apiClient';
@@ -27,12 +27,6 @@ interface ChartData {
   invoiceTrend: Array<{ month: number; year: number; output_count: string; input_count: string; output_total: string; input_total: string }>;
 }
 
-interface Analytics {
-  topCustomers: Array<{ counterparty_name: string; counterparty_tax_code: string; invoice_count: string; total_amount: string }>;
-  topSuppliers: Array<{ counterparty_name: string; counterparty_tax_code: string; invoice_count: string; total_amount: string }>;
-  statusBreakdown: Array<{ status: string; direction: string; count: string }>;
-}
-
 interface AnomalyItem {
   id: string;
   invoiceId: string;
@@ -52,20 +46,14 @@ interface AnomalyReport {
 }
 
 /* ─── Constants ───────────────────────────────────────────────────────────── */
-const PIE_COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6'];
 const PROVIDER_LABELS: Record<string, string> = {
   misa: 'MISA', viettel: 'Viettel', bkav: 'BKAV', gdt_intermediary: 'GDT',
 };
-const STATUS_VN: Record<string, string> = {
-  valid: 'Hợp lệ', cancelled: 'Hủy', replaced: 'Thay thế', adjusted: 'Điều chỉnh',
-};
-
 /* ─── Formatters ──────────────────────────────────────────────────────────── */
 import { formatVND, formatVNDShort, formatVNDFull } from '../../../utils/formatCurrency';
 
 const compact = formatVND;
 const full = (n: string | number) => Number(n).toLocaleString('vi-VN');
-const mVnd = (n: string | number) => formatVND(Number(n));
 function timeAgo(iso: string) {
   const diff = Math.floor((Date.now() - new Date(iso).getTime()) / 60_000);
   if (diff < 1) return 'vừa xong';
@@ -88,31 +76,7 @@ function KCard({ label, value, sub, color = 'text-gray-900' }: {
   );
 }
 
-function TopTable({ rows, caption }: { rows: Analytics['topCustomers']; caption: string }) {
-  if (rows.length === 0) return <p className="text-sm text-center text-gray-400 py-4">Chưa có dữ liệu</p>;
-  return (
-    <div>
-      <p className="text-xs font-semibold text-gray-500 uppercase mb-2">{caption}</p>
-      <div className="space-y-2">
-        {rows.map((r, i) => (
-          <div key={i} className="flex items-center justify-between gap-2">
-            <div className="flex items-center gap-2 min-w-0">
-              <span className="text-xs font-bold text-gray-400 w-4">{i + 1}</span>
-              <div className="min-w-0">
-                <p className="text-sm font-medium text-gray-800 truncate">{r.counterparty_name}</p>
-                <p className="text-xs text-gray-400 font-mono">{r.counterparty_tax_code}</p>
-              </div>
-            </div>
-            <div className="text-right shrink-0">
-              <p className="text-sm font-bold text-gray-900">{formatVND(r.total_amount)}</p>
-              <p className="text-xs text-gray-400">{r.invoice_count} HĐ</p>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
+
 
 interface VatForecast {
   forecast_output_vat: number;
@@ -151,15 +115,14 @@ export default function DashboardPage() {
   const { activeCompanyId } = useCompany();
   const [kpi, setKpi] = useState<KpiData | null>(null);
   const [chart, setChart] = useState<ChartData | null>(null);
-  const [analytics, setAnalytics] = useState<Analytics | null>(null);
   const [anomalies, setAnomalies] = useState<AnomalyReport | null>(null);
   const [loadingAnomalies, setLoadingAnomalies] = useState(false);
   const [forecast, setForecast] = useState<VatForecast | null>(null);
   const [esg, setEsg] = useState<EsgWidgetData | null>(null);
   const [ghostSummary, setGhostSummary] = useState<GhostSummary | null>(null);
   const [loading, setLoading] = useState(true);
-  const [analyticsPeriod, setAnalyticsPeriod] = useState(3);
   const [quickActions, setQuickActions] = useState<QuickAction[]>([]);
+  const [vatViewMode, setVatViewMode] = useState<'monthly' | 'quarterly'>('monthly');
 
   // Period navigator: default to current month/year
   const now = new Date();
@@ -175,30 +138,28 @@ export default function DashboardPage() {
     setPeriodYear(newYear);
   };
 
-  const load = useCallback(async (period = analyticsPeriod, month = periodMonth, year = periodYear) => {
+  const load = useCallback(async (month = periodMonth, year = periodYear) => {
     try {
-      const [kpiRes, chartRes, analyticsRes, forecastRes] = await Promise.all([
+      const [kpiRes, chartRes, forecastRes] = await Promise.all([
         apiClient.get<{ data: KpiData }>(`/dashboard/kpi?month=${month}&year=${year}`),
         apiClient.get<{ data: ChartData }>(`/dashboard/charts?month=${month}&year=${year}`),
-        apiClient.get<{ data: Analytics }>(`/dashboard/analytics?months=${period}&month=${month}&year=${year}`),
         apiClient.get<{ data: VatForecast }>('/forecast/vat').catch(() => ({ data: { data: null } })),
       ]);
       setKpi(kpiRes.data.data);
       setChart(chartRes.data.data);
-      setAnalytics(analyticsRes.data.data);
       setForecast((forecastRes as { data: { data: VatForecast | null } }).data.data);
     } catch {
       // silent
     } finally {
       setLoading(false);
     }
-  }, [analyticsPeriod, periodMonth, periodYear]);
+  }, [periodMonth, periodYear]);
 
   useEffect(() => { void load(); }, [load, activeCompanyId]);
 
   useEffect(() => {
     setLoading(true);
-    void load(analyticsPeriod, periodMonth, periodYear);
+    void load(periodMonth, periodYear);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [periodMonth, periodYear]);
 
@@ -223,11 +184,6 @@ export default function DashboardPage() {
       .catch(() => setGhostSummary(null));
   }, [activeCompanyId]);
 
-  const handlePeriodChange = (p: number) => {
-    setAnalyticsPeriod(p);
-    void load(p, periodMonth, periodYear);
-  };
-
   const detectAnomalies = async () => {
     setLoadingAnomalies(true);
     try {
@@ -251,15 +207,43 @@ export default function DashboardPage() {
     'Phải Nộp': Math.round(Number(r.payable_vat) / 1_000_000),
   })) ?? [];
 
-  const revenueChartData = chart?.invoiceTrend.map((r) => ({
+  /* P&L chart: revenue, cost, gross profit per month */
+  const plChartData = chart?.invoiceTrend.map((r) => ({
     name: `T${r.month}/${String(r.year).slice(2)}`,
-    'Bán Ra': Math.round(Number(r.output_total) / 1_000_000),
-    'Mua Vào': Math.round(Number(r.input_total) / 1_000_000),
+    'Doanh Thu': Math.round(Number(r.output_total) / 1_000_000),
+    'Chi Phí': Math.round(Number(r.input_total) / 1_000_000),
+    'Lãi Gộp': Math.round((Number(r.output_total) - Number(r.input_total)) / 1_000_000),
   })) ?? [];
 
-  const pieData = analytics?.statusBreakdown
-    .filter((r) => r.direction === 'output')
-    .map((r) => ({ name: STATUS_VN[r.status] ?? r.status, value: Number(r.count) })) ?? [];
+  /* VAT quarterly grouping */
+  const vatQuarterlyData = (() => {
+    if (!chart?.vatTrend.length) return [] as typeof vatChartData;
+    const qMap: Record<string, { name: string; 'Đầu Ra': number; 'Đầu Vào': number; 'Phải Nộp': number }> = {};
+    chart.vatTrend.forEach((r) => {
+      const q = Math.ceil(r.period_month / 3);
+      const key = `Q${q}/${String(r.period_year).slice(2)}`;
+      if (!qMap[key]) qMap[key] = { name: key, 'Đầu Ra': 0, 'Đầu Vào': 0, 'Phải Nộp': 0 };
+      qMap[key]['Đầu Ra']   += Math.round(Number(r.output_vat)  / 1_000_000);
+      qMap[key]['Đầu Vào']  += Math.round(Number(r.input_vat)   / 1_000_000);
+      qMap[key]['Phải Nộp'] += Math.round(Number(r.payable_vat) / 1_000_000);
+    });
+    return Object.values(qMap);
+  })();
+  const activeVatData = vatViewMode === 'monthly' ? vatChartData : vatQuarterlyData;
+
+  /* CIT (Corporate Income Tax) annual estimate — 20% on gross profit */
+  const citYearData = chart?.invoiceTrend.filter(r => r.year === periodYear) ?? [];
+  const annualRevenue   = citYearData.reduce((s, r) => s + Number(r.output_total), 0);
+  const annualCost      = citYearData.reduce((s, r) => s + Number(r.input_total),  0);
+  const annualProfit    = annualRevenue - annualCost;
+  const estimatedCIT    = Math.max(0, annualProfit * 0.20);
+  const monthsWithData  = citYearData.length;
+  const projectedAnnualProfit = monthsWithData > 0 ? (annualProfit / monthsWithData) * 12 : 0;
+  const projectedCIT    = Math.max(0, projectedAnnualProfit * 0.20);
+  const citMonthlyData  = citYearData.map((r) => ({
+    name: `T${r.month}`,
+    'Lãi Gộp': Math.round((Number(r.output_total) - Number(r.input_total)) / 1_000_000),
+  }));
 
   if (loading) {
     return (
@@ -320,17 +304,11 @@ export default function DashboardPage() {
 
       {/* ── KPI Cards ── */}
       {kpi && (
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <KCard
             label="Tổng Hóa Đơn"
             value={full(kpi.invoices.total)}
             sub={`Ra: ${kpi.invoices.output_count} · Vào: ${kpi.invoices.input_count}`}
-          />
-          <KCard
-            label="Chờ Xét Duyệt GDT"
-            value={full(kpi.invoices.unvalidated_count)}
-            sub="Hóa đơn chưa được GDT xác nhận"
-            color="text-yellow-600"
           />
           <KCard
             label="Thuế GTGT Phải Nộp"
@@ -368,93 +346,128 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {/* ── Revenue Trend ── */}
-      {revenueChartData.length > 0 && (
+      {/* ── Revenue Trend replaced by P&L chart ── */}
+      {plChartData.length > 0 && (
         <div className="bg-white rounded-xl shadow-sm p-4">
-          <h2 className="text-sm font-semibold text-gray-700 mb-3">Doanh Thu / Chi Phí</h2>
-          <ResponsiveContainer width="100%" height={180}>
-            {revenueChartData.length <= 2 ? (
-              <BarChart data={revenueChartData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
-                <XAxis dataKey="name" tick={{ fontSize: 10 }} />
-                <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v * 1_000_000)} />
-                <Tooltip formatter={(val: number) => formatVNDFull(Number(val) * 1_000_000)} />
-                <Legend wrapperStyle={{ fontSize: 11 }} />
-                <Bar dataKey="Bán Ra" fill="#3b82f6" radius={[3, 3, 0, 0]} maxBarSize={30} />
-                <Bar dataKey="Mua Vào" fill="#10b981" radius={[3, 3, 0, 0]} maxBarSize={30} />
-              </BarChart>
-            ) : (
-              <LineChart data={revenueChartData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
-                <XAxis dataKey="name" tick={{ fontSize: 10 }} />
-                <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v * 1_000_000)} />
-                <Tooltip formatter={(val: number) => formatVNDFull(Number(val) * 1_000_000)} />
-                <Legend wrapperStyle={{ fontSize: 11 }} />
-                <Line type="monotone" dataKey="Bán Ra" stroke="#3b82f6" strokeWidth={2} dot={false} />
-                <Line type="monotone" dataKey="Mua Vào" stroke="#10b981" strokeWidth={2} dot={false} />
-              </LineChart>
-            )}
+          <h2 className="text-sm font-semibold text-gray-700 mb-1">📊 Lãi / Lỗ Tạm Thời</h2>
+          <p className="text-xs text-gray-400 mb-3">Doanh thu bán ra − chi phí mua vào (chưa trừ thuế, lương, khấu hao)</p>
+          <ResponsiveContainer width="100%" height={200}>
+            <ComposedChart data={plChartData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
+              <XAxis dataKey="name" tick={{ fontSize: 10 }} />
+              <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v * 1_000_000)} />
+              <Tooltip formatter={(val: number) => formatVNDFull(Number(val) * 1_000_000)} />
+              <Legend wrapperStyle={{ fontSize: 11 }} />
+              <Bar dataKey="Doanh Thu" fill="#3b82f6" radius={[3, 3, 0, 0]} maxBarSize={18} />
+              <Bar dataKey="Chi Phí" fill="#f87171" radius={[3, 3, 0, 0]} maxBarSize={18} />
+              <Line type="monotone" dataKey="Lãi Gộp" stroke="#10b981" strokeWidth={2} dot={{ r: 3 }} />
+            </ComposedChart>
           </ResponsiveContainer>
         </div>
       )}
       </div>{/* end charts grid */}
 
-      {/* ── Analytics period selector ── */}
-      <div className="flex items-center justify-between">
-        <h2 className="text-base font-semibold text-gray-800">Phân Tích</h2>
-        <div className="flex gap-1 bg-gray-100 rounded-lg p-1">
-          {[1, 3, 6, 12].map((m) => (
-            <button
-              key={m}
-              onClick={() => handlePeriodChange(m)}
-              className={`text-xs px-2.5 py-1 rounded-md font-medium transition-colors ${
-                analyticsPeriod === m ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500'
-              }`}
-            >
-              {m}T
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* ── Top Customers & Suppliers ── */}
-      {analytics && (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          <div className="bg-white rounded-xl shadow-sm p-4">
-            <TopTable rows={analytics.topCustomers} caption="Top 5 khách hàng (đầu ra)" />
-          </div>
-          <div className="bg-white rounded-xl shadow-sm p-4">
-            <TopTable rows={analytics.topSuppliers} caption="Top 5 nhà cung cấp (đầu vào)" />
-          </div>
-        </div>
-      )}
-
-      {/* ── Status Breakdown Pie ── */}
-      {pieData.length > 0 && (
+      {/* ── VAT Payable Monthly/Quarterly ── */}
+      {(vatChartData.length > 0 || vatQuarterlyData.length > 0) && (
         <div className="bg-white rounded-xl shadow-sm p-4">
-          <h2 className="text-sm font-semibold text-gray-700 mb-3">Trạng Thái HĐ Đầu Ra</h2>
-          <div className="flex items-center gap-4">
-            <ResponsiveContainer width={120} height={120}>
-              <PieChart>
-                <Pie data={pieData} cx="50%" cy="50%" innerRadius={30} outerRadius={55} dataKey="value" paddingAngle={2}>
-                  {pieData.map((_, i) => (
-                    <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />
-                  ))}
-                </Pie>
-              </PieChart>
-            </ResponsiveContainer>
-            <div className="flex-1 space-y-1.5">
-              {pieData.map((d, i) => (
-                <div key={i} className="flex items-center justify-between text-sm">
-                  <div className="flex items-center gap-2">
-                    <div className="w-2.5 h-2.5 rounded-full" style={{ background: PIE_COLORS[i % PIE_COLORS.length] }} />
-                    <span className="text-gray-600">{d.name}</span>
-                  </div>
-                  <span className="font-semibold text-gray-800">{d.value.toLocaleString('vi-VN')}</span>
-                </div>
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-semibold text-gray-700">💰 Thuế GTGT Phải Nộp</h2>
+            <div className="flex gap-0.5 bg-gray-100 rounded-lg p-0.5">
+              {(['monthly', 'quarterly'] as const).map((mode) => (
+                <button
+                  key={mode}
+                  onClick={() => setVatViewMode(mode)}
+                  className={`text-xs px-2.5 py-1 rounded-md font-medium transition-colors ${
+                    vatViewMode === mode ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500'
+                  }`}
+                >
+                  {mode === 'monthly' ? 'Tháng' : 'Quý'}
+                </button>
               ))}
             </div>
           </div>
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={activeVatData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
+              <XAxis dataKey="name" tick={{ fontSize: 10 }} />
+              <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v * 1_000_000)} />
+              <Tooltip formatter={(val: number) => formatVNDFull(Number(val) * 1_000_000)} />
+              <Legend wrapperStyle={{ fontSize: 11 }} />
+              <Bar dataKey="Đầu Ra" fill="#3b82f6" radius={[3, 3, 0, 0]} maxBarSize={22} />
+              <Bar dataKey="Đầu Vào" fill="#10b981" radius={[3, 3, 0, 0]} maxBarSize={22} />
+              <Bar dataKey="Phải Nộp" fill="#ef4444" radius={[3, 3, 0, 0]} maxBarSize={22} />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
+      {/* ── CIT Annual Estimate ── */}
+      {citYearData.length > 0 && (
+        <div className="bg-white rounded-xl shadow-sm p-4">
+          <div className="flex items-center justify-between mb-1">
+            <h2 className="text-sm font-semibold text-gray-700">🏗️ Thuế TNDN Ước Tính Năm {periodYear}</h2>
+            <span className="text-xs bg-amber-50 text-amber-600 px-2 py-0.5 rounded-full font-medium">Thuế suất 20%</span>
+          </div>
+          <p className="text-xs text-gray-400 mb-3">Dựa trên hóa đơn — chưa trừ chi phí nhân công, khấu hao, lãi vay và các khoản ưu đãi</p>
+
+          {/* Summary KPIs */}
+          <div className="grid grid-cols-3 gap-2 mb-4">
+            <div className="bg-blue-50 rounded-lg p-2.5">
+              <p className="text-xs text-blue-500 mb-0.5">Doanh thu YTD</p>
+              <p className="text-sm font-bold text-blue-800">{compact(annualRevenue)}₫</p>
+            </div>
+            <div className="bg-gray-50 rounded-lg p-2.5">
+              <p className="text-xs text-gray-400 mb-0.5">Chi phí YTD</p>
+              <p className="text-sm font-bold text-gray-700">{compact(annualCost)}₫</p>
+            </div>
+            <div className={`rounded-lg p-2.5 ${annualProfit >= 0 ? 'bg-green-50' : 'bg-red-50'}`}>
+              <p className={`text-xs mb-0.5 ${annualProfit >= 0 ? 'text-green-500' : 'text-red-500'}`}>Lãi gộp YTD</p>
+              <p className={`text-sm font-bold ${annualProfit >= 0 ? 'text-green-800' : 'text-red-800'}`}>
+                {compact(annualProfit)}₫
+              </p>
+            </div>
+          </div>
+
+          {/* CIT estimate banner */}
+          <div className={`flex items-center justify-between rounded-lg px-4 py-3 mb-3 ${
+            estimatedCIT > 0 ? 'bg-amber-50 border border-amber-200' : 'bg-green-50 border border-green-200'
+          }`}>
+            <div>
+              <p className="text-xs font-medium text-gray-600">Thuế TNDN phát sinh YTD ({monthsWithData} tháng)</p>
+              <p className={`text-xl font-bold ${estimatedCIT > 0 ? 'text-amber-700' : 'text-green-700'}`}>
+                {compact(estimatedCIT)}₫
+              </p>
+            </div>
+            {monthsWithData < 12 && projectedCIT > 0 && (
+              <div className="text-right">
+                <p className="text-xs text-gray-400">Dự báo cả năm</p>
+                <p className="text-sm font-semibold text-gray-600">{compact(projectedCIT)}₫</p>
+              </div>
+            )}
+          </div>
+
+          {/* Monthly profit bar chart */}
+          {citMonthlyData.length > 0 && (
+            <ResponsiveContainer width="100%" height={130}>
+              <BarChart data={citMonthlyData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
+                <XAxis dataKey="name" tick={{ fontSize: 10 }} />
+                <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v * 1_000_000)} />
+                <Tooltip
+                  formatter={(val: number) => [formatVNDFull(Number(val) * 1_000_000), 'Lãi Gộp']}
+                  labelFormatter={(label) => `Tháng ${label}`}
+                />
+                <Bar dataKey="Lãi Gộp" radius={[3, 3, 0, 0]} maxBarSize={22}>
+                  {citMonthlyData.map((entry, i) => (
+                    <Cell key={i} fill={(entry['Lãi Gộp'] ?? 0) >= 0 ? '#10b981' : '#ef4444'} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          )}
+          <p className="text-xs text-amber-600 mt-2">
+            ⚠️ Chỉ mang tính tham khảo — chưa qua kiểm toán thuế chính thức
+          </p>
         </div>
       )}
 
