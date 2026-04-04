@@ -331,6 +331,8 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction) =>
       await client.query('DELETE FROM import_temp_files WHERE company_id = $1', [companyId]);
       // bot_failed_jobs has nullable FK without ON DELETE CASCADE
       await client.query('DELETE FROM bot_failed_jobs   WHERE company_id = $1', [companyId]);
+      // audit_logs has company_id UUID REFERENCES companies(id) WITHOUT CASCADE (013_soft_delete.sql)
+      await client.query('DELETE FROM audit_logs        WHERE company_id = $1', [companyId]);
 
       // ── Tables whose FK points at invoices.id without cascade ────────
       // (gdt_validation_queue has ON DELETE CASCADE from invoices per 002 migration,
