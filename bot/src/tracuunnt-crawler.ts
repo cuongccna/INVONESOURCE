@@ -61,7 +61,9 @@ export class TracuunntCrawler {
     });
 
     if (proxyUrl) {
-      const agent = createTunnelAgent({ proxyUrl });
+      // tracuunnt.gdt.gov.vn is plain HTTP (port 80) — use plainHttp:true so the
+      // tunnel agent returns the raw TCP socket instead of wrapping a TLS layer.
+      const agent = createTunnelAgent({ proxyUrl, plainHttp: true });
       instance.defaults.httpAgent  = agent;
       instance.defaults.httpsAgent = agent;
     }
@@ -100,7 +102,8 @@ export class TracuunntCrawler {
     }
 
     const rows: Record<string, string> = {};
-    $('table tr').each((_, row) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    $('table tr').each((_: number, row: any) => {
       const cells = $(row).find('td');
       if (cells.length >= 2) {
         const key   = $(cells[0]).text().trim().replace(/:$/, '');
@@ -132,13 +135,16 @@ export class TracuunntCrawler {
   }
 
   private async lookupMasothue(taxCode: string): Promise<CompanyLookupResult> {
+    // masothue.com is an HTTPS fallback — must also go through proxy.
+    const proxyUrl = proxyManager.nextForSession(this.sessionId);
+    const masothueClient = axios.create({
+      headers: { 'User-Agent': getSessionHeaders(getProfileForSession(this.sessionId))['User-Agent'] },
+      timeout: 10_000,
+      ...(proxyUrl ? { httpAgent: createTunnelAgent({ proxyUrl }), httpsAgent: createTunnelAgent({ proxyUrl }) } : {}),
+    });
     try {
-      const res = await axios.get(
+      const res = await masothueClient.get(
         `https://masothue.com/Search/Party?s=${encodeURIComponent(taxCode)}`,
-        {
-          headers: { 'User-Agent': getSessionHeaders(getProfileForSession(this.sessionId))['User-Agent'] },
-          timeout: 10_000,
-        },
       );
       const raw: unknown = res.data;
       if (!raw || (Array.isArray(raw) && raw.length === 0)) {

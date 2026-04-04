@@ -63,6 +63,9 @@ const PAGE_SIZE = 50;
 const MAX_RETRIES   = 3;
 const RETRY_DELAY   = 3_000; // ms
 const REQUEST_TIMEOUT = 30_000;
+// Binary downloads (XML ZIP, XLSX) can be large and GDT server is slow to generate them.
+// TMProxy and residential proxies have short idle timeouts — give generous room.
+const BINARY_TIMEOUT = 120_000; // 2 min — override with recipe.timing.binaryTimeoutMs
 
 // ── GDT API types ──────────────────────────────────────────────────────────────
 
@@ -314,12 +317,6 @@ export class GdtDirectApiService {
    * Falls back to this.http (HTTP CONNECT) when socks5ProxyUrl is null.
    */
   private binaryHttp:     AxiosInstance | null = null;
-  /**
-   * Last-resort direct HTTPS client (no proxy) for binary downloads.
-   * Used when both SOCKS5 and HTTP CONNECT proxy paths fail.
-   * Will succeed if the VPS IP is not blocked by GDT, or if proxy is the issue.
-   */
-  private directHttp:     AxiosInstance | null = null;
   private recipe:         CrawlerRecipe | null = null;
 
   constructor(proxyUrl?: string | null, socks5ProxyUrl?: string | null, recipe?: CrawlerRecipe) {
@@ -361,19 +358,9 @@ export class GdtDirectApiService {
       const socks5Agent = createSocks5TunnelAgent({ proxyUrl: socks5ProxyUrl });
       this.binaryHttp = axios.create({
         baseURL:   this.recipe?.api.baseUrlHttp ?? GDT_API_HTTP,   // http:// so axios uses httpAgent (our SOCKS5 tunnel does TLS)
-        timeout:   REQUEST_TIMEOUT * 2,
+        timeout:   BINARY_TIMEOUT,
         headers:   commonHeaders,
         httpAgent: socks5Agent,
-      });
-    }
-    // Direct HTTPS client (no proxy) — last resort for binary downloads.
-    // Only created when a proxy is in use; if proxy methods both fail, attempt
-    // direct from VPS IP. Suppressed when DISABLE_DIRECT_BINARY=true.
-    if (proxyUrl && process.env.DISABLE_DIRECT_BINARY !== 'true') {
-      this.directHttp = axios.create({
-        baseURL: this.recipe?.api.baseUrl ?? GDT_API_HTTPS,
-        timeout: REQUEST_TIMEOUT * 2,
-        headers: commonHeaders,
       });
     }
   }
@@ -736,7 +723,7 @@ export class GdtDirectApiService {
     const client = primaryClient;
     const maxRetries   = this.recipe?.timing.maxRetries    ?? MAX_RETRIES;
     const retryDelayMs = this.recipe?.timing.retryDelayMs  ?? RETRY_DELAY;
-    const binaryTimeout = this.recipe?.timing.binaryTimeoutMs ?? REQUEST_TIMEOUT * 2;
+    const binaryTimeout = this.recipe?.timing.binaryTimeoutMs ?? BINARY_TIMEOUT;
     let lastErr: Error | null = null;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
@@ -788,30 +775,6 @@ export class GdtDirectApiService {
           url,
           msg: fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr),
         });
-        // Fall through to direct connection attempt
-      }
-    }
-
-    // Both proxy methods failed — try direct HTTPS from VPS (no proxy).
-    // Handles cases where residential proxy drops binary/ZIP streams but the VPS IP
-    // is not blocked by GDT. Set DISABLE_DIRECT_BINARY=true to suppress this.
-    if (this.directHttp && lastErr != null) {
-      logger.warn('[GdtDirect] Proxy binary failed — trying direct HTTPS (no proxy)', { url });
-      try {
-        const res = await this.directHttp.get<ArrayBuffer>(url, {
-          params,
-          headers: { Authorization: `Bearer ${this.token}` },
-          responseType: 'arraybuffer',
-          timeout: binaryTimeout,
-        });
-        logger.info('[GdtDirect] Direct HTTPS binary succeeded', { url });
-        return Buffer.from(res.data);
-      } catch (directErr) {
-        logger.warn('[GdtDirect] Direct HTTPS binary also failed', {
-          url,
-          msg: directErr instanceof Error ? directErr.message : String(directErr),
-        });
-        // Fall through to throw original error
       }
     }
 

@@ -3,21 +3,28 @@
  *
  * Three operating modes — selected automatically at startup:
  *
- * A) TMProxy multi-key pool (preferred — TMPROXY_API_KEYS=key1,key2,key3):
+ * A) TMProxy multi-key pool (TMPROXY_API_KEYS=key1,key2,key3):
  *    • Each API key = 1 dedicated residential IP on TMProxy "Đổi IP" plan.
  *    • nextForCompany() hashes company session suffix → consistent slot → own IP.
- *    • GDT sees a different IP per company (N companies ÷ N keys = 1 IP each).
  *    • Scale: buy 1 key per ~10 companies.  Cost: 5,000đ/key/day.
  *    • TMPROXY_API_KEY (single key) is also accepted for backward-compat (1-key pool).
  *
+ * C) IPRoyal sticky-session pool (preferred for binary downloads — IPROYAL_PROXY_LIST):
+ *    • Format: host:port:user:pass per entry, comma-separated.
+ *    • Example: geo.iproyal.com:12321:user:pass_country-vn_session-ABC_lifetime-30m,...
+ *    • SOCKS5 is derived from the same credentials (same host:port, socks5:// scheme).
+ *    • Each session ID in the password gives a sticky IP for 30 min — stable for streams.
+ *    • Scale: add more entries to IPROYAL_PROXY_LIST.
+ *    • Priority: IPRoyal is checked BEFORE TMProxy when both are configured.
+ *
  * B) Static pool fallback (PROXY_LIST env, comma-separated http:// URLs):
  *    • Round-robin across the list; failed ones are skipped until all fail (then reset).
+ *    • SOCKS5 NOT available in this mode.
  *
- * How to add more TMProxy API keys:
- *   1. Buy additional "Đổi IP" APIs on tmproxy.com dashboard.
- *   2. Add all keys (including the existing one) to TMPROXY_API_KEYS in bot/.env:
- *         TMPROXY_API_KEYS=4c0320b1...,newkey2,newkey3
- *   3. Restart bot — companies are automatically redistributed across keys.
+ * How to add more IPRoyal sessions:
+ *   Generate new sessions on dashboard.iproyal.com → Residential → Proxy access.
+ *   Set session lifetime to 30m. Add to IPROYAL_PROXY_LIST in bot/.env:
+ *     IPROYAL_PROXY_LIST=geo.iproyal.com:12321:user:pass_session-A,geo.iproyal.com:12321:user:pass_session-B
  */
 import { EventEmitter } from 'events';
 import { TmproxyRefresher, TmproxyNoSessionError } from './tmproxy-refresher';
@@ -40,9 +47,22 @@ interface TmproxySlot {
   failedUrls:           Set<string>;
 }
 
+// ── One slot = one IPRoyal sticky session ────────────────────────────────────
+// Both HTTP CONNECT and SOCKS5 share the same host:port — scheme only differs.
+// The session ID embedded in the password provides IP stickiness for 30 min.
+interface IProyalSlot {
+  readonly httpUrl:   string;   // http://user:pass@host:port
+  readonly socks5Url: string;   // socks5://user:pass@host:port
+  readonly sessionId: string;   // extracted from password for logging
+  failed:             boolean;
+}
+
 export class ProxyManager extends EventEmitter {
   // ── Mode A: TMProxy multi-key pool ───────────────────────────────────────
   private slots: TmproxySlot[] = [];
+
+  // ── Mode C: IPRoyal sticky-session pool ──────────────────────────────────
+  private iproyalSlots: IProyalSlot[] = [];
 
   // ── Mode B: static pool ──────────────────────────────────────────────────
   private proxies: string[];
@@ -60,6 +80,43 @@ export class ProxyManager extends EventEmitter {
     this.failed  = new Set();
     this.index   = 0;
 
+    // ── Mode C: IPRoyal sticky-session pool ──────────────────────────────
+    // Format: host:port:user:pass  (comma-separated, one entry per session)
+    // Example: geo.iproyal.com:12321:user:pass_country-vn_session-ABC_lifetime-30m
+    const iproyalRaw = (process.env['IPROYAL_PROXY_LIST'] ?? '')
+      .split(',').map(s => s.trim()).filter(Boolean);
+    if (iproyalRaw.length > 0) {
+      this.iproyalSlots = iproyalRaw.map(entry => {
+        // Format is host:port:user:pass — but password may contain colons
+        // Split on first 3 colons only to preserve password intact
+        const firstColon  = entry.indexOf(':');
+        const secondColon = entry.indexOf(':', firstColon + 1);
+        const thirdColon  = entry.indexOf(':', secondColon + 1);
+        if (firstColon < 0 || secondColon < 0 || thirdColon < 0) {
+          throw new Error(`IPROYAL_PROXY_LIST: invalid entry format "${entry.slice(0, 30)}…" — expected host:port:user:pass`);
+        }
+        const host = entry.slice(0, firstColon);
+        const port = entry.slice(firstColon + 1, secondColon);
+        const user = entry.slice(secondColon + 1, thirdColon);
+        const pass = entry.slice(thirdColon + 1);
+        // Extract session ID from password for readable logging
+        const sessionMatch = pass.match(/_session-([^_]+)/);
+        const sessionId    = sessionMatch?.[1] ?? pass.slice(-8);
+        const auth = `${encodeURIComponent(user)}:${encodeURIComponent(pass)}`;
+        return {
+          httpUrl:   `http://${auth}@${host}:${port}`,
+          socks5Url: `socks5://${auth}@${host}:${port}`,
+          sessionId,
+          failed:    false,
+        };
+      });
+      logger.info('[ProxyManager] IPRoyal sticky pool initialised', {
+        slots:    this.iproyalSlots.length,
+        sessions: this.iproyalSlots.map(s => s.sessionId),
+      });
+    }
+
+    // ── Mode A: TMProxy multi-key pool ───────────────────────────────────
     // Collect all TMProxy API keys:
     //   TMPROXY_API_KEYS=key1,key2,key3   (preferred — multi-key pool)
     //   TMPROXY_API_KEY=key1              (single key — backward-compat)
@@ -93,7 +150,9 @@ export class ProxyManager extends EventEmitter {
           });
         });
       }
-    } else {
+    }
+
+    if (this.iproyalSlots.length === 0 && allKeys.length === 0) {
       logger.info(`[ProxyManager] Static pool — ${this.proxies.length} proxies loaded`);
     }
   }
@@ -105,6 +164,10 @@ export class ProxyManager extends EventEmitter {
    * Used only for non-company-specific calls (health checks etc).
    */
   next(): string | null {
+    if (this.iproyalSlots.length > 0) {
+      const slot = this.iproyalSlots.find(s => !s.failed) ?? this.iproyalSlots[0]!;
+      return slot.httpUrl;
+    }
     if (this.slots.length > 0) return this.slots[0]!.currentUrl;
 
     if (this.proxies.length === 0) return null;
@@ -132,6 +195,14 @@ export class ProxyManager extends EventEmitter {
    *   Same deterministic hash → consistent pool entry per company.
    */
   nextForCompany(sessionSuffix: string): string | null {
+    // Mode C: IPRoyal — hash to consistent slot, skip failed slots
+    if (this.iproyalSlots.length > 0) {
+      const available = this.iproyalSlots.filter(s => !s.failed);
+      const pool = available.length > 0 ? available : this.iproyalSlots;
+      return pool[this._hashToIndex(sessionSuffix, pool.length)]!.httpUrl;
+    }
+
+    // Mode A: TMProxy
     if (this.slots.length > 0) {
       const slotIdx = this._hashToIndex(sessionSuffix, this.slots.length);
       const slot    = this.slots[slotIdx]!;
@@ -202,6 +273,14 @@ export class ProxyManager extends EventEmitter {
    * Returns null for static-pool mode (those entries are HTTP proxies only).
    */
   nextSocks5ForCompany(sessionSuffix: string): string | null {
+    // Mode C: IPRoyal — same slot as nextForCompany, return socks5Url
+    if (this.iproyalSlots.length > 0) {
+      const available = this.iproyalSlots.filter(s => !s.failed);
+      const pool = available.length > 0 ? available : this.iproyalSlots;
+      return pool[this._hashToIndex(sessionSuffix, pool.length)]!.socks5Url;
+    }
+
+    // Mode A: TMProxy
     if (this.slots.length > 0) {
       const slotIdx = this._hashToIndex(sessionSuffix, this.slots.length);
       const slot    = this.slots[slotIdx]!;
@@ -221,6 +300,19 @@ export class ProxyManager extends EventEmitter {
    * Mode B: removes from round-robin.
    */
   markFailed(url: string): void {
+    // Mode C: IPRoyal
+    const iproyalSlot = this.iproyalSlots.find(s => s.httpUrl === url || s.socks5Url === url);
+    if (iproyalSlot) {
+      iproyalSlot.failed = true;
+      logger.warn('[ProxyManager] IPRoyal slot marked failed', {
+        sessionId: iproyalSlot.sessionId,
+        remaining: this.iproyalSlots.filter(s => !s.failed).length,
+      });
+      this.emit('proxyFailed', url);
+      return;
+    }
+
+    // Mode A: TMProxy
     if (this.slots.length > 0) {
       const slot = this.slots.find(s => s.currentUrl === url);
       if (slot) {
@@ -238,6 +330,13 @@ export class ProxyManager extends EventEmitter {
   }
 
   markHealthy(url: string): void {
+    // Mode C: IPRoyal
+    const iproyalSlot = this.iproyalSlots.find(s => s.httpUrl === url || s.socks5Url === url);
+    if (iproyalSlot) {
+      iproyalSlot.failed = false;
+      return;
+    }
+
     this.failed.delete(url);
     for (const slot of this.slots) slot.failedUrls.delete(url);
   }
@@ -248,6 +347,7 @@ export class ProxyManager extends EventEmitter {
   }
 
   get size(): number {
+    if (this.iproyalSlots.length > 0) return this.iproyalSlots.length;
     return this.slots.length > 0 ? this.slots.length : this.proxies.length;
   }
   get failedCount(): number { return this.failed.size; }

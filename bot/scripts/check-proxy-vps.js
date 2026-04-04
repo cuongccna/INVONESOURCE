@@ -37,6 +37,31 @@ function redactProxy(url) {
   }
 }
 
+function pickIproyalFirst() {
+  const list = (process.env.IPROYAL_PROXY_LIST || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (list.length === 0) return null;
+  // Format: host:port:user:pass
+  const entry = list[0];
+  const firstColon  = entry.indexOf(':');
+  const secondColon = entry.indexOf(':', firstColon + 1);
+  const thirdColon  = entry.indexOf(':', secondColon + 1);
+  if (thirdColon < 0) return null;
+  const host = entry.slice(0, firstColon);
+  const port = entry.slice(firstColon + 1, secondColon);
+  const user = entry.slice(secondColon + 1, thirdColon);
+  const pass = entry.slice(thirdColon + 1);
+  const auth = `${encodeURIComponent(user)}:${encodeURIComponent(pass)}`;
+  return {
+    httpProxyUrl:   `http://${auth}@${host}:${port}`,
+    socks5ProxyUrl: `socks5://${auth}@${host}:${port}`,
+    total: list.length,
+    sessionMatch: pass.match(/_session-([^_]+)/)?.[1] ?? pass.slice(-10),
+  };
+}
+
 function pickTmproxyKey() {
   const keys = (process.env.TMPROXY_API_KEYS || '')
     .split(',')
@@ -205,13 +230,21 @@ async function main() {
   console.log(`Rounds: ${TEST_ROUNDS}, Timeout: ${TEST_TIMEOUT_MS}ms`);
   console.log(`Binary URL: ${TEST_BINARY_URL}`);
 
+  const iproyal = pickIproyalFirst();
   const tmproxyKey = pickTmproxyKey();
   const staticProxy = pickStaticProxy();
 
   let httpProxyUrl = null;
   let socks5ProxyUrl = null;
 
-  if (tmproxyKey) {
+  if (iproyal) {
+    console.log('\n[1] IPRoyal mode detected');
+    console.log(`sessions total: ${iproyal.total}, testing session: ${iproyal.sessionMatch}`);
+    httpProxyUrl   = iproyal.httpProxyUrl;
+    socks5ProxyUrl = iproyal.socks5ProxyUrl;
+    console.log(`httpProxy=${redactProxy(httpProxyUrl)}`);
+    console.log(`socks5Proxy=${redactProxy(socks5ProxyUrl)}`);
+  } else if (tmproxyKey) {
     console.log('\n[1] TMProxy mode detected');
     let tm = await getTmproxyCurrent(tmproxyKey);
     console.log(`TMProxy get-current-proxy code=${tm.code}, message=${tm.message}`);
@@ -239,7 +272,7 @@ async function main() {
     console.log(`httpProxy=${redactProxy(httpProxyUrl)}`);
     console.log('socks5Proxy=(none from PROXY_LIST)');
   } else {
-    throw new Error('No proxy configured: TMPROXY_API_KEY(S) and PROXY_LIST are both empty');
+    throw new Error('No proxy configured: IPROYAL_PROXY_LIST, TMPROXY_API_KEY(S), and PROXY_LIST are all empty');
   }
 
   console.log('\n[2] Testing HTTP CONNECT tunnel -> GDT /captcha');

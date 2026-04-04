@@ -36,6 +36,13 @@ export interface ProxyOptions {
   proxyUrl: string;
   /** Skip TLS verification for the target server (default: false = verify normally) */
   rejectUnauthorized?: boolean;
+  /**
+   * Set to true for plain-HTTP targets (port 80).
+   * When true, the tunnel returns the raw TCP socket after CONNECT 200 instead
+   * of wrapping it in TLS. Use with http:// axios URLs + httpAgent.
+   * Default: false (assumes HTTPS target — wraps TLS after CONNECT).
+   */
+  plainHttp?: boolean;
 }
 
 /**
@@ -62,6 +69,7 @@ export function createTunnelAgent(opts: ProxyOptions): http.Agent {
     : null;
 
   const rejectUnauthorized = opts.rejectUnauthorized ?? false;
+  const plainHttp          = opts.plainHttp          ?? false;
 
   const agent = new http.Agent({ keepAlive: false });
 
@@ -118,7 +126,14 @@ export function createTunnelAgent(opts: ProxyOptions): http.Agent {
           return;
         }
 
-        // 4. Upgrade to TLS over the existing TCP socket.
+        // 4a. Plain HTTP target: return the raw TCP socket directly.
+        //     http.request will write HTTP text to it (no TLS needed).
+        if (plainHttp) {
+          callback(null, sock as unknown as net.Socket);
+          return;
+        }
+
+        // 4b. HTTPS target: upgrade to TLS over the existing TCP socket.
         //    We do TLS here so http.request gets a ready-to-use TLS socket.
         //    When the callback fires, http writes HTTP headers immediately
         //    (synchronously in the same tick) — no event-loop gap, no timeout.
