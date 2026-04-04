@@ -63,6 +63,9 @@ export default function CompaniesSettingsPage() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [deleteTarget, setDeleteTarget] = useState<Company | null>(null);
+  const [deletePassword, setDeletePassword] = useState('');
+  const [deleteError, setDeleteError] = useState('');
+  const [deleteSubmitting, setDeleteSubmitting] = useState(false);
   const { setActiveCompanyId, activeCompanyId, refreshCompanies } = useCompany();
   const router = useRouter();
 
@@ -144,14 +147,26 @@ export default function CompaniesSettingsPage() {
   };
 
   const handleDelete = async () => {
-    if (!deleteTarget) return;
+    if (!deleteTarget || !deletePassword) return;
+    setDeleteError('');
+    setDeleteSubmitting(true);
     try {
-      await apiClient.delete(`/companies/${deleteTarget.id}`);
+      await apiClient.delete(`/companies/${deleteTarget.id}`, { data: { password: deletePassword } });
+      // If the deleted company was active, clear the active selection
+      if (deleteTarget.id === activeCompanyId) {
+        setActiveCompanyId('');
+      }
       await loadCompanies();
       await refreshCompanies();
       setDeleteTarget(null);
-    } catch {
-      // silent
+      setDeletePassword('');
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { error?: { message?: string } } } })?.response?.data?.error
+          ?.message ?? 'Có lỗi xảy ra, vui lòng thử lại';
+      setDeleteError(msg);
+    } finally {
+      setDeleteSubmitting(false);
     }
   };
 
@@ -405,18 +420,38 @@ export default function CompaniesSettingsPage() {
                 hóa đơn, tờ khai thuế, sổ tiền mặt, báo cáo KQKD, cấu hình bot và tất cả dữ liệu liên quan.
               </p>
             </div>
+
+            {/* Password confirmation */}
+            <div className="mb-4">
+              <label className="block text-xs font-medium text-gray-700 mb-1">
+                Nhập mật khẩu của bạn để xác nhận xóa
+              </label>
+              <input
+                type="password"
+                value={deletePassword}
+                onChange={(e) => { setDeletePassword(e.target.value); setDeleteError(''); }}
+                placeholder="Mật khẩu hiện tại"
+                autoComplete="current-password"
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-red-400"
+              />
+              {deleteError && (
+                <p className="mt-1.5 text-xs text-red-600 font-medium">{deleteError}</p>
+              )}
+            </div>
+
             <div className="flex gap-3">
               <button
-                onClick={() => setDeleteTarget(null)}
+                onClick={() => { setDeleteTarget(null); setDeletePassword(''); setDeleteError(''); }}
                 className="flex-1 border border-gray-200 py-2.5 rounded-xl text-sm font-medium text-gray-600 hover:bg-gray-50 transition-colors"
               >
                 Hủy
               </button>
               <button
                 onClick={() => void handleDelete()}
-                className="flex-1 bg-red-600 text-white py-2.5 rounded-xl text-sm font-medium hover:bg-red-700 transition-colors"
+                disabled={!deletePassword || deleteSubmitting}
+                className="flex-1 bg-red-600 text-white py-2.5 rounded-xl text-sm font-medium hover:bg-red-700 disabled:opacity-50 transition-colors"
               >
-                Xóa vĩnh viễn
+                {deleteSubmitting ? 'Đang xóa...' : 'Xóa vĩnh viễn'}
               </button>
             </div>
           </div>

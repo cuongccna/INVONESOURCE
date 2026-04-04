@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { v4 as uuidv4 } from 'uuid';
+import bcrypt from 'bcryptjs';
 import { pool } from '../db/pool';
 import { authenticate, requireRole } from '../middleware/auth';
 import { sendSuccess } from '../utils/response';
@@ -288,38 +289,79 @@ router.patch('/:id/onboarded', async (req: Request, res: Response, next: NextFun
   }
 });
 
-// DELETE /api/companies/:id — xóa vĩnh viễn toàn bộ dữ liệu công ty (OWNER only)
+// DELETE /api/companies/:id — xóa vĩnh viễn toàn bộ dữ liệu công ty (OWNER only, yêu cầu mật khẩu)
 router.delete('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const access = await pool.query(
+    // 1. Validate request body — password required
+    const parsed = z.object({
+      password: z.string().min(1, 'Vui lòng nhập mật khẩu để xác nhận xóa'),
+    }).safeParse(req.body);
+    if (!parsed.success) throw new ValidationError(parsed.error.issues[0]?.message ?? 'Thiếu mật khẩu xác nhận');
+
+    // 2. Check OWNER role
+    const access = await pool.query<{ role: string }>(
       'SELECT role FROM user_companies WHERE user_id = $1 AND company_id = $2',
       [req.user!.userId, req.params.id]
     );
-    if (!access.rows[0]) throw new NotFoundError('Company not found');
+    if (!access.rows[0]) throw new NotFoundError('Không tìm thấy công ty');
     if (access.rows[0].role !== 'OWNER') throw new ForbiddenError('Chỉ OWNER mới được xóa công ty');
+
+    // 3. Verify current user’s password (prevent unauthorized deletion)
+    const userRow = await pool.query<{ password_hash: string }>(
+      'SELECT password_hash FROM users WHERE id = $1',
+      [req.user!.userId]
+    );
+    if (!userRow.rows[0]) throw new NotFoundError('User not found');
+    const passwordValid = await bcrypt.compare(parsed.data.password, userRow.rows[0].password_hash);
+    if (!passwordValid) throw new ForbiddenError('Mật khẩu không chính xác');
 
     const companyId = req.params.id;
 
-    // Cascade hard-delete tất cả dữ liệu liên quan, sau đó xóa company
-    // Thứ tự: xóa bảng con trước (FK), company sau cùng.
-    await pool.query('DELETE FROM gdt_bot_runs       WHERE company_id = $1', [companyId]);
-    await pool.query('DELETE FROM gdt_bot_configs    WHERE company_id = $1', [companyId]);
-    await pool.query('DELETE FROM gdt_validation_queue WHERE invoice_id IN (SELECT id FROM invoices WHERE company_id = $1)', [companyId]);
-    await pool.query('DELETE FROM invoice_line_items WHERE invoice_id IN (SELECT id FROM invoices WHERE company_id = $1)', [companyId]);
-    await pool.query('DELETE FROM invoices           WHERE company_id = $1', [companyId]);
-    await pool.query('DELETE FROM tax_declarations   WHERE company_id = $1', [companyId]);
-    await pool.query('DELETE FROM vat_reconciliations WHERE company_id = $1', [companyId]);
-    await pool.query('DELETE FROM cash_book_entries  WHERE company_id = $1', [companyId]);
-    await pool.query('DELETE FROM inventory_movements WHERE company_id = $1', [companyId]);
-    await pool.query('DELETE FROM profit_loss_statements WHERE company_id = $1', [companyId]);
-    await pool.query('DELETE FROM hkd_tax_statements WHERE company_id = $1', [companyId]);
-    await pool.query('DELETE FROM sync_logs          WHERE company_id = $1', [companyId]);
-    await pool.query('DELETE FROM notifications      WHERE company_id = $1', [companyId]);
-    await pool.query('DELETE FROM company_connectors WHERE company_id = $1', [companyId]);
-    await pool.query('DELETE FROM user_companies     WHERE company_id = $1', [companyId]);
-    await pool.query('DELETE FROM companies          WHERE id = $1',         [companyId]);
+    // 4. Hard-delete inside a single transaction
+    //    Order: delete tables WITHOUT ON DELETE CASCADE first, then delete
+    //    the company row (which will cascade-delete all remaining children).
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
 
-    sendSuccess(res, null, 'Đã xóa công ty và toàn bộ dữ liệu liên quan');
+      // ── Tables with NO FK or NO CASCADE on company_id ──────────────────────
+      // gdt_bot_runs has company_id UUID NOT NULL (no REFERENCES declared)
+      await client.query('DELETE FROM gdt_bot_runs      WHERE company_id = $1', [companyId]);
+      // import_temp_files has company_id UUID NOT NULL (no REFERENCES declared)
+      await client.query('DELETE FROM import_temp_files WHERE company_id = $1', [companyId]);
+      // bot_failed_jobs has nullable FK without ON DELETE CASCADE
+      await client.query('DELETE FROM bot_failed_jobs   WHERE company_id = $1', [companyId]);
+
+      // ── Tables whose FK points at invoices.id without cascade ────────
+      // (gdt_validation_queue has ON DELETE CASCADE from invoices per 002 migration,
+      //  but we delete explicitly here to be safe before invoices is removed)
+      await client.query(
+        'DELETE FROM gdt_validation_queue WHERE invoice_id IN (SELECT id FROM invoices WHERE company_id = $1)',
+        [companyId]
+      );
+
+      // ── Delete the company — PG cascades everything else ─────────────────
+      // Tables covered by ON DELETE CASCADE from companies:
+      //   invoice_line_items, invoices, gdt_bot_configs, import_sessions,
+      //   import_templates, tax_declarations (-> declaration_attachments),
+      //   vat_reconciliations, cash_book_entries, inventory_movements,
+      //   profit_loss_statements, hkd_tax_statements, sync_logs, notifications,
+      //   company_connectors, user_companies, customer_rfm, dismissed_anomalies,
+      //   price_alerts, product_catalog, telegram_chat_configs, company_settings,
+      //   esg_estimates, insights_cache, repurchase_predictions, price_anomalies,
+      //   audit_rule_configs, code_sequences, customer_catalog, supplier_catalog,
+      //   missing_invoice_alerts, tax_rate_anomalies, company_risk_flags,
+      //   raw_invoice_data
+      await client.query('DELETE FROM companies WHERE id = $1', [companyId]);
+
+      await client.query('COMMIT');
+      sendSuccess(res, null, 'Đã xóa công ty và toàn bộ dữ liệu liên quan');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     next(err);
   }

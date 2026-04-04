@@ -55,3 +55,4 @@ scripts/check_view_columns.js
 scripts/check_view_def.js
 scripts/run-remaining-migs.js
 scripts/seed-admin.js
+dump.rdb
