@@ -70,6 +70,21 @@ async function getTmproxyCurrent(apiKey) {
   return res.data;
 }
 
+async function getTmproxyNew(apiKey) {
+  const res = await axios.post(
+    'https://tmproxy.com/api/proxy/get-new-proxy',
+    { api_key: apiKey, id_location: 0, id_isp: 0 },
+    {
+      timeout: 15000,
+      headers: {
+        accept: 'application/json',
+        'content-type': 'application/json',
+      },
+    }
+  );
+  return res.data;
+}
+
 function buildProxyFromTmproxy(data) {
   const httpsHost = data?.https;
   const socks5Host = data?.socks5;
@@ -165,10 +180,17 @@ async function main() {
 
   if (tmproxyKey) {
     console.log('\n[1] TMProxy mode detected');
-    const tm = await getTmproxyCurrent(tmproxyKey);
-    console.log(`TMProxy code=${tm.code}, message=${tm.message}`);
+    let tm = await getTmproxyCurrent(tmproxyKey);
+    console.log(`TMProxy get-current-proxy code=${tm.code}, message=${tm.message}`);
+
+    if (tm.code === 27) {
+      console.log('TMProxy chưa có session active, đang gọi get-new-proxy...');
+      tm = await getTmproxyNew(tmproxyKey);
+      console.log(`TMProxy get-new-proxy code=${tm.code}, message=${tm.message}`);
+    }
+
     if (tm.code !== 0) {
-      throw new Error(`TMProxy get-current-proxy failed: code=${tm.code} message=${tm.message}`);
+      throw new Error(`TMProxy failed: code=${tm.code} message=${tm.message}`);
     }
 
     const built = buildProxyFromTmproxy(tm.data);
