@@ -34,6 +34,7 @@ VALUES (
         "auth":                "/security-taxpayer/authenticate",
         "sold":                "/query/invoices/sold",
         "purchase":            "/query/invoices/purchase",
+        "detail":              "/query/invoices/detail",
         "exportXml":           "/query/invoices/export-xml",
         "exportExcel":         "/query/invoices/export-excel",
         "exportExcelPurchase": "/query/invoices/export-excel-sold"

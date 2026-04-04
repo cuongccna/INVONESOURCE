@@ -793,11 +793,38 @@ async function _maybeInsertLineItems(
   );
   if (existing.rows.length > 0) return 0;
 
-  // Rate-limit: wait 2.5–4.5s before every XML fetch
+  // Rate-limit: small delay before every detail/XML fetch
   await thinkTime(XML_FETCH_DELAY_MIN, XML_FETCH_DELAY_MAX);
 
+  // ── Strategy 1: Detail API (JSON, ~6KB) ─────────────────────────────────
+  // Uses the normal HTTP CONNECT proxy — small JSON response, always reliable.
+  // Avoids downloading 400KB+ binary ZIP which TMProxy 4G sessions cannot complete.
   try {
-    // Retry once on 429 (rate-limited) with a 10s back-off
+    const detail = await gdtApi.fetchInvoiceDetail({
+      nbmst:    inv.seller_tax_code,
+      khhdon:   inv.serial_number,
+      shdon:    inv.invoice_number,
+      khmshdon: 1,
+    });
+    const lineItems = GdtDirectApiService.parseLineItemsFromDetail(detail);
+    if (lineItems.length > 0) {
+      await _bulkInsertLineItems(lineItems, invoiceId, companyId);
+      logger.info('[SyncWorker] Line items inserted (detail API)', { invoiceId, count: lineItems.length });
+      return 1;
+    }
+    // Detail returned 200 but hdhhdvu empty — invoice may have no line items (e.g. summary invoice)
+    logger.info('[SyncWorker] Detail API: no line items in hdhhdvu', { invoiceId });
+    return 1;
+  } catch (detailErr: unknown) {
+    const msg = detailErr instanceof Error ? detailErr.message : String(detailErr);
+    // 401 = token expired, propagate
+    if (msg.includes('token expired')) throw detailErr;
+    logger.warn('[SyncWorker] Detail API failed — falling back to XML', { invoiceId, msg });
+  }
+
+  // ── Strategy 2: XML ZIP fallback ────────────────────────────────────────
+  // Only reached if detail API fails (network error, unexpected 500, etc.)
+  try {
     let xmlBuf: Buffer;
     try {
       xmlBuf = await gdtApi.exportInvoiceXml({
@@ -820,41 +847,44 @@ async function _maybeInsertLineItems(
     }
 
     const lineItems: LineItem[] = xmlParser.parseLineItems(xmlBuf);
-    if (lineItems.length === 0) return 1;
-
-    // Delete stale items then bulk insert
-    await pool.query('DELETE FROM invoice_line_items WHERE invoice_id = $1', [invoiceId]);
-    const values = lineItems.map((item, i) => {
-      const base = i * 11;
-      return `($${base+1},$${base+2},$${base+3},$${base+4},$${base+5},$${base+6},$${base+7},$${base+8},$${base+9},$${base+10},$${base+11})`;
-    }).join(',');
-    const params: unknown[] = [];
-    for (const item of lineItems) {
-      params.push(
-        uuidv4(), invoiceId, companyId,
-        item.line_number, item.item_code, item.item_name,
-        item.unit, item.quantity, item.unit_price,
-        item.subtotal, item.vat_rate, item.vat_amount, item.total
-      );
+    if (lineItems.length > 0) {
+      await _bulkInsertLineItems(lineItems, invoiceId, companyId);
+      logger.info('[SyncWorker] Line items inserted (XML)', { invoiceId, count: lineItems.length });
     }
-    // Rebuild values with 13 placeholders per item
-    const values13 = lineItems.map((_, i) => {
-      const b = i * 13;
-      return `($${b+1},$${b+2},$${b+3},$${b+4},$${b+5},$${b+6},$${b+7},$${b+8},$${b+9},$${b+10},$${b+11},$${b+12},$${b+13})`;
-    }).join(',');
-    await pool.query(
-      `INSERT INTO invoice_line_items
-       (id, invoice_id, company_id, line_number, item_code, item_name,
-        unit, quantity, unit_price, subtotal, vat_rate, vat_amount, total)
-       VALUES ${values13}`,
-      params
-    );
-    logger.info('[SyncWorker] Line items inserted', { invoiceId, count: lineItems.length });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.warn('[SyncWorker] Line items fetch failed (non-fatal)', { invoiceId, msg });
   }
   return 1;
+}
+
+/** Bulk-insert line items for one invoice (delete stale rows first). */
+async function _bulkInsertLineItems(
+  lineItems: LineItem[],
+  invoiceId: string,
+  companyId: string,
+): Promise<void> {
+  await pool.query('DELETE FROM invoice_line_items WHERE invoice_id = $1', [invoiceId]);
+  const values13 = lineItems.map((_, i) => {
+    const b = i * 13;
+    return `($${b+1},$${b+2},$${b+3},$${b+4},$${b+5},$${b+6},$${b+7},$${b+8},$${b+9},$${b+10},$${b+11},$${b+12},$${b+13})`;
+  }).join(',');
+  const params: unknown[] = [];
+  for (const item of lineItems) {
+    params.push(
+      uuidv4(), invoiceId, companyId,
+      item.line_number, item.item_code, item.item_name,
+      item.unit, item.quantity, item.unit_price,
+      item.subtotal, item.vat_rate, item.vat_amount, item.total,
+    );
+  }
+  await pool.query(
+    `INSERT INTO invoice_line_items
+     (id, invoice_id, company_id, line_number, item_code, item_name,
+      unit, quantity, unit_price, subtotal, vat_rate, vat_amount, total)
+     VALUES ${values13}`,
+    params,
+  );
 }
 
 /**

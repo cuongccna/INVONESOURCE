@@ -78,6 +78,48 @@ interface AuthResponse {
   token: string;
 }
 
+/** Supplementary key-value field from GDT detail response (ttkhac arrays) */
+interface GdtTtkhacEntry {
+  ttruong?: string;  // field label
+  kdlieu?:  string;  // data type
+  dlieu?:   unknown; // value (string number or null)
+}
+
+/** One line item from hdhhdvu in the GDT detail response */
+interface GdtHdhhdvuItem {
+  stt?:     number;   // line number
+  ten?:     string;   // item name
+  sluong?:  number;   // quantity
+  dgia?:    number;   // unit price
+  dvtinh?:  string;   // unit
+  tsuat?:   number;   // VAT rate as decimal (e.g. 0.08)
+  ltsuat?:  string;   // VAT rate as string (e.g. "8%")
+  thtien?:  number;   // subtotal before VAT
+  tthue?:   number;   // VAT amount per line (may be null)
+  stckhau?: number;   // discount amount
+  tlckhau?: number;   // discount rate
+  tchat?:   number;
+  ttkhac?:  GdtTtkhacEntry[];
+}
+
+/** Top-level GDT invoice detail response */
+interface GdtInvoiceDetail {
+  nbmst?:    string;
+  khhdon?:   string;
+  shdon?:    number;
+  khmshdon?: number;
+  nbten?:    string;   // seller name
+  nmten?:    string;   // buyer name
+  nmmst?:    string;   // buyer tax code
+  tdlap?:    string;   // invoice date ISO
+  tgtcthue?: number;   // total before VAT
+  tgtthue?:  number;   // total VAT
+  tgtttbso?: number;   // total with VAT
+  ttxly?:    number;   // processing status
+  hdhhdvu?:  GdtHdhhdvuItem[];  // line items array
+  [key: string]: unknown;
+}
+
 /**
  * Raw invoice record as returned by the GDT JSON API.
  * Field names follow Vietnamese abbreviations used by the GDT portal.
@@ -551,6 +593,90 @@ export class GdtDirectApiService {
     logger.debug('[GdtDirect] exportInvoiceXml', { nbmst, khhdon, shdon });
     return this._getBinaryWithRetry(this.recipe?.api.endpoints.exportXml ?? '/query/invoices/export-xml', {
       nbmst, khhdon, shdon, khmshdon,
+    });
+  }
+
+  // ── Invoice detail (JSON — preferred over XML for line items) ─────────────────
+
+  /**
+   * Fetch invoice detail JSON from GDT.
+   * Endpoint: GET /query/invoices/detail?nbmst=...&khhdon=...&shdon=...&khmshdon=...
+   *
+   * This is the PREFERRED way to obtain line items.
+   * The XML ZIP approach (~400KB, chunked, binary) is unreliable over residential
+   * 4G proxies (TMProxy cuts TCP after ~4-5s). This endpoint returns a tiny ~6KB
+   * JSON response that goes through the normal HTTP CONNECT proxy reliably.
+   *
+   * The response field `hdhhdvu` contains the line items array.
+   * Field mapping:
+   *   stt       → line_number
+   *   ten       → item_name
+   *   sluong    → quantity
+   *   dgia      → unit_price
+   *   dvtinh    → unit
+   *   tsuat     → vat_rate (decimal, e.g. 0.08)
+   *   thtien    → subtotal (before VAT)
+   *   tthue     → vat_amount (may be null — computed from tsuat*thtien if so)
+   *   stckhau   → discount amount
+   *   ttkhac entry "Tiền thuế dòng (Tiền thuế GTGT)" → vat_amount (more reliable)
+   *   ttkhac entry "Thành tiền thanh toán của hàng hóa" → total (with VAT)
+   */
+  async fetchInvoiceDetail(params: {
+    nbmst:    string;
+    khhdon:   string;
+    shdon:    string | number;
+    khmshdon?: string | number;
+  }): Promise<GdtInvoiceDetail> {
+    if (!this.token) throw new Error('Not authenticated — call login() first');
+    const { nbmst, khhdon, shdon, khmshdon = 1 } = params;
+    const url = this.recipe?.api.endpoints.detail ?? '/query/invoices/detail';
+    logger.debug('[GdtDirect] fetchInvoiceDetail', { nbmst, khhdon, shdon });
+    const res = await this.http.get<GdtInvoiceDetail>(url, {
+      params: { nbmst, khhdon, shdon, khmshdon },
+      headers: { Authorization: `Bearer ${this.token}` },
+    });
+    return res.data;
+  }
+
+  /**
+   * Parse line items from a GDT invoice detail response.
+   * Returns array compatible with the LineItem interface used by the XML parser.
+   */
+  static parseLineItemsFromDetail(detail: GdtInvoiceDetail): import('./parsers/GdtXmlParser').LineItem[] {
+    if (!Array.isArray(detail.hdhhdvu) || detail.hdhhdvu.length === 0) return [];
+
+    return detail.hdhhdvu.map((item): import('./parsers/GdtXmlParser').LineItem => {
+      // Extract vat_amount and total from ttkhac supplementary fields
+      let vatAmountFromExtra: number | null = null;
+      let totalFromExtra: number | null = null;
+      if (Array.isArray(item.ttkhac)) {
+        for (const extra of item.ttkhac) {
+          if (extra.ttruong?.includes('Tiền thuế dòng') && extra.dlieu != null) {
+            vatAmountFromExtra = parseFloat(String(extra.dlieu)) || null;
+          }
+          if (extra.ttruong?.includes('Thành tiền thanh toán') && extra.dlieu != null) {
+            totalFromExtra = parseFloat(String(extra.dlieu)) || null;
+          }
+        }
+      }
+
+      const subtotal   = item.thtien   ?? null;
+      const vatRate    = item.tsuat    ?? null;   // decimal e.g. 0.08
+      const vatAmount  = item.tthue    ?? vatAmountFromExtra ?? (subtotal != null && vatRate != null ? Math.round(subtotal * vatRate) : null);
+      const total      = totalFromExtra ?? (subtotal != null && vatAmount != null ? subtotal + vatAmount : subtotal);
+
+      return {
+        line_number: item.stt     ?? null,
+        item_code:   null,                        // GDT detail API does not expose item code
+        item_name:   item.ten     ?? null,
+        unit:        item.dvtinh  ?? null,
+        quantity:    item.sluong  ?? null,
+        unit_price:  item.dgia    ?? null,
+        subtotal,
+        vat_rate:    vatRate != null ? Math.round(vatRate * 100) : null,  // store as integer % (e.g. 8)
+        vat_amount:  vatAmount,
+        total,
+      };
     });
   }
 

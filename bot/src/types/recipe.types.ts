@@ -11,7 +11,8 @@ export interface RecipeApiEndpoints {
   auth:                string; // POST — returns { token }
   sold:                string; // GET — paginated output invoice list
   purchase:            string; // GET — paginated input invoice list
-  exportXml:           string; // GET — per-invoice signed XML
+  detail?:             string; // GET — single invoice detail JSON (hdhhdvu = line items)
+  exportXml:           string; // GET — per-invoice signed XML ZIP (fallback only)
   exportExcel:         string; // GET — output bulk XLSX
   exportExcelPurchase: string; // GET — input bulk XLSX (?type=purchase)
 }
