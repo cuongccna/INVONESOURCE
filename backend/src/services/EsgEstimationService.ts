@@ -23,6 +23,8 @@ const DISCLAIMER =
 
 export class EsgEstimationService {
   async estimateForYear(companyId: string, year: number): Promise<EsgEstimate> {
+    if (!companyId) throw new Error('Missing companyId for ESG estimate');
+
     // Check cache first
     const cached = await pool.query<{ data: { by_category: EsgCategoryEstimate[]; total_tco2e: number } }>(
       `SELECT data FROM insights_cache WHERE company_id = $1 AND insight_type = 'esg' AND period_key = $2
@@ -135,6 +137,8 @@ export class EsgEstimationService {
   }
 
   async getSeasonalInsights(companyId: string): Promise<{ raw: unknown; ai_analysis: string | null }> {
+    if (!companyId) throw new Error('Missing companyId for seasonal insights');
+
     // Check cache
     const key = new Date().getFullYear().toString();
     const cached = await pool.query<{ data: unknown; ai_analysis: string | null }>(
