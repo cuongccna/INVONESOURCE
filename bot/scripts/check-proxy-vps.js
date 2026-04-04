@@ -22,7 +22,7 @@ const axios = require('axios');
 const { createTunnelAgent, createSocks5TunnelAgent } = require('../dist/proxy-tunnel');
 
 const GDT_BASE_HTTP = 'http://hoadondientu.gdt.gov.vn:30000';
-const DEFAULT_BINARY_URL = 'http://speed.hetzner.de:443/1MB.bin';
+const DEFAULT_BINARY_URL = 'http://speed.hetzner.de/1MB.bin';
 const TEST_ROUNDS = Number(process.env.TEST_ROUNDS || 3);
 const TEST_TIMEOUT_MS = Number(process.env.TEST_TIMEOUT_MS || 45000);
 const TEST_BINARY_URL = process.env.TEST_BINARY_URL || DEFAULT_BINARY_URL;
@@ -123,6 +123,39 @@ async function testGdtCaptcha(label, agent) {
   const ms = Date.now() - t0;
   const ok = !!(res.data && res.data.key && res.data.content);
   return { ok, ms, status: res.status };
+}
+
+/**
+ * Test unauthenticated HTTP to GDT export-xml — we expect 401/400/403.
+ * If we get ANY HTTP status back, the TCP+TLS+HTTP path works.
+ * If we get status=0 / network error, the proxy is dropping binary-endpoint connections.
+ */
+async function testGdtExportXmlConnectivity(label, agent) {
+  const client = axios.create({
+    baseURL: GDT_BASE_HTTP,
+    timeout: TEST_TIMEOUT_MS,
+    httpAgent: agent,
+    maxRedirects: 0,
+    validateStatus: () => true, // don't throw on any HTTP status
+    headers: {
+      accept: 'application/json, text/plain, */*',
+      'user-agent': 'proxy-check/1.0',
+      origin: 'https://hoadondientu.gdt.gov.vn',
+      referer: 'https://hoadondientu.gdt.gov.vn/',
+    },
+  });
+
+  const t0 = Date.now();
+  try {
+    // Send without token — expect 401/403, but ANY HTTP response means the path works
+    const res = await client.get('/query/invoices/export-xml', {
+      params: { nbmst: 'test', khhdon: 'test', shdon: 1, khmshdon: 1 },
+    });
+    const ms = Date.now() - t0;
+    return { ok: true, ms, status: res.status, msg: `HTTP ${res.status} (expected 401/403 without token — path works!)` };
+  } catch (err) {
+    return { ok: false, ms: Date.now() - t0, status: 0, msg: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 async function testBinaryStream(label, agent, rounds) {
@@ -228,7 +261,15 @@ async function main() {
       console.log(`FAIL SOCKS5 captcha: ${err instanceof Error ? err.message : String(err)}`);
     }
 
-    console.log('\n[4] Testing SOCKS5 binary stream stability');
+    console.log('\n[4] Testing SOCKS5 -> GDT export-xml connectivity (no auth, expect 401/403)');
+    const socksXml = await testGdtExportXmlConnectivity('socks5-xml', socksAgent);
+    if (socksXml.ok) {
+      console.log(`PASS SOCKS5 export-xml: ${socksXml.msg} latency=${socksXml.ms}ms`);
+    } else {
+      console.log(`FAIL SOCKS5 export-xml: ${socksXml.msg} (status=0 = proxy drops binary endpoint)`);
+    }
+
+    console.log('\n[5] Testing SOCKS5 binary stream stability (generic HTTP)');
     const socksBin = await testBinaryStream('socks5-binary', socksAgent, TEST_ROUNDS);
     console.log(`SOCKS5 binary success: ${socksBin.success}/${socksBin.total}`);
     socksBin.stats.forEach((s, i) => {
@@ -242,7 +283,15 @@ async function main() {
     console.log('\n[3] SOCKS5 test skipped (no socks5 URL)');
   }
 
-  console.log('\n[5] Testing HTTP CONNECT binary stream stability');
+  console.log('\n[6] Testing HTTP CONNECT -> GDT export-xml connectivity (no auth, expect 401/403)');
+  const httpXml = await testGdtExportXmlConnectivity('http-xml', httpAgent);
+  if (httpXml.ok) {
+    console.log(`PASS HTTP CONNECT export-xml: ${httpXml.msg} latency=${httpXml.ms}ms`);
+  } else {
+    console.log(`FAIL HTTP CONNECT export-xml: ${httpXml.msg} (status=0 = proxy drops binary endpoint)`);
+  }
+
+  console.log('\n[7] Testing HTTP CONNECT binary stream stability (generic HTTP)');
   const httpBin = await testBinaryStream('http-binary', httpAgent, TEST_ROUNDS);
   console.log(`HTTP CONNECT binary success: ${httpBin.success}/${httpBin.total}`);
   httpBin.stats.forEach((s, i) => {
@@ -254,9 +303,10 @@ async function main() {
   });
 
   console.log('\n=== Summary ===');
-  console.log('- Nếu captcha pass nhưng binary fail nhiều: proxy stream không ổn cho tải file XML');
-  console.log('- Nếu cả SOCKS5 và HTTP đều fail: kiểm tra firewall/VPS egress hoặc TMProxy session');
-  console.log('- Nếu SOCKS5 fail nhưng HTTP pass: tạm thời disable SOCKS5 path cho binary trên VPS');
+  console.log('- Test [4]/[6]: nếu FAIL = proxy bị block ngay trên endpoint export-xml (cần direct connection hoặc proxy khác)');
+  console.log('- Test [4]/[6]: nếu PASS (HTTP 401/403) = path OK, lỗi bot là do thiếu/hết hạn token hoặc params');
+  console.log('- Test [5]/[7]: nếu FAIL binary = proxy không ổn định cho stream lớn');
+  console.log('- Nếu cả SOCKS5 và HTTP đều fail trên export-xml: đặt DISABLE_PROXY_BINARY=true trong .env để dùng direct');
 }
 
 main().catch((err) => {
