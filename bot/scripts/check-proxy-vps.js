@@ -22,7 +22,7 @@ const axios = require('axios');
 const { createTunnelAgent, createSocks5TunnelAgent } = require('../dist/proxy-tunnel');
 
 const GDT_BASE_HTTP = 'http://hoadondientu.gdt.gov.vn:30000';
-const DEFAULT_BINARY_URL = 'http://speed.hetzner.de/1MB.bin';
+const DEFAULT_BINARY_URL = 'https://httpbin.org/bytes/131072'; // 128 KB, HTTPS, no cert issues
 const TEST_ROUNDS = Number(process.env.TEST_ROUNDS || 3);
 const TEST_TIMEOUT_MS = Number(process.env.TEST_TIMEOUT_MS || 45000);
 const TEST_BINARY_URL = process.env.TEST_BINARY_URL || DEFAULT_BINARY_URL;
@@ -224,11 +224,15 @@ async function testBinaryStream(label, agent, rounds) {
   return { success, total: rounds, stats };
 }
 
+// Pass TEST_MODE=tmproxy env var to force TMProxy even if IPRoyal is configured
+const FORCE_TMPROXY = (process.env.TEST_MODE || '').toLowerCase() === 'tmproxy';
+
 async function main() {
   console.log('=== Proxy Diagnostics (VPS) ===');
   console.log(`Node: ${process.version}`);
   console.log(`Rounds: ${TEST_ROUNDS}, Timeout: ${TEST_TIMEOUT_MS}ms`);
   console.log(`Binary URL: ${TEST_BINARY_URL}`);
+  if (FORCE_TMPROXY) console.log('Mode: FORCE TMProxy (TEST_MODE=tmproxy)');
 
   const iproyal = pickIproyalFirst();
   const tmproxyKey = pickTmproxyKey();
@@ -237,7 +241,7 @@ async function main() {
   let httpProxyUrl = null;
   let socks5ProxyUrl = null;
 
-  if (iproyal) {
+  if (iproyal && !FORCE_TMPROXY) {
     console.log('\n[1] IPRoyal mode detected');
     console.log(`sessions total: ${iproyal.total}, testing session: ${iproyal.sessionMatch}`);
     httpProxyUrl   = iproyal.httpProxyUrl;
@@ -340,6 +344,8 @@ async function main() {
   console.log('- Test [4]/[6]: nếu PASS (HTTP 401/403) = path OK, lỗi bot là do thiếu/hết hạn token hoặc params');
   console.log('- Test [5]/[7]: nếu FAIL binary = proxy không ổn định cho stream lớn');
   console.log('- Nếu cả SOCKS5 và HTTP đều fail trên export-xml: đặt DISABLE_PROXY_BINARY=true trong .env để dùng direct');
+  console.log('- IPRoyal 403/blocked: proxy không cho CONNECT đến port 30000 (non-standard) — thử TMPROXY_API_KEY thay thế');
+  console.log('- TMProxy fail binary: dùng BINARY_RETRY_COUNT=5 hoặc nâng BINARY_TIMEOUT_MS trong .env');
 }
 
 main().catch((err) => {
