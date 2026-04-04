@@ -56,6 +56,40 @@ export function errorHandler(
     return;
   }
 
+  // PostgreSQL constraint violations — convert to user-friendly 409/422
+  const pgErr = err as unknown as Record<string, unknown>;
+  const pgCode = pgErr['code'];
+  const pgConstraint = pgErr['constraint'] as string | undefined;
+  const pgTable = pgErr['table'] as string | undefined;
+  const pgDetail = pgErr['detail'] as string | undefined;
+  if (typeof pgCode === 'string') {
+    if (pgCode === '23505') {
+      // Unique constraint violation
+      let message = 'Dữ liệu đã tồn tại, vui lòng kiểm tra lại';
+      if (pgConstraint?.includes('tax_code')) {
+        message = 'Mã số thuế này đã được đăng ký trong hệ thống';
+      } else if (pgConstraint?.includes('email')) {
+        message = 'Email này đã được đăng ký';
+      } else if (pgConstraint?.includes('invoice_number') || pgConstraint?.includes('uq_invoice')) {
+        message = 'Hóa đơn đã tồn tại (trùng số hóa đơn)';
+      }
+      console.warn(JSON.stringify({ level: 'warn', requestId, code: '23505', constraint: pgConstraint, table: pgTable }));
+      res.status(409).json({ success: false, error: { code: 'DUPLICATE', message } });
+      return;
+    }
+    if (pgCode === '23503') {
+      // Foreign key violation — log full detail for debugging
+      console.error(JSON.stringify({ level: 'error', requestId, code: '23503', constraint: pgConstraint, table: pgTable, detail: pgDetail, message: err.message }));
+      res.status(422).json({ success: false, error: { code: 'REFERENCE_ERROR', message: `Lỗi ràng buộc dữ liệu${pgTable ? ` (bảng: ${pgTable})` : ''} — liên hệ admin` } });
+      return;
+    }
+    if (pgCode === '23502') {
+      // Not null violation
+      res.status(422).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Thiếu thông tin bắt buộc' } });
+      return;
+    }
+  }
+
   // Unexpected error — log at error level with full context
   console.error(
     JSON.stringify({
