@@ -118,6 +118,7 @@ export function createTunnelAgent(opts: ProxyOptions): http.Agent {
 
         sock.removeListener('data', onData);
         sock.setTimeout(0);
+        sock.setKeepAlive(true, 5_000);  // prevent TMProxy idle-timeout during slow binary downloads
 
         const statusLine = buf.toString('ascii').split('\r\n')[0] ?? '';
         if (!statusLine.includes('200')) {
@@ -273,6 +274,7 @@ export function createSocks5TunnelAgent(opts: ProxyOptions): http.Agent {
           // SOCKS5 tunnel established — wrap in TLS
           sock.removeListener('data', onData);
           sock.setTimeout(0);
+          sock.setKeepAlive(true, 5_000);  // prevent TMProxy idle-timeout during slow binary downloads
           const tlsSock = tls.connect({ socket: sock, servername, rejectUnauthorized });
           tlsSock.once('error',         (err) => callback(err, null));
           tlsSock.once('secureConnect', ()    => callback(null, tlsSock as unknown as net.Socket));

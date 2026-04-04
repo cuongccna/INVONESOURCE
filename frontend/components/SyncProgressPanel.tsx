@@ -6,6 +6,13 @@ import apiClient from '../lib/apiClient';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 
+// If all jobs are still unresolved after this many ms, show a force-close button
+const STALL_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
+// Max SSE reconnect attempts per job before giving up
+const MAX_SSE_RETRIES = 4;
+// Backoff delays (ms): 2s, 4s, 8s, 16s
+const SSE_BACKOFF = [2000, 4000, 8000, 16000];
+
 interface JobProgress {
   jobId: string;
   state: 'waiting' | 'delayed' | 'active' | 'completed' | 'failed';
@@ -29,40 +36,80 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
   const [jobs, setJobs] = useState<Record<string, JobProgress>>({});
   const [cancelling, setCancelling] = useState(false);
   const [cancelled, setCancelled] = useState(false);
+  // Jobs where SSE exhausted all retries — treated as timed-out
+  const [stalledJobs, setStalledJobs] = useState<Set<string>>(new Set());
+  // Whether the stall timeout has elapsed (shows force-close button)
+  const [showForceClose, setShowForceClose] = useState(false);
+
   const eventSourcesRef = useRef<EventSource[]>([]);
+  const retryCountRef = useRef<Record<string, number>>({});
+  const retryTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const stallTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const openedAtRef = useRef(Date.now());
 
   const cleanup = useCallback(() => {
     eventSourcesRef.current.forEach((es) => es.close());
     eventSourcesRef.current = [];
+    Object.values(retryTimersRef.current).forEach(clearTimeout);
+    retryTimersRef.current = {};
+    if (stallTimerRef.current) clearTimeout(stallTimerRef.current);
   }, []);
 
+  const openSSE = useCallback((jobId: string) => {
+    const token = getAccessToken();
+    const params = new URLSearchParams();
+    if (token) params.set('token', token);
+    if (companyId) params.set('companyId', companyId);
+    const url = `${API_URL}/api/sync/progress/${encodeURIComponent(jobId)}?${params.toString()}`;
+    const es = new EventSource(url);
+    eventSourcesRef.current.push(es);
+
+    es.onmessage = (evt) => {
+      try {
+        const data = JSON.parse(evt.data) as JobProgress;
+        // Reset error counter on successful message
+        retryCountRef.current[jobId] = 0;
+        setJobs((prev) => ({ ...prev, [data.jobId]: data }));
+        // Close SSE when terminal state received — no need to keep connection open
+        if (data.state === 'completed' || data.state === 'failed') {
+          es.close();
+        }
+      } catch { /* ignore parse errors */ }
+    };
+
+    es.onerror = () => {
+      es.close();
+      const attempts = (retryCountRef.current[jobId] ?? 0);
+      if (attempts >= MAX_SSE_RETRIES) {
+        // All retries exhausted — mark job as stalled (treat as done to unblock UI)
+        setStalledJobs((prev) => new Set([...prev, jobId]));
+        return;
+      }
+      retryCountRef.current[jobId] = attempts + 1;
+      const delay = SSE_BACKOFF[Math.min(attempts, SSE_BACKOFF.length - 1)] ?? 16000;
+      retryTimersRef.current[jobId] = setTimeout(() => {
+        openSSE(jobId);
+      }, delay);
+    };
+  }, [companyId]); // eslint-disable-line react-hooks/exhaustive-deps
+
   useEffect(() => {
-    if (cancelled) return; // don't reconnect after cancel
+    if (cancelled) return;
     cleanup();
+    retryCountRef.current = {};
+    openedAtRef.current = Date.now();
 
     for (const jobId of jobIds) {
-      const token = getAccessToken();
-      const params = new URLSearchParams();
-      if (token) params.set('token', token);
-      if (companyId) params.set('companyId', companyId);
-      const url = `${API_URL}/api/sync/progress/${encodeURIComponent(jobId)}?${params.toString()}`;
-      const es = new EventSource(url);
-      eventSourcesRef.current.push(es);
-
-      es.onmessage = (evt) => {
-        try {
-          const data = JSON.parse(evt.data) as JobProgress;
-          setJobs((prev) => ({ ...prev, [data.jobId]: data }));
-        } catch { /* ignore parse errors */ }
-      };
-
-      es.onerror = () => {
-        es.close();
-      };
+      openSSE(jobId);
     }
 
+    // Stall safety-net: if some jobs are still unresolved after STALL_TIMEOUT_MS, show force-close
+    stallTimerRef.current = setTimeout(() => {
+      setShowForceClose(true);
+    }, STALL_TIMEOUT_MS);
+
     return cleanup;
-  }, [jobIds, cancelled, cleanup]);
+  }, [jobIds, cancelled, cleanup, openSSE]);
 
   const handleCancel = async () => {
     if (cancelling || cancelled) return;
@@ -72,7 +119,6 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
       cleanup();
       setCancelled(true);
     } catch {
-      // Even if backend call fails, mark cancelled so the UI unblocks
       cleanup();
       setCancelled(true);
     } finally {
@@ -80,12 +126,16 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
     }
   };
 
-  // Check if all jobs are done
-  const allDone = cancelled || (jobIds.length > 0 && jobIds.every((id) => {
+  // Job is done if: completed, failed, or SSE retries exhausted (stalled)
+  const isJobDone = (id: string) => {
     const j = jobs[id];
-    return j && (j.state === 'completed' || j.state === 'failed');
-  }));
-  const anyFailed = !cancelled && jobIds.some((id) => jobs[id]?.state === 'failed');
+    return stalledJobs.has(id) || (j != null && (j.state === 'completed' || j.state === 'failed'));
+  };
+
+  const allDone = cancelled || (jobIds.length > 0 && jobIds.every(isJobDone));
+  const anyFailed = !cancelled && jobIds.some((id) => {
+    return stalledJobs.has(id) || jobs[id]?.state === 'failed';
+  });
   const totalFetched = Object.values(jobs).reduce((s, j) => s + (j.invoicesFetched ?? 0), 0);
 
   useEffect(() => {
@@ -94,6 +144,8 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
       return () => clearTimeout(t);
     }
   }, [allDone, anyFailed, cancelled, onDone]);
+
+  const retryCount = (id: string) => retryCountRef.current[id] ?? 0;
 
   return (
     <div className="bg-white rounded-2xl shadow-lg border border-gray-100 p-4 space-y-3">
@@ -114,7 +166,7 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
               : 'Đang đồng bộ hóa đơn...'}
           </h4>
         </div>
-        {allDone && (
+        {(allDone || showForceClose) && (
           <button onClick={onClose} className="text-gray-400 hover:text-gray-700 text-sm">✕</button>
         )}
       </div>
@@ -123,11 +175,14 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
       <div className="space-y-2">
         {jobIds.map((id) => {
           const j = jobs[id];
+          const stalled = stalledJobs.has(id);
           const pct = j ? Math.min(100, Math.max(0, j.progress)) : 0;
           const label = j?.currentMonth || id.split('-').pop() || '';
           const stateLabel = cancelled
             ? (j?.state === 'completed' ? `✅ ${j.invoicesFetched} HĐ` : '⏹ Đã hủy')
-            : !j ? 'Đang kết nối...'
+            : stalled ? '⚠️ Mất kết nối'
+            : !j
+            ? (retryCount(id) > 0 ? `Đang kết nối lại (${retryCount(id)}/${MAX_SSE_RETRIES})...` : 'Đang kết nối...')
             : j.state === 'waiting' || j.state === 'delayed' ? 'Chờ...'
             : j.state === 'active' ? j.message || `${pct}%`
             : j.state === 'completed' ? `✅ ${j.invoicesFetched} HĐ`
@@ -137,17 +192,18 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
             <div key={id}>
               <div className="flex items-center justify-between text-xs mb-1">
                 <span className="text-gray-600 font-medium">{label}</span>
-                <span className="text-gray-500">{stateLabel}</span>
+                <span className={`${stalled ? 'text-amber-500' : 'text-gray-500'}`}>{stateLabel}</span>
               </div>
               <div className="w-full bg-gray-100 rounded-full h-2 overflow-hidden">
                 <div
                   className={`h-full rounded-full transition-all duration-500 ${
                     cancelled && j?.state !== 'completed' ? 'bg-amber-400'
+                    : stalled ? 'bg-amber-400'
                     : j?.state === 'completed' ? 'bg-green-500'
                     : j?.state === 'failed' ? 'bg-red-500'
                     : 'bg-primary-500'
                   }`}
-                  style={{ width: `${pct}%` }}
+                  style={{ width: stalled ? '100%' : `${pct}%` }}
                 />
               </div>
             </div>
@@ -157,13 +213,21 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
 
       {/* Actions */}
       <div className="flex gap-2 pt-1">
-        {!allDone && (
+        {!allDone && !showForceClose && (
           <button
             onClick={() => void handleCancel()}
             disabled={cancelling}
             className="flex-1 text-sm py-2 border border-red-200 text-red-600 rounded-xl font-medium hover:bg-red-50 disabled:opacity-50 transition-colors"
           >
             {cancelling ? 'Đang hủy...' : '⏹ Hủy đồng bộ'}
+          </button>
+        )}
+        {!allDone && showForceClose && (
+          <button
+            onClick={onClose}
+            className="flex-1 text-sm py-2 border border-gray-300 rounded-xl text-gray-600 font-medium hover:bg-gray-50"
+          >
+            Đóng (chạy nền)
           </button>
         )}
         {allDone && !anyFailed && !cancelled && (

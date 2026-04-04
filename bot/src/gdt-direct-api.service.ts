@@ -727,14 +727,7 @@ export class GdtDirectApiService {
     let lastErr: Error | null = null;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
-        const res = await client.get<ArrayBuffer>(url, {
-          params,
-          headers: { Authorization: `Bearer ${this.token}` },
-          responseType: 'arraybuffer',
-          // Binary downloads can be large — allow more time
-          timeout: binaryTimeout,
-        });
-        return Buffer.from(res.data);
+        return await this._streamResponse(client, url, params, binaryTimeout);
       } catch (err) {
         if (axios.isAxiosError(err)) {
           const status = err.response?.status ?? 0;
@@ -763,13 +756,7 @@ export class GdtDirectApiService {
     if (this.binaryHttp && lastErr != null) {
       logger.warn('[GdtDirect] SOCKS5 binary all retries failed — falling back to HTTP proxy', { url });
       try {
-        const res = await this.http.get<ArrayBuffer>(url, {
-          params,
-          headers: { Authorization: `Bearer ${this.token}` },
-          responseType: 'arraybuffer',
-          timeout: binaryTimeout,
-        });
-        return Buffer.from(res.data);
+        return await this._streamResponse(this.http, url, params, binaryTimeout);
       } catch (fallbackErr) {
         logger.warn('[GdtDirect] HTTP proxy fallback also failed', {
           url,
@@ -779,5 +766,68 @@ export class GdtDirectApiService {
     }
 
     throw lastErr ?? new Error(`Failed binary GET ${url} after ${maxRetries} retries`);
+  }
+
+  /**
+   * Stream binary response through proxy tunnel into a Buffer.
+   *
+   * Why stream instead of arraybuffer:
+   *   arraybuffer = axios buffers EVERYTHING before resolving.
+   *   If TMProxy sees idle TCP (no bytes flowing) it drops the connection.
+   *   stream = data chunks flow immediately as GDT sends them,
+   *   keeping the TCP connection active through the proxy.
+   *
+   * Why Accept-Encoding: identity:
+   *   commonHeaders sends gzip/deflate/br. Proxy may try to decompress
+   *   the already-binary ZIP response and corrupt it. identity = raw bytes.
+   *
+   * Why decompress: false:
+   *   Prevents axios from running the zlib decompressor on the stream.
+   *   If response has no Content-Encoding (plain binary), the decompressor
+   *   would abort with "stream has been aborted".
+   */
+  private async _streamResponse(
+    client: AxiosInstance,
+    url: string,
+    params: Record<string, unknown>,
+    timeout: number,
+  ): Promise<Buffer> {
+    const res = await client.get<NodeJS.ReadableStream>(url, {
+      params,
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        'Accept-Encoding': 'identity',
+      },
+      responseType: 'stream',
+      decompress: false,
+      timeout,
+    });
+
+    return new Promise<Buffer>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let totalBytes = 0;
+
+      // Hard deadline: destroy stream if full response not received within timeout
+      const deadline = setTimeout(() => {
+        (res.data as NodeJS.ReadableStream & { destroy?: (e: Error) => void }).destroy?.(
+          new Error('Binary stream timeout'),
+        );
+      }, timeout);
+
+      (res.data as NodeJS.ReadableStream)
+        .on('data', (chunk: Buffer | string) => {
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
+          chunks.push(buf);
+          totalBytes += buf.length;
+        })
+        .on('end', () => {
+          clearTimeout(deadline);
+          resolve(Buffer.concat(chunks, totalBytes));
+        })
+        .on('error', (e: Error) => {
+          clearTimeout(deadline);
+          reject(e);
+        });
+    });
   }
 }

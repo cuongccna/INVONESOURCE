@@ -23,7 +23,13 @@ export function SyncProvider({ children }: { children: ReactNode }) {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
-        const parsed = JSON.parse(raw) as { jobIds: string[]; companyId: string };
+        const parsed = JSON.parse(raw) as { jobIds: string[]; companyId: string; startedAt?: number };
+        // Auto-clear state older than 35 minutes — sync must have finished already
+        const age = Date.now() - (parsed.startedAt ?? 0);
+        if (age > 35 * 60 * 1000) {
+          localStorage.removeItem(STORAGE_KEY);
+          return;
+        }
         if (Array.isArray(parsed.jobIds) && parsed.jobIds.length > 0) {
           setSyncJobIds(parsed.jobIds);
           setSyncCompanyId(parsed.companyId ?? '');
@@ -36,7 +42,7 @@ export function SyncProvider({ children }: { children: ReactNode }) {
     setSyncJobIds(jobIds);
     setSyncCompanyId(companyId);
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ jobIds, companyId }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ jobIds, companyId, startedAt: Date.now() }));
     } catch { /* ignore */ }
   }, []);
 
