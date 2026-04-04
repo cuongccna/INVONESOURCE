@@ -21,7 +21,7 @@ CREATE INDEX IF NOT EXISTS idx_crawler_recipes_active
 
 -- Seed the default recipe for the GDT portal.
 -- All values mirror the hardcoded constants in gdt-direct-api.service.ts.
--- ON CONFLICT DO NOTHING ensures re-runs are safe.
+-- ON CONFLICT DO UPDATE: safely adds new endpoints (e.g. "detail") to existing rows.
 INSERT INTO crawler_recipes (name, recipe, notes)
 VALUES (
   'gdt_main',
@@ -80,4 +80,22 @@ VALUES (
   }'::jsonb,
   'Default GDT portal recipe. Edit field arrays if GDT renames response keys. Edit endpoint paths if GDT moves routes.'
 )
-ON CONFLICT (name) DO NOTHING;
+ON CONFLICT (name) DO UPDATE
+  SET
+    -- Merge: add "detail" endpoint if missing, leave everything else untouched
+    recipe     = crawler_recipes.recipe
+                   || jsonb_build_object(
+                       'api', (crawler_recipes.recipe->'api')
+                                || jsonb_build_object(
+                                    'endpoints',
+                                    (crawler_recipes.recipe->'api'->'endpoints')
+                                    || CASE
+                                         WHEN (crawler_recipes.recipe->'api'->'endpoints') ? 'detail'
+                                         THEN '{}'::jsonb
+                                         ELSE '{"detail": "/query/invoices/detail"}'::jsonb
+                                       END
+                                  )
+                     ),
+    updated_at = NOW()
+WHERE crawler_recipes.recipe->'api'->'endpoints' IS NOT NULL;
+

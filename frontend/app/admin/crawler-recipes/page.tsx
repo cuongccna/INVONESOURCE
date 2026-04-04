@@ -247,12 +247,53 @@ export default function CrawlerRecipesPage() {
                 {showRef && (
                   <div className="px-4 py-3 text-xs text-gray-600 space-y-2 bg-white">
                     <p><strong>GDT đổi URL / port:</strong> Sửa <code>api.baseUrl</code> và <code>api.baseUrlHttp</code></p>
-                    <p><strong>GDT đổi đường dẫn endpoint:</strong> Sửa các key trong <code>api.endpoints</code> (captcha, auth, sold, purchase, exportXml…)</p>
-                    <p><strong>GDT đổi tên trường JSON:</strong> Tìm field tương ứng trong <code>fields</code> và thêm tên mới vào đầu mảng (VD: <code>"fields.sellerTax": ["ten_moi", "nbmst", ...]</code>)</p>
-                    <p><strong>GDT thêm tab mua vào mới:</strong> Thêm filter vào <code>api.query.purchaseFilters</code> (VD: <code>"ttxly==9"</code>)</p>
+                    <p><strong>GDT đổi đường dẫn endpoint:</strong> Sửa các key trong <code>api.endpoints</code></p>
+                    <div className="bg-gray-50 rounded p-2 space-y-1">
+                      <p className="font-medium text-gray-700">Các endpoint hiện tại:</p>
+                      <table className="w-full">
+                        <tbody className="divide-y divide-gray-100">
+                          {([
+                            ['captcha',             '/captcha',                                    'Lấy captcha SVG'],
+                            ['auth',                '/security-taxpayer/authenticate',             'Đăng nhập → JWT token'],
+                            ['sold',                '/query/invoices/sold',                        'Danh sách hóa đơn bán ra (JSON)'],
+                            ['purchase',            '/query/invoices/purchase',                    'Danh sách hóa đơn mua vào (JSON)'],
+                            ['detail',              '/query/invoices/detail',                      '✅ Chi tiết 1 hóa đơn + line items (~6KB JSON) — ưu tiên'],
+                            ['exportXml',           '/query/invoices/export-xml',                  'Tải XML ZIP (~400KB) — fallback khi detail fail'],
+                            ['exportExcel',         '/query/invoices/export-excel',                'Tải XLSX bán ra'],
+                            ['exportExcelPurchase', '/query/invoices/export-excel-sold',           'Tải XLSX mua vào'],
+                          ] as [string, string, string][]).map(([key, path, desc]) => (
+                            <tr key={key}>
+                              <td className="py-0.5 pr-2 font-mono text-indigo-700 whitespace-nowrap">{key}</td>
+                              <td className="py-0.5 pr-2 font-mono text-gray-500 whitespace-nowrap">{path}</td>
+                              <td className="py-0.5 text-gray-500">{desc}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <p><strong>GDT đổi tên trường JSON:</strong> Tìm field tương ứng trong <code>fields</code> và thêm tên mới vào đầu mảng</p>
+                    <p><strong>GDT thêm tab mua vào mới:</strong> Thêm filter vào <code>api.query.purchaseFilters</code> (VD: <code>&quot;ttxly==9&quot;</code>)</p>
                     <p><strong>GDT thay đổi mã trạng thái:</strong> Sửa <code>statusMap</code> (key = mã số dạng chuỗi, value = valid/cancelled/replaced/adjusted)</p>
-                    <p><strong>GDT thay đổi kích thước trang:</strong> Sửa <code>api.pagination.pageSize</code> và <code>timing.pageSize</code></p>
                     <p><strong>Tăng timeout / retry:</strong> Sửa <code>timing.requestTimeoutMs</code>, <code>timing.binaryTimeoutMs</code>, <code>timing.maxRetries</code></p>
+                    <div className="mt-2 border-t border-gray-200 pt-2">
+                      <p className="font-medium text-gray-700 mb-1">Cách chạy migration DB (khi có script SQL mới):</p>
+                      <pre className="bg-gray-900 text-green-400 rounded p-2 text-xs overflow-x-auto whitespace-pre">{`# Trên VPS — chạy 1 lần sau khi git pull
+cd /opt/INVONESOURCE
+node -e "
+require('dotenv').config();
+const {Client}=require('pg');
+const fs=require('fs');
+const db=new Client({connectionString:process.env.DATABASE_URL});
+db.connect().then(async()=>{
+  await db.query(fs.readFileSync('scripts/022_crawler_recipes.sql','utf8'));
+  console.log('Done');
+  await db.end();
+});
+"
+
+# Hoặc dùng script có sẵn (local):
+node scripts/apply-026.js  # thay 026 bằng số migration cần chạy`}</pre>
+                    </div>
                   </div>
                 )}
               </div>
