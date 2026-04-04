@@ -729,6 +729,7 @@ export class GdtDirectApiService {
       try {
         return await this._streamResponse(client, url, params, binaryTimeout);
       } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
         if (axios.isAxiosError(err)) {
           const status = err.response?.status ?? 0;
           if (status === 401) throw new Error('GDT token expired — re-login required');
@@ -741,10 +742,21 @@ export class GdtDirectApiService {
               } catch { /* ignore decode errors */ }
             }
             lastErr = err as Error;
-            logger.warn('[GdtDirect] Binary retry', { url, attempt, status });
+            logger.warn('[GdtDirect] Binary retry (axios)', { url, attempt, status });
             await sleep(retryDelayMs * (attempt + 1));
             continue;
           }
+        }
+        // Also retry on plain stream/TCP errors (responseType:'stream' errors are NOT AxiosErrors).
+        // "aborted" = axios cancels the stream after headers received, or Node http abort.
+        // "ECONNRESET" / "socket hang up" = proxy dropped mid-stream.
+        // These must retry just like network errors, not throw immediately.
+        const isRetriableStream = /aborted|ECONNRESET|ECONNREFUSED|ETIMEDOUT|socket hang up|stream|EPIPE/i.test(errMsg);
+        if (isRetriableStream) {
+          lastErr = err as Error;
+          logger.warn('[GdtDirect] Binary retry (stream error)', { url, attempt, msg: errMsg });
+          await sleep(retryDelayMs * (attempt + 1));
+          continue;
         }
         throw err;
       }
@@ -803,6 +815,16 @@ export class GdtDirectApiService {
       timeout,
     });
 
+    // Log response headers so we can diagnose what GDT is actually returning
+    logger.info('[GdtDirect] Stream response headers', {
+      url,
+      status:        res.status,
+      contentType:   res.headers['content-type'],
+      contentLength: res.headers['content-length'],
+      contentEncoding: res.headers['content-encoding'],
+      transferEncoding: res.headers['transfer-encoding'],
+    });
+
     return new Promise<Buffer>((resolve, reject) => {
       const chunks: Buffer[] = [];
       let totalBytes = 0;
@@ -822,10 +844,12 @@ export class GdtDirectApiService {
         })
         .on('end', () => {
           clearTimeout(deadline);
+          logger.info('[GdtDirect] Stream complete', { url, totalBytes });
           resolve(Buffer.concat(chunks, totalBytes));
         })
         .on('error', (e: Error) => {
           clearTimeout(deadline);
+          logger.warn('[GdtDirect] Stream error', { url, msg: e.message, bytesReceived: totalBytes });
           reject(e);
         });
     });
