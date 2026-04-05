@@ -57,6 +57,5 @@ scripts/run-remaining-migs.js
 scripts/seed-admin.js
 dump.rdb
 scripts/check-missing-tables.js
-scripts/test-company-delete.js
 backend/tmp/check_col.js
 backend/tmp/run_024.js
