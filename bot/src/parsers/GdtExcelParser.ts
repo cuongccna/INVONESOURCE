@@ -122,6 +122,8 @@ export class GdtExcelParser {
       // Excel exports don't distinguish coded vs non-coded; default to true
       // (XML fetch will fail gracefully if not available)
       xml_available:   true,
+      // Excel-parsed invoices are not from sco-query endpoint
+      is_sco:          false,
     };
   }
 

@@ -57,6 +57,10 @@ const GDT_API_HTTPS = 'https://hoadondientu.gdt.gov.vn:30000';
 // TLS socket, so HTTP text is encrypted end-to-end. Using https.request would
 // double-wrap TLS and break the connection.
 const GDT_API_HTTP  = 'http://hoadondientu.gdt.gov.vn:30000';
+// sco-query endpoints serve invoices sourced from POS machines (máy tính tiền — MTTTT)
+const GDT_SCO_SOLD     = '/sco-query/invoices/sold';
+const GDT_SCO_PURCHASE = '/sco-query/invoices/purchase';
+const GDT_SCO_DETAIL   = '/sco-query/invoices/detail';
 const PAGE_SIZE = 50;
 
 // Retry config for transient errors
@@ -200,7 +204,21 @@ function formatGdtDate(d: Date): string {
 function parseInvoiceDate(raw: unknown): string | null {
   if (!raw) return null;
   const s = String(raw);
-  // ISO format: 2026-03-01T... or 2026-03-01
+  // ISO timestamp with time component — GDT API returns UTC strings (e.g. "2026-04-03T17:00:00Z")
+  // which is Vietnam midnight (UTC+7 = 2026-04-04 00:00). Must convert to VN timezone before
+  // extracting date, otherwise invoices appear 1 day early.
+  if (s.includes('T')) {
+    const d = new Date(s);
+    if (!isNaN(d.getTime())) {
+      const vnMs = d.getTime() + 7 * 3_600_000; // UTC+7
+      const vn = new Date(vnMs);
+      const yyyy = vn.getUTCFullYear();
+      const mm   = String(vn.getUTCMonth() + 1).padStart(2, '0');
+      const dd   = String(vn.getUTCDate()).padStart(2, '0');
+      return `${yyyy}-${mm}-${dd}`;
+    }
+  }
+  // YYYY-MM-DD date string (already a calendar date, no timezone conversion needed)
   const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
   if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
   // VN format: 01/03/2026
@@ -261,6 +279,7 @@ function splitIntoMonths(from: Date, to: Date): Array<{ from: Date; to: Date }> 
 
 interface MapInvoiceOpts {
   ttxlyFilter?:     string;
+  isSco?:           boolean;  // true when fetched via /sco-query (MTTTT)
   fields?:          RecipeFields;
   statusMap?:       Record<string, string>;
   xmlAvailableTtxly?: Set<number>;
@@ -271,7 +290,7 @@ function mapInvoice(
   direction: 'output' | 'input',
   opts:      MapInvoiceOpts = {},
 ): RawInvoice {
-  const { ttxlyFilter, fields, statusMap: recipeStatusMap, xmlAvailableTtxly: recipeXmlSet } = opts;
+  const { ttxlyFilter, isSco, fields, statusMap: recipeStatusMap, xmlAvailableTtxly: recipeXmlSet } = opts;
   const r = row as Record<string, unknown>;
 
   // tthai = trạng thái hóa đơn (1=valid, 3=cancelled, 5=replaced, 6=adjusted)
@@ -342,6 +361,7 @@ function mapInvoice(
     xml_available:   direction === 'output'
       ? true
       : xmlSet.has(parseInt((ttxlyFilter ?? '').replace('ttxly==', ''), 10)),
+    is_sco:          isSco ?? false,
   };
 }
 
@@ -503,35 +523,76 @@ export class GdtDirectApiService {
 
   // ── Invoice fetching ───────────────────────────────────────────────────────
 
-  /** Fetch all output invoices (hóa đơn bán ra) for the given period */
+  /**
+   * Fetch all output invoices (hóa đơn bán ra) for the given period.
+   *
+   * GDT portal has two tabs:
+   *   /query/invoices/sold     — HĐ điện tử (standard e-invoices)
+   *   /sco-query/invoices/sold — HĐ có mã khởi tạo từ máy tính tiền (MTTTT / POS-coded)
+   * Both are merged and deduplicated.
+   */
   async fetchOutputInvoices(fromDate: Date, toDate: Date): Promise<RawInvoice[]> {
-    return this._fetchRangeByMonth('sold', fromDate, toDate);
+    const scoPath = this.recipe?.api.endpoints.scoSold ?? GDT_SCO_SOLD;
+    const queryResult = await this._fetchRangeByMonth('sold', fromDate, toDate);
+    await humanDelay(1_500, 3_000);
+    const scoResult = await this._fetchRangeByMonth('sold', fromDate, toDate, undefined, scoPath);
+
+    // Dedup by invoice_number + serial_number + invoice_date
+    const seen   = new Set<string>();
+    const merged: RawInvoice[] = [];
+    for (const inv of [...queryResult, ...scoResult]) {
+      const key = `${inv.invoice_number ?? ''}|${inv.serial_number ?? ''}|${inv.invoice_date ?? ''}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        merged.push(inv);
+      }
+    }
+    logger.info('[GdtDirect] Output invoices merged', {
+      query: queryResult.length,
+      sco:   scoResult.length,
+      merged: merged.length,
+    });
+    return merged;
   }
 
   /**
    * Fetch all input invoices (hóa đơn mua vào) for the given period.
    *
-   * GDT portal has three tabs for purchase invoices:
-   *   ttxly==5  →  "Đã cấp mã hóa đơn"         (e-invoice with GDT code)
-   *   ttxly==6  →  "Cục Thuế đã nhận không mã"  (received without code)
-   *   ttxly==8  →  "Hóa đơn uỷ nhiệm"           (delegated/ủy nhiệm invoices)
-   * All three are valid deductible input invoices — we fetch and merge them.
+   * GDT portal has two invoice source tabs, each with a "Kết quả kiểm tra" dropdown:
+   *
+   *   /query/invoices/purchase   — HĐ điện tử:
+   *     ttxly==5  →  "Đã cấp mã hóa đơn"           (has signed XML)
+   *     ttxly==6  →  "Cục Thuế đã nhận không mã"    (no XML)
+   *
+   *   /sco-query/invoices/purchase — HĐ có mã khởi tạo từ máy tính tiền (MTTTT):
+   *     ttxly==5  →  "Cục Thuế đã nhận HĐ có mã MTTTT" (has signed XML)
+   *     ttxly==6  →  "Cục Thuế đã nhận HĐ MTTTT không mã" (no XML)
+   *     ttxly==8  →  "Cục Thuế đã nhận HĐ MTTTT ủy nhiệm" (no XML)
+   *
+   * All five streams are valid deductible input invoices — fetch and merge.
+   * NOTE: ttxly==8 previously used /query (wrong) — correct endpoint is /sco-query.
    */
   async fetchInputInvoices(fromDate: Date, toDate: Date): Promise<RawInvoice[]> {
-    // Fetch all three types sequentially (not parallel — avoids GDT rate-limit spike)
-    const filters = this.recipe?.api.query.purchaseFilters ?? ['ttxly==5', 'ttxly==6', 'ttxly==8'];
-    const [f5 = 'ttxly==5', f6 = 'ttxly==6', f8 = 'ttxly==8'] = filters;
-    const type5 = await this._fetchRangeByMonth('purchase', fromDate, toDate, f5);
-    await humanDelay(1_500, 3_000);
-    const type6 = await this._fetchRangeByMonth('purchase', fromDate, toDate, f6);
-    await humanDelay(1_500, 3_000);
-    const type8 = await this._fetchRangeByMonth('purchase', fromDate, toDate, f8);
+    const scoPurchasePath = this.recipe?.api.endpoints.scoPurchase ?? GDT_SCO_PURCHASE;
 
-    // Merge & deduplicate across all three types.
+    // HĐ điện tử via /query
+    const q5 = await this._fetchRangeByMonth('purchase', fromDate, toDate, 'ttxly==5');
+    await humanDelay(1_500, 3_000);
+    const q6 = await this._fetchRangeByMonth('purchase', fromDate, toDate, 'ttxly==6');
+    await humanDelay(1_500, 3_000);
+
+    // HĐ MTTTT via /sco-query
+    const sco5 = await this._fetchRangeByMonth('purchase', fromDate, toDate, 'ttxly==5', scoPurchasePath);
+    await humanDelay(1_500, 3_000);
+    const sco6 = await this._fetchRangeByMonth('purchase', fromDate, toDate, 'ttxly==6', scoPurchasePath);
+    await humanDelay(1_500, 3_000);
+    const sco8 = await this._fetchRangeByMonth('purchase', fromDate, toDate, 'ttxly==8', scoPurchasePath);
+
+    // Merge & deduplicate across all five streams.
     // Dedup key: invoice_number + seller_tax_code + invoice_date
     const seen   = new Set<string>();
     const merged: RawInvoice[] = [];
-    for (const inv of [...type5, ...type6, ...type8]) {
+    for (const inv of [...q5, ...q6, ...sco5, ...sco6, ...sco8]) {
       const key = `${inv.invoice_number ?? ''}|${inv.seller_tax_code ?? ''}|${inv.invoice_date ?? ''}`;
       if (!seen.has(key)) {
         seen.add(key);
@@ -539,9 +600,11 @@ export class GdtDirectApiService {
       }
     }
     logger.info('[GdtDirect] Purchase invoices merged', {
-      ttxly5: type5.length,
-      ttxly6: type6.length,
-      ttxly8: type8.length,
+      ttxly5_query: q5.length,
+      ttxly6_query: q6.length,
+      sco5: sco5.length,
+      sco6: sco6.length,
+      sco8: sco8.length,
       merged: merged.length,
     });
     return merged;
@@ -551,12 +614,14 @@ export class GdtDirectApiService {
    * Split [fromDate, toDate] into calendar-month windows (GDT max = 1 month)
    * and concatenate results.
    * @param extraFilter  Optional FIQL filter appended to the search string (e.g. 'ttxly==5').
+   * @param overridePath Optional API path override (e.g. GDT_SCO_SOLD for MTTTT endpoints).
    */
   private async _fetchRangeByMonth(
-    endpoint:    'sold' | 'purchase',
-    fromDate:    Date,
-    toDate:      Date,
+    endpoint:     'sold' | 'purchase',
+    fromDate:     Date,
+    toDate:       Date,
     extraFilter?: string,
+    overridePath?: string,
   ): Promise<RawInvoice[]> {
     const chunks = splitIntoMonths(fromDate, toDate);
     const all: RawInvoice[] = [];
@@ -567,7 +632,7 @@ export class GdtDirectApiService {
       // Without this, consecutive month requests arrive < 1s apart — GDT detects bot pattern
       // and responds with 429 after ~20 rapid requests.
       if (i > 0) await humanDelay(4_000, 8_000);
-      const chunk = await this._fetchAllPages(endpoint, from, to, extraFilter);
+      const chunk = await this._fetchAllPages(endpoint, from, to, extraFilter, overridePath);
       all.push(...chunk);
     }
     return all;
@@ -630,11 +695,14 @@ export class GdtDirectApiService {
     khhdon:   string;
     shdon:    string | number;
     khmshdon?: string | number;
+    isSco?:   boolean;  // true = use /sco-query/invoices/detail (MTTTT invoices)
   }): Promise<GdtInvoiceDetail> {
     if (!this.token) throw new Error('Not authenticated — call login() first');
-    const { nbmst, khhdon, shdon, khmshdon = 1 } = params;
-    const url = this.recipe?.api.endpoints.detail ?? '/query/invoices/detail';
-    logger.debug('[GdtDirect] fetchInvoiceDetail', { nbmst, khhdon, shdon });
+    const { nbmst, khhdon, shdon, khmshdon = 1, isSco = false } = params;
+    const url = isSco
+      ? (this.recipe?.api.endpoints.scoDetail ?? GDT_SCO_DETAIL)
+      : (this.recipe?.api.endpoints.detail    ?? '/query/invoices/detail');
+    logger.debug('[GdtDirect] fetchInvoiceDetail', { nbmst, khhdon, shdon, isSco });
     const res = await this.http.get<GdtInvoiceDetail>(url, {
       params: { nbmst, khhdon, shdon, khmshdon },
       headers: { Authorization: `Bearer ${this.token}` },
@@ -735,19 +803,22 @@ export class GdtDirectApiService {
   // ── Pagination ─────────────────────────────────────────────────────────────
 
   private async _fetchAllPages(
-    endpoint:    'sold' | 'purchase',
-    fromDate:    Date,
-    toDate:      Date,
+    endpoint:     'sold' | 'purchase',
+    fromDate:     Date,
+    toDate:       Date,
     extraFilter?: string,
+    overridePath?: string,
   ): Promise<RawInvoice[]> {
     if (!this.token) throw new Error('Not authenticated — call login() first');
 
     const direction: 'output' | 'input' = endpoint === 'sold' ? 'output' : 'input';
     const pageSize  = this.recipe?.api.pagination.pageSize ?? PAGE_SIZE;
-    // Resolve the actual API path for this endpoint type from recipe (with fallback)
-    const endpointPath = endpoint === 'sold'
-      ? (this.recipe?.api.endpoints.sold     ?? '/query/invoices/sold')
-      : (this.recipe?.api.endpoints.purchase ?? '/query/invoices/purchase');
+    // Resolve the actual API path: overridePath takes precedence (used for sco-query endpoints),
+    // then recipe setting, then hardcoded default.
+    const endpointPath = overridePath
+      ?? (endpoint === 'sold'
+        ? (this.recipe?.api.endpoints.sold     ?? '/query/invoices/sold')
+        : (this.recipe?.api.endpoints.purchase ?? '/query/invoices/purchase'));
     const from   = formatGdtDate(fromDate);
     const to     = formatGdtDate(toDate);
     // Build FIQL search string.
@@ -777,8 +848,10 @@ export class GdtDirectApiService {
 
       if (rows.length === 0) break;
 
+      const isSco = overridePath?.includes('sco-query') ?? false;
       const mapped = rows.map(r => mapInvoice(r, direction, {
         ttxlyFilter:      extraFilter,
+        isSco,
         fields:           this.recipe?.fields,
         statusMap:        this.recipe?.statusMap,
         xmlAvailableTtxly: this.recipe

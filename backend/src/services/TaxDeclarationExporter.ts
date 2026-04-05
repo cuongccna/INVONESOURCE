@@ -358,9 +358,21 @@ export class TaxDeclarationExporter {
 </html>`;
 
     const { default: puppeteer } = await import('puppeteer');
+    // On Linux VPS: set CHROMIUM_PATH=/usr/bin/chromium-browser (or chromium / google-chrome)
+    // to use the system-installed browser instead of puppeteer's bundled one.
+    // If CHROMIUM_PATH is not set, puppeteer uses its own bundled Chrome (needs system libs).
+    const executablePath = process.env['CHROMIUM_PATH'] || undefined;
     const browser = await puppeteer.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+      executablePath,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-zygote',
+        '--single-process',
+      ],
     });
     try {
       const page = await browser.newPage();

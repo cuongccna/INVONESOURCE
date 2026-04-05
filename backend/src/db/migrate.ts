@@ -42,19 +42,44 @@ async function migrate() {
 
       const sql = fs.readFileSync(path.join(scriptsDir, file), 'utf-8');
       console.log(`[RUN]  ${file}...`);
-      await client.query('BEGIN');
-      try {
-        await client.query(sql);
-        await client.query(
-          'INSERT INTO schema_migrations (version) VALUES ($1)',
-          [version]
-        );
-        await client.query('COMMIT');
-        console.log(`[DONE] ${file}`);
-      } catch (err) {
-        await client.query('ROLLBACK');
-        console.error(`[FAIL] ${file}:`, err);
-        throw err;
+
+      // CREATE INDEX CONCURRENTLY cannot run inside a transaction block.
+      // For migrations that contain it, run each statement individually outside a transaction,
+      // then record the version separately inside a small transaction.
+      const needsConcurrent = /CREATE\s+INDEX\s+CONCURRENTLY/i.test(sql);
+
+      if (needsConcurrent) {
+        // Run each semicolon-separated statement individually (no wrapping transaction)
+        const stmts = sql.split(';').map(s => s.trim()).filter(s => s.length > 0);
+        try {
+          for (const stmt of stmts) {
+            await client.query(stmt);
+          }
+          // Record version in its own small transaction
+          await client.query('BEGIN');
+          await client.query('INSERT INTO schema_migrations (version) VALUES ($1)', [version]);
+          await client.query('COMMIT');
+          console.log(`[DONE] ${file}`);
+        } catch (err) {
+          await client.query('ROLLBACK').catch(() => {});
+          console.error(`[FAIL] ${file}:`, err);
+          throw err;
+        }
+      } else {
+        await client.query('BEGIN');
+        try {
+          await client.query(sql);
+          await client.query(
+            'INSERT INTO schema_migrations (version) VALUES ($1)',
+            [version]
+          );
+          await client.query('COMMIT');
+          console.log(`[DONE] ${file}`);
+        } catch (err) {
+          await client.query('ROLLBACK');
+          console.error(`[FAIL] ${file}:`, err);
+          throw err;
+        }
       }
     }
 

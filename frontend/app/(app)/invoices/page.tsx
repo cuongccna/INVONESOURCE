@@ -30,6 +30,12 @@ const GROUP_OPTS = [
   { v: 8   as const, label: '8 · MTT',         cls: 'bg-amber-50 text-amber-700 border-amber-200 hover:border-amber-400',    activeCls: 'bg-amber-600 text-white border-amber-600' },
 ];
 
+const SCO_OPTS: { v: boolean | null; label: string }[] = [
+  { v: null,  label: 'Tất cả nguồn' },
+  { v: false, label: 'HĐ điện tử' },
+  { v: true,  label: 'HĐ máy tính tiền' },
+];
+
 export default function InvoicesPage() {
   const searchParams = useSearchParams();
   const importSessionId = searchParams.get('importSessionId');
@@ -44,6 +50,9 @@ export default function InvoicesPage() {
     (searchParams.get('direction') as 'output' | 'input') || ''
   );
   const [invoiceGroup, setInvoiceGroup] = useState<number | ''>('');
+  const [isSco, setIsSco] = useState<boolean | null>(null);
+  const [fromDate, setFromDate] = useState('');
+  const [toDate, setToDate] = useState('');
   const [trashCount, setTrashCount] = useState(0);
   const [search, setSearch] = useState(searchParams.get('search') ?? '');
   const [debouncedSearch, setDebouncedSearch] = useState(search);
@@ -74,6 +83,9 @@ export default function InvoicesPage() {
       if (debouncedSearch) params.search = debouncedSearch;
       if (importSessionId) params.importSessionId = importSessionId;
       if (invoiceGroup !== '') params.invoiceGroup = invoiceGroup;
+      if (isSco !== null) params.isSco = String(isSco);
+      if (fromDate) params.fromDate = fromDate;
+      if (toDate) params.toDate = toDate;
 
       const [res, trashRes] = await Promise.all([
         apiClient.get<PaginatedResponse>('/invoices', { params }),
@@ -89,7 +101,7 @@ export default function InvoicesPage() {
     } finally {
       setLoading(false);
     }
-  }, [activeCompanyId, direction, debouncedSearch, importSessionId, invoiceGroup, pageSize]);
+  }, [activeCompanyId, direction, debouncedSearch, importSessionId, invoiceGroup, isSco, fromDate, toDate, pageSize]);
 
   const handleDelete = async () => {
     if (!deleteTarget) return;
@@ -184,6 +196,9 @@ export default function InvoicesPage() {
       if (direction)            params.set('direction',    direction);
       if (debouncedSearch)      params.set('search',       debouncedSearch);
       if (invoiceGroup !== '')  params.set('invoiceGroup', String(invoiceGroup));
+      if (isSco !== null)       params.set('isSco',        String(isSco));
+      if (fromDate)             params.set('fromDate',     fromDate);
+      if (toDate)               params.set('toDate',       toDate);
       const res = await apiClient.get(`/invoices/export?${params.toString()}`, { responseType: 'blob' });
       const url = URL.createObjectURL(new Blob([res.data as BlobPart]));
       const a = document.createElement('a');
@@ -250,7 +265,7 @@ export default function InvoicesPage() {
       </div>
 
       {/* ── Filter Row 2: Invoice Group ── */}
-      <div className="flex gap-1.5 mb-3 flex-wrap">
+      <div className="flex gap-1.5 mb-2 flex-wrap">
         {GROUP_OPTS.map(opt => (
           <button key={String(opt.v)}
             onClick={() => { setInvoiceGroup(invoiceGroup === opt.v ? '' : (opt.v as number | '')); setSelectedIds([]); }}
@@ -262,7 +277,55 @@ export default function InvoicesPage() {
         ))}
       </div>
 
-      {/* ── Filter Row 3: Search ── */}
+      {/* ── Filter Row 3: Source type (HĐ điện tử vs MTTTT) ── */}
+      <div className="flex gap-1.5 mb-3 flex-wrap">
+        {SCO_OPTS.map(opt => (
+          <button key={String(opt.v)}
+            onClick={() => { setIsSco(isSco === opt.v ? null : opt.v); setSelectedIds([]); }}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+              isSco === opt.v
+                ? opt.v === true
+                  ? 'bg-purple-600 text-white border-purple-600'
+                  : opt.v === false
+                    ? 'bg-sky-600 text-white border-sky-600'
+                    : 'bg-gray-900 text-white border-gray-900'
+                : opt.v === true
+                  ? 'bg-white text-purple-700 border-purple-200 hover:border-purple-400'
+                  : opt.v === false
+                    ? 'bg-white text-sky-700 border-sky-200 hover:border-sky-400'
+                    : 'bg-white text-gray-600 border-gray-300 hover:border-gray-500'
+            }`}>
+            {opt.label}
+          </button>
+        ))}
+      </div>
+
+      {/* ── Filter Row 4: Date range ── */}
+      <div className="flex gap-2 mb-3 flex-wrap items-center">
+        <span className="text-xs text-gray-500 font-medium">Ngày lập:</span>
+        <input
+          type="date"
+          value={fromDate}
+          onChange={e => { setFromDate(e.target.value); setSelectedIds([]); }}
+          className="border border-gray-300 rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-primary-500"
+        />
+        <span className="text-xs text-gray-400">—</span>
+        <input
+          type="date"
+          value={toDate}
+          onChange={e => { setToDate(e.target.value); setSelectedIds([]); }}
+          className="border border-gray-300 rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-primary-500"
+        />
+        {(fromDate || toDate) && (
+          <button
+            onClick={() => { setFromDate(''); setToDate(''); setSelectedIds([]); }}
+            className="text-xs text-gray-400 hover:text-gray-700 underline">
+            Xóa
+          </button>
+        )}
+      </div>
+
+      {/* ── Filter Row 5: Search ── */}
       <div className="mb-4">
         <input
           type="text"

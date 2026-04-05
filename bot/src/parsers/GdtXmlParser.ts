@@ -41,6 +41,11 @@ export interface RawInvoice {
    * these are paper/non-coded invoices; calling export-xml returns HTTP 500.
    */
   xml_available:   boolean;
+  /**
+   * true = fetched from /sco-query (HĐ có mã khởi tạo từ máy tính tiền — MTTTT).
+   * false = fetched from /query (HĐ điện tử thông thường).
+   */
+  is_sco:          boolean;
 }
 
 export interface LineItem {
@@ -151,6 +156,8 @@ export class GdtXmlParser {
       gdt_validated:   true,
       // Invoices parsed directly from XML by definition have XML available
       xml_available:   true,
+      // XML-parsed invoices come from direct upload, not sco-query endpoint
+      is_sco:          false,
     };
   }
 

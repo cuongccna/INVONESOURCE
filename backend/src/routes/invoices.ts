@@ -46,6 +46,7 @@ const listSchema = z.object({
   search: z.string().optional(),
   importSessionId: z.string().uuid().optional(),
   invoiceGroup: z.coerce.number().int().optional(),
+  isSco: z.enum(['true', 'false']).optional(),
 });
 
 // GET /api/invoices
@@ -54,7 +55,7 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
     const query = listSchema.safeParse(req.query);
     if (!query.success) throw new ValidationError(query.error.issues[0]?.message ?? 'Invalid query');
 
-    const { page, pageSize, direction, status, fromDate, toDate, search, importSessionId, invoiceGroup } = query.data;
+    const { page, pageSize, direction, status, fromDate, toDate, search, importSessionId, invoiceGroup, isSco } = query.data;
     const companyId = req.user!.companyId;
     const offset = (page - 1) * pageSize;
 
@@ -68,6 +69,7 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
     if (toDate) { conditions.push(`invoice_date <= $${idx++}`); params.push(toDate); }
     if (importSessionId) { conditions.push(`import_session_id = $${idx++}`); params.push(importSessionId); }
     if (invoiceGroup != null) { conditions.push(`invoice_group = $${idx++}`); params.push(invoiceGroup); }
+    if (isSco != null) { conditions.push(`is_sco = $${idx++}`); params.push(isSco === 'true'); }
     if (search) {
       conditions.push(`(invoice_number ILIKE $${idx} OR seller_name ILIKE $${idx} OR buyer_name ILIKE $${idx})`);
       params.push(`%${search}%`);
@@ -130,7 +132,7 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
 router.get('/export', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const companyId = req.user!.companyId!;
-    const { direction, search, invoiceGroup, fromDate, toDate } = req.query as Record<string, string>;
+    const { direction, search, invoiceGroup, fromDate, toDate, isSco } = req.query as Record<string, string>;
 
     const conditions: string[] = ['company_id = $1', 'deleted_at IS NULL'];
     const params: unknown[] = [companyId];
@@ -140,6 +142,7 @@ router.get('/export', async (req: Request, res: Response, next: NextFunction) =>
     if (fromDate)  { conditions.push(`invoice_date >= $${idx++}`); params.push(fromDate); }
     if (toDate)    { conditions.push(`invoice_date <= $${idx++}`); params.push(toDate); }
     if (invoiceGroup) { conditions.push(`invoice_group = $${idx++}`); params.push(Number(invoiceGroup)); }
+    if (isSco === 'true' || isSco === 'false') { conditions.push(`is_sco = $${idx++}`); params.push(isSco === 'true'); }
     if (search) {
       conditions.push(`(invoice_number ILIKE $${idx} OR seller_name ILIKE $${idx} OR buyer_name ILIKE $${idx})`);
       params.push(`%${search}%`);

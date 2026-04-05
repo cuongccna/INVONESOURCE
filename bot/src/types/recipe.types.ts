@@ -9,9 +9,12 @@
 export interface RecipeApiEndpoints {
   captcha:             string; // GET — returns { key, content: SVG }
   auth:                string; // POST — returns { token }
-  sold:                string; // GET — paginated output invoice list
-  purchase:            string; // GET — paginated input invoice list
-  detail?:             string; // GET — single invoice detail JSON (hdhhdvu = line items)
+  sold:                string; // GET — paginated output invoice list (HĐ điện tử)
+  purchase:            string; // GET — paginated input invoice list (HĐ điện tử)
+  scoSold?:            string; // GET — MTTTT output list: /sco-query/invoices/sold
+  scoPurchase?:        string; // GET — MTTTT input list: /sco-query/invoices/purchase
+  detail?:             string; // GET — single invoice detail JSON for HĐ điện tử
+  scoDetail?:          string; // GET — single invoice detail JSON for HĐ MTTTT: /sco-query/invoices/detail
   exportXml:           string; // GET — per-invoice signed XML ZIP (fallback only)
   exportExcel:         string; // GET — output bulk XLSX
   exportExcelPurchase: string; // GET — input bulk XLSX (?type=purchase)

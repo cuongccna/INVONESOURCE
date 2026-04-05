@@ -553,33 +553,11 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
       let xmlFetchCount = 0;
 
-      // FIX-PERF-01: Warm up deduplicator from DB so already-stored invoices are skipped.
+      // Note: DB warmup removed — each sync re-upserts all invoices from GDT.
+      // This ensures dates are always corrected if parseInvoiceDate logic changes.
+      // _dedup.markSeen() is still called within the session to prevent duplicates
+      // when the same invoice appears in multiple GDT streams (e.g. query + sco-query).
       const yyyymm = `${fromDate.getFullYear()}${String(fromDate.getMonth() + 1).padStart(2, '0')}`;
-      try {
-        const [existingOut, existingIn] = await Promise.all([
-          pool.query<{ inv_key: string }>(
-            `SELECT COALESCE(serial_number,'') || ':' || invoice_number AS inv_key
-             FROM invoices WHERE company_id=$1 AND direction='output'
-               AND invoice_date::date BETWEEN $2::date AND $3::date`,
-            [companyId, fromDate.toISOString().slice(0, 10), toDate.toISOString().slice(0, 10)]
-          ),
-          pool.query<{ inv_key: string }>(
-            `SELECT COALESCE(serial_number,'') || ':' || invoice_number AS inv_key
-             FROM invoices WHERE company_id=$1 AND direction='input'
-               AND invoice_date::date BETWEEN $2::date AND $3::date`,
-            [companyId, fromDate.toISOString().slice(0, 10), toDate.toISOString().slice(0, 10)]
-          ),
-        ]);
-        await Promise.all([
-          _dedup.warmup(companyId, yyyymm, 'output', existingOut.rows.map(r => r.inv_key)),
-          _dedup.warmup(companyId, yyyymm, 'input',  existingIn.rows.map(r => r.inv_key)),
-        ]);
-        logger.info('[SyncWorker] Dedup warmup complete', {
-          companyId, outputKnown: existingOut.rowCount, inputKnown: existingIn.rowCount,
-        });
-      } catch (dedupErr) {
-        logger.warn('[SyncWorker] Dedup warmup failed (non-fatal), proceeding without cache', { companyId });
-      }
 
       // Output invoices
       const outputInvoices = await runner.fetchOutputInvoices(fromDate, toDate);
@@ -819,12 +797,13 @@ async function _upsertInvoice(
      (id, company_id, invoice_number, serial_number, invoice_date, direction, status,
       seller_name, seller_tax_code, buyer_name, buyer_tax_code,
       subtotal, total_amount, vat_amount, vat_rate, gdt_validated, source, provider,
-      invoice_group, serial_has_cqt, has_line_items, created_at)
+      invoice_group, serial_has_cqt, has_line_items, is_sco, created_at)
      VALUES ($1,$2,$3,$4,COALESCE($5, CURRENT_DATE),$6,$7,$8,COALESCE($9,''),$10,$11,$12,$13,$14,$15,true,'gdt_bot','gdt_bot',
-      $16,$17,$18,NOW())
-     ON CONFLICT (company_id, provider, invoice_number, COALESCE(seller_tax_code, ''), invoice_date) DO UPDATE SET
+      $16,$17,$18,$19,NOW())
+     ON CONFLICT (company_id, provider, invoice_number, COALESCE(seller_tax_code, ''), COALESCE(serial_number, '')) DO UPDATE SET
        direction       = EXCLUDED.direction,
        status          = EXCLUDED.status,
+       invoice_date    = EXCLUDED.invoice_date,
        serial_number   = COALESCE(EXCLUDED.serial_number, invoices.serial_number),
        seller_name     = EXCLUDED.seller_name,
        buyer_name      = EXCLUDED.buyer_name,
@@ -837,6 +816,7 @@ async function _upsertInvoice(
        invoice_group   = COALESCE(EXCLUDED.invoice_group, invoices.invoice_group),
        serial_has_cqt  = COALESCE(EXCLUDED.serial_has_cqt, invoices.serial_has_cqt),
        has_line_items  = COALESCE(EXCLUDED.has_line_items, invoices.has_line_items),
+       is_sco          = EXCLUDED.is_sco,
        updated_at      = NOW()
      RETURNING id`,
     [
@@ -847,7 +827,7 @@ async function _upsertInvoice(
       inv.seller_name, inv.seller_tax_code,
       inv.buyer_name, inv.buyer_tax_code,
       computedSubtotal, inv.total_amount, inv.vat_amount, inv.vat_rate,
-      invoiceGroup, serialHasCqt, hasLineItems,
+      invoiceGroup, serialHasCqt, hasLineItems, inv.is_sco,
     ]
   );
   return res.rows[0].id as string;
@@ -864,13 +844,11 @@ async function _maybeInsertLineItems(
   invoiceId: string,
   companyId: string,
 ): Promise<number> {
-  // Invoices without GDT code (ttxly==6, ttxly==8) have no XML on GDT server.
-  // Attempting export-xml for them always returns HTTP 500 — skip immediately.
-  if (!inv.xml_available) {
-    return 0;
-  }
+  // NOTE: xml_available=false (ttxly==6, ttxly==8) means export-xml returns HTTP 500.
+  // However, /query/invoices/detail DOES return hdhhdvu line items for all invoice types.
+  // We always attempt the detail API first; xml_available only gates the XML ZIP fallback below.
 
-  // Need serial_number + seller_tax_code to call exportInvoiceXml
+  // Need invoice_number + serial_number + seller_tax_code to call detail API
   if (!inv.invoice_number || !inv.serial_number || !inv.seller_tax_code) {
     logger.info('[SyncWorker] XML skip — missing params', {
       invoiceId,
@@ -900,6 +878,7 @@ async function _maybeInsertLineItems(
       khhdon:   inv.serial_number,
       shdon:    inv.invoice_number,
       khmshdon: 1,
+      isSco:    inv.is_sco,
     });
     const lineItems = GdtDirectApiService.parseLineItemsFromDetail(detail);
     if (lineItems.length > 0) {
@@ -919,6 +898,11 @@ async function _maybeInsertLineItems(
 
   // ── Strategy 2: XML ZIP fallback ────────────────────────────────────────
   // Only reached if detail API fails (network error, unexpected 500, etc.)
+  // Also skip for invoices with no XML on GDT server (ttxly==6, ttxly==8).
+  if (!inv.xml_available) {
+    logger.info('[SyncWorker] XML skip — no XML for this invoice type (ttxly==6/8)', { invoiceId });
+    return 1;
+  }
   try {
     let xmlBuf: Buffer;
     try {
