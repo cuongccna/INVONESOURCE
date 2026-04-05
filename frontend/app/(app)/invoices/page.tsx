@@ -142,6 +142,8 @@ export default function InvoicesPage() {
   const [botPassword, setBotPassword] = useState('');
   const [botSetupLoading, setBotSetupLoading] = useState(false);
   const [showSyncPicker, setShowSyncPicker] = useState(false);
+  // Persist the sync jobs the user selected so we can re-use them after quick bot setup.
+  const [pendingSyncJobs, setPendingSyncJobs] = useState<SyncJob[]>([]);
   const { isSyncing, startSync } = useSyncContext();
 
   const openSyncPicker = () => {
@@ -160,7 +162,11 @@ export default function InvoicesPage() {
     } catch (err: unknown) {
       const status = (err as { response?: { status?: number } })?.response?.status;
       if (status === 409) toast.error('⚠️ Đang có đồng bộ đang chạy.');
-      else if (status === 428) setShowBotSetup(true);
+      else if (status === 428) {
+        // Bot not configured yet — save the jobs, show quick-setup dialog
+        setPendingSyncJobs(jobs);
+        setShowBotSetup(true);
+      }
       else toast.error('Lỗi kích hoạt đồng bộ. Vui lòng thử lại.');
     } finally {
       setSyncing(false);
@@ -177,15 +183,39 @@ export default function InvoicesPage() {
     if (!botPassword.trim()) { toast.error('Vui lòng nhập mật khẩu.'); return; }
     setBotSetupLoading(true);
     try {
-      await apiClient.post('/bot/setup', { password: botPassword });
-      setShowBotSetup(false);
-      setBotPassword('');
-      await apiClient.post('/invoices/sync');
-      toast.success('Đã cấu hình và kích hoạt đồng bộ. Hóa đơn sẽ cập nhật sau ít phút.');
-      setTimeout(() => void load(1), 3000);
+      // Step 1: Save credentials. Pass sync_frequency_hours=0 so setup does NOT
+      // auto-enqueue a first-run job — we will trigger the sync ourselves below
+      // with the exact date range the user already selected.
+      await apiClient.post('/bot/setup', { password: botPassword, sync_frequency_hours: 0 });
     } catch {
-      toast.error('Lỗi cấu hình. Vui lòng kiểm tra lại mật khẩu cổng thuế.');
+      toast.error('Sai mật khẩu hoặc cổng thuế điện tử đang lỗi. Vui lòng thử lại.');
+      setBotSetupLoading(false);
+      return;
+    }
+
+    // Step 2: Close modal, clear inputs
+    setShowBotSetup(false);
+    setBotPassword('');
+
+    // Step 3: Kick off sync with the original jobs the user selected
+    const jobs = pendingSyncJobs;
+    if (jobs.length === 0) {
+      toast.success('Đã lưu cấu hình. Chọn kỳ cần đồng bộ để bắt đầu.');
+      setBotSetupLoading(false);
+      return;
+    }
+    setSyncing(true);
+    try {
+      const res = await apiClient.post<{ data: { jobIds: string[] } }>('/sync/start', { jobs });
+      startSync(res.data.data.jobIds, activeCompanyId ?? '');
+      toast.success(`Đã cấu hình và kích hoạt đồng bộ ${jobs.length} kỳ. Theo dõi tiến trình bên dưới.`);
+      setPendingSyncJobs([]);
+    } catch (err: unknown) {
+      const status = (err as { response?: { status?: number } })?.response?.status;
+      if (status === 409) toast.error('⚠️ Đang có đồng bộ đang chạy. Thử lại sau.');
+      else toast.error('Cấu hình thành công nhưng đồng bộ thất bại. Vui lòng thử lại từ nút Đồng Bộ.');
     } finally {
+      setSyncing(false);
       setBotSetupLoading(false);
     }
   };

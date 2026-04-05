@@ -13,7 +13,7 @@ const SETTINGS_SECTIONS = [
   {
     title: 'Kết nối & Đồng bộ',
     items: [
-      { href: '/settings/connectors', label: 'Kết nối nhà mạng', desc: 'MISA, Viettel, BKAV', icon: '🔌' },
+      { href: '/settings/connectors', label: 'GDT Bot — Đồng bộ tự động', desc: 'Cấu hình tài khoản cổng thuế, lịch đồng bộ', icon: '🤖' },
       { href: '/settings/sync-logs', label: 'Lịch sử đồng bộ', desc: 'Nhật ký và trạng thái đồng bộ', icon: '📋' },
     ],
   },

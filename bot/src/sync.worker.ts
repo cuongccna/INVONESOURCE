@@ -248,10 +248,11 @@ interface SyncJobData {
   toDate?:   string; // YYYY-MM-DD, optional
   label?:    string; // display label (e.g. 'Tháng 1')
   // Sequential chaining fields (quarter sync)
-  groupId?:  string;
-  jobIndex?: number; // 0-based index in the group
-  jobTotal?: number; // total jobs in the group
-  allJobs?:  SyncJobGroupItem[]; // all jobs, so each job can enqueue the next
+  groupId?:   string;
+  jobIndex?:  number; // 0-based index in the group
+  jobTotal?:  number; // total jobs in the group
+  allJobs?:   SyncJobGroupItem[]; // all jobs, so each job can enqueue the next
+  isChained?: boolean; // true = this job was enqueued by the previous month in a quarter sync
 }
 
 const xmlParser = new GdtXmlParser();
@@ -271,7 +272,10 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
   // Detect whether this job came from the user-triggered manual queue.
   // Manual jobs get: no off-hours delay, reduced thinkTime, proxy probe, strict timeout.
-  const isManual = job.queueName === 'gdt-sync-manual';
+  const isManual  = job.queueName === 'gdt-sync-manual';
+  // Chained jobs are sequential months in a quarter sync (enqueued by the previous month).
+  // They reuse the cached GDT token (no new login), so the 15-min login cooldown does not apply.
+  const isChained = job.data.isChained ?? false;
 
   // ── 0. Time-of-day awareness (BEFORE lock — don't hold lock while sleeping) ──
   // Prefer running during Vietnam business hours (8am-8pm GMT+7).
@@ -322,6 +326,21 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       last_run_at: string | null;
     };
 
+    // Manual sync: clear the auto-block so the user can force a re-run.
+    // The block was set by _failRun after consecutive failures (captcha/proxy errors).
+    // A manual action means the user knows what they're doing — honour the request.
+    if (isManual && cfg.blocked_until && new Date(cfg.blocked_until) > new Date()) {
+      logger.info('[SyncWorker] Manual sync — clearing auto-block', { companyId, was_blocked_until: cfg.blocked_until });
+      await pool.query(
+        `UPDATE gdt_bot_configs
+         SET blocked_until = NULL, consecutive_failures = 0, updated_at = NOW()
+         WHERE company_id = $1`,
+        [companyId]
+      );
+      cfg.blocked_until = null;
+      cfg.consecutive_failures = 0;
+    }
+
     // Check if blocked — skip _failRun (not a real failure, just a cooldown)
     if (cfg.blocked_until && new Date(cfg.blocked_until) > new Date()) {
       logger.warn('[SyncWorker] Company blocked until', { companyId, blocked_until: cfg.blocked_until });
@@ -332,11 +351,13 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     // Throws UnrecoverableError if owner's quota is exhausted or subscription suspended.
     await _checkQuota(companyId);
 
-    // Anti-detection: enforce minimum 15 minutes between logins per company.
+    // Anti-detection: enforce minimum 5 minutes between logins per company.
     // Prevents rapid successive logins to GDT (e.g. from manual retrigger or BullMQ backoff cascade).
     // Manual sync jobs bypass this cooldown — the user explicitly requested immediate sync.
-    const MIN_LOGIN_INTERVAL_MS = 15 * 60 * 1000;
-    if (!isManual && cfg.last_run_at) {
+    // Chained jobs (quarter sync month 2/3) also bypass — they reuse the cached session token,
+    // so no new GDT login happens and there is no spam risk.
+    const MIN_LOGIN_INTERVAL_MS = 5 * 60 * 1000;
+    if (!isManual && !isChained && cfg.last_run_at) {
       const elapsedMs = Date.now() - new Date(cfg.last_run_at).getTime();
       if (elapsedMs < MIN_LOGIN_INTERVAL_MS) {
         const elapsedMin = Math.floor(elapsedMs / 60_000);
@@ -723,19 +744,22 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
         const nextJobData = job.data.allJobs[nextIndex];
         if (nextJobData) {
           const nextJobId = `${job.data.groupId}-${nextIndex}`;
+          // Random 3–7 min delay between months — human-like gap, avoids 15-min cooldown trigger.
+          const chainDelayMs = (3 * 60_000) + Math.floor(Math.random() * (4 * 60_000));
           try {
             await _botSyncQueue.add('sync', {
               companyId,
-              fromDate: nextJobData.fromDate,
-              toDate:   nextJobData.toDate,
-              label:    nextJobData.label,
-              groupId:  job.data.groupId,
-              jobIndex: nextIndex,
+              fromDate:  nextJobData.fromDate,
+              toDate:    nextJobData.toDate,
+              label:     nextJobData.label,
+              groupId:   job.data.groupId,
+              jobIndex:  nextIndex,
               jobTotal,
-              allJobs:  job.data.allJobs,
+              allJobs:   job.data.allJobs,
+              isChained: true,
             }, {
               jobId:    nextJobId,
-              delay:    5_000, // 5s gap before next month starts
+              delay:    chainDelayMs, // 3–7 min random gap between months
               attempts: 6,
               backoff:  { type: 'exponential', delay: 60_000 },
               removeOnComplete: { count: 100 },
@@ -751,8 +775,24 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       const msg = err instanceof Error ? err.message : String(err);
       // COOLDOWN_SKIP / CANCEL_SKIP: not real failures — don't touch consecutive_failures.
       const isSkip = msg.startsWith('COOLDOWN_SKIP:') || msg.startsWith('CANCEL_SKIP:');
-      if (!isSkip) {
+      // Infrastructure / DB errors (Postgres error code = 5-digit string like '42P10')
+      // are bugs in our code or missing migrations — NOT GDT captcha/auth issues.
+      // They must NOT increment consecutive_failures (which would trigger anti-bot blocking).
+      const pgCode  = (err as Record<string, unknown>)['code'];
+      const isInfra = typeof pgCode === 'string' && /^[0-9A-Z]{5}$/.test(pgCode);
+      if (isInfra) {
+        logger.error('[SyncWorker] DB/infrastructure error — skipping consecutive_failures increment', {
+          companyId, pgCode, msg,
+        });
+      }
+      if (!isSkip && !isInfra) {
         await _failRun(runId, companyId, msg, false);
+      } else if (isInfra) {
+        // Still update gdt_bot_runs status so the run is marked as error in the UI.
+        await pool.query(
+          `UPDATE gdt_bot_runs SET status = 'error', finished_at = NOW(), error_detail = $1 WHERE id = $2`,
+          [msg.slice(0, 1000), runId]
+        ).catch(() => {});
       }
       throw err;
     }
