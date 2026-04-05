@@ -91,10 +91,7 @@ export default function LoginPage() {
               Quên mật khẩu?
             </Link>
           </div>
-
-          <p className="text-xs text-gray-400 text-center mt-2">
-            Demo: admin@demoabc.vn / Admin@123456
-          </p>
+          
         </div>
       </div>
     </div>
