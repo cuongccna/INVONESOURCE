@@ -933,14 +933,16 @@ async function _maybeInsertLineItems(
     const msg = detailErr instanceof Error ? detailErr.message : String(detailErr);
     // 401 = token expired, propagate
     if (msg.includes('token expired')) throw detailErr;
-    logger.warn('[SyncWorker] Detail API failed — falling back to XML', { invoiceId, msg });
+    logger.warn('[SyncWorker] Detail API failed — falling back to XML', { invoiceId, isSco: inv.is_sco, msg });
   }
 
   // ── Strategy 2: XML ZIP fallback ────────────────────────────────────────
   // Only reached if detail API fails (network error, unexpected 500, etc.)
-  // Also skip for invoices with no XML on GDT server (ttxly==6, ttxly==8).
+  // xml_available=false: ttxly==6 (không mã) and ttxly==8 (ủy nhiệm) have no XML on GDT server.
+  // For SCO (is_sco=true) types 6/8: detail API should succeed above; reaching here means GDT API error.
+  // For non-SCO ttxly==6: /query/invoices/detail returns 500; no XML either — GDT limitation.
   if (!inv.xml_available) {
-    logger.info('[SyncWorker] XML skip — no XML for this invoice type (ttxly==6/8)', { invoiceId });
+    logger.info('[SyncWorker] XML skip — no XML available for this invoice', { invoiceId, isSco: inv.is_sco });
     return 1;
   }
   try {

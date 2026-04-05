@@ -340,6 +340,17 @@ function mapInvoice(
 
   const xmlSet = recipeXmlSet ?? XML_AVAILABLE_TTXLY;
 
+  // Read ttxly directly from the row to determine xml_available.
+  // This is accurate for unfiltered sco-query calls (where ttxlyFilter is absent)
+  // and also correct for filtered calls. Falls back to filter string parsing if
+  // the row doesn't have a ttxly field (legacy / recipe-overridden endpoints).
+  const rowTtxly = typeof r['ttxly'] === 'number' ? r['ttxly'] as number : null;
+  const xmlAvailable = direction === 'output'
+    ? true
+    : rowTtxly != null
+      ? xmlSet.has(rowTtxly)
+      : xmlSet.has(parseInt((ttxlyFilter ?? '').replace('ttxly==', ''), 10));
+
   return {
     invoice_number:  invoiceNum,
     serial_number:   serial,
@@ -356,11 +367,7 @@ function mapInvoice(
     invoice_type:    String(pick(r, ...(fields?.invoiceType ?? ['thdon', 'loaiHD', 'loai_hd', 'la'])) ?? '').trim() || null,
     source:          'gdt_bot',
     gdt_validated:   true,
-    // XML is only available for coded invoices (ttxly==5).
-    // For purchase: check the filter we used; for output: always has XML.
-    xml_available:   direction === 'output'
-      ? true
-      : xmlSet.has(parseInt((ttxlyFilter ?? '').replace('ttxly==', ''), 10)),
+    xml_available:   xmlAvailable,
     is_sco:          isSco ?? false,
   };
 }
@@ -569,30 +576,30 @@ export class GdtDirectApiService {
    *     ttxly==6  →  "Cục Thuế đã nhận HĐ MTTTT không mã" (no XML)
    *     ttxly==8  →  "Cục Thuế đã nhận HĐ MTTTT ủy nhiệm" (no XML)
    *
-   * All five streams are valid deductible input invoices — fetch and merge.
-   * NOTE: ttxly==8 previously used /query (wrong) — correct endpoint is /sco-query.
+   * NOTE: /sco-query/invoices/purchase does NOT support ttxly==8 as a FIQL filter
+   * (GDT returns HTTP 500). We therefore fetch all SCO purchases in ONE request
+   * without any ttxly filter — the row-level ttxly field determines xml_available
+   * for each invoice individually (handled in mapInvoice).
    */
   async fetchInputInvoices(fromDate: Date, toDate: Date): Promise<RawInvoice[]> {
     const scoPurchasePath = this.recipe?.api.endpoints.scoPurchase ?? GDT_SCO_PURCHASE;
 
-    // HĐ điện tử via /query
+    // HĐ điện tử via /query (separate calls needed because /query requires ttxly filter)
     const q5 = await this._fetchRangeByMonth('purchase', fromDate, toDate, 'ttxly==5');
     await humanDelay(1_500, 3_000);
     const q6 = await this._fetchRangeByMonth('purchase', fromDate, toDate, 'ttxly==6');
     await humanDelay(1_500, 3_000);
 
-    // HĐ MTTTT via /sco-query
-    const sco5 = await this._fetchRangeByMonth('purchase', fromDate, toDate, 'ttxly==5', scoPurchasePath);
-    await humanDelay(1_500, 3_000);
-    const sco6 = await this._fetchRangeByMonth('purchase', fromDate, toDate, 'ttxly==6', scoPurchasePath);
-    await humanDelay(1_500, 3_000);
-    const sco8 = await this._fetchRangeByMonth('purchase', fromDate, toDate, 'ttxly==8', scoPurchasePath);
+    // HĐ MTTTT via /sco-query — single call with NO ttxly filter.
+    // The SCO endpoint returns all types (5/6/8) in one paginated response.
+    // xml_available is derived from each row's ttxly value in mapInvoice.
+    const scoAll = await this._fetchRangeByMonth('purchase', fromDate, toDate, undefined, scoPurchasePath);
 
-    // Merge & deduplicate across all five streams.
+    // Merge & deduplicate across all three streams.
     // Dedup key: invoice_number + seller_tax_code + invoice_date
     const seen   = new Set<string>();
     const merged: RawInvoice[] = [];
-    for (const inv of [...q5, ...q6, ...sco5, ...sco6, ...sco8]) {
+    for (const inv of [...q5, ...q6, ...scoAll]) {
       const key = `${inv.invoice_number ?? ''}|${inv.seller_tax_code ?? ''}|${inv.invoice_date ?? ''}`;
       if (!seen.has(key)) {
         seen.add(key);
@@ -602,9 +609,7 @@ export class GdtDirectApiService {
     logger.info('[GdtDirect] Purchase invoices merged', {
       ttxly5_query: q5.length,
       ttxly6_query: q6.length,
-      sco5: sco5.length,
-      sco6: sco6.length,
-      sco8: sco8.length,
+      sco_all: scoAll.length,
       merged: merged.length,
     });
     return merged;
