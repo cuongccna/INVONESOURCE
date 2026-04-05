@@ -2,7 +2,7 @@
  * BOT-01 entry point
  */
 import 'dotenv/config';
-import { worker, flushStaleLocks } from './sync.worker';
+import { worker, manualWorker, autoWorker, flushStaleLocks } from './sync.worker';
 import { proxyManager } from './proxy-manager';
 import { logger } from './logger';
 
@@ -15,19 +15,31 @@ logger.info('[Bot] GDT Crawler Bot starting', {
 // Flush any locks left by a previous crashed/killed process
 void flushStaleLocks();
 
+// Legacy worker (gdt-bot-sync) — processes older queued jobs from sync.ts /start
 worker.on('ready', () => {
-  logger.info('[Bot] Worker ready — listening for jobs');
+  logger.info('[Bot] Legacy worker ready — gdt-bot-sync queue');
 });
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  logger.info('[Bot] SIGTERM received, graceful shutdown...');
-  await worker.close();
-  process.exit(0);
+// Manual worker — user-triggered syncs, high concurrency + priority
+manualWorker.on('ready', () => {
+  logger.info('[Bot] Manual worker ready — gdt-sync-manual queue (concurrency 10)');
 });
 
-process.on('SIGINT', async () => {
-  logger.info('[Bot] SIGINT received, graceful shutdown...');
-  await worker.close();
-  process.exit(0);
+// Auto worker — background scheduled syncs, conservative concurrency
+autoWorker.on('ready', () => {
+  logger.info('[Bot] Auto worker ready — gdt-sync-auto queue (concurrency 2)');
 });
+
+// Graceful shutdown — drain all three workers before exiting
+async function shutdown(signal: string): Promise<void> {
+  logger.info(`[Bot] ${signal} received, graceful shutdown...`);
+  await Promise.all([
+    worker.close(),
+    manualWorker.close(),
+    autoWorker.close(),
+  ]);
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT',  () => void shutdown('SIGINT'));

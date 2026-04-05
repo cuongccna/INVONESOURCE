@@ -32,8 +32,23 @@ interface BotRun {
   status: string;
   output_count: number;
   input_count: number;
+  invoices_skipped: number | null;
   duration_ms: number | null;
   error_detail: string | null;
+}
+
+/** Map kỹ thuật → thông điệp tiếng Việt thân thiện */
+function friendlyError(raw: string | null): string {
+  if (!raw) return 'Lỗi không xác định';
+  const s = raw.toLowerCase();
+  if (s.includes('407') || s.includes('proxy authentication')) return 'Lỗi xác thực proxy — kiểm tra lại mật khẩu proxy.';
+  if (s.includes('econnrefused'))  return 'Proxy đang offline — không thể kết nối.';
+  if (s.includes('etimedout'))     return 'Hết thời gian chờ — proxy hoặc GDT phản hồi chậm.';
+  if (s.includes('captcha_timeout') || (s.includes('captcha') && s.includes('timeout'))) return '2Captcha không giải được trong thời gian cho phép.';
+  if (s.includes('invalid_credentials') || s.includes('mật khẩu') || s.includes('sai thông tin')) return 'Sai tên đăng nhập hoặc mật khẩu cổng thuế GDT.';
+  if (s.includes('socket') || s.includes('stream') || s.includes('aborted')) return 'Mất kết nối mạng trong khi đồng bộ.';
+  if (s.includes('proxy') || s.includes('connect failed')) return 'Kết nối proxy thất bại.';
+  return raw.slice(0, 80) + (raw.length > 80 ? '...' : '');
 }
 
 const INPUT = 'w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 bg-white';
@@ -75,6 +90,9 @@ export default function ConnectorsPage() {
 
   // Import stats
   const [importStats, setImportStats] = useState<{ total: number; lastDate: string | null } | null>(null);
+
+  // Per-run raw error toggle
+  const [expandedRunError, setExpandedRunError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -415,24 +433,41 @@ export default function ConnectorsPage() {
                 {lastRuns.length > 0 && (
                   <div>
                     <p className="text-xs font-medium text-gray-500 mb-2">Lịch sử đồng bộ gần đây</p>
-                    <div className="space-y-1.5">
-                      {lastRuns.slice(0, 5).map((run) => (
-                        <div key={run.id} className="flex items-center justify-between text-xs">
-                          <span className="text-gray-500">
-                            {new Date(run.started_at).toLocaleString('vi-VN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}
-                          </span>
-                          <span className={
-                            run.status === 'success' ? 'text-green-600' :
-                            run.status === 'error' ? 'text-red-600' : 'text-amber-600'
-                          }>
-                            {run.status === 'success'
-                              ? `✅ ${run.output_count + run.input_count} HĐ`
-                              : run.status === 'error'
-                              ? `❌ ${run.error_detail?.slice(0, 40) ?? 'Lỗi'}`
-                              : '⏳ Đang chạy'}
-                          </span>
-                        </div>
-                      ))}
+                    <div className="space-y-2">
+                      {lastRuns.slice(0, 5).map((run) => {
+                        const ts = new Date(run.started_at).toLocaleString('vi-VN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+                        const durationS = run.duration_ms ? (run.duration_ms / 1000).toFixed(1) + 's' : null;
+                        const newCount  = run.output_count + run.input_count;
+                        const skipped   = run.invoices_skipped;
+                        return (
+                          <div key={run.id} className="text-xs">
+                            <div className="flex items-center justify-between">
+                              <span className="text-gray-400">{ts}</span>
+                              <span className={run.status === 'success' ? 'text-green-600' : run.status === 'error' ? 'text-red-600' : 'text-amber-600'}>
+                                {run.status === 'success' ? (
+                                  <>
+                                    ✅ {newCount} HĐ mới
+                                    {skipped != null && skipped > 0 && <span className="text-gray-400 ml-1">· {skipped} bỏ qua</span>}
+                                    {durationS && <span className="text-gray-400 ml-1">· {durationS}</span>}
+                                  </>
+                                ) : run.status === 'error' ? (
+                                  <button
+                                    className="text-red-600 underline"
+                                    onClick={() => setExpandedRunError(expandedRunError === run.id ? null : run.id)}
+                                  >
+                                    ❌ {friendlyError(run.error_detail)}
+                                  </button>
+                                ) : '⏳ Đang chạy...'}
+                              </span>
+                            </div>
+                            {run.status === 'error' && expandedRunError === run.id && run.error_detail && (
+                              <div className="mt-1 bg-red-50 border border-red-100 rounded p-2 text-red-700 font-mono break-all">
+                                {run.error_detail}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
                     </div>
                   </div>
                 )}

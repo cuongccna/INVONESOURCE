@@ -24,6 +24,30 @@ function getQueue(): Queue {
   return _queue;
 }
 
+// Manual queue — user-triggered syncs processed with high concurrency by manualWorker
+let _manualQueue: Queue | null = null;
+function getManualQueue(): Queue {
+  if (!_manualQueue) {
+    _manualQueue = new Queue('gdt-sync-manual', {
+      connection: { url: env.REDIS_URL } as unknown,
+    } as ConstructorParameters<typeof Queue>[1]);
+  }
+  return _manualQueue;
+}
+
+/**
+ * Try to find a job by ID across all bot queues: manual first, then legacy.
+ * Returns [job, queue] or [null, null] if not found.
+ */
+async function getJobFromAnyQueue(jobId: string): Promise<{ job: Awaited<ReturnType<Queue['getJob']>>; queue: Queue } | null> {
+  const queues: Queue[] = [getManualQueue(), getQueue()];
+  for (const q of queues) {
+    const job = await q.getJob(jobId);
+    if (job) return { job, queue: q };
+  }
+  return null;
+}
+
 // Shared Redis client for distributed locks
 let _redis: Redis | null = null;
 function getRedis(): Redis {
@@ -107,7 +131,7 @@ router.post('/start', syncStartLimiter, requireRole('OWNER', 'ADMIN', 'ACCOUNTAN
       }
     }
 
-    const queue = getQueue();
+    const queue = getManualQueue();  // user-triggered → manual queue (high priority)
     const groupId = `sync-${companyId}-${Date.now()}`;
     // Pre-compute all jobIds so the frontend can open SSE for all of them upfront.
     // Only job 0 is enqueued here — the bot chains jobs 1 and 2 sequentially after
@@ -161,12 +185,13 @@ router.get('/progress/:jobId', async (req: Request, res: Response) => {
   const jobId  = req.params.jobId;
 
   // Pre-flight: if the job exists, verify it belongs to this company.
+  // Check all queues — job may be in gdt-sync-manual or legacy gdt-bot-sync.
   // If it doesn't exist yet (chained job 1 or 2), allow SSE — we send "waiting" events
   // until the bot enqueues it. Ownership will be verified when the job appears.
   // If job not found AND no qCompanyId → can't verify ownership → 404.
-  const initialJob = await queue.getJob(jobId);
-  if (initialJob) {
-    if (initialJob.data.companyId !== authCompanyId) {
+  const found = await getJobFromAnyQueue(jobId);
+  if (found) {
+    if (found.job!.data.companyId !== authCompanyId) {
       res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Access denied' } });
       return;
     }
@@ -188,7 +213,8 @@ router.get('/progress/:jobId', async (req: Request, res: Response) => {
   const sendEvent = async () => {
     try {
       if (res.destroyed) return true;
-      const freshJob = await queue.getJob(jobId);
+      const result = await getJobFromAnyQueue(jobId);
+      const freshJob = result?.job ?? null;
 
       if (!freshJob) {
         // Job not yet enqueued (bot is still processing the previous month in the chain).
@@ -266,23 +292,29 @@ router.delete('/cancel', requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'), async (req
     const companyId = req.user!.companyId;
     if (!companyId) throw new ValidationError('Company not associated');
 
-    const queue  = getQueue();
-    const redis  = getRedis();
+    const queue       = getQueue();
+    const manualQueue = getManualQueue();
+    const redis       = getRedis();
 
-    // 1. Remove waiting/delayed jobs (active job can't be force-killed, but we signal it)
-    const [activeJobs, waitingJobs, delayedJobs] = await Promise.all([
+    // Remove waiting/delayed jobs from both queues
+    const [activeJobs, waitingJobs, delayedJobs,
+           manualActive, manualWaiting, manualDelayed] = await Promise.all([
       queue.getJobs(['active']),
       queue.getJobs(['waiting']),
       queue.getJobs(['delayed']),
+      manualQueue.getJobs(['active']),
+      manualQueue.getJobs(['waiting']),
+      manualQueue.getJobs(['delayed']),
     ]);
     let removed = 0;
-    for (const j of [...waitingJobs, ...delayedJobs]) {
+    for (const j of [...waitingJobs, ...delayedJobs, ...manualWaiting, ...manualDelayed]) {
       if (j.data.companyId === companyId) {
         try { await j.remove(); removed++; } catch { /* ignore */ }
       }
     }
     // Active jobs: can't remove, but signal cancellation
-    const activeCount = activeJobs.filter(j => j.data.companyId === companyId).length;
+    const allActive = [...activeJobs, ...manualActive];
+    const activeCount = allActive.filter(j => j.data.companyId === companyId).length;
 
     // 2. Release locks so a new sync can start after cancellation
     await Promise.all([
@@ -310,15 +342,20 @@ router.delete('/clear-stale', requireRole('OWNER', 'ADMIN'), async (req: Request
     const companyId = req.user!.companyId;
     if (!companyId) throw new ValidationError('Company not associated');
 
-    const queue = getQueue();
-    const [activeJobs, waitingJobs, delayedJobs] = await Promise.all([
+    const queue       = getQueue();
+    const manualQueue = getManualQueue();
+    const [activeJobs, waitingJobs, delayedJobs,
+           mActive, mWaiting, mDelayed] = await Promise.all([
       queue.getJobs(['active']),
       queue.getJobs(['waiting']),
       queue.getJobs(['delayed']),
+      manualQueue.getJobs(['active']),
+      manualQueue.getJobs(['waiting']),
+      manualQueue.getJobs(['delayed']),
     ]);
 
     let removed = 0;
-    for (const j of [...activeJobs, ...waitingJobs, ...delayedJobs]) {
+    for (const j of [...activeJobs, ...waitingJobs, ...delayedJobs, ...mActive, ...mWaiting, ...mDelayed]) {
       if (j.data.companyId === companyId) {
         try { await j.remove(); removed++; } catch { /* ignore */ }
       }

@@ -26,6 +26,7 @@
  *   Set session lifetime to 30m. Add to IPROYAL_PROXY_LIST in bot/.env:
  *     IPROYAL_PROXY_LIST=geo.iproyal.com:12321:user:pass_session-A,geo.iproyal.com:12321:user:pass_session-B
  */
+import * as net from 'net';
 import { EventEmitter } from 'events';
 import { TmproxyRefresher, TmproxyNoSessionError } from './tmproxy-refresher';
 import { logger } from './logger';
@@ -341,6 +342,55 @@ export class ProxyManager extends EventEmitter {
     for (const slot of this.slots) slot.failedUrls.delete(url);
   }
 
+  /**
+   * Lightweight TCP probe to check if a proxy is reachable before committing to a sync.
+   *
+   * Opens a TCP connection to the proxy host:port and waits for the socket to connect.
+   * Does NOT send any HTTP/SOCKS data — just checks the TCP layer.
+   *
+   * Returns true if the proxy TCP port is reachable within timeoutMs.
+   * Returns false on timeout, ECONNREFUSED, EHOSTUNREACH, or any other connection error.
+   *
+   * A successful TCP connect does NOT guarantee the proxy will authenticate correctly,
+   * but it eliminates the most common failure (proxy server down / wrong port / blocked IP).
+   *
+   * Usage before sync:
+   *   if (proxyUrl && !await proxyManager.probe(proxyUrl)) {
+   *     proxyManager.markFailed(proxyUrl);
+   *     throw new Error('Proxy health check failed — aborting sync');
+   *   }
+   */
+  async probe(proxyUrl: string, timeoutMs = 5000): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const done = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        socket.destroy();
+        resolve(ok);
+      };
+
+      let proxy: URL;
+      try {
+        proxy = new URL(proxyUrl);
+      } catch {
+        // unparseable proxy URL — treat as failed
+        resolve(false);
+        return;
+      }
+
+      const host = proxy.hostname;
+      const port = Number(proxy.port) || 80;
+
+      const socket = net.connect({ host, port });
+      const timer  = setTimeout(() => done(false), timeoutMs);
+
+      socket.once('connect', () => done(true));
+      socket.once('error',   () => done(false));
+    });
+  }
+
   reset(): void {
     this.failed.clear();
     this.index = 0;
@@ -422,18 +472,21 @@ export function parseProxyForAxios(proxyUrl: string | null): AxiosProxyConfig | 
     const u = new URL(proxyUrl);
     const config: AxiosProxyConfig = {
       host:     u.hostname,
-      port:     parseInt(u.port, 10) || 1080,
+      port:     parseInt(u.port, 10) || (u.protocol === 'https:' ? 443 : 80),
       protocol: u.protocol.replace(':', ''),
     };
-    if (u.username) {
+    // CRITICAL: auth must be passed separately so axios auto-sets Proxy-Authorization header
+    // Condition checks username OR password — handles edge cases where only one is present
+    if (u.username || u.password) {
       config.auth = {
-        username: decodeURIComponent(u.username),
-        password: decodeURIComponent(u.password),
+        username: decodeURIComponent(u.username || ''),
+        password: decodeURIComponent(u.password || ''),
       };
     }
     return config;
   } catch {
-    logger.error('[ProxyManager] Failed to parse proxy URL', { proxyUrl });
+    const masked = proxyUrl.replace(/:([^@:]+)@/, ':****@');
+    logger.error('[ProxyManager] Failed to parse proxy URL', { proxy: masked });
     return false;
   }
 }

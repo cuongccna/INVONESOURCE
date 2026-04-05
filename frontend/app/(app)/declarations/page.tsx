@@ -85,6 +85,24 @@ export default function DeclarationsPage() {
     }
   };
 
+  const downloadExport = async (id: string, format: 'excel' | 'pdf', month: number, year: number) => {
+    try {
+      const mime = format === 'excel'
+        ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        : 'application/pdf';
+      const ext = format === 'excel' ? 'xlsx' : 'pdf';
+      const res = await apiClient.get(`/declarations/${id}/export?format=${format}`, { responseType: 'blob' });
+      const url = URL.createObjectURL(new Blob([res.data as BlobPart], { type: mime }));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `TK01GTGT_${year}_${String(month).padStart(2, '0')}.${ext}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      toast.error(`Lỗi tải ${format === 'excel' ? 'Excel' : 'PDF'}. Vui lòng thử lại.`);
+    }
+  };
+
   const handleDelete = async (decl: Declaration) => {
     setDeletingId(decl.id);
     setConfirmDelete(null);
@@ -187,12 +205,26 @@ export default function DeclarationsPage() {
                   </div>
                 </div>
 
-                <button
-                  onClick={(e) => { e.stopPropagation(); void downloadXml(decl.id, decl.period_month, decl.period_year); }}
-                  className="w-full border border-gray-300 rounded-lg py-2 text-sm text-gray-700 font-medium"
-                >
-                  📥 Tải XML HTKK
-                </button>
+                <div className="flex rounded-lg border border-gray-300 overflow-hidden text-xs text-gray-700 font-medium divide-x divide-gray-300">
+                  <button
+                    onClick={(e) => { e.stopPropagation(); void downloadXml(decl.id, decl.period_month, decl.period_year); }}
+                    className="flex-1 py-2 hover:bg-gray-50"
+                  >
+                    📄 XML
+                  </button>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); void downloadExport(decl.id, 'excel', decl.period_month, decl.period_year); }}
+                    className="flex-1 py-2 hover:bg-gray-50"
+                  >
+                    📊 Excel
+                  </button>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); void downloadExport(decl.id, 'pdf', decl.period_month, decl.period_year); }}
+                    className="flex-1 py-2 hover:bg-gray-50"
+                  >
+                    🖨️ PDF
+                  </button>
+                </div>
               </div>
             );
           })}

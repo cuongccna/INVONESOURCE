@@ -7,6 +7,7 @@ import { requireCompany } from '../middleware/company';
 import { TaxDeclarationEngine } from '../services/TaxDeclarationEngine';
 import { HtkkXmlGenerator } from '../services/HtkkXmlGenerator';
 import { TVanSubmissionService } from '../services/TVanSubmissionService';
+import { TaxDeclarationExporter } from '../services/TaxDeclarationExporter';
 import { ValidationError, NotFoundError } from '../utils/AppError';
 import { sendSuccess, sendPaginated } from '../utils/response';
 import type { TaxDeclaration } from 'shared';
@@ -166,6 +167,48 @@ router.patch(
       );
       if (!result.rows[0]) throw new NotFoundError('Declaration not found');
       sendSuccess(res, result.rows[0]);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// GET /api/declarations/:id/export?format=excel|pdf — tải Excel / PDF
+router.get(
+  '/:id/export',
+  requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { id } = req.params;
+      const format  = String(req.query.format ?? '');
+      if (format !== 'excel' && format !== 'pdf') {
+        throw new ValidationError('format phải là excel hoặc pdf');
+      }
+
+      const check = await pool.query(
+        `SELECT period_month, period_year, period_type
+         FROM tax_declarations WHERE id = $1 AND company_id = $2`,
+        [id, req.user!.companyId],
+      );
+      if (!check.rows[0]) throw new NotFoundError('Tờ khai không tìm thấy');
+
+      const exporter = new TaxDeclarationExporter();
+      const { period_month, period_year, period_type } = check.rows[0] as { period_month: number; period_year: number; period_type: string };
+      const periodTag = period_type === 'quarterly' ? `Q${period_month}` : `T${period_month < 10 ? '0' : ''}${period_month}`;
+
+      if (format === 'excel') {
+        const buf = await exporter.exportToExcel(id, req.user!.companyId!);
+        const filename = `TK01GTGT_${periodTag}_${period_year}.xlsx`;
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.send(buf);
+      } else {
+        const buf = await exporter.exportToPdf(id, req.user!.companyId!);
+        const filename = `TK01GTGT_${periodTag}_${period_year}.pdf`;
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.send(buf);
+      }
     } catch (err) {
       next(err);
     }

@@ -18,6 +18,8 @@ import { GdtDirectApiService } from './gdt-direct-api.service';
 import { GdtXmlParser } from './parsers/GdtXmlParser';
 import { logger } from './logger';
 import type { LineItem } from './parsers/GdtXmlParser';
+import { InvoiceDeduplicator } from './crawl-cache/InvoiceDeduplicator';
+import { GdtSessionCache }     from './crawl-cache/GdtSessionCache';
 
 const REDIS_URL    = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
 const CONCURRENCY  = parseInt(process.env['WORKER_CONCURRENCY'] ?? '2', 10);
@@ -171,6 +173,9 @@ async function _consumeQuota(companyId: string, invoiceCount: number): Promise<v
 // No TOCTOU race: if SET NX succeeds, we have exclusive access.
 import Redis from 'ioredis';
 const _lockRedis = new Redis(REDIS_URL, { maxRetriesPerRequest: 3 });
+// FIX-PERF-01: Crawl-cache singletons (reuse _lockRedis connection)
+const _dedup        = new InvoiceDeduplicator(_lockRedis);
+const _sessionCache = new GdtSessionCache(_lockRedis);
 const BOT_LOCK_PREFIX   = 'bot:sync:lock:';
 const BOT_LOCK_TTL      = 45 * 60; // 45 min — upper bound for any single sync run
 const BOT_CANCEL_PREFIX = 'bot:sync:cancel:';
@@ -264,12 +269,16 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
   logger.info('[SyncWorker] Starting job', { jobId: job.id, companyId });
 
+  // Detect whether this job came from the user-triggered manual queue.
+  // Manual jobs get: no off-hours delay, reduced thinkTime, proxy probe, strict timeout.
+  const isManual = job.queueName === 'gdt-sync-manual';
+
   // ── 0. Time-of-day awareness (BEFORE lock — don't hold lock while sleeping) ──
   // Prefer running during Vietnam business hours (8am-8pm GMT+7).
-  // Skip delay for: development, first-run jobs triggered manually by user setup.
+  // Skip delay for: development, first-run jobs triggered manually by user setup, manual queue.
   const isDev = process.env['NODE_ENV'] !== 'production';
   const isFirstRun = (job.id ?? '').startsWith('gdt-bot-first-');
-  if (!isDev && !isFirstRun) {
+  if (!isDev && !isFirstRun && !isManual) {
     const vnHour = new Date(Date.now() + 7 * 3600_000).getUTCHours();
     if (vnHour < 7 || vnHour >= 20) {
       const delayMs = 5 * 60_000 + Math.floor(Math.random() * 25 * 60_000); // 5-30 min
@@ -325,8 +334,9 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
     // Anti-detection: enforce minimum 15 minutes between logins per company.
     // Prevents rapid successive logins to GDT (e.g. from manual retrigger or BullMQ backoff cascade).
+    // Manual sync jobs bypass this cooldown — the user explicitly requested immediate sync.
     const MIN_LOGIN_INTERVAL_MS = 15 * 60 * 1000;
-    if (cfg.last_run_at) {
+    if (!isManual && cfg.last_run_at) {
       const elapsedMs = Date.now() - new Date(cfg.last_run_at).getTime();
       if (elapsedMs < MIN_LOGIN_INTERVAL_MS) {
         const elapsedMin = Math.floor(elapsedMs / 60_000);
@@ -395,6 +405,27 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       );
     }
 
+    // ── 3b. Pre-sync proxy health check ────────────────────────────────────────
+    // TCP probe before consuming a DB run row or doing any work.
+    // Catches dead proxies (wrong port, server down, IP banned) before login fails mid-sync.
+    // Only runs when a proxyUrl is assigned. Auto-syncs also probe but with a longer timeout.
+    if (proxyUrl) {
+      const probeTimeoutMs = isManual ? 4_000 : 8_000;
+      await job.updateProgress({ percent: 0, statusMessage: 'Đang kiểm tra proxy...' });
+      const proxyOk = await proxyManager.probe(proxyUrl, probeTimeoutMs);
+      if (!proxyOk) {
+        proxyManager.markFailed(proxyUrl);
+        logger.warn('[SyncWorker] Proxy health check failed — rotating proxy', { companyId, proxyUrl });
+        // Clear the DB proxy_session_id so next run gets a fresh session ID → fresh IP.
+        await pool.query(
+          `UPDATE gdt_bot_configs SET proxy_session_id = NULL, updated_at = NOW() WHERE company_id = $1`,
+          [companyId],
+        );
+        throw new Error(`PROXY_DEAD: Proxy TCP probe failed (${proxyUrl.slice(0, 32)}…) — will retry`);
+      }
+      logger.info('[SyncWorker] Proxy TCP probe OK', { companyId });
+    }
+
     // ── 4. Login via GDT Direct API ──────────────────────────────────────────────
     await pool.query(
       `INSERT INTO gdt_bot_runs (id, company_id, started_at, status) VALUES ($1, $2, NOW(), 'running')`,
@@ -403,58 +434,79 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
     // Human-like warmup: 3–15s random pause before opening session.
     // Simulates an accountant opening a browser and navigating to the portal.
-    await thinkTime(3_000, 15_000);
+    // Manual syncs use a shorter pause (0.5–2s) to stay within the 3-minute target.
+    await job.updateProgress({ percent: 5, statusMessage: 'Đang đăng nhập GDT...' } as Record<string, unknown>);
+    await thinkTime(isManual ? 500 : 3_000, isManual ? 2_000 : 15_000);
 
     const gdtApi = new GdtDirectApiService(proxyUrl, socks5ProxyUrl);
+
+    // FIX-PERF-01: Check session cache — skip captcha+login if we have a valid token.
+    let cachedToken: string | null = null;
     try {
-      await gdtApi.login(creds.username, creds.password);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const msgLc = msg.toLowerCase();
-      // Captcha failures (from gdt-direct-api after exhausting MAX_RETRIES) are transient —
-      // do NOT deactivate the account. GDT returns wrong-captcha for 400/401, so
-      // 'auth failed' can appear in the message even for captcha issues.
-      const isCaptchaFailure = msgLc.includes('captcha') || msgLc.includes('mã xác nhận');
-      const isInvalidCreds = !isCaptchaFailure && (
-        msgLc.includes('auth failed') ||
-        msgLc.includes('mật khẩu') ||
-        msgLc.includes('sai thông tin')
-      );
-      if (isInvalidCreds) {
-        await _failRun(runId, companyId, msg, true);
-        throw new UnrecoverableError(`[SyncWorker] Invalid credentials: ${msg}`);
-      }
+      cachedToken = await _sessionCache.get(companyId, proxySessionId ?? '');
+    } catch (cacheErr) {
+      logger.warn('[SyncWorker] Session cache read failed (non-fatal)', { companyId });
+    }
+    if (cachedToken) {
+      gdtApi.setToken(cachedToken);
+      logger.info('[SyncWorker] Reusing cached GDT session token — skipping login', { companyId });
+    } else {
+      try {
+        await gdtApi.login(creds.username, creds.password);
+        try {
+          const freshToken = gdtApi.getToken();
+          if (freshToken) await _sessionCache.set(companyId, proxySessionId ?? '', freshToken);
+        } catch { /* non-fatal — cache write failure never blocks sync */ }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const msgLc = msg.toLowerCase();
+        // Captcha failures (from gdt-direct-api after exhausting MAX_RETRIES) are transient —
+        // do NOT deactivate the account. GDT returns wrong-captcha for 400/401, so
+        // 'auth failed' can appear in the message even for captcha issues.
+        const isCaptchaFailure = msgLc.includes('captcha') || msgLc.includes('mã xác nhận');
+        const isInvalidCreds = !isCaptchaFailure && (
+          msgLc.includes('auth failed') ||
+          msgLc.includes('mật khẩu') ||
+          msgLc.includes('sai thông tin')
+        );
+        if (isInvalidCreds) {
+          await _sessionCache.invalidate(companyId, proxySessionId ?? '').catch(() => {});
+          await _failRun(runId, companyId, msg, true);
+          throw new UnrecoverableError(`[SyncWorker] Invalid credentials: ${msg}`);
+        }
       // Non-credential failure (proxy blocked, GDT rate-limit, network error).
-      // Mark current proxy as failed and clear the sticky session —
-      // next run will pick a fresh session ID = fresh IP for this company only.
-      if (proxyUrl) proxyManager.markFailed(proxyUrl);
-      // Detect if the error is a pre-GDT network/proxy/TLS failure.
-      // In that case GDT never received any login attempt — no need for the
-      // 15-minute cooldown. BullMQ backoff + consecutive_failures block handles protection.
-      // Use lowercase (msgLc) for case-insensitive matching.
-      // 'Proxy CONNECT failed' has capital P — msg.includes('proxy') missed it.
-      // 'stream has been aborted' also wasn't detected.
-      const isProxyOrNetworkError =
-        msgLc.includes('socket disconnected') ||
-        msgLc.includes('econnreset') ||
-        msgLc.includes('etimedout') ||
-        msgLc.includes('econnrefused') ||
-        msgLc.includes('tls') ||
-        msgLc.includes('ssl') ||
-        msgLc.includes('proxy') ||
-        msgLc.includes('stream') ||
-        msgLc.includes('aborted') ||
-        msgLc.includes('407') ||
-        msgLc.includes('connect failed');
-      // _failRun increments consecutive_failures + clears proxy_session_id in DB
-      await _failRun(runId, companyId, msg, false, isProxyOrNetworkError);
-      throw new Error(`[SyncWorker] Login failed: ${msg}`);
+        // Mark current proxy as failed and clear the sticky session —
+        // next run will pick a fresh session ID = fresh IP for this company only.
+        if (proxyUrl) proxyManager.markFailed(proxyUrl);
+        // Detect if the error is a pre-GDT network/proxy/TLS failure.
+        // In that case GDT never received any login attempt — no need for the
+        // 15-minute cooldown. BullMQ backoff + consecutive_failures block handles protection.
+        // Use lowercase (msgLc) for case-insensitive matching.
+        // 'Proxy CONNECT failed' has capital P — msg.includes('proxy') missed it.
+        // 'stream has been aborted' also wasn't detected.
+        const isProxyOrNetworkError =
+          msgLc.includes('socket disconnected') ||
+          msgLc.includes('econnreset') ||
+          msgLc.includes('etimedout') ||
+          msgLc.includes('econnrefused') ||
+          msgLc.includes('tls') ||
+          msgLc.includes('ssl') ||
+          msgLc.includes('proxy') ||
+          msgLc.includes('stream') ||
+          msgLc.includes('aborted') ||
+          msgLc.includes('407') ||
+          msgLc.includes('connect failed');
+        // _failRun increments consecutive_failures + clears proxy_session_id in DB
+        await _failRun(runId, companyId, msg, false, isProxyOrNetworkError);
+        throw new Error(`[SyncWorker] Login failed: ${msg}`);
+      }
     }
 
     // ── 5. Fetch invoices via Direct API ─────────────────────────────────────────
     const runner = gdtApi;
-    let outputCount = 0;
-    let inputCount  = 0;
+    let outputCount  = 0;
+    let inputCount   = 0;
+    let skippedCount = 0; // FIX-PERF-01
 
     try {
       // Date range priority:
@@ -501,6 +553,34 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
       let xmlFetchCount = 0;
 
+      // FIX-PERF-01: Warm up deduplicator from DB so already-stored invoices are skipped.
+      const yyyymm = `${fromDate.getFullYear()}${String(fromDate.getMonth() + 1).padStart(2, '0')}`;
+      try {
+        const [existingOut, existingIn] = await Promise.all([
+          pool.query<{ inv_key: string }>(
+            `SELECT COALESCE(serial_number,'') || ':' || invoice_number AS inv_key
+             FROM invoices WHERE company_id=$1 AND direction='output'
+               AND invoice_date::date BETWEEN $2::date AND $3::date`,
+            [companyId, fromDate.toISOString().slice(0, 10), toDate.toISOString().slice(0, 10)]
+          ),
+          pool.query<{ inv_key: string }>(
+            `SELECT COALESCE(serial_number,'') || ':' || invoice_number AS inv_key
+             FROM invoices WHERE company_id=$1 AND direction='input'
+               AND invoice_date::date BETWEEN $2::date AND $3::date`,
+            [companyId, fromDate.toISOString().slice(0, 10), toDate.toISOString().slice(0, 10)]
+          ),
+        ]);
+        await Promise.all([
+          _dedup.warmup(companyId, yyyymm, 'output', existingOut.rows.map(r => r.inv_key)),
+          _dedup.warmup(companyId, yyyymm, 'input',  existingIn.rows.map(r => r.inv_key)),
+        ]);
+        logger.info('[SyncWorker] Dedup warmup complete', {
+          companyId, outputKnown: existingOut.rowCount, inputKnown: existingIn.rowCount,
+        });
+      } catch (dedupErr) {
+        logger.warn('[SyncWorker] Dedup warmup failed (non-fatal), proceeding without cache', { companyId });
+      }
+
       // Output invoices
       const outputInvoices = await runner.fetchOutputInvoices(fromDate, toDate);
 
@@ -511,7 +591,14 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
       for (let i = 0; i < outputInvoices.length; i++) {
         const inv = outputInvoices[i]!;
+        // FIX-PERF-01: Skip invoices already in DB (dedup check)
+        const dk = _dedup.invoiceKey(inv.invoice_number ?? '', inv.serial_number ?? '');
+        if (await _dedup.exists(companyId, yyyymm, 'output', dk)) {
+          skippedCount++;
+          continue;
+        }
         const invoiceId = await _upsertInvoice(inv, companyId, 'output');
+        await _dedup.markSeen(companyId, yyyymm, 'output', dk).catch(() => {});
         outputCount++;
         if (xmlFetchCount < MAX_XML_FETCHES_PER_RUN) {
           xmlFetchCount += await _maybeInsertLineItems(runner, inv, invoiceId, companyId);
@@ -547,7 +634,14 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       const inputInvoices = await runner.fetchInputInvoices(fromDate, toDate);
       for (let i = 0; i < inputInvoices.length; i++) {
         const inv = inputInvoices[i]!;
+        // FIX-PERF-01: Skip invoices already in DB (dedup check)
+        const dkIn = _dedup.invoiceKey(inv.invoice_number ?? '', inv.serial_number ?? '');
+        if (await _dedup.exists(companyId, yyyymm, 'input', dkIn)) {
+          skippedCount++;
+          continue;
+        }
         const invoiceId = await _upsertInvoice(inv, companyId, 'input');
+        await _dedup.markSeen(companyId, yyyymm, 'input', dkIn).catch(() => {});
         inputCount++;
         if (xmlFetchCount < MAX_XML_FETCHES_PER_RUN) {
           xmlFetchCount += await _maybeInsertLineItems(runner, inv, invoiceId, companyId);
@@ -589,9 +683,10 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       const durationMs = Date.now() - startedAt;
       await pool.query(
         `UPDATE gdt_bot_runs
-         SET status = 'success', finished_at = NOW(), output_count = $1, input_count = $2, duration_ms = $3
+         SET status = 'success', finished_at = NOW(), output_count = $1, input_count = $2,
+             duration_ms = $3, invoices_skipped = $5
          WHERE id = $4`,
-        [outputCount, inputCount, durationMs, runId]
+        [outputCount, inputCount, durationMs, runId, skippedCount]
       );
       // Reset consecutive_failures on success — unblocks the company automatically
       await pool.query(
@@ -1054,9 +1149,24 @@ export const worker = new Worker<SyncJobData>(
 );
 
 // ── Manual worker (concurrency 10 — user-triggered syncs) ────────────────────
+// Wraps processGdtSync with a 170-second hard timeout (safety margin under 3 min).
+// If a manual job stalls (e.g. GDT rate-limit, slow proxy), it fails fast and
+// retries with backoff rather than blocking the queue for a full manual sync window.
+const MANUAL_SYNC_TIMEOUT_MS = 170_000; // 2m50s — leaves 10s headroom under 3 min
+
 export const manualWorker = new Worker<SyncJobData>(
   'gdt-sync-manual',
-  processGdtSync,
+  async (job) => {
+    return await Promise.race([
+      processGdtSync(job),
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error('MANUAL_SYNC_TIMEOUT: Sync exceeded 3-minute limit — will retry')),
+          MANUAL_SYNC_TIMEOUT_MS,
+        ),
+      ),
+    ]);
+  },
   {
     connection:  { url: REDIS_URL } as import('bullmq').ConnectionOptions,
     concurrency: 10,

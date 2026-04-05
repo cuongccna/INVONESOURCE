@@ -129,13 +129,33 @@ export default function DashboardPage() {
   const [periodMonth, setPeriodMonth] = useState(now.getMonth() + 1);
   const [periodYear, setPeriodYear] = useState(now.getFullYear());
 
+  const quarterOf     = (m: number) => Math.ceil(m / 3);
+  const quarterStart  = (q: number) => (q - 1) * 3 + 1;
+
+  const handleVatViewMode = (mode: 'monthly' | 'quarterly') => {
+    setVatViewMode(mode);
+    if (mode === 'quarterly') {
+      // Snap periodMonth to the first month of the current quarter
+      setPeriodMonth(quarterStart(quarterOf(periodMonth)));
+    }
+  };
+
   const navigatePeriod = (delta: number) => {
-    let newMonth = periodMonth + delta;
-    let newYear = periodYear;
-    if (newMonth < 1)  { newYear -= 1; newMonth = 12; }
-    if (newMonth > 12) { newYear += 1; newMonth = 1; }
-    setPeriodMonth(newMonth);
-    setPeriodYear(newYear);
+    if (vatViewMode === 'quarterly') {
+      let q = quarterOf(periodMonth) + delta;
+      let y = periodYear;
+      if (q < 1) { y -= 1; q = 4; }
+      if (q > 4) { y += 1; q = 1; }
+      setPeriodMonth(quarterStart(q));
+      setPeriodYear(y);
+    } else {
+      let newMonth = periodMonth + delta;
+      let newYear = periodYear;
+      if (newMonth < 1)  { newYear -= 1; newMonth = 12; }
+      if (newMonth > 12) { newYear += 1; newMonth = 1; }
+      setPeriodMonth(newMonth);
+      setPeriodYear(newYear);
+    }
   };
 
   const load = useCallback(async (month = periodMonth, year = periodYear) => {
@@ -270,33 +290,61 @@ export default function DashboardPage() {
       </div>
 
       {/* ── Period Navigator ── */}
-      <div className="bg-white rounded-xl shadow-sm px-4 py-2.5 flex items-center justify-between">
+      <div className="bg-white rounded-xl shadow-sm px-4 py-2.5 flex items-center justify-between gap-2">
         <button
           onClick={() => navigatePeriod(-1)}
           className="text-gray-500 hover:text-gray-900 text-lg font-bold px-2 py-0.5 rounded hover:bg-gray-100 transition-colors"
-          aria-label="Tháng trước"
+          aria-label="Kỳ trước"
         >
           ‹
         </button>
-        <div className="text-center">
+        <div className="flex flex-col items-center gap-1">
           <p className="text-sm font-semibold text-gray-800">
-            Kỳ kê khai: Tháng {periodMonth}/{periodYear}
+            Kỳ kê khai:{' '}
+            {vatViewMode === 'quarterly'
+              ? `Quý ${quarterOf(periodMonth)}/${periodYear}`
+              : `Tháng ${periodMonth}/${periodYear}`}
           </p>
-          {periodMonth !== (now.getMonth() + 1) || periodYear !== now.getFullYear() ? (
-            <button
-              onClick={() => { setPeriodMonth(now.getMonth() + 1); setPeriodYear(now.getFullYear()); }}
-              className="text-xs text-primary-600 hover:underline"
-            >
-              Về tháng hiện tại
-            </button>
-          ) : (
-            <p className="text-xs text-gray-400">Tháng hiện tại</p>
-          )}
+          {/* Tháng / Quý toggle — shared with bottom chart */}
+          <div className="flex gap-0.5 bg-gray-100 rounded-lg p-0.5">
+            {(['monthly', 'quarterly'] as const).map((mode) => (
+              <button
+                key={mode}
+                onClick={() => handleVatViewMode(mode)}
+                className={`text-xs px-2.5 py-0.5 rounded-md font-medium transition-colors ${
+                  vatViewMode === mode ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+                }`}
+              >
+                {mode === 'monthly' ? 'Tháng' : 'Quý'}
+              </button>
+            ))}
+          </div>
+          {(() => {
+            const nowQ = quarterOf(now.getMonth() + 1);
+            const curQ = quarterOf(periodMonth);
+            const isCurrentPeriod = vatViewMode === 'quarterly'
+              ? (curQ === nowQ && periodYear === now.getFullYear())
+              : (periodMonth === now.getMonth() + 1 && periodYear === now.getFullYear());
+            const resetPeriod = () => {
+              const m = now.getMonth() + 1;
+              setPeriodYear(now.getFullYear());
+              setPeriodMonth(vatViewMode === 'quarterly' ? quarterStart(quarterOf(m)) : m);
+            };
+            return isCurrentPeriod ? (
+              <p className="text-xs text-gray-400">
+                {vatViewMode === 'quarterly' ? 'Quý hiện tại' : 'Tháng hiện tại'}
+              </p>
+            ) : (
+              <button onClick={resetPeriod} className="text-xs text-primary-600 hover:underline">
+                {vatViewMode === 'quarterly' ? 'Về quý hiện tại' : 'Về tháng hiện tại'}
+              </button>
+            );
+          })()}
         </div>
         <button
           onClick={() => navigatePeriod(1)}
           className="text-gray-500 hover:text-gray-900 text-lg font-bold px-2 py-0.5 rounded hover:bg-gray-100 transition-colors"
-          aria-label="Tháng sau"
+          aria-label="Kỳ sau"
         >
           ›
         </button>
@@ -372,19 +420,7 @@ export default function DashboardPage() {
         <div className="bg-white rounded-xl shadow-sm p-4">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-sm font-semibold text-gray-700">💰 Thuế GTGT Phải Nộp</h2>
-            <div className="flex gap-0.5 bg-gray-100 rounded-lg p-0.5">
-              {(['monthly', 'quarterly'] as const).map((mode) => (
-                <button
-                  key={mode}
-                  onClick={() => setVatViewMode(mode)}
-                  className={`text-xs px-2.5 py-1 rounded-md font-medium transition-colors ${
-                    vatViewMode === mode ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500'
-                  }`}
-                >
-                  {mode === 'monthly' ? 'Tháng' : 'Quý'}
-                </button>
-              ))}
-            </div>
+            <span className="text-xs text-gray-400">{vatViewMode === 'quarterly' ? 'Theo quý' : 'Theo tháng'}</span>
           </div>
           <ResponsiveContainer width="100%" height={200}>
             <BarChart data={activeVatData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>

@@ -1,0 +1,376 @@
+'use client';
+
+import React, { useState, useRef, useEffect } from 'react';
+import { format } from 'date-fns';
+import { vi } from 'date-fns/locale';
+import { useRouter } from 'next/navigation';
+import InvoiceEditPanel from './InvoiceEditPanel';
+
+export interface GridInvoice {
+  id: string;
+  invoice_number: string;
+  serial_number: string;
+  invoice_date: string;
+  direction: 'output' | 'input';
+  status: string;
+  seller_name: string;
+  seller_tax_code: string;
+  buyer_name: string;
+  buyer_tax_code: string;
+  subtotal: string | null;
+  total_amount: string;
+  vat_amount: string;
+  vat_rate: number;
+  gdt_validated: boolean;
+  provider: string;
+  invoice_group: number | null;
+  serial_has_cqt: boolean | null;
+  has_line_items: boolean | null;
+  payment_method: string | null;
+  customer_code: string | null;
+  item_code: string | null;
+  notes: string | null;
+}
+
+export interface GridMeta {
+  total: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  summary?: { count: number; subtotal: number; vat: number };
+}
+
+interface Props {
+  invoices: GridInvoice[];
+  meta: GridMeta;
+  loading: boolean;
+  direction: 'output' | 'input' | '';
+  selectedIds: string[];
+  onSelectionChange: (ids: string[]) => void;
+  onDelete: (id: string) => void;
+  onPermanentIgnore: (id: string) => void;
+  onPageChange: (page: number) => void;
+  onPageSizeChange: (size: number) => void;
+  onExcelExport?: () => void;
+  onRefresh: () => void;
+}
+
+const STATUS_LABELS: Record<string, { label: string; color: string }> = {
+  valid:     { label: 'Hợp lệ',    color: 'bg-green-100 text-green-700' },
+  cancelled: { label: 'Đã hủy',    color: 'bg-red-100 text-red-700' },
+  replaced:  { label: 'Thay thế',  color: 'bg-yellow-100 text-yellow-700' },
+  adjusted:  { label: 'Điều chỉnh', color: 'bg-blue-100 text-blue-700' },
+};
+
+const PAGE_SIZES = [15, 30, 50, 100];
+
+function rowBg(inv: GridInvoice): string {
+  if (inv.status === 'cancelled' || inv.status === 'invalid') return 'bg-red-50/50';
+  if (!inv.payment_method && Number(inv.total_amount) >= 5_000_000 && inv.direction === 'input') return 'bg-yellow-50/60';
+  return '';
+}
+
+function fmtVND(n: string | number | null | undefined): string {
+  if (n == null) return '—';
+  const num = Number(n);
+  if (isNaN(num)) return '—';
+  return num.toLocaleString('vi-VN');
+}
+
+export default function InvoiceGrid({
+  invoices, meta, loading, direction,
+  selectedIds, onSelectionChange,
+  onDelete, onPermanentIgnore,
+  onPageChange, onPageSizeChange,
+  onExcelExport, onRefresh,
+}: Props) {
+  const router = useRouter();
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null);
+  const menuRef = useRef<HTMLTableCellElement | null>(null);
+
+  // Close menu on outside click
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setOpenMenuId(null);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
+
+  const allPageSelected = invoices.length > 0 && invoices.every(inv => selectedIds.includes(inv.id));
+  const someSelected    = selectedIds.length > 0;
+
+  const toggleAll = () => {
+    if (allPageSelected) {
+      onSelectionChange(selectedIds.filter(id => !invoices.find(inv => inv.id === id)));
+    } else {
+      const newIds = new Set(selectedIds);
+      invoices.forEach(inv => newIds.add(inv.id));
+      onSelectionChange(Array.from(newIds));
+    }
+  };
+
+  const toggleOne = (id: string) => {
+    if (selectedIds.includes(id)) onSelectionChange(selectedIds.filter(x => x !== id));
+    else onSelectionChange([...selectedIds, id]);
+  };
+
+  const handleRowClick = (inv: GridInvoice) => {
+    setOpenMenuId(null);
+    setExpandedId(expandedId === inv.id ? null : inv.id);
+  };
+
+  const sum = meta.summary;
+  const partyLabel = direction === 'output' ? 'Người mua' : direction === 'input' ? 'Người bán' : 'Đối tác';
+
+  return (
+    <div className="space-y-2">
+      {/* ── Summary Bar ── */}
+      {sum && (
+        <div className="flex items-center justify-between bg-gray-50 border border-gray-200 rounded-xl px-4 py-2.5 text-sm flex-wrap gap-2">
+          <div className="flex items-center gap-4 text-gray-600 flex-wrap gap-y-1">
+            <span>Tổng: <strong className="text-gray-900">{sum.count.toLocaleString('vi-VN')}</strong> HĐ</span>
+            <span>Tiền hàng: <strong className="text-gray-900">{fmtVND(sum.subtotal)}đ</strong></span>
+            <span>Thuế VAT: <strong className="text-gray-900">{fmtVND(sum.vat)}đ</strong></span>
+          </div>
+          {onExcelExport && (
+            <button
+              onClick={onExcelExport}
+              className="text-xs border border-gray-300 rounded-lg px-3 py-1.5 text-gray-600 hover:bg-gray-100 flex items-center gap-1"
+            >
+              📊 Xuất Excel
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* ── Bulk Action Bar ── */}
+      {someSelected && (
+        <BulkActionBar
+          selectedIds={selectedIds}
+          onClear={() => onSelectionChange([])}
+          onRefresh={onRefresh}
+        />
+      )}
+
+      {/* ── Table ── */}
+      <div className="overflow-x-auto rounded-xl border border-gray-200 bg-white">
+        {loading ? (
+          <div className="flex justify-center py-16">
+            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600" />
+          </div>
+        ) : invoices.length === 0 ? (
+          <div className="text-center py-16 text-gray-400">
+            <p className="text-lg">Không có hóa đơn nào</p>
+            <p className="text-sm mt-1">Thay đổi bộ lọc hoặc nhấn Đồng Bộ để tải về</p>
+          </div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="bg-gray-50 border-b border-gray-200">
+                <th className="w-10 px-3 py-3 text-left">
+                  <input
+                    type="checkbox"
+                    checked={allPageSelected}
+                    onChange={toggleAll}
+                    className="rounded border-gray-300 text-primary-600"
+                  />
+                </th>
+                <th className="w-10 px-2 py-3 text-left text-xs font-semibold text-gray-500">STT</th>
+                <th className="px-3 py-3 text-left text-xs font-semibold text-gray-500 hidden md:table-cell">{partyLabel} MST</th>
+                <th className="px-3 py-3 text-left text-xs font-semibold text-gray-500 hidden lg:table-cell">Ký hiệu</th>
+                <th className="px-3 py-3 text-left text-xs font-semibold text-gray-500">Số HĐ</th>
+                <th className="px-3 py-3 text-left text-xs font-semibold text-gray-500 hidden sm:table-cell">Ngày lập</th>
+                <th className="px-3 py-3 text-left text-xs font-semibold text-gray-500">Tên {partyLabel}</th>
+                <th className="px-3 py-3 text-right text-xs font-semibold text-gray-500 hidden xl:table-cell">Tiền hàng</th>
+                <th className="px-3 py-3 text-right text-xs font-semibold text-gray-500">Thuế VAT</th>
+                <th className="px-3 py-3 text-left text-xs font-semibold text-gray-500">Trạng thái</th>
+                <th className="w-10 px-2 py-3" />
+              </tr>
+            </thead>
+            <tbody>
+              {invoices.map((inv, idx) => {
+                const isSelected = selectedIds.includes(inv.id);
+                const isExpanded = expandedId === inv.id;
+                const bg = rowBg(inv);
+                const statusInfo = STATUS_LABELS[inv.status] ?? { label: inv.status, color: 'bg-gray-100 text-gray-700' };
+                const partyName    = direction === 'output' ? inv.buyer_name  : direction === 'input' ? inv.seller_name  : (inv.direction === 'output' ? inv.buyer_name : inv.seller_name);
+                const partyTaxCode = direction === 'output' ? inv.buyer_tax_code : direction === 'input' ? inv.seller_tax_code : (inv.direction === 'output' ? inv.buyer_tax_code : inv.seller_tax_code);
+
+                return (
+                  <React.Fragment key={inv.id}>
+                    <tr
+                      className={`border-b border-gray-100 cursor-pointer hover:bg-blue-50/30 transition-colors ${bg} ${isSelected ? 'bg-primary-50/40' : ''} ${isExpanded ? 'bg-blue-50/40' : ''}`}
+                    >
+                      <td className="px-3 py-3" onClick={e => { e.stopPropagation(); toggleOne(inv.id); }}>
+                        <input
+                          type="checkbox"
+                          checked={isSelected}
+                          onChange={() => toggleOne(inv.id)}
+                          className="rounded border-gray-300 text-primary-600"
+                        />
+                      </td>
+                      <td className="px-2 py-3 text-gray-400 text-xs" onClick={() => handleRowClick(inv)}>
+                        {(meta.page - 1) * meta.pageSize + idx + 1}
+                      </td>
+                      <td className="px-3 py-3 hidden md:table-cell" onClick={() => handleRowClick(inv)}>
+                        <span className="text-xs font-mono text-gray-500">{partyTaxCode || '—'}</span>
+                      </td>
+                      <td className="px-3 py-3 hidden lg:table-cell" onClick={() => handleRowClick(inv)}>
+                        <div className="flex flex-col gap-0.5">
+                          <span className="text-xs text-gray-500 font-mono">{inv.serial_number}</span>
+                          {inv.invoice_group && inv.invoice_group !== 5 && (
+                            <span className="text-xs bg-orange-100 text-orange-700 px-1 py-0 rounded w-fit">
+                              Nhóm {inv.invoice_group}
+                            </span>
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-3 py-3" onClick={() => handleRowClick(inv)}>
+                        <div>
+                          <span className="font-medium text-gray-900">{inv.invoice_number}</span>
+                          {inv.has_line_items === false && (
+                            <span className="ml-1 text-xs bg-gray-100 text-gray-500 px-1 rounded">Thiếu CT</span>
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-3 py-3 text-gray-500 text-xs hidden sm:table-cell" onClick={() => handleRowClick(inv)}>
+                        {format(new Date(inv.invoice_date), 'dd/MM/yyyy', { locale: vi })}
+                      </td>
+                      <td className="px-3 py-3 max-w-[180px]" onClick={() => handleRowClick(inv)}>
+                        <p className="text-sm text-gray-800 truncate" title={partyName}>{partyName || '—'}</p>
+                      </td>
+                      <td className="px-3 py-3 text-right text-gray-700 tabular-nums text-xs hidden xl:table-cell" onClick={() => handleRowClick(inv)}>
+                        {fmtVND(inv.subtotal)}
+                      </td>
+                      <td className="px-3 py-3 text-right text-gray-700 tabular-nums text-xs" onClick={() => handleRowClick(inv)}>
+                        {fmtVND(inv.vat_amount)}
+                      </td>
+                      <td className="px-3 py-3" onClick={() => handleRowClick(inv)}>
+                        <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${statusInfo.color}`}>
+                          {statusInfo.label}
+                        </span>
+                      </td>
+                      <td className="px-2 py-3 relative" ref={openMenuId === inv.id ? menuRef : undefined}>
+                        <button
+                          onClick={e => { e.stopPropagation(); setOpenMenuId(openMenuId === inv.id ? null : inv.id); }}
+                          className="p-1 rounded-lg text-gray-400 hover:bg-gray-100"
+                        >
+                          <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                            <circle cx="10" cy="4" r="1.5" /><circle cx="10" cy="10" r="1.5" /><circle cx="10" cy="16" r="1.5" />
+                          </svg>
+                        </button>
+                        {openMenuId === inv.id && (
+                          <div className="absolute right-0 top-8 bg-white rounded-xl shadow-lg border border-gray-100 z-30 py-1 min-w-[160px]">
+                            <button onClick={e => { e.stopPropagation(); router.push(`/invoices/${inv.id}`); }} className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50">Xem chi tiết</button>
+                            <button onClick={e => { e.stopPropagation(); setOpenMenuId(null); setExpandedId(inv.id); }} className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50">Gán mã hàng / KH</button>
+                            <button onClick={e => { e.stopPropagation(); setOpenMenuId(null); onDelete(inv.id); }} className="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50">Ẩn hóa đơn</button>
+                            <button onClick={e => { e.stopPropagation(); setOpenMenuId(null); onPermanentIgnore(inv.id); }} className="w-full text-left px-4 py-2 text-sm text-red-700 hover:bg-red-50">Bỏ qua vĩnh viễn</button>
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+                    {isExpanded && (
+                      <tr key={`${inv.id}-panel`}>
+                        <td colSpan={11} className="p-0 bg-blue-50/20 border-b border-blue-200">
+                          <InvoiceEditPanel
+                            invoice={inv}
+                            onClose={() => setExpandedId(null)}
+                            onSaved={onRefresh}
+                          />
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* ── Pagination ── */}
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        {/* Page size */}
+        <div className="flex items-center gap-1">
+          <span className="text-xs text-gray-500">Hiển thị:</span>
+          {PAGE_SIZES.map(size => (
+            <button
+              key={size}
+              onClick={() => onPageSizeChange(size)}
+              className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${meta.pageSize === size ? 'bg-primary-600 text-white' : 'border border-gray-300 text-gray-600 hover:border-primary-300'}`}
+            >
+              {size}
+            </button>
+          ))}
+          <span className="text-xs text-gray-400 ml-1">/ trang</span>
+        </div>
+        {/* Page nav */}
+        {meta.totalPages > 1 && (
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => onPageChange(Math.max(1, meta.page - 1))}
+              disabled={meta.page <= 1}
+              className="px-2.5 py-1 rounded border border-gray-300 text-xs text-gray-600 disabled:opacity-40"
+            >
+              ‹
+            </button>
+            {Array.from({ length: Math.min(meta.totalPages, 5) }, (_, i) => {
+              const p = meta.totalPages <= 5 ? i + 1 : Math.max(1, meta.page - 2) + i;
+              if (p > meta.totalPages) return null;
+              return (
+                <button
+                  key={p}
+                  onClick={() => onPageChange(p)}
+                  className={`w-8 h-7 rounded text-xs font-medium ${p === meta.page ? 'bg-primary-600 text-white' : 'border border-gray-300 text-gray-600 hover:border-primary-300'}`}
+                >
+                  {p}
+                </button>
+              );
+            })}
+            <button
+              onClick={() => onPageChange(Math.min(meta.totalPages, meta.page + 1))}
+              disabled={meta.page >= meta.totalPages}
+              className="px-2.5 py-1 rounded border border-gray-300 text-xs text-gray-600 disabled:opacity-40"
+            >
+              ›
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Bulk Action Bar (shown when selectedIds.length >= 2) ─────────────────────
+import { BulkItemCodeModal, BulkCustomerCodeModal, BulkPaymentModal } from './BulkActionModals';
+
+function BulkActionBar({
+  selectedIds,
+  onClear,
+  onRefresh,
+}: {
+  selectedIds: string[];
+  onClear: () => void;
+  onRefresh: () => void;
+}) {
+  const [modal, setModal] = useState<'item' | 'customer' | 'payment' | null>(null);
+  const n = selectedIds.length;
+
+  return (
+    <>
+      <div className="flex items-center gap-2 bg-primary-50 border border-primary-200 rounded-xl px-4 py-2.5 flex-wrap">
+        <span className="text-sm font-medium text-primary-700">Đã chọn {n} hóa đơn —</span>
+        <button onClick={() => setModal('item')}     className="text-xs border border-primary-300 bg-white rounded-lg px-3 py-1.5 text-primary-700 hover:bg-primary-50">Gán mã hàng</button>
+        <button onClick={() => setModal('customer')} className="text-xs border border-primary-300 bg-white rounded-lg px-3 py-1.5 text-primary-700 hover:bg-primary-50">Gán mã KH/NCC</button>
+        <button onClick={() => setModal('payment')}  className="text-xs border border-primary-300 bg-white rounded-lg px-3 py-1.5 text-primary-700 hover:bg-primary-50">Khai báo TT</button>
+        <button onClick={onClear} className="ml-auto text-xs text-gray-400 hover:text-gray-700">Hủy chọn</button>
+      </div>
+
+      {modal === 'item'     && <BulkItemCodeModal     ids={selectedIds} onClose={() => { setModal(null); onClear(); onRefresh(); }} />}
+      {modal === 'customer' && <BulkCustomerCodeModal ids={selectedIds} onClose={() => { setModal(null); onClear(); onRefresh(); }} />}
+      {modal === 'payment'  && <BulkPaymentModal      ids={selectedIds} onClose={() => { setModal(null); onClear(); onRefresh(); }} />}
+    </>
+  );
+}

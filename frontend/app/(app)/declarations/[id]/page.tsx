@@ -143,6 +143,28 @@ export default function DeclarationDetailPage() {
     }
   };
 
+  const downloadExport = async (format: 'excel' | 'pdf') => {
+    if (!decl) return;
+    setDownloading(true);
+    try {
+      const mime = format === 'excel'
+        ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        : 'application/pdf';
+      const ext  = format === 'excel' ? 'xlsx' : 'pdf';
+      const res  = await apiClient.get(`/declarations/${decl.id}/export?format=${format}`, { responseType: 'blob' });
+      const url  = URL.createObjectURL(new Blob([res.data as BlobPart], { type: mime }));
+      const a    = document.createElement('a');
+      a.href = url;
+      a.download = `TK01GTGT_T${String(decl.period_month).padStart(2,'0')}${decl.period_year}.${ext}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      toast.error(`Lỗi tải ${format === 'excel' ? 'Excel' : 'PDF'}. Vui lòng thử lại.`);
+    } finally {
+      setDownloading(false);
+    }
+  };
+
   const downloadExcel = async (type: 'pl011' | 'pl012') => {
     if (!decl) return;
     try {
@@ -599,16 +621,30 @@ export default function DeclarationDetailPage() {
             {marking ? 'Đang lưu...' : '✓ Đánh dấu Hoàn thiện'}
           </button>
         )}
-        <button
-          onClick={() => void downloadXml()}
-          disabled={downloading}
-          className="flex-1 bg-primary-600 text-white py-3 rounded-xl text-sm font-medium hover:bg-primary-700 disabled:opacity-60 transition-colors flex items-center justify-center gap-2"
-        >
-          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-          </svg>
-          {downloading ? 'Đang tải...' : 'Tải XML HTKK'}
-        </button>
+        <div className="flex-1 flex rounded-xl overflow-hidden border border-primary-600 divide-x divide-primary-600">
+          <button
+            onClick={() => void downloadXml()}
+            disabled={downloading}
+            className="flex-1 bg-primary-600 text-white py-3 text-sm font-medium hover:bg-primary-700 disabled:opacity-60 transition-colors flex items-center justify-center gap-1.5"
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+            {downloading ? '...' : 'XML'}
+          </button>
+          <button
+            onClick={() => void downloadExport('excel')}
+            disabled={downloading}
+            className="px-4 bg-primary-600 text-white py-3 text-sm font-medium hover:bg-primary-700 disabled:opacity-60 transition-colors"
+          >
+            Excel
+          </button>
+          <button
+            onClick={() => void downloadExport('pdf')}
+            disabled={downloading}
+            className="px-4 bg-primary-600 text-white py-3 text-sm font-medium hover:bg-primary-700 disabled:opacity-60 transition-colors"
+          >
+            PDF
+          </button>
+        </div>
         {['draft', 'ready'].includes(decl.submission_status) && (
           <button
             onClick={() => setShowTvanConfirm(true)}

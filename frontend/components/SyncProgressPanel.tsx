@@ -32,6 +32,32 @@ interface SyncProgressPanelProps {
   onDone?: () => void;
 }
 
+/** Format seconds → "Xm Ys" or "Xs" */
+function formatSec(sec: number): string {
+  if (sec <= 0) return '...';
+  if (sec < 60) return `${Math.ceil(sec)}s`;
+  return `${Math.floor(sec / 60)}m ${Math.ceil(sec % 60)}s`;
+}
+
+/**
+ * Map a statusMessage from the bot into a human-readable Vietnamese label.
+ * Known patterns come from sync.worker.ts job.updateProgress calls.
+ */
+function formatStatusMsg(msg: string, pct: number, fetched: number, page: number, totalPages: number | null): string {
+  if (!msg) return pct > 0 ? `${pct}% — ${fetched} HĐ` : 'Đang khởi động...';
+
+  const m = msg.toLowerCase();
+  if (m.includes('kiểm tra proxy') || m.includes('proxy'))    return '🔌 Kiểm tra proxy...';
+  if (m.includes('đăng nhập') || m.includes('login'))         return '🔐 Đang đăng nhập GDT...';
+  if (m.includes('đầu ra') || m.includes('output'))           return `📤 HĐ đầu ra — trang ${page}${totalPages ? '/' + totalPages : ''}`;
+  if (m.includes('đầu vào') || m.includes('input') || m.includes('mua vào')) return `📥 HĐ đầu vào — trang ${page}${totalPages ? '/' + totalPages : ''}`;
+  if (m.includes('xml'))                                       return `📄 Đang lấy XML (${fetched} HĐ)`;
+  if (m.includes('hoàn thành') || m.includes('done'))         return `✅ Xong — ${fetched} HĐ`;
+
+  // Generic: show message as-is with progress suffix
+  return `${msg}${pct > 0 ? ` (${pct}%)` : ''}`;
+}
+
 export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }: SyncProgressPanelProps) {
   const [jobs, setJobs] = useState<Record<string, JobProgress>>({});
   const [cancelling, setCancelling] = useState(false);
@@ -40,6 +66,8 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
   const [stalledJobs, setStalledJobs] = useState<Set<string>>(new Set());
   // Whether the stall timeout has elapsed (shows force-close button)
   const [showForceClose, setShowForceClose] = useState(false);
+  // Per-job: timestamp when state first became 'active'
+  const activeStartRef = useRef<Record<string, number>>({});
 
   const eventSourcesRef = useRef<EventSource[]>([]);
   const retryCountRef = useRef<Record<string, number>>({});
@@ -69,6 +97,10 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
         const data = JSON.parse(evt.data) as JobProgress;
         // Reset error counter on successful message
         retryCountRef.current[jobId] = 0;
+        // Record when this job first became active (for ETA)
+        if (data.state === 'active' && !activeStartRef.current[jobId]) {
+          activeStartRef.current[jobId] = Date.now();
+        }
         setJobs((prev) => ({ ...prev, [data.jobId]: data }));
         // Close SSE when terminal state received — no need to keep connection open
         if (data.state === 'completed' || data.state === 'failed') {
@@ -97,6 +129,7 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
     if (cancelled) return;
     cleanup();
     retryCountRef.current = {};
+    activeStartRef.current = {};
     openedAtRef.current = Date.now();
 
     for (const jobId of jobIds) {
@@ -147,6 +180,18 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
 
   const retryCount = (id: string) => retryCountRef.current[id] ?? 0;
 
+  /** Compute ETA string for an active job given current progress % */
+  const etaLabel = (id: string, pct: number): string | null => {
+    if (pct < 5) return null; // not enough data for reliable ETA
+    const startedAt = activeStartRef.current[id];
+    if (!startedAt) return null;
+    const elapsed = (Date.now() - startedAt) / 1000;
+    const totalEstSec = elapsed / (pct / 100);
+    const remainSec = totalEstSec - elapsed;
+    if (remainSec <= 0) return null;
+    return `~${formatSec(remainSec)} còn lại`;
+  };
+
   return (
     <div className="bg-white rounded-2xl shadow-lg border border-gray-100 p-4 space-y-3">
       {/* Header */}
@@ -178,21 +223,43 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
           const stalled = stalledJobs.has(id);
           const pct = j ? Math.min(100, Math.max(0, j.progress)) : 0;
           const label = j?.currentMonth || id.split('-').pop() || '';
-          const stateLabel = cancelled
-            ? (j?.state === 'completed' ? `✅ ${j.invoicesFetched} HĐ` : '⏹ Đã hủy')
-            : stalled ? '⚠️ Mất kết nối'
-            : !j
-            ? (retryCount(id) > 0 ? `Đang kết nối lại (${retryCount(id)}/${MAX_SSE_RETRIES})...` : 'Đang kết nối...')
-            : j.state === 'waiting' || j.state === 'delayed' ? 'Chờ...'
-            : j.state === 'active' ? j.message || `${pct}%`
-            : j.state === 'completed' ? `✅ ${j.invoicesFetched} HĐ`
-            : `❌ ${j.error?.slice(0, 80) ?? 'Lỗi'}`;
+
+          let stateLabel: string;
+          if (cancelled) {
+            stateLabel = j?.state === 'completed' ? `✅ ${j.invoicesFetched} HĐ` : '⏹ Đã hủy';
+          } else if (stalled) {
+            stateLabel = '⚠️ Mất kết nối — chạy nền';
+          } else if (!j) {
+            stateLabel = retryCount(id) > 0
+              ? `Đang kết nối lại (${retryCount(id)}/${MAX_SSE_RETRIES})...`
+              : '⏳ Đang kết nối...';
+          } else if (j.state === 'waiting') {
+            stateLabel = '⏳ Chờ trong hàng...';
+          } else if (j.state === 'delayed') {
+            stateLabel = '⏳ Đã lên lịch...';
+          } else if (j.state === 'active') {
+            const msgLabel = formatStatusMsg(j.message, pct, j.invoicesFetched, j.currentPage, j.totalPages);
+            const eta = etaLabel(id, pct);
+            stateLabel = eta ? `${msgLabel} · ${eta}` : msgLabel;
+          } else if (j.state === 'completed') {
+            stateLabel = `✅ ${j.invoicesFetched} HĐ`;
+          } else {
+            // Failed — show concise error
+            const err = j.error ?? 'Lỗi không xác định';
+            const isProxy = /proxy|407|PROXY_DEAD/i.test(err);
+            const isTimeout = /TIMEOUT/i.test(err);
+            stateLabel = isProxy ? '❌ Lỗi proxy — sẽ thử lại'
+              : isTimeout ? '❌ Quá thời gian — sẽ thử lại'
+              : `❌ ${err.slice(0, 60)}`;
+          }
 
           return (
             <div key={id}>
               <div className="flex items-center justify-between text-xs mb-1">
                 <span className="text-gray-600 font-medium">{label}</span>
-                <span className={`${stalled ? 'text-amber-500' : 'text-gray-500'}`}>{stateLabel}</span>
+                <span className={`${stalled ? 'text-amber-500' : j?.state === 'failed' ? 'text-red-500' : 'text-gray-500'} text-right max-w-[180px] truncate`}>
+                  {stateLabel}
+                </span>
               </div>
               <div className="w-full bg-gray-100 rounded-full h-2 overflow-hidden">
                 <div
@@ -206,6 +273,12 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
                   style={{ width: stalled ? '100%' : `${pct}%` }}
                 />
               </div>
+              {/* Sub-detail: page counter for active jobs */}
+              {j?.state === 'active' && j.totalPages && j.totalPages > 1 && (
+                <div className="text-[10px] text-gray-400 mt-0.5 text-right">
+                  Trang {j.currentPage}/{j.totalPages} · {j.invoicesFetched} hóa đơn
+                </div>
+              )}
             </div>
           );
         })}

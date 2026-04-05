@@ -350,6 +350,10 @@ function mapInvoice(
 export class GdtDirectApiService {
   private token:          string | null = null;
   private captchaService: CaptchaService;
+
+  /** FIX-PERF-01: Allow session cache to restore a previously-issued JWT. */
+  setToken(token: string): void { this.token = token; }
+  getToken(): string | null     { return this.token; }
   private http:           AxiosInstance;
   /**
    * Binary downloads client (XML ZIP / XLSX).

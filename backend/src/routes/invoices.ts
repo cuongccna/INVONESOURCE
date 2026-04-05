@@ -38,7 +38,7 @@ router.use(requireCompany);
 
 const listSchema = z.object({
   page: z.coerce.number().int().positive().default(1),
-  pageSize: z.coerce.number().int().min(1).max(200).default(50),
+  pageSize: z.coerce.number().int().min(1).max(100).default(50),
   direction: z.enum(['output', 'input']).optional(),
   status: z.enum(['valid', 'cancelled', 'replaced', 'adjusted', 'invalid']).optional(),
   fromDate: z.string().optional(),
@@ -76,27 +76,152 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
 
     const where = conditions.join(' AND ');
 
-    const [countResult, dataResult] = await Promise.all([
+    const [countResult, dataResult, summaryResult] = await Promise.all([
       pool.query(`SELECT COUNT(*) FROM invoices WHERE ${where}`, params),
       pool.query(
         `SELECT id, invoice_number, serial_number, invoice_date, direction, status,
                 seller_name, seller_tax_code, buyer_name, buyer_tax_code,
-                total_amount, vat_amount, vat_rate, gdt_validated, provider,
-                invoice_group, serial_has_cqt, has_line_items
+                subtotal, total_amount, vat_amount, vat_rate, gdt_validated, provider,
+                invoice_group, serial_has_cqt, has_line_items,
+                payment_method,
+                COALESCE(customer_code, NULL)::TEXT AS customer_code,
+                COALESCE(item_code, NULL)::TEXT     AS item_code,
+                COALESCE(notes, NULL)::TEXT          AS notes
          FROM invoices WHERE ${where}
          ORDER BY invoice_date DESC
          LIMIT $${idx} OFFSET $${idx + 1}`,
         [...params, pageSize, offset]
       ),
+      pool.query(
+        `SELECT COUNT(*) AS count,
+                COALESCE(SUM(subtotal), 0)    AS total_subtotal,
+                COALESCE(SUM(vat_amount), 0)  AS total_vat
+         FROM invoices WHERE ${where}`,
+        params
+      ),
     ]);
 
-    sendPaginated(res, dataResult.rows, Number(countResult.rows[0].count), page, pageSize);
+    const summary = {
+      count:    Number(summaryResult.rows[0].count),
+      subtotal: Number(summaryResult.rows[0].total_subtotal),
+      vat:      Number(summaryResult.rows[0].total_vat),
+    };
+
+    const total = Number(countResult.rows[0].count);
+    res.json({
+      success: true,
+      data: dataResult.rows,
+      meta: {
+        total,
+        page,
+        pageSize,
+        totalPages: Math.ceil(total / pageSize),
+        summary,
+      },
+    });
   } catch (err) {
     next(err);
   }
 });
 
 // ─── STATIC ROUTES — phải đặt trước /:id để Express không nhầm ─────────────
+
+// GET /api/invoices/export — tải Excel toàn bộ danh sách hóa đơn (cùng bộ lọc với list)
+router.get('/export', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const { direction, search, invoiceGroup, fromDate, toDate } = req.query as Record<string, string>;
+
+    const conditions: string[] = ['company_id = $1', 'deleted_at IS NULL'];
+    const params: unknown[] = [companyId];
+    let idx = 2;
+
+    if (direction) { conditions.push(`direction = $${idx++}`); params.push(direction); }
+    if (fromDate)  { conditions.push(`invoice_date >= $${idx++}`); params.push(fromDate); }
+    if (toDate)    { conditions.push(`invoice_date <= $${idx++}`); params.push(toDate); }
+    if (invoiceGroup) { conditions.push(`invoice_group = $${idx++}`); params.push(Number(invoiceGroup)); }
+    if (search) {
+      conditions.push(`(invoice_number ILIKE $${idx} OR seller_name ILIKE $${idx} OR buyer_name ILIKE $${idx})`);
+      params.push(`%${search}%`);
+      idx++;
+    }
+
+    const where = conditions.join(' AND ');
+    const { rows } = await pool.query(
+      `SELECT invoice_number, serial_number, invoice_date, direction, status,
+              seller_name, seller_tax_code, buyer_name, buyer_tax_code,
+              subtotal, total_amount, vat_amount, vat_rate,
+              payment_method, customer_code, item_code, notes
+       FROM invoices WHERE ${where}
+       ORDER BY invoice_date DESC
+       LIMIT 5000`,
+      params
+    );
+
+    const ExcelJS = (await import('exceljs')).default;
+    const wb = new ExcelJS.Workbook();
+    wb.creator = 'INVONE Platform';
+    const sh = wb.addWorksheet('Hóa Đơn');
+
+    sh.columns = [
+      { header: 'STT',           key: 'stt',     width: 6  },
+      { header: 'Hướng',         key: 'dir',     width: 8  },
+      { header: 'Số HĐ',         key: 'inv_no',  width: 16 },
+      { header: 'Ký hiệu',       key: 'serial',  width: 14 },
+      { header: 'Ngày lập',      key: 'date',    width: 13 },
+      { header: 'Người bán',     key: 'seller',  width: 28 },
+      { header: 'MST người bán', key: 'seller_tc', width: 14 },
+      { header: 'Người mua',     key: 'buyer',   width: 28 },
+      { header: 'MST người mua', key: 'buyer_tc', width: 14 },
+      { header: 'Tiền hàng',     key: 'sub',     width: 16 },
+      { header: 'Thuế VAT',      key: 'vat',     width: 14 },
+      { header: 'Tổng tiền',     key: 'total',   width: 16 },
+      { header: 'TS%',           key: 'rate',    width: 6  },
+      { header: 'TT thanh toán', key: 'pay',     width: 14 },
+      { header: 'Mã KH/NCC',    key: 'cust',    width: 14 },
+      { header: 'Mã hàng',      key: 'item',    width: 14 },
+      { header: 'Trạng thái',   key: 'status',  width: 12 },
+      { header: 'Ghi chú',      key: 'notes',   width: 24 },
+    ];
+
+    const hdr = sh.getRow(1);
+    hdr.font = { bold: true };
+    hdr.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE3F2FD' } };
+
+    rows.forEach((inv, i) => {
+      const r = sh.addRow({
+        stt:       i + 1,
+        dir:       inv.direction === 'output' ? 'Bán ra' : 'Mua vào',
+        inv_no:    inv.invoice_number,
+        serial:    inv.serial_number,
+        date:      inv.invoice_date ? new Date(inv.invoice_date) : '',
+        seller:    inv.seller_name,
+        seller_tc: inv.seller_tax_code,
+        buyer:     inv.buyer_name,
+        buyer_tc:  inv.buyer_tax_code,
+        sub:       inv.subtotal    ? Number(inv.subtotal)    : '',
+        vat:       Number(inv.vat_amount),
+        total:     Number(inv.total_amount),
+        rate:      inv.vat_rate,
+        pay:       inv.payment_method ?? '',
+        cust:      inv.customer_code  ?? '',
+        item:      inv.item_code      ?? '',
+        status:    inv.status,
+        notes:     inv.notes         ?? '',
+      });
+      for (const c of ['sub', 'vat', 'total']) r.getCell(c).numFmt = '#,##0';
+      r.getCell('date').numFmt = 'DD/MM/YYYY';
+    });
+
+    const raw = await wb.xlsx.writeBuffer();
+    const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as ArrayBuffer);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="HoaDon_${new Date().toISOString().slice(0, 10)}.xlsx"`);
+    res.send(buf);
+  } catch (err) {
+    next(err);
+  }
+});
 
 // GET /api/invoices/trash — danh sách hóa đơn đã ẩn (OWNER/ADMIN only)
 router.get('/trash', requireRole('OWNER', 'ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
@@ -290,9 +415,115 @@ router.patch('/missing/:id', async (req: Request, res: Response, next: NextFunct
   } catch (err) { next(err); }
 });
 
+// ── Bulk update (category + payment) ─────────────────────────────────────────
+
+// PATCH /api/invoices/bulk-update — gán mã hàng / mã KH / phương thức TT hàng loạt (OWNER/ADMIN)
+router.patch('/bulk-update', requireRole('OWNER', 'ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const userId    = req.user!.userId;
+    const schema = z.object({
+      ids:     z.array(z.string().uuid()).min(1).max(500),
+      updates: z.object({
+        item_code:      z.string().max(100).optional(),
+        customer_code:  z.string().max(100).optional(),
+        payment_method: z.enum(['transfer', 'cash', 'card', 'cheque']).optional(),
+      }).refine(u => Object.keys(u).length > 0, { message: 'At least one field required' }),
+      only_missing: z.boolean().optional().default(false),
+    });
+    const body = schema.safeParse(req.body);
+    if (!body.success) throw new ValidationError(body.error.issues[0]?.message ?? 'Invalid body');
+
+    const { ids, updates, only_missing } = body.data;
+    const setClauses: string[] = [];
+    const params: unknown[] = [];
+    let idx = 1;
+
+    if (updates.item_code !== undefined) {
+      const cond = only_missing ? ` AND (item_code IS NULL OR item_code = '')` : '';
+      setClauses.push(`item_code = $${idx++}${cond}`);
+      params.push(updates.item_code);
+    }
+    if (updates.customer_code !== undefined) {
+      const cond = only_missing ? ` AND (customer_code IS NULL OR customer_code = '')` : '';
+      setClauses.push(`customer_code = $${idx++}${cond}`);
+      params.push(updates.customer_code);
+    }
+    if (updates.payment_method !== undefined) {
+      setClauses.push(`payment_method = $${idx++}, payment_method_source = 'manual'`);
+      params.push(updates.payment_method);
+    }
+
+    if (setClauses.length === 0) throw new ValidationError('No fields to update');
+
+    params.push(ids);
+    params.push(companyId);
+
+    await pool.query(
+      `UPDATE invoices SET ${setClauses.join(', ')}, updated_at = NOW()
+       WHERE id = ANY($${idx}::uuid[]) AND company_id = $${idx + 1} AND deleted_at IS NULL`,
+      params
+    );
+    await writeAuditLog(companyId, userId, 'bulk_update_category', null, { ids, updates });
+    sendSuccess(res, { count: ids.length }, `Đã cập nhật ${ids.length} hóa đơn`);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // ─── PARAMETERIZED ROUTES — sau cùng để không bắt nhầm static paths ─────────
 
-// GET /api/invoices/:id
+// PATCH /api/invoices/:id — cập nhật phân loại, thanh toán, ghi chú (ACCOUNTANT+)
+router.patch('/:id', requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const userId    = req.user!.userId;
+    const schema = z.object({
+      item_code:       z.string().max(100).nullable().optional(),
+      customer_code:   z.string().max(100).nullable().optional(),
+      payment_method:  z.enum(['transfer', 'cash', 'card', 'cheque']).nullable().optional(),
+      payment_date:    z.string().nullable().optional(),
+      payment_due_date: z.string().nullable().optional(),
+      notes:           z.string().max(1000).nullable().optional(),
+    });
+    const body = schema.safeParse(req.body);
+    if (!body.success) throw new ValidationError(body.error.issues[0]?.message ?? 'Invalid body');
+
+    const updates = body.data;
+    const setClauses: string[] = [];
+    const params: unknown[] = [];
+    let idx = 1;
+
+    if ('item_code'       in updates) { setClauses.push(`item_code = $${idx++}`);        params.push(updates.item_code); }
+    if ('customer_code'   in updates) { setClauses.push(`customer_code = $${idx++}`);    params.push(updates.customer_code); }
+    if ('payment_method'  in updates) {
+      setClauses.push(`payment_method = $${idx++}, payment_method_source = 'manual'`);
+      params.push(updates.payment_method);
+    }
+    if ('payment_date'    in updates) { setClauses.push(`payment_date = $${idx++}`);     params.push(updates.payment_date); }
+    if ('payment_due_date' in updates){ setClauses.push(`payment_due_date = $${idx++}`); params.push(updates.payment_due_date); }
+    if ('notes'           in updates) { setClauses.push(`notes = $${idx++}`);            params.push(updates.notes); }
+
+    if (setClauses.length === 0) throw new ValidationError('No fields to update');
+
+    params.push(req.params.id);
+    params.push(companyId);
+
+    const result = await pool.query(
+      `UPDATE invoices SET ${setClauses.join(', ')}, updated_at = NOW()
+       WHERE id = $${idx} AND company_id = $${idx + 1} AND deleted_at IS NULL
+       RETURNING id`,
+      params
+    );
+    if (!result.rows[0]) throw new NotFoundError('Invoice not found');
+    await writeAuditLog(companyId, userId, 'update_category', req.params.id, updates);
+    sendSuccess(res, { id: req.params.id });
+  } catch (err) {
+    next(err);
+  }
+});
+
+
 router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const result = await pool.query(
