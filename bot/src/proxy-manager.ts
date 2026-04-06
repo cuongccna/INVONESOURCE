@@ -44,6 +44,7 @@ interface TmproxySlot {
   refresher:            TmproxyRefresher;
   currentUrl:           string | null;  // http:// for HTTP CONNECT (JSON API)
   currentSocks5Url:     string | null;  // socks5:// for binary downloads (ZIP/XLSX)
+  currentExpiresAt:     Date | null;    // when the current IP expires
   refreshing:           boolean;
   failedUrls:           Set<string>;
 }
@@ -132,6 +133,7 @@ export class ProxyManager extends EventEmitter {
       this.slots = allKeys.map(apiKey => ({
         apiKey,
         refresher:        new TmproxyRefresher(apiKey),
+        currentExpiresAt: null,
         currentUrl:       null,
         currentSocks5Url: null,
         refreshing:       false,
@@ -330,6 +332,42 @@ export class ProxyManager extends EventEmitter {
     this.emit('proxyFailed', url);
   }
 
+  /**
+   * Proactively rotate the TMProxy IP for this company's slot if the current IP
+   * expires within minTtlMs milliseconds.
+   * Call before starting a sync so the IP never expires mid-run.
+   * Returns true if a rotation was triggered (caller can await the new URL).
+   * No-op for IPRoyal / static-pool modes.
+   */
+  async refreshIfExpiringSoon(sessionSuffix: string, minTtlMs = 3 * 60_000): Promise<boolean> {
+    if (this.slots.length === 0) return false;
+    const slotIdx = this._hashToIndex(sessionSuffix, this.slots.length);
+    const slot    = this.slots[slotIdx]!;
+    if (!slot.currentExpiresAt) return false;
+    const ttlMs = slot.currentExpiresAt.getTime() - Date.now();
+    if (ttlMs > minTtlMs) return false;
+    logger.warn('[ProxyManager] Proxy IP expiring soon — rotating before sync', {
+      apiKey:    slot.apiKey.slice(0, 8) + '…',
+      expiresAt: slot.currentExpiresAt.toISOString(),
+      ttlSec:    Math.round(ttlMs / 1000),
+    });
+    try {
+      const session = await slot.refresher.getNew();
+      slot.currentUrl       = session.url;
+      slot.currentSocks5Url = session.socks5Url;
+      slot.currentExpiresAt = session.expiresAt;
+      logger.info('[ProxyManager] Proactive proxy rotation done', {
+        apiKey: slot.apiKey.slice(0, 8) + '…', publicIp: session.publicIp,
+        expiresAt: session.expiresAt.toISOString(),
+      });
+    } catch (err) {
+      logger.error('[ProxyManager] Proactive rotation failed (proceeding with current IP)', {
+        apiKey: slot.apiKey.slice(0, 8) + '…', err: (err as Error).message,
+      });
+    }
+    return true;
+  }
+
   markHealthy(url: string): void {
     // Mode C: IPRoyal
     const iproyalSlot = this.iproyalSlots.find(s => s.httpUrl === url || s.socks5Url === url);
@@ -429,6 +467,7 @@ export class ProxyManager extends EventEmitter {
     }
     slot.currentUrl       = session.url;
     slot.currentSocks5Url = session.socks5Url;
+    slot.currentExpiresAt = session.expiresAt;
     logger.info('[ProxyManager] TMProxy slot ready', {
       apiKey:    slot.apiKey.slice(0, 8) + '…',
       publicIp:  session.publicIp,
@@ -445,6 +484,7 @@ export class ProxyManager extends EventEmitter {
       .then(session => {
         slot.currentUrl       = session.url;
         slot.currentSocks5Url = session.socks5Url;
+        slot.currentExpiresAt = session.expiresAt;
         logger.info('[ProxyManager] TMProxy slot rotated', {
           apiKey: slot.apiKey.slice(0, 8) + '…', publicIp: session.publicIp,
         });

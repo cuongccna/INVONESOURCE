@@ -749,6 +749,26 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
       const yyyymm = `${fromDate.getFullYear()}${String(fromDate.getMonth() + 1).padStart(2, '0')}`;
 
+      // ── Pre-sync proxy freshness check ───────────────────────────────────────
+      // If the TMProxy IP expires within the next 3 minutes, rotate now so the
+      // IP never expires mid-fetch. getCurrent() gives ~45-min IPs; a sync for
+      // 200+ invoices can take 5-10 min, so expiry mid-run is a real risk.
+      if (proxyUrl) {
+        const rotated = await proxyManager.refreshIfExpiringSoon(proxySessionId!, 3 * 60_000);
+        if (rotated) {
+          // Re-read the fresh URL so the GDtDirectApiService gets the new IP.
+          const freshUrl       = proxyManager.nextForCompany(proxySessionId!);
+          const freshSocks5Url = proxyManager.nextSocks5ForCompany(proxySessionId!);
+          if (freshUrl && freshUrl !== proxyUrl) {
+            // Rebuild GdtDirectApiService with fresh proxy; re-login with the new IP.
+            const freshApi = new GdtDirectApiService(freshUrl, freshSocks5Url, undefined, companyId, _checkpoint);
+            await freshApi.login(creds.username, creds.password, isManual);
+            // Swap in-scope references
+            Object.assign(gdtApi, freshApi);
+          }
+        }
+      }
+
       // ── Phase 3: Pre-flight volume estimate ────────────────────────────────
       // Fetch X-Total-Count from GDT with size=1 (no data downloaded) to warn
       // the user if the sync will take a very long time.
