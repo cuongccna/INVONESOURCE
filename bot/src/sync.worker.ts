@@ -20,6 +20,7 @@ import { logger } from './logger';
 import type { LineItem } from './parsers/GdtXmlParser';
 import { InvoiceDeduplicator } from './crawl-cache/InvoiceDeduplicator';
 import { GdtSessionCache }     from './crawl-cache/GdtSessionCache';
+import { SyncCheckpoint }      from './crawl-cache/SyncCheckpoint';
 
 const REDIS_URL    = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
 const CONCURRENCY  = parseInt(process.env['WORKER_CONCURRENCY'] ?? '2', 10);
@@ -48,7 +49,8 @@ const _notifQueue = new Queue('sync-notifications', {
   connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
 });
 // Self-reference queue for sequential job chaining (quarter sync: job 0 → job 1 → job 2)
-const _botSyncQueue = new Queue('gdt-bot-sync', {
+// Routes to gdt-sync-auto so chained jobs get autoWorker concurrency + backoff.
+const _botSyncQueue = new Queue('gdt-sync-auto', {
   connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
 });
 
@@ -176,6 +178,8 @@ const _lockRedis = new Redis(REDIS_URL, { maxRetriesPerRequest: 3 });
 // FIX-PERF-01: Crawl-cache singletons (reuse _lockRedis connection)
 const _dedup        = new InvoiceDeduplicator(_lockRedis);
 const _sessionCache = new GdtSessionCache(_lockRedis);
+// FIX-2: Pagination checkpoint singleton — resumes on crash, no restart from page 0
+const _checkpoint   = new SyncCheckpoint(_lockRedis);
 const BOT_LOCK_PREFIX   = 'bot:sync:lock:';
 const BOT_LOCK_TTL      = 45 * 60; // 45 min — upper bound for any single sync run
 const BOT_CANCEL_PREFIX = 'bot:sync:cancel:';
@@ -263,6 +267,165 @@ const MAX_XML_FETCHES_PER_RUN = 50;
 const XML_FETCH_DELAY_MIN = 2500;
 const XML_FETCH_DELAY_MAX = 4500;
 
+// ── Phase 5: Smart enqueue with mutual exclusion ──────────────────────────────
+
+const BOT_PENDING_PREFIX  = 'bot:pending:';
+const BOT_PRIORITY_PREFIX = 'bot:priority:';
+
+// ── Phase 6: Token bucket rate limiter ───────────────────────────────────────
+
+interface RateLimitState {
+  tokens:     number;
+  lastRefill: number;
+  plan:       string;
+}
+interface RateLimitResult {
+  allowed:         boolean;
+  tokensRemaining?: number;
+  retryAfterMs?:   number;
+  message?:        string;
+  suggestion?:     string;
+}
+
+const RATE_LIMIT_PLANS: Record<string, { tokensPerHour: number; burstMax: number }> = {
+  free:       { tokensPerHour: 3,  burstMax: 3  },
+  pro:        { tokensPerHour: 10, burstMax: 5  },
+  enterprise: { tokensPerHour: 30, burstMax: 10 },
+};
+const RATE_LIMIT_DEFAULT_PLAN = 'free';
+
+/**
+ * Phase 6: Token bucket rate limiter — prevents manual sync abuse per user.
+ * Redis key: ratelimit:manual:{userId}   TTL: 86400s
+ * Admin override key: ratelimit:override:{userId}  — set by admin API to bypass limits
+ */
+export async function checkManualRateLimit(
+  userId: string,
+  plan:   string,
+): Promise<RateLimitResult> {
+  try {
+    // Admin bypass
+    const override = await _lockRedis.get(`ratelimit:override:${userId}`).catch(() => null);
+    if (override) return { allowed: true, tokensRemaining: 999 };
+
+    const cfg = RATE_LIMIT_PLANS[plan] ?? RATE_LIMIT_PLANS[RATE_LIMIT_DEFAULT_PLAN]!;
+    const key  = `ratelimit:manual:${userId}`;
+    const raw  = await _lockRedis.get(key).catch(() => null);
+
+    let state: RateLimitState;
+    if (raw) {
+      state = JSON.parse(raw) as RateLimitState;
+    } else {
+      // First call — start with full burst
+      state = { tokens: cfg.burstMax, lastRefill: Date.now(), plan };
+    }
+
+    // Continuous refill
+    const elapsedHours = (Date.now() - state.lastRefill) / 3_600_000;
+    const refillTokens = Math.floor(elapsedHours * cfg.tokensPerHour);
+    if (refillTokens > 0) {
+      state.tokens    = Math.min(cfg.burstMax, state.tokens + refillTokens);
+      state.lastRefill = Date.now();
+    }
+
+    if (state.tokens <= 0) {
+      const nextRefillMs = Math.ceil(3_600_000 / cfg.tokensPerHour);
+      await _lockRedis.set(key, JSON.stringify(state), 'EX', 86400).catch(() => {});
+      return {
+        allowed:      false,
+        retryAfterMs: nextRefillMs,
+        message:      `Bạn đã sync quá nhiều lần. Thử lại sau ${Math.ceil(nextRefillMs / 60_000)} phút.`,
+        suggestion:   'Hệ thống tự động sync mỗi 5–6 giờ. Bạn có thể chờ đợt sync tiếp theo.',
+      };
+    }
+
+    // Consume 1 token
+    state.tokens -= 1;
+    await _lockRedis.set(key, JSON.stringify(state), 'EX', 86400).catch(() => {});
+    return { allowed: true, tokensRemaining: state.tokens };
+  } catch (err) {
+    // Rate limit check failures are non-fatal — allow sync to proceed
+    logger.warn('[SyncWorker] checkManualRateLimit error (non-fatal, allowing sync)', {
+      userId, error: (err as Error).message,
+    });
+    return { allowed: true, tokensRemaining: -1 };
+  }
+}
+
+type EnqueueResult =
+  | { status: 'enqueued';      jobId: string }
+  | { status: 'promoted';      message: string }
+  | { status: 'notified';      message: string }
+  | { status: 'skipped';       message: string }
+  | { status: 'deduplicated';  message: string };
+
+/**
+ * Phase 5: Smart enqueue with mutual exclusion.
+ * - Manual + running job     → set priority flag, current job will yield checkpoint at next check
+ * - Auto + running job       → skip (already running)
+ * - Manual + waiting in queue → promote to manualQueue with higher priority
+ * - Auto + waiting in queue  → deduplicate (skip)
+ * - No conflict              → enqueue normally, register pending key
+ *
+ * Phase 6: Applies token bucket rate limit for manual enqueues.
+ * Pass userId + userPlan to enable rate limiting; omit to skip the check.
+ */
+export async function enqueueSync(
+  companyId: string,
+  type: 'manual' | 'auto',
+  jobData: SyncJobData,
+  userId?:   string,
+  userPlan?: string,
+): Promise<EnqueueResult> {
+  try {
+    // Phase 6: Rate limit check for manual syncs
+    if (type === 'manual' && userId) {
+      const rl = await checkManualRateLimit(userId, userPlan ?? RATE_LIMIT_DEFAULT_PLAN);
+      if (!rl.allowed) {
+        return {
+          status:  'skipped',
+          message: rl.message ?? 'Rate limit exceeded',
+        };
+      }
+    }
+    // 1. Check if a job is currently RUNNING (lock held)
+    const isLocked = await _lockRedis.exists(`${BOT_LOCK_PREFIX}${companyId}`);
+    if (isLocked) {
+      if (type === 'manual') {
+        await _lockRedis.set(`${BOT_PRIORITY_PREFIX}${companyId}`, 'manual', 'EX', 300);
+        return { status: 'notified', message: 'Đang sync, sẽ ưu tiên trong vài giây' };
+      }
+      return { status: 'skipped', message: 'Job đang chạy, bỏ qua lần này' };
+    }
+
+    // 2. Check if a job is PENDING in queue
+    const pendingJobId = await _lockRedis.get(`${BOT_PENDING_PREFIX}${companyId}`);
+    if (pendingJobId) {
+      if (type === 'manual') {
+        // Promote existing auto-job to manual queue (higher concurrency + priority)
+        const addedJob = await manualQueue.add('sync', jobData, { priority: 1 });
+        await _lockRedis.set(`${BOT_PENDING_PREFIX}${companyId}`, addedJob.id ?? pendingJobId, 'EX', 3600);
+        return { status: 'promoted', message: 'Đã ưu tiên lên đầu hàng' };
+      }
+      return { status: 'deduplicated', message: 'Job đã trong hàng chờ' };
+    }
+
+    // 3. No conflict — enqueue normally
+    const queue = type === 'manual' ? manualQueue : autoQueue;
+    const addedJob = await queue.add('sync', jobData, type === 'manual' ? { priority: 1 } : {});
+    const jobId = addedJob.id ?? uuidv4();
+    await _lockRedis.set(`${BOT_PENDING_PREFIX}${companyId}`, jobId, 'EX', 3600);
+    return { status: 'enqueued', jobId };
+  } catch (err) {
+    logger.warn('[SyncWorker] enqueueSync error (non-fatal, falling back to direct enqueue)', {
+      companyId, type, error: (err as Error).message,
+    });
+    const queue = type === 'manual' ? manualQueue : autoQueue;
+    const addedJob = await queue.add('sync', jobData, type === 'manual' ? { priority: 1 } : {});
+    return { status: 'enqueued', jobId: addedJob.id ?? uuidv4() };
+  }
+}
+
 async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
   const { companyId, fromDate: jobFromDate, toDate: jobToDate } = job.data;
   const runId     = uuidv4();
@@ -303,6 +466,16 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     logger.warn('[SyncWorker] Company already syncing — will retry via backoff', { jobId: job.id, companyId });
     throw new Error(`LOCK_CONFLICT: company ${companyId} already syncing`);
   }
+  // FIX-3: Lock heartbeat — renews the 45-minute TTL every 10 minutes.
+  // Prevents lock expiry during 100k+ invoice runs (2–30h) which would allow
+  // a second job to acquire the lock and cause concurrent DB writes.
+  const lockHeartbeat = setInterval(async () => {
+    try {
+      await _lockRedis.expire(`${BOT_LOCK_PREFIX}${companyId}`, BOT_LOCK_TTL);
+    } catch (e) {
+      logger.warn('[SyncWorker] Lock heartbeat thất bại (non-fatal)', { companyId, err: (e as Error).message });
+    }
+  }, 10 * 60 * 1000); // every 10 min
   try {
 
     // ── 1. Load config ──────────────────────────────────────────────────────────
@@ -459,7 +632,7 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     await job.updateProgress({ percent: 5, statusMessage: 'Đang đăng nhập GDT...' } as Record<string, unknown>);
     await thinkTime(isManual ? 500 : 3_000, isManual ? 2_000 : 15_000);
 
-    const gdtApi = new GdtDirectApiService(proxyUrl, socks5ProxyUrl);
+    const gdtApi = new GdtDirectApiService(proxyUrl, socks5ProxyUrl, undefined, companyId, _checkpoint);
 
     // FIX-PERF-01: Check session cache — skip captcha+login if we have a valid token.
     let cachedToken: string | null = null;
@@ -473,7 +646,7 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       logger.info('[SyncWorker] Reusing cached GDT session token — skipping login', { companyId });
     } else {
       try {
-        await gdtApi.login(creds.username, creds.password);
+        await gdtApi.login(creds.username, creds.password, isManual);
         try {
           const freshToken = gdtApi.getToken();
           if (freshToken) await _sessionCache.set(companyId, proxySessionId ?? '', freshToken);
@@ -574,100 +747,176 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
       let xmlFetchCount = 0;
 
-      // Note: DB warmup removed — each sync re-upserts all invoices from GDT.
-      // This ensures dates are always corrected if parseInvoiceDate logic changes.
-      // _dedup.markSeen() is still called within the session to prevent duplicates
-      // when the same invoice appears in multiple GDT streams (e.g. query + sco-query).
       const yyyymm = `${fromDate.getFullYear()}${String(fromDate.getMonth() + 1).padStart(2, '0')}`;
 
-      // Output invoices
-      const outputInvoices = await runner.fetchOutputInvoices(fromDate, toDate);
-
-      // Check cancellation after login (before any heavy work)
-      if (await checkCancellationRequested(companyId)) {
-        throw new Error('CANCEL_SKIP: sync cancelled by user');
-      }
-
-      for (let i = 0; i < outputInvoices.length; i++) {
-        const inv = outputInvoices[i]!;
-        // FIX-PERF-01: Skip invoices already in DB (dedup check)
-        const dk = _dedup.invoiceKey(inv.invoice_number ?? '', inv.serial_number ?? '');
-        if (await _dedup.exists(companyId, yyyymm, 'output', dk)) {
-          skippedCount++;
-          continue;
-        }
-        const invoiceId = await _upsertInvoice(inv, companyId, 'output');
-        await _dedup.markSeen(companyId, yyyymm, 'output', dk).catch(() => {});
-        outputCount++;
-        if (xmlFetchCount < MAX_XML_FETCHES_PER_RUN) {
-          xmlFetchCount += await _maybeInsertLineItems(runner, inv, invoiceId, companyId);
-        }
-        if (i > 0 && i % JITTER_EVERY === 0) await jitteredDelay();
-        if (shouldReadPause(i)) {
-          logger.info('[SyncWorker] Read pause (human-like)', { companyId, index: i });
-          await readPause();
-        }
-        // Cancellation check every JITTER_EVERY invoices (same cadence as jitter delay)
-        if (i > 0 && i % JITTER_EVERY === 0) {
-          if (await checkCancellationRequested(companyId)) {
-            logger.info('[SyncWorker] Cancellation requested mid-output-fetch', { companyId, processedSoFar: i });
-            throw new Error('CANCEL_SKIP: sync cancelled by user');
-          }
-        }
-        // Progress update
-        if (i % 5 === 0 || i === outputInvoices.length - 1) {
-          const pct = Math.round(((i + 1) / (outputInvoices.length * 2)) * 50);
+      // ── Phase 3: Pre-flight volume estimate ────────────────────────────────
+      // Fetch X-Total-Count from GDT with size=1 (no data downloaded) to warn
+      // the user if the sync will take a very long time.
+      // Runs in parallel (Promise.all) — both calls are lightweight (size=1 each).
+      const [outEst, inEst] = await Promise.all([
+        runner.prefetchCount('sold', fromDate, toDate).catch(() => -1),
+        runner.prefetchCount('purchase', fromDate, toDate).catch(() => -1),
+      ]);
+      if (outEst >= 0 || inEst >= 0) {
+        const estimatedMs = GdtDirectApiService.estimateSyncDurationMs(
+          outEst >= 0 ? outEst : 0,
+          inEst  >= 0 ? inEst  : 0,
+        );
+        const estimatedMin = Math.round(estimatedMs / 60_000);
+        const isLargeVolume = (outEst + inEst) > 10_000 || estimatedMin > 120;
+        logger.info('[SyncWorker] Ước tính khối lượng đồng bộ', {
+          outEst, inEst, estimatedMin, isLargeVolume,
+        });
+        if (isLargeVolume) {
           await job.updateProgress({
-            percent: pct,
-            invoicesFetched: outputCount + inputCount,
-            statusMessage: `Đang xử lý HĐ đầu ra ${i + 1}/${outputInvoices.length}...`,
-            currentPage: i + 1,
-            totalPages: outputInvoices.length,
+            percent: 8,
+            statusMessage: `⚠️ Khối lượng lớn: ~${outEst + inEst} hóa đơn, ước tính ${estimatedMin} phút`,
+            estimatedMinutes: estimatedMin,
+            outputEstimate:   outEst,
+            inputEstimate:    inEst,
+            warning: 'LARGE_VOLUME',
           } as Record<string, unknown>);
         }
+      }
+
+      // Phase 8: Stream output invoices page-by-page (HĐ đầu ra)
+      // Each page (~50 invoices) is deduped + upserted as it arrives — lower memory,
+      // earlier progress updates, and streaming naturally fits our UNNEST batch size.
+      const BATCH_SIZE = 50;
+      const outDedupSetKey = `gdt:dedup:${companyId}:${yyyymm}:output`;
+      let outPageIdx = 0;
+
+      for await (const pageBatch of runner.fetchOutputInvoicesStream(fromDate, toDate)) {
+        // Dedup check: pipeline SISMEMBER for this page batch
+        const batchOutKeys = pageBatch.map(inv =>
+          _dedup.invoiceKey(inv.invoice_number ?? '', inv.serial_number ?? ''));
+        const outDedupPipe = _lockRedis.pipeline();
+        for (const dk of batchOutKeys) outDedupPipe.sismember(outDedupSetKey, dk);
+        const outDedupResults = await outDedupPipe.exec().catch(() => null);
+
+        const toUpsertOut: Array<{ inv: typeof pageBatch[0]; dk: string }> = [];
+        for (let i = 0; i < pageBatch.length; i++) {
+          if ((outDedupResults?.[i]?.[1] as number) === 1) { skippedCount++; continue; }
+          toUpsertOut.push({ inv: pageBatch[i]!, dk: batchOutKeys[i]! });
+        }
+
+        if (toUpsertOut.length > 0) {
+          // Batch upsert (UNNEST — 1 DB round-trip for up to 50 invoices)
+          for (let b = 0; b < toUpsertOut.length; b += BATCH_SIZE) {
+            const slice = toUpsertOut.slice(b, b + BATCH_SIZE);
+            const idMap = await _batchUpsertInvoices(slice.map(x => x.inv), companyId, 'output');
+            outputCount += slice.length;
+
+            // Batch dedup markSeen
+            await _lockRedis.pipeline()
+              .sadd(outDedupSetKey, ...slice.map(x => x.dk))
+              .expire(outDedupSetKey, 7200)
+              .exec().catch(() => {});
+
+            // Line items (XML fetch) per invoice in slice
+            for (const { inv } of slice) {
+              const invoiceId = idMap.get(_invMapKey(inv)) ?? null;
+              if (invoiceId && xmlFetchCount < MAX_XML_FETCHES_PER_RUN) {
+                const xmlFetched = await _maybeInsertLineItems(runner, inv, invoiceId, companyId);
+                xmlFetchCount += xmlFetched;
+                if (xmlFetched > 0) await jitteredDelay();
+              }
+            }
+          }
+        }
+
+        outPageIdx++;
+
+        // Cancellation + YIELD_TO_MANUAL check per page batch (every page ≈ JITTER_EVERY invoices)
+        if (await checkCancellationRequested(companyId)) {
+          logger.info('[SyncWorker] Hủy đồng bộ giữa chừng (HĐ đầu ra)', { companyId, outPageIdx });
+          throw new Error('CANCEL_SKIP: sync cancelled by user');
+        }
+        if (!isManual) {
+          const priorityOverride = await _lockRedis.get(`${BOT_PRIORITY_PREFIX}${companyId}`).catch(() => null);
+          if (priorityOverride === 'manual') {
+            await _lockRedis.del(`${BOT_PRIORITY_PREFIX}${companyId}`).catch(() => {});
+            logger.info('[SyncWorker] YIELD_TO_MANUAL — auto job nhường chỗ cho manual (đầu ra)', { companyId, outPageIdx });
+            throw new Error(`YIELD_TO_MANUAL: Auto job yielding at output page ${outPageIdx}`);
+          }
+        }
+
+        // Progress update — anchored to Phase 3 estimate if available
+        const estOut = outEst >= 0 ? outEst : outputCount;
+        const pct = Math.min(49, Math.round((outputCount / Math.max(estOut, 1)) * 50));
+        await job.updateProgress({
+          percent: pct,
+          invoicesFetched: outputCount + inputCount,
+          statusMessage: `Đang tải HĐ đầu ra: ${outputCount.toLocaleString('vi-VN')} hóa đơn...`,
+          batchSize: toUpsertOut.length,
+        } as Record<string, unknown>);
       }
 
       // Human-like pause between output and input fetch (2–8s)
-      // Mimics user switching tabs or waiting for a page to load.
-      if (outputInvoices.length > 0) await thinkTime(2_000, 8_000);
-      const inputInvoices = await runner.fetchInputInvoices(fromDate, toDate);
-      for (let i = 0; i < inputInvoices.length; i++) {
-        const inv = inputInvoices[i]!;
-        // FIX-PERF-01: Skip invoices already in DB (dedup check)
-        const dkIn = _dedup.invoiceKey(inv.invoice_number ?? '', inv.serial_number ?? '');
-        if (await _dedup.exists(companyId, yyyymm, 'input', dkIn)) {
-          skippedCount++;
-          continue;
+      if (outputCount > 0) await thinkTime(2_000, 8_000);
+
+      // Phase 8: Stream input invoices page-by-page (HĐ đầu vào)
+      const inDedupSetKey = `gdt:dedup:${companyId}:${yyyymm}:input`;
+      let inPageIdx = 0;
+
+      for await (const pageBatch of runner.fetchInputInvoicesStream(fromDate, toDate)) {
+        const batchInKeys = pageBatch.map(inv =>
+          _dedup.invoiceKey(inv.invoice_number ?? '', inv.serial_number ?? ''));
+        const inDedupPipe = _lockRedis.pipeline();
+        for (const dk of batchInKeys) inDedupPipe.sismember(inDedupSetKey, dk);
+        const inDedupResults = await inDedupPipe.exec().catch(() => null);
+
+        const toUpsertIn: Array<{ inv: typeof pageBatch[0]; dk: string }> = [];
+        for (let i = 0; i < pageBatch.length; i++) {
+          if ((inDedupResults?.[i]?.[1] as number) === 1) { skippedCount++; continue; }
+          toUpsertIn.push({ inv: pageBatch[i]!, dk: batchInKeys[i]! });
         }
-        const invoiceId = await _upsertInvoice(inv, companyId, 'input');
-        await _dedup.markSeen(companyId, yyyymm, 'input', dkIn).catch(() => {});
-        inputCount++;
-        if (xmlFetchCount < MAX_XML_FETCHES_PER_RUN) {
-          xmlFetchCount += await _maybeInsertLineItems(runner, inv, invoiceId, companyId);
-        }
-        if (i > 0 && i % JITTER_EVERY === 0) await jitteredDelay();
-        if (shouldReadPause(i)) {
-          logger.info('[SyncWorker] Read pause (human-like)', { companyId, index: i });
-          await readPause();
-        }
-        // Cancellation check every JITTER_EVERY invoices
-        if (i > 0 && i % JITTER_EVERY === 0) {
-          if (await checkCancellationRequested(companyId)) {
-            logger.info('[SyncWorker] Cancellation requested mid-input-fetch', { companyId, processedSoFar: i });
-            throw new Error('CANCEL_SKIP: sync cancelled by user');
+
+        if (toUpsertIn.length > 0) {
+          for (let b = 0; b < toUpsertIn.length; b += BATCH_SIZE) {
+            const slice = toUpsertIn.slice(b, b + BATCH_SIZE);
+            const idMap = await _batchUpsertInvoices(slice.map(x => x.inv), companyId, 'input');
+            inputCount += slice.length;
+
+            await _lockRedis.pipeline()
+              .sadd(inDedupSetKey, ...slice.map(x => x.dk))
+              .expire(inDedupSetKey, 7200)
+              .exec().catch(() => {});
+
+            for (const { inv } of slice) {
+              const invoiceId = idMap.get(_invMapKey(inv)) ?? null;
+              if (invoiceId && xmlFetchCount < MAX_XML_FETCHES_PER_RUN) {
+                const xmlFetched = await _maybeInsertLineItems(runner, inv, invoiceId, companyId);
+                xmlFetchCount += xmlFetched;
+                if (xmlFetched > 0) await jitteredDelay();
+              }
+            }
           }
         }
-        // Progress update
-        if (i % 5 === 0 || i === inputInvoices.length - 1) {
-          const pct = 50 + Math.round(((i + 1) / inputInvoices.length) * 50);
-          await job.updateProgress({
-            percent: pct,
-            invoicesFetched: outputCount + inputCount,
-            statusMessage: `Đang xử lý HĐ đầu vào ${i + 1}/${inputInvoices.length}...`,
-            currentPage: i + 1,
-            totalPages: inputInvoices.length,
-          } as Record<string, unknown>);
+
+        inPageIdx++;
+
+        if (await checkCancellationRequested(companyId)) {
+          logger.info('[SyncWorker] Hủy đồng bộ giữa chừng (HĐ đầu vào)', { companyId, inPageIdx });
+          throw new Error('CANCEL_SKIP: sync cancelled by user');
         }
+        if (!isManual) {
+          const priorityOverride = await _lockRedis.get(`${BOT_PRIORITY_PREFIX}${companyId}`).catch(() => null);
+          if (priorityOverride === 'manual') {
+            await _lockRedis.del(`${BOT_PRIORITY_PREFIX}${companyId}`).catch(() => {});
+            logger.info('[SyncWorker] YIELD_TO_MANUAL — auto job nhường chỗ cho manual (đầu vào)', { companyId, inPageIdx });
+            throw new Error(`YIELD_TO_MANUAL: Auto job yielding at input page ${inPageIdx}`);
+          }
+        }
+
+        const estIn = inEst >= 0 ? inEst : inputCount;
+        const pct = 50 + Math.min(49, Math.round((inputCount / Math.max(estIn, 1)) * 50));
+        await job.updateProgress({
+          percent: pct,
+          invoicesFetched: outputCount + inputCount,
+          statusMessage: `Đang tải HĐ đầu vào: ${inputCount.toLocaleString('vi-VN')} hóa đơn...`,
+          batchSize: toUpsertIn.length,
+        } as Record<string, unknown>);
       }
 
       if (proxyUrl) proxyManager.markHealthy(proxyUrl);
@@ -702,22 +951,14 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       await _consumeQuota(companyId, totalSynced);
 
       // ── Schedule next auto-sync with jitter (BOT-ENT-01) ────────────────────────
-      // Non-fatal: wrap in try/catch — column may not exist until migration 026 is applied.
-      // Invoices are already saved; a missing schedule update must NEVER fail the job.
-      try {
-        await pool.query(
-          `UPDATE gdt_bot_configs
-           SET next_auto_sync_at = NOW() + INTERVAL '5 hours'
-             + (FLOOR(RANDOM() * 180) || ' minutes')::INTERVAL
-           WHERE company_id = $1`,
-          [companyId],
-        );
-      } catch (schedErr) {
-        logger.warn('[SyncWorker] next_auto_sync_at update skipped (migration 026 not applied?)', {
-          companyId,
-          err: schedErr instanceof Error ? schedErr.message : String(schedErr),
-        });
-      }
+      // Migration 026 confirmed applied — no fallback wrapper needed.
+      await pool.query(
+        `UPDATE gdt_bot_configs
+         SET next_auto_sync_at = NOW() + INTERVAL '5 hours'
+           + (FLOOR(RANDOM() * 180) || ' minutes')::INTERVAL
+         WHERE company_id = $1`,
+        [companyId],
+      );
 
       logger.info('[SyncWorker] Done', { companyId, outputCount, inputCount, durationMs });
 
@@ -773,8 +1014,8 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      // COOLDOWN_SKIP / CANCEL_SKIP: not real failures — don't touch consecutive_failures.
-      const isSkip = msg.startsWith('COOLDOWN_SKIP:') || msg.startsWith('CANCEL_SKIP:');
+      // COOLDOWN_SKIP / CANCEL_SKIP / YIELD_TO_MANUAL: not real failures — don't touch consecutive_failures.
+      const isSkip = msg.startsWith('COOLDOWN_SKIP:') || msg.startsWith('CANCEL_SKIP:') || msg.startsWith('YIELD_TO_MANUAL:');
       // Infrastructure / DB errors (Postgres error code = 5-digit string like '42P10')
       // are bugs in our code or missing migrations — NOT GDT captcha/auth issues.
       // They must NOT increment consecutive_failures (which would trigger anti-bot blocking).
@@ -796,13 +1037,157 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       }
       throw err;
     }
-  } finally {
+    } finally {
+    clearInterval(lockHeartbeat);   // FIX-3: dừng heartbeat TRƯỚC khi giải phóng lock
     // Release both locks:
     // 1. Bot worker lock (bot:sync:lock:) — prevents concurrent bot jobs
     // 2. HTTP route lock (sync:lock:) — prevents double-click from UI
     await releaseCompanyLock(companyId);
     await _lockRedis.del(`sync:lock:${companyId}`);
   }
+}
+
+// ── FIX-5 Helpers ─────────────────────────────────────────────────────────────
+
+/** Compute GROUP 47 serial classification — extracted from _upsertInvoice for reuse. */
+function _classifySerial(serialNumber: string | null | undefined): {
+  invoiceGroup: number | null;
+  serialHasCqt: boolean | null;
+  hasLineItems: boolean;
+} {
+  const serial = (serialNumber ?? '').toUpperCase().trim();
+  if (serial.length < 4) return { invoiceGroup: null, serialHasCqt: null, hasLineItems: false };
+  const firstChar = serial[0];
+  if (firstChar === 'C') return { invoiceGroup: 5, serialHasCqt: true,  hasLineItems: true  };
+  if (firstChar === 'K') return {
+    invoiceGroup: serial[3] === 'M' ? 8 : 6,
+    serialHasCqt: false,
+    hasLineItems:  false,
+  };
+  return { invoiceGroup: null, serialHasCqt: null, hasLineItems: false };
+}
+
+/** Stable lookup key for the batch upsert return map. */
+function _invMapKey(inv: import('./parsers/GdtXmlParser').RawInvoice): string {
+  return `${inv.invoice_number ?? ''}|${inv.serial_number ?? ''}|${inv.seller_tax_code ?? ''}`;
+}
+
+/**
+ * FIX-5: Batch upsert up to 50 invoices in a single round-trip via PostgreSQL UNNEST.
+ * Replaces N×1 INSERT…ON CONFLICT calls (was the bottleneck for 100k+ invoice runs).
+ * Returns a Map of _invMapKey(inv) → db UUID (needed for line-item fetching).
+ */
+async function _batchUpsertInvoices(
+  invoices: import('./parsers/GdtXmlParser').RawInvoice[],
+  companyId: string,
+  direction: 'output' | 'input',
+): Promise<Map<string, string>> {
+  if (invoices.length === 0) return new Map();
+
+  const ids:            string[]           = [];
+  const invNums:        (string | null)[]  = [];
+  const serials:        (string | null)[]  = [];
+  const dates:          (string | null)[]  = [];
+  const statuses:       string[]           = [];
+  const sellerNames:    (string | null)[]  = [];
+  const sellerTaxes:    string[]           = [];
+  const buyerNames:     (string | null)[]  = [];
+  const buyerTaxes:     (string | null)[]  = [];
+  const subtotals:      number[]           = [];
+  const totals:         (number | null)[]  = [];
+  const vatAmounts:     (number | null)[]  = [];
+  const vatRates:       (string | null)[]  = [];
+  const invoiceGroups:  (number | null)[]  = [];
+  const serialHasCqts:  (boolean | null)[] = [];
+  const hasLineItemsArr: boolean[]         = [];
+  const isScos:         boolean[]          = [];
+
+  for (const inv of invoices) {
+    const { invoiceGroup, serialHasCqt, hasLineItems } = _classifySerial(inv.serial_number);
+    ids.push(uuidv4());
+    invNums.push(inv.invoice_number ?? null);
+    serials.push(inv.serial_number ?? null);
+    dates.push(inv.invoice_date ?? null);
+    statuses.push(inv.status ?? 'valid');
+    sellerNames.push(inv.seller_name ?? null);
+    sellerTaxes.push(inv.seller_tax_code ?? '');
+    buyerNames.push(inv.buyer_name ?? null);
+    buyerTaxes.push(inv.buyer_tax_code ?? null);
+    subtotals.push((inv.total_amount ?? 0) - (inv.vat_amount ?? 0));
+    totals.push(inv.total_amount ?? null);
+    vatAmounts.push(inv.vat_amount ?? null);
+    vatRates.push(inv.vat_rate ?? null);
+    invoiceGroups.push(invoiceGroup);
+    serialHasCqts.push(serialHasCqt);
+    hasLineItemsArr.push(hasLineItems);
+    isScos.push(inv.is_sco ?? false);
+  }
+
+  const dirArr  = Array(invoices.length).fill(direction) as string[];
+  const compArr = Array(invoices.length).fill(companyId) as string[];
+
+  const res = await pool.query(
+    `INSERT INTO invoices
+     (id, company_id, invoice_number, serial_number, invoice_date, direction, status,
+      seller_name, seller_tax_code, buyer_name, buyer_tax_code,
+      subtotal, total_amount, vat_amount, vat_rate, gdt_validated, source, provider,
+      invoice_group, serial_has_cqt, has_line_items, is_sco, created_at)
+     SELECT
+       t.id, t.company_id, t.invoice_number, t.serial_number,
+       COALESCE(t.invoice_date::date, CURRENT_DATE), t.direction, t.status,
+       t.seller_name, COALESCE(t.seller_tax_code, ''), t.buyer_name, t.buyer_tax_code,
+       t.subtotal, t.total_amount, t.vat_amount, t.vat_rate,
+       true, 'gdt_bot', 'gdt_bot',
+       t.invoice_group, t.serial_has_cqt, t.has_line_items, t.is_sco, NOW()
+     FROM UNNEST(
+       $1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::text[], $6::invoice_direction[], $7::invoice_status[],
+       $8::text[], $9::text[], $10::text[], $11::text[],
+       $12::numeric[], $13::numeric[], $14::numeric[], $15::numeric[],
+       $16::int[], $17::boolean[], $18::boolean[], $19::boolean[]
+     ) AS t(
+       id, company_id, invoice_number, serial_number, invoice_date, direction, status,
+       seller_name, seller_tax_code, buyer_name, buyer_tax_code,
+       subtotal, total_amount, vat_amount, vat_rate,
+       invoice_group, serial_has_cqt, has_line_items, is_sco
+     )
+     ON CONFLICT (company_id, provider, invoice_number,
+       COALESCE(seller_tax_code, ''), COALESCE(serial_number, '')) DO UPDATE SET
+       direction      = EXCLUDED.direction,
+       status         = EXCLUDED.status,
+       invoice_date   = EXCLUDED.invoice_date,
+       serial_number  = COALESCE(EXCLUDED.serial_number, invoices.serial_number),
+       seller_name    = EXCLUDED.seller_name,
+       buyer_name     = EXCLUDED.buyer_name,
+       buyer_tax_code = EXCLUDED.buyer_tax_code,
+       subtotal       = EXCLUDED.subtotal,
+       total_amount   = EXCLUDED.total_amount,
+       vat_amount     = EXCLUDED.vat_amount,
+       vat_rate       = EXCLUDED.vat_rate,
+       gdt_validated  = true,
+       invoice_group  = COALESCE(EXCLUDED.invoice_group,  invoices.invoice_group),
+       serial_has_cqt = COALESCE(EXCLUDED.serial_has_cqt, invoices.serial_has_cqt),
+       has_line_items = COALESCE(EXCLUDED.has_line_items, invoices.has_line_items),
+       is_sco         = EXCLUDED.is_sco,
+       updated_at     = NOW()
+     RETURNING id,
+       invoice_number,
+       COALESCE(serial_number,    '') AS serial_number,
+       COALESCE(seller_tax_code,  '') AS seller_tax_code`,
+    [
+      ids, compArr, invNums, serials, dates, dirArr, statuses,
+      sellerNames, sellerTaxes, buyerNames, buyerTaxes,
+      subtotals, totals, vatAmounts, vatRates,
+      invoiceGroups, serialHasCqts, hasLineItemsArr, isScos,
+    ],
+  );
+
+  const resultMap = new Map<string, string>();
+  for (const row of res.rows as Array<{
+    id: string; invoice_number: string; serial_number: string; seller_tax_code: string;
+  }>) {
+    resultMap.set(`${row.invoice_number}|${row.serial_number}|${row.seller_tax_code}`, row.id);
+  }
+  return resultMap;
 }
 
 /** Upsert invoice header. Returns the actual DB row UUID (via RETURNING id). */
@@ -1211,12 +1596,20 @@ export const autoWorker = new Worker<SyncJobData>(
   }
 );
 
-worker.on('completed', job => {
+worker.on('completed', (job) => {
   logger.info('[SyncWorker] Job completed', { jobId: job.id });
+  const dur = (job.finishedOn ?? Date.now()) - (job.processedOn ?? Date.now());
+  void recordMetrics(job, 'success', dur);
+  // Phase 5: Clear pending key so enqueueSync knows next job can be enqueued
+  void _lockRedis.del(`${BOT_PENDING_PREFIX}${job.data.companyId}`).catch(() => {});
 });
 
 worker.on('failed', (job, err) => {
   logger.error('[SyncWorker] Job failed', { jobId: job?.id, error: err.message });
+  if (job) void recordMetrics(job, 'failed', Date.now() - (job.processedOn ?? Date.now()));
+  void handleJobFailure(job, err);
+  // Phase 5: Clear pending key on failure so the next enqueue is not blocked
+  if (job) void _lockRedis.del(`${BOT_PENDING_PREFIX}${job.data.companyId}`).catch(() => {});
 });
 
 worker.on('error', err => {
@@ -1228,11 +1621,15 @@ for (const [name, w] of [['manualWorker', manualWorker], ['autoWorker', autoWork
     logger.info(`[SyncWorker/${name}] Job completed`, { jobId: job.id });
     const dur = (job.finishedOn ?? Date.now()) - (job.processedOn ?? Date.now());
     void recordMetrics(job, 'success', dur);
+    // Phase 5: Clear pending key so enqueueSync knows the slot is free
+    void _lockRedis.del(`${BOT_PENDING_PREFIX}${job.data.companyId}`).catch(() => {});
   });
   w.on('failed', (job, err) => {
     logger.error(`[SyncWorker/${name}] Job failed`, { jobId: job?.id, error: err.message });
     if (job) void recordMetrics(job, 'failed', Date.now() - (job.processedOn ?? Date.now()));
     void handleJobFailure(job, err);
+    // Phase 5: Clear pending key on failure
+    if (job) void _lockRedis.del(`${BOT_PENDING_PREFIX}${job.data.companyId}`).catch(() => {});
   });
   w.on('error', err => logger.error(`[SyncWorker/${name}] Worker error`, { error: err.message }));
 }

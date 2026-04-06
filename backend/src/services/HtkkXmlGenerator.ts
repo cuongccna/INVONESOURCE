@@ -103,6 +103,9 @@ export class HtkkXmlGenerator {
     const xml_ct36_nq142 = plucOutputSumReduction;
     // ct40a (xml) = tổng thuế đầu ra - giảm NQ142
     const xml_ct40a = n(d.ct40a_total_output_vat) - xml_ct36_nq142;
+    // ct41/ct43: tính lại từ xml_ct40a để tránh xung đột làm lỗi công thức tờ khai GDT
+    const xml_ct41 = Math.max(0, xml_ct40a - n(d.ct25_total_deductible));
+    const xml_ct43 = Math.max(0, n(d.ct25_total_deductible) - xml_ct40a);
 
     // ── 4. Ngày kỳ khai ──────────────────────────────────────────────────────
     const period = buildPeriod(declaration.period_month, declaration.period_year, isQuarterly);
@@ -213,9 +216,9 @@ export class HtkkXmlGenerator {
             <ct40a>${xml_ct40a}</ct40a>
             <ct40b>0</ct40b>
             <ct40>${xml_ct40a}</ct40>
-            <ct41>${n(d.ct41_payable_vat)}</ct41>
+            <ct41>${xml_ct41}</ct41>
             <ct42>0</ct42>
-            <ct43>${n(d.ct43_carry_forward_vat)}</ct43>
+            <ct43>${xml_ct43}</ct43>
         </CTieuTKhaiChinh>
         ${_buildPlucXml(plucInputItems, plucOutputItems, plucInputSumSubtotal, plucInputSumVat, plucOutputSumSubtotal, plucOutputSumReduction)}
     </HSoKhaiThue>

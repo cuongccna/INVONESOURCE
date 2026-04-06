@@ -3,7 +3,11 @@
  *
  * Runs every 30 minutes on the backend. For each active gdt_bot_configs row,
  * checks whether the company is due for a sync based on sync_frequency_hours
- * and last_run_at. If due, enqueues a job to the 'gdt-bot-sync' queue.
+ * and last_run_at. If due, enqueues a job to the 'gdt-sync-auto' queue.
+ *
+ * Routes to 'gdt-sync-auto' (not the legacy 'gdt-bot-sync') so jobs get:
+ *   - exponential backoff (attempts: 3, delay: 120s)
+ *   - autoWorker concurrency + rate limiter
  *
  * Human-like scheduling: each enqueued job gets a random delay of 0–10 minutes
  * so that companies never all hit GDT at the exact same second, mimicking
@@ -14,17 +18,18 @@ import { pool } from '../db/pool';
 import { env } from '../config/env';
 
 const SCHEDULER_QUEUE   = 'gdt-bot-scheduler';
-const BOT_SYNC_QUEUE    = 'gdt-bot-sync';
-const POLL_EVERY_MS     = 30 * 60 * 1000;   // 30 minutes
-const MAX_JITTER_MS     = 10 * 60 * 1000;   // up to 10-min random delay per company
+const BOT_SYNC_QUEUE    = 'gdt-sync-auto';   // → autoWorker (concurrency 2, rate limited, backoff)
+const POLL_EVERY_MS     = 30 * 60 * 1000;    // 30 minutes
+const MAX_JITTER_MS     = 10 * 60 * 1000;    // up to 10-min random delay per company
 
-// The queue this scheduler will enqueue work into
+// The queue this scheduler will enqueue work into (gdt-sync-auto = background scheduled syncs)
 const botSyncQueue = new Queue<{ companyId: string }>(BOT_SYNC_QUEUE, {
   connection: { url: env.REDIS_URL },
   defaultJobOptions: {
-    attempts: 1,          // No retries: scheduler re-evaluates every 30 min
-    removeOnComplete: 200,
-    removeOnFail:     100,
+    attempts:          3,                              // retry 3× on transient failures
+    backoff:           { type: 'exponential', delay: 120_000 }, // 2m → 4m → 8m
+    removeOnComplete:  100,
+    removeOnFail:      50,
   },
 });
 
@@ -78,9 +83,9 @@ async function runScheduler(_job: Job): Promise<void> {
       { companyId: row.company_id },
       {
         jobId,
-        delay:    jitterMs,
-        attempts: 1,      // No retries: UnrecoverableError on concurrent/cooldown/no-proxy;
-                          // scheduler re-enqueues on next 30-min tick if a transient error occurs.
+        delay: jitterMs,
+        // attempts/backoff inherited from defaultJobOptions (3× exponential 120s)
+        // UnrecoverableError (bad creds / quota exhausted) uses attempts:1 semantics inside worker
       },
     );
     enqueued++;

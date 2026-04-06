@@ -24,6 +24,7 @@ import { CaptchaService } from './captcha.service';
 import { logger } from './logger';
 import type { RawInvoice } from './parsers/GdtXmlParser';
 import type { CrawlerRecipe, RecipeFields } from './types/recipe.types';
+import { SyncCheckpoint } from './crawl-cache/SyncCheckpoint';
 
 // ── Human-like browser simulation ───────────────────────────────────────────
 // Realistic Chrome User-Agents observed on Vietnamese ISPs (Viettel / VNPT / FPT).
@@ -39,6 +40,34 @@ const USER_AGENTS = [
 
 function randomUserAgent(): string {
   return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]!;
+}
+
+/**
+ * Phase 4: Pick a random UA, guaranteeing it is different from `last`.
+ * Prevents GDT from seeing the exact same UA on back-to-back jobs for the same company.
+ */
+function randomUserAgentExcluding(last: string | null): string {
+  const pool = last ? USER_AGENTS.filter(u => u !== last) : USER_AGENTS;
+  const source = pool.length > 0 ? pool : USER_AGENTS;
+  return source[Math.floor(Math.random() * source.length)]!;
+}
+
+/**
+ * BUG-1: Custom paramsSerializer — encode keys only, keep FIQL values raw.
+ *
+ * GDT WAF performs immediate TCP RST when FIQL delimiters are percent-encoded.
+ * Default axios encodes:
+ *   tdlap=ge=01/03/2026T00:00:00  →  tdlap%3Dge%3D01%2F03%2F2026T00%3A00%3A00
+ * GDT WAF treats %3D/%3B as injection → TCP RST, status:0 within 1s.
+ *
+ * Rule: encode KEY (prevent key collision), do NOT encode VALUE.
+ * sort=tdlap:desc → sort key encoded, colon in value stays raw.
+ */
+function serializeParams(params: Record<string, unknown>): string {
+  return Object.entries(params)
+    .filter(([, v]) => v != null)
+    .map(([k, v]) => `${encodeURIComponent(k)}=${String(v)}`)
+    .join('&');
 }
 
 /**
@@ -275,6 +304,31 @@ function splitIntoMonths(from: Date, to: Date): Array<{ from: Date; to: Date }> 
   return chunks;
 }
 
+/**
+ * FIX-6: Split a date range into ISO-week windows (Mon–Sun).
+ * Used when estimated invoice count > 5 000 to keep each fetch run manageable.
+ * e.g. [Mar 3, Mar 31] → [{Mar 3–Mar 9}, {Mar 10–Mar 16}, ..., {Mar 31–Mar 31}]
+ */
+function splitIntoWeeks(from: Date, to: Date): Array<{ from: Date; to: Date }> {
+  const chunks: Array<{ from: Date; to: Date }> = [];
+  let cur = new Date(from);
+  while (cur <= to) {
+    // End of the ISO week (Sunday 23:59:59)
+    const dow     = cur.getDay(); // 0=Sun,1=Mon,...,6=Sat
+    const toSun   = dow === 0 ? 0 : 7 - dow; // days until Sunday
+    const weekEnd = new Date(cur);
+    weekEnd.setDate(weekEnd.getDate() + toSun);
+    weekEnd.setHours(23, 59, 59, 999);
+    const chunkEnd = weekEnd < to ? weekEnd : to;
+    chunks.push({ from: new Date(cur), to: chunkEnd });
+    const next = new Date(chunkEnd);
+    next.setDate(next.getDate() + 1);
+    next.setHours(0, 0, 0, 0);
+    cur = next;
+  }
+  return chunks;
+}
+
 // ── Map GDT JSON row → RawInvoice ─────────────────────────────────────────────
 
 interface MapInvoiceOpts {
@@ -377,6 +431,16 @@ function mapInvoice(
 export class GdtDirectApiService {
   private token:          string | null = null;
   private captchaService: CaptchaService;
+  // FIX-1: Store credentials for mid-run token refresh
+  private _loginUsername: string | null = null;
+  private _loginPassword: string | null = null;
+  private _reloginAttempted = false;
+  // FIX-2: Pagination checkpoint (resume after crash)
+  private _companyId:    string | null = null;
+  private _checkpoint:   SyncCheckpoint | null = null;
+  // Phase 4: UA rotation — never use the same UA twice in a row per company
+  private static _lastUaMap = new Map<string, string>();
+  private _lastUa:       string | null = null;
 
   /** FIX-PERF-01: Allow session cache to restore a previously-issued JWT. */
   setToken(token: string): void { this.token = token; }
@@ -392,26 +456,42 @@ export class GdtDirectApiService {
   private binaryHttp:     AxiosInstance | null = null;
   private recipe:         CrawlerRecipe | null = null;
 
-  constructor(proxyUrl?: string | null, socks5ProxyUrl?: string | null, recipe?: CrawlerRecipe) {
-    this.recipe = recipe ?? null;
+  constructor(
+    proxyUrl?:     string | null,
+    socks5ProxyUrl?: string | null,
+    recipe?:       CrawlerRecipe,
+    companyId?:    string | null,
+    checkpoint?:   SyncCheckpoint | null,
+  ) {
+    this.recipe       = recipe ?? null;
+    this._companyId   = companyId ?? null;
+    this._checkpoint  = checkpoint ?? null;
     this.captchaService = new CaptchaService();
     const httpAgent = proxyUrl ? createTunnelAgent({ proxyUrl }) : undefined;
-    // Pick a random User-Agent per session — rotates on every GdtDirectApiService
-    // instantiation (i.e., each BullMQ job) so GDT never sees a fixed UA pattern.
-    const ua = randomUserAgent();
+    // Phase 4: Pick a UA that differs from the previous one for this company.
+    // Prevents GDT from fingerprinting the same UA repeated every 6 hours.
+    const companyKey = companyId ?? '_';
+    const lastUa = GdtDirectApiService._lastUaMap.get(companyKey) ?? null;
+    const ua = randomUserAgentExcluding(lastUa);
+    GdtDirectApiService._lastUaMap.set(companyKey, ua);
+    this._lastUa = ua;
     const commonHeaders = {
-      'Accept':           'application/json, text/plain, */*',
-      'Accept-Language':  'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
-      'Accept-Encoding':  'gzip, deflate, br',
-      'Cache-Control':    'no-cache',
-      'User-Agent':       ua,
-      'Origin':           'https://hoadondientu.gdt.gov.vn',
-      'Referer':          'https://hoadondientu.gdt.gov.vn/',
-      'sec-ch-ua':        '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-      'sec-ch-ua-mobile': '?0',
-      'sec-fetch-site':   'same-origin',
-      'sec-fetch-mode':   'cors',
-      'sec-fetch-dest':   'empty',
+      'Accept':                    'application/json, text/plain, */*',
+      'Accept-Language':           'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Accept-Encoding':           'gzip, deflate, br',
+      'Cache-Control':             'no-cache',
+      'Pragma':                    'no-cache',
+      'User-Agent':                ua,
+      'Origin':                    'https://hoadondientu.gdt.gov.vn',
+      'Referer':                   'https://hoadondientu.gdt.gov.vn/',
+      'sec-ch-ua':                 '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+      'sec-ch-ua-mobile':          '?0',
+      'sec-ch-ua-platform':        '"Windows"',
+      'sec-ch-ua-platform-version': '"15.0.0"',
+      'sec-ch-ua-full-version-list': '"Chromium";v="122.0.6261.94", "Not(A:Brand";v="24.0.0.0", "Google Chrome";v="122.0.6261.94"',
+      'sec-fetch-site':            'same-origin',
+      'sec-fetch-mode':            'cors',
+      'sec-fetch-dest':            'empty',
     };
     this.http = axios.create({
       // With proxy: use http:// so axios uses http.request + our httpAgent
@@ -422,6 +502,7 @@ export class GdtDirectApiService {
         : (this.recipe?.api.baseUrl    ?? GDT_API_HTTPS),
       timeout: REQUEST_TIMEOUT,
       headers: commonHeaders,
+      paramsSerializer: serializeParams,  // BUG-1: raw FIQL values, encoded keys only
       ...(httpAgent ? { httpAgent } : {}),
     });
     // SOCKS5 client for binary downloads (XML ZIP / XLSX).
@@ -430,10 +511,11 @@ export class GdtDirectApiService {
     if (socks5ProxyUrl) {
       const socks5Agent = createSocks5TunnelAgent({ proxyUrl: socks5ProxyUrl });
       this.binaryHttp = axios.create({
-        baseURL:   this.recipe?.api.baseUrlHttp ?? GDT_API_HTTP,   // http:// so axios uses httpAgent (our SOCKS5 tunnel does TLS)
-        timeout:   BINARY_TIMEOUT,
-        headers:   commonHeaders,
-        httpAgent: socks5Agent,
+        baseURL:          this.recipe?.api.baseUrlHttp ?? GDT_API_HTTP,   // http:// so axios uses httpAgent (our SOCKS5 tunnel does TLS)
+        timeout:          BINARY_TIMEOUT,
+        headers:          commonHeaders,
+        paramsSerializer: serializeParams,  // BUG-1: raw FIQL values, encoded keys only
+        httpAgent:        socks5Agent,
       });
     }
   }
@@ -443,13 +525,78 @@ export class GdtDirectApiService {
     return this.recipe;
   }
 
+  // ── Phase 3: Pre-flight count ──────────────────────────────────────────────
+
+  /**
+   * FIX-6 / Phase 3: Fetch only the first page (page=0, size=1) and read X-Total-Count
+   * to estimate how many invoices exist without downloading them all.
+   * Returns -1 on any error (caller should proceed without warning).
+   */
+  async prefetchCount(
+    endpoint:      'sold' | 'purchase',
+    fromDate:      Date,
+    toDate:        Date,
+    extraFilter?:  string,
+    overridePath?: string,
+  ): Promise<number> {
+    if (!this.token) return -1;
+    try {
+      const endpointPath = overridePath
+        ?? (endpoint === 'sold'
+          ? (this.recipe?.api.endpoints.sold     ?? '/query/invoices/sold')
+          : (this.recipe?.api.endpoints.purchase ?? '/query/invoices/purchase'));
+      const from   = formatGdtDate(fromDate);
+      const to     = formatGdtDate(toDate);
+      const search = extraFilter
+        ? `tdlap=ge=${from};tdlap=le=${to};${extraFilter}`
+        : `tdlap=ge=${from};tdlap=le=${to}`;
+
+      const res = await this.http.get(endpointPath, {
+        params: { sort: 'tdlap:desc', size: 1, page: 0, search },
+        headers: { Authorization: `Bearer ${this.token}` },
+      });
+      const headerTotal = parseInt((res.headers as Record<string, string>)['x-total-count'] ?? '', 10);
+      if (!isNaN(headerTotal)) return headerTotal;
+      const bodyTotal = (res.data as { total?: number }).total;
+      return typeof bodyTotal === 'number' ? bodyTotal : -1;
+    } catch {
+      return -1;
+    }
+  }
+
+  /**
+   * Phase 3: Estimate total sync duration in milliseconds.
+   * Used to warn users before starting a very long sync.
+   *
+   * Model (conservative):
+   *   pages  = ceil(total / 50)
+   *   fetch  = pages × 2s avg page delay
+   *   upsert = total × 20ms avg DB write (batch of 50 ≈ 1s round-trip)
+   *   xml    = min(total, MAX_XML_FETCHES) × 3.5s avg detail call
+   */
+  static estimateSyncDurationMs(outputCount: number, inputCount: number): number {
+    const total     = Math.max(0, outputCount) + Math.max(0, inputCount);
+    const pageSize  = 50;
+    const pages     = Math.ceil(total / pageSize);
+    const fetchMs   = pages * 2_000;
+    const upsertMs  = total * 20;
+    const xmlCount  = Math.min(total, 50); // MAX_XML_FETCHES_PER_RUN
+    const xmlMs     = xmlCount * 3_500;
+    return fetchMs + upsertMs + xmlMs;
+  }
+
   // ── Auth ───────────────────────────────────────────────────────────────────
 
   /**
    * Login to GDT portal and store JWT token.
    * Retries up to MAX_RETRIES times on wrong captcha.
+   * Phase 4: Pass isManual=true for user-triggered syncs to use shorter warmup delay.
    */
-  async login(username: string, password: string): Promise<void> {
+  async login(username: string, password: string, isManual = false): Promise<void> {
+    // FIX-1: Cache credentials at start so _getWithRetry can re-login on 401
+    this._loginUsername     = username;
+    this._loginPassword     = password;
+    this._reloginAttempted  = false;
     let attempts = 0;
     let lastCaptchaId: string | null = null;
     const maxRetries   = this.recipe?.timing.maxRetries    ?? MAX_RETRIES;
@@ -463,17 +610,25 @@ export class GdtDirectApiService {
       const { key: ckey, content: svgContent } = captchaRes.data;
 
       // Step 2: SVG → PNG → base64 → 2captcha
+      // Phase 4: Run human warmup delay IN PARALLEL with captcha solve so the
+      // anti-detection delay never adds on top of the 2Captcha round-trip.
       let cvalue: string;
       try {
+        const captchaStart = Date.now();
         const { default: sharp } = await import('sharp');
         const pngBuffer = await sharp(Buffer.from(svgContent)).png().toBuffer();
         const base64    = pngBuffer.toString('base64');
-        const result    = await this.captchaService.solve(base64);
-        cvalue          = result.text.trim().toUpperCase();
-        lastCaptchaId   = result.captchaId;
-        logger.debug('[GdtDirect] Captcha solved', { captchaId: lastCaptchaId, cvalue });
+        // Warmup delay (human-like pause) runs concurrently with captcha API call.
+        const [result] = await Promise.all([
+          this.captchaService.solve(base64),
+          humanDelay(isManual ? 500 : 3_000, isManual ? 2_000 : 8_000),
+        ]);
+        const captchaElapsedMs = Date.now() - captchaStart;
+        cvalue        = result.text.trim().toUpperCase();
+        lastCaptchaId = result.captchaId;
+        logger.info('[GdtDirect] Captcha giải xong', { captchaId: lastCaptchaId, cvalue, captchaElapsedMs });
       } catch (err) {
-        logger.warn('[GdtDirect] Captcha error', { attempts, err });
+        logger.warn('[GdtDirect] Lỗi captcha', { attempts, err });
         attempts++;
         await sleep(retryDelayMs);
         continue;
@@ -484,6 +639,10 @@ export class GdtDirectApiService {
         const authRes = await this.http.post<AuthResponse>(
           authPath,
           { username, password, cvalue, ckey },
+          // BUG-2: Force fresh TCP socket after login.
+          // Prevents 'stream has been aborted' from reusing a server-half-closed socket
+          // on the first API call immediately after authentication.
+          { headers: { 'Connection': 'close' } },
         );
         this.token = authRes.data.token;
         logger.info('[GdtDirect] Login success', { username });
@@ -618,6 +777,8 @@ export class GdtDirectApiService {
   /**
    * Split [fromDate, toDate] into calendar-month windows (GDT max = 1 month)
    * and concatenate results.
+   * FIX-6: Auto-switches to weekly chunks when estimated invoice count > 5 000
+   *        to keep each run bounded in time.
    * @param extraFilter  Optional FIQL filter appended to the search string (e.g. 'ttxly==5').
    * @param overridePath Optional API path override (e.g. GDT_SCO_SOLD for MTTTT endpoints).
    */
@@ -628,7 +789,26 @@ export class GdtDirectApiService {
     extraFilter?: string,
     overridePath?: string,
   ): Promise<RawInvoice[]> {
-    const chunks = splitIntoMonths(fromDate, toDate);
+    // FIX-6: Pre-check count and choose chunk strategy
+    const LARGE_VOLUME_THRESHOLD = 5_000;
+    let chunks: Array<{ from: Date; to: Date }>;
+    try {
+      const estimated = await this.prefetchCount(
+        endpoint === 'sold' ? 'sold' : 'purchase',
+        fromDate, toDate, extraFilter, overridePath,
+      );
+      if (estimated > LARGE_VOLUME_THRESHOLD) {
+        logger.info('[GdtDirect] Khối lượng lớn — dùng chunk theo tuần', {
+          endpoint, estimated, threshold: LARGE_VOLUME_THRESHOLD,
+        });
+        chunks = splitIntoWeeks(fromDate, toDate);
+      } else {
+        chunks = splitIntoMonths(fromDate, toDate);
+      }
+    } catch {
+      chunks = splitIntoMonths(fromDate, toDate);
+    }
+
     const all: RawInvoice[] = [];
     for (let i = 0; i < chunks.length; i++) {
       const { from, to } = chunks[i]!;
@@ -637,7 +817,7 @@ export class GdtDirectApiService {
       // Without this, consecutive month requests arrive < 1s apart — GDT detects bot pattern
       // and responds with 429 after ~20 rapid requests.
       if (i > 0) await humanDelay(4_000, 8_000);
-      const chunk = await this._fetchAllPages(endpoint, from, to, extraFilter, overridePath);
+      const chunk = await this._fetchAllPagesBuffered(endpoint, from, to, extraFilter, overridePath);
       all.push(...chunk);
     }
     return all;
@@ -807,7 +987,7 @@ export class GdtDirectApiService {
 
   // ── Pagination ─────────────────────────────────────────────────────────────
 
-  private async _fetchAllPages(
+  private async _fetchAllPagesBuffered(
     endpoint:     'sold' | 'purchase',
     fromDate:     Date,
     toDate:       Date,
@@ -833,10 +1013,25 @@ export class GdtDirectApiService {
       ? `tdlap=ge=${from};tdlap=le=${to};${extraFilter}`
       : `tdlap=ge=${from};tdlap=le=${to}`;
     const all:   RawInvoice[] = [];
-    let   page   = 0;
     let   total  = Infinity;
 
-    logger.info('[GdtDirect] Fetching invoices', { endpoint, from, to, filter: extraFilter ?? 'none' });
+    // FIX-2: Pagination checkpoint — resume from last saved page after a crash.
+    // Key: gdt:checkpoint:{companyId}:{yyyymm}:{direction}, TTL 1h.
+    const yyyymm = this._companyId
+      ? `${fromDate.getFullYear()}${String(fromDate.getMonth() + 1).padStart(2, '0')}`
+      : null;
+    let page = 0;
+    if (this._checkpoint && this._companyId && yyyymm) {
+      page = await this._checkpoint.loadStartPage(this._companyId, yyyymm, direction).catch(() => 0);
+      if (page > 0) {
+        logger.info('[GdtDirect] Đang tiếp tục từ checkpoint', {
+          companyId: this._companyId, page, direction,
+          message: `Đang tiếp tục từ trang ${page}, bỏ qua ${page * pageSize} hóa đơn đã lấy`,
+        });
+      }
+    }
+
+    logger.info('[GdtDirect] Fetching invoices', { endpoint, from, to, filter: extraFilter ?? 'none', startPage: page });
 
     while (all.length < total) {
       const res = await this._getWithRetry<GdtPagedResponse>(
@@ -869,6 +1064,11 @@ export class GdtDirectApiService {
         endpoint, page, rows: rows.length, soFar: all.length, total,
       });
 
+      // FIX-2: Save checkpoint after each successful page (non-fatal)
+      if (this._checkpoint && this._companyId && yyyymm) {
+        await this._checkpoint.save(this._companyId, yyyymm, direction, page).catch(() => {});
+      }
+
       if (all.length >= total) break;
       page++;
       // Random 0.8-2.5s between pages — mimics human scrolling through results.
@@ -877,12 +1077,141 @@ export class GdtDirectApiService {
     }
 
     logger.info('[GdtDirect] Fetch complete', { endpoint, total: all.length });
+    // FIX-2: Clear checkpoint on success — next run starts fresh from page 0.
+    if (this._checkpoint && this._companyId && yyyymm) {
+      await this._checkpoint.clear(this._companyId, yyyymm, direction).catch(() => {});
+    }
     return all;
   }
 
+  // ── Phase 8: Streaming (async generator) ──────────────────────────────────
+
+  /**
+   * Phase 8: Same logic as _fetchAllPages but yields each page as it arrives
+   * instead of accumulating and returning at the end.
+   * Enables the sync worker to upsert + report progress incrementally.
+   */
+  private async *_streamPages(
+    endpoint:      'sold' | 'purchase',
+    fromDate:      Date,
+    toDate:        Date,
+    extraFilter?:  string,
+    overridePath?: string,
+  ): AsyncGenerator<RawInvoice[]> {
+    if (!this.token) throw new Error('Not authenticated — call login() first');
+
+    const direction: 'output' | 'input' = endpoint === 'sold' ? 'output' : 'input';
+    const pageSize    = this.recipe?.api.pagination.pageSize ?? PAGE_SIZE;
+    const endpointPath = overridePath
+      ?? (endpoint === 'sold'
+        ? (this.recipe?.api.endpoints.sold     ?? '/query/invoices/sold')
+        : (this.recipe?.api.endpoints.purchase ?? '/query/invoices/purchase'));
+    const from   = formatGdtDate(fromDate);
+    const to     = formatGdtDate(toDate);
+    const search = extraFilter
+      ? `tdlap=ge=${from};tdlap=le=${to};${extraFilter}`
+      : `tdlap=ge=${from};tdlap=le=${to}`;
+
+    const yyyymm = this._companyId
+      ? `${fromDate.getFullYear()}${String(fromDate.getMonth() + 1).padStart(2, '0')}`
+      : null;
+    let page = 0;
+    if (this._checkpoint && this._companyId && yyyymm) {
+      page = await this._checkpoint.loadStartPage(this._companyId, yyyymm, direction).catch(() => 0);
+    }
+
+    const isSco  = overridePath?.includes('sco-query') ?? false;
+    let fetched  = 0;
+    let total    = Infinity;
+
+    while (fetched < total) {
+      const res = await this._getWithRetry<GdtPagedResponse>(
+        endpointPath,
+        { sort: 'tdlap:desc', size: pageSize, page, search },
+      );
+
+      const rows = res.data.datas ?? res.data.data ?? [];
+      const headerTotal = parseInt(res.headers['x-total-count'] ?? '', 10);
+      if (!isNaN(headerTotal)) total = headerTotal;
+      else if (res.data.total != null) total = Number(res.data.total);
+
+      if (rows.length === 0) break;
+
+      const mapped = rows.map(r => mapInvoice(r, direction, {
+        ttxlyFilter:       extraFilter,
+        isSco,
+        fields:            this.recipe?.fields,
+        statusMap:         this.recipe?.statusMap,
+        xmlAvailableTtxly: this.recipe
+          ? new Set(this.recipe.api.query.xmlAvailableTtxly)
+          : undefined,
+      }));
+
+      fetched += mapped.length;
+
+      if (this._checkpoint && this._companyId && yyyymm) {
+        await this._checkpoint.save(this._companyId, yyyymm, direction, page).catch(() => {});
+      }
+
+      yield mapped;
+
+      if (fetched >= total) break;
+      page++;
+      await humanDelay(800, 2500);
+    }
+
+    if (this._checkpoint && this._companyId && yyyymm) {
+      await this._checkpoint.clear(this._companyId, yyyymm, direction).catch(() => {});
+    }
+  }
+
+  /**
+   * Phase 8: Stream output invoices page-by-page (hóa đơn đầu ra).
+   * Each yielded batch contains invoices from one page (~50 items).
+   * Note: De-duplication across main vs SCO endpoints happens at caller level.
+   */
+  async *fetchOutputInvoicesStream(
+    fromDate: Date,
+    toDate:   Date,
+  ): AsyncGenerator<RawInvoice[]> {
+    const scoPath = this.recipe?.api.endpoints.scoSold ?? GDT_SCO_SOLD;
+    // Main endpoint
+    for await (const batch of this._streamPages('sold', fromDate, toDate)) {
+      yield batch;
+    }
+    await humanDelay(1_500, 3_000);
+    // SCO endpoint
+    for await (const batch of this._streamPages('sold', fromDate, toDate, undefined, scoPath)) {
+      yield batch;
+    }
+  }
+
+  /**
+   * Phase 8: Stream input invoices page-by-page (hóa đơn đầu vào).
+   */
+  async *fetchInputInvoicesStream(
+    fromDate: Date,
+    toDate:   Date,
+  ): AsyncGenerator<RawInvoice[]> {
+    const scoPurchasePath = this.recipe?.api.endpoints.scoPurchase ?? GDT_SCO_PURCHASE;
+    // ttxly==5 stream
+    for await (const batch of this._streamPages('purchase', fromDate, toDate, 'ttxly==5')) {
+      yield batch;
+    }
+    await humanDelay(1_500, 3_000);
+    // ttxly==6 stream
+    for await (const batch of this._streamPages('purchase', fromDate, toDate, 'ttxly==6')) {
+      yield batch;
+    }
+    await humanDelay(1_500, 3_000);
+    // SCO (no ttxly filter — all types)
+    for await (const batch of this._streamPages('purchase', fromDate, toDate, undefined, scoPurchasePath)) {
+      yield batch;
+    }
+  }
+
   /** GET JSON with auto-retry on transient errors (5xx, timeout) */
-  private async _getWithRetry<T>(url: string, params: Record<string, unknown>) {
-    const maxRetries   = this.recipe?.timing.maxRetries   ?? MAX_RETRIES;
+  private async _getWithRetry<T>(url: string, params: Record<string, unknown>) {    const maxRetries   = this.recipe?.timing.maxRetries   ?? MAX_RETRIES;
     const retryDelayMs = this.recipe?.timing.retryDelayMs ?? RETRY_DELAY;
     let lastErr: Error | null = null;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -894,7 +1223,18 @@ export class GdtDirectApiService {
       } catch (err) {
         if (axios.isAxiosError(err)) {
           const status = err.response?.status ?? 0;
-          if (status === 401) throw new Error('GDT token expired — re-login required');
+          if (status === 401) {
+            // FIX-1: Mid-run token refresh — re-login once on JWT expiry, then give up.
+            // At page 600/2000 the JWT (~30-45 min TTL) expires — without this the job
+            // fails and increments consecutive_failures, auto-blocking the company.
+            if (!this._reloginAttempted && this._loginUsername && this._loginPassword) {
+              this._reloginAttempted = true;
+              logger.warn('[GdtDirect] Token hết hạn giữa lúc lấy dữ liệu — đang đăng nhập lại', { url });
+              await this.login(this._loginUsername, this._loginPassword);
+              continue; // retry request with fresh token
+            }
+            throw new Error('GDT token expired — re-login required');
+          }
           // Log body for 4xx to help diagnose field/format issues
           if (status >= 400 && status < 500) {
             const body = JSON.stringify(err.response?.data ?? '').slice(0, 300);

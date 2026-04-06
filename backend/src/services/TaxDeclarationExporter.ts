@@ -362,16 +362,15 @@ export class TaxDeclarationExporter {
     // to use the system-installed browser instead of puppeteer's bundled one.
     // If CHROMIUM_PATH is not set, puppeteer uses its own bundled Chrome (needs system libs).
     const executablePath = process.env['CHROMIUM_PATH'] || undefined;
+    const isLinux = process.platform === 'linux';
     const browser = await puppeteer.launch({
       headless: true,
       executablePath,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
+        ...(isLinux ? ['--disable-dev-shm-usage', '--no-zygote'] : []),
         '--disable-gpu',
-        '--no-zygote',
-        '--single-process',
       ],
     });
     try {

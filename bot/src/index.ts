@@ -5,6 +5,7 @@ import 'dotenv/config';
 import { worker, manualWorker, autoWorker, flushStaleLocks } from './sync.worker';
 import { proxyManager } from './proxy-manager';
 import { logger } from './logger';
+import { runGdtHealthCheck } from './cron/gdt-health-check';
 
 logger.info('[Bot] GDT Crawler Bot starting', {
   concurrency: process.env['WORKER_CONCURRENCY'] ?? '2',
@@ -43,3 +44,10 @@ async function shutdown(signal: string): Promise<void> {
 
 process.on('SIGTERM', () => void shutdown('SIGTERM'));
 process.on('SIGINT',  () => void shutdown('SIGINT'));
+
+// Phase 7: GDT canary health check every 15 minutes
+// Runs prefetchCount on dedicated canary account — no DB writes.
+// GDT_CANARY_COMPANY_ID env must be set; otherwise silently skipped.
+const HEALTH_CHECK_INTERVAL_MS = 15 * 60 * 1000; // 15 min
+void runGdtHealthCheck(); // Run immediately on startup
+setInterval(() => void runGdtHealthCheck(), HEALTH_CHECK_INTERVAL_MS);

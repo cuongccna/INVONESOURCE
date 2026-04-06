@@ -1,217 +1,347 @@
-'use client';
+﻿'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
+import Link from 'next/link';
 import apiClient from '../../../../lib/apiClient';
-import { useCompany } from '../../../../contexts/CompanyContext';
+import { useToast } from '../../../../components/ToastProvider';
 import { formatVND } from '../../../../utils/formatCurrency';
 
-interface TaxSettings {
-  business_type: string;
-  tax_regime: string;
-  vat_rate_hkd: number;
-}
-
-interface HkdStatementData {
-  period: { month: number; year: number };
-  company_type: string;
-  tax_regime: string;
-  vat_rate_hkd: number;
-  revenue: number;
-  vat_payable: number;
-  pit_payable: number;
+interface HkdDeclaration {
+  id: string;
+  period_quarter: number;
+  period_year: number;
+  revenue_m1: number;
+  revenue_m2: number;
+  revenue_m3: number;
+  revenue_total: number;
+  vat_rate: number;
+  vat_m1: number;
+  vat_m2: number;
+  vat_m3: number;
+  vat_total: number;
+  pit_m1: number;
+  pit_m2: number;
+  pit_m3: number;
+  pit_total: number;
   total_payable: number;
-  must_declare: boolean;
-  threshold: number;
-  saved_statement: Record<string, unknown> | null;
+  submission_status: string;
+  created_at: string;
 }
 
-const BUSINESS_TYPES = [
-  { value: 'DN', label: 'Doanh nghiệp (DN)' },
-  { value: 'HKD', label: 'Hộ kinh doanh (HKD)' },
-  { value: 'HND', label: 'Hộ nông dân (HND)' },
-  { value: 'CA_NHAN', label: 'Cá nhân kinh doanh' },
-];
+const STATUS_LABELS: Record<string, { label: string; color: string }> = {
+  draft:     { label: 'Nháp',          color: 'bg-gray-100 text-gray-700' },
+  ready:     { label: 'Hoàn thiện',    color: 'bg-blue-100 text-blue-700' },
+  submitted: { label: 'Đã nộp',        color: 'bg-orange-100 text-orange-700' },
+  accepted:  { label: 'GDT tiếp nhận', color: 'bg-green-100 text-green-700' },
+  rejected:  { label: 'Từ chối',       color: 'bg-red-100 text-red-700' },
+};
 
-const TAX_REGIMES = [
-  { value: 'khoan', label: 'Thuế khoán' },
-  { value: 'thuc_te', label: 'Theo thực tế' },
-  { value: 'khau_tru', label: 'Phương pháp khấu trừ' },
-];
+const QUARTER_MONTHS: Record<number, string> = {
+  1: 'T1–T3', 2: 'T4–T6', 3: 'T7–T9', 4: 'T10–T12',
+};
 
-export default function HkdPage() {
-  const { activeCompanyId } = useCompany();
-  const [statement, setStatement] = useState<HkdStatementData | null>(null);
-  const [settings, setSettings] = useState<TaxSettings>({ business_type: 'DN', tax_regime: 'khau_tru', vat_rate_hkd: 1.0 });
+export default function HkdDeclarationsPage() {
+  const toast = useToast();
+  const currentYear = new Date().getFullYear();
+  const [year, setYear] = useState(currentYear);
+  const [declarations, setDeclarations] = useState<HkdDeclaration[]>([]);
   const [loading, setLoading] = useState(true);
-  const [generating, setGenerating] = useState(false);
-  const [savingSettings, setSavingSettings] = useState(false);
-  const [settingsMsg, setSettingsMsg] = useState('');
-  const [month, setMonth] = useState(() => new Date().getMonth() + 1);
-  const [year, setYear] = useState(() => new Date().getFullYear());
+  const [calculating, setCalculating] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<HkdDeclaration | null>(null);
+  const [showCalcModal, setShowCalcModal] = useState(false);
+  const [calcQuarter, setCalcQuarter] = useState<number>(() => Math.ceil((new Date().getMonth() + 1) / 3));
+  const [calcYear, setCalcYear] = useState(currentYear);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
 
-  const fetch = () => {
-    if (!activeCompanyId) return;
+  const load = useCallback(async () => {
     setLoading(true);
-    apiClient
-      .get<{ data: HkdStatementData }>(`/hkd/tax-statement?month=${month}&year=${year}`)
-      .then((r) => {
-        setStatement(r.data.data);
-        setSettings({
-          business_type: r.data.data.company_type,
-          tax_regime: r.data.data.tax_regime,
-          vat_rate_hkd: r.data.data.vat_rate_hkd,
-        });
-      })
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  };
-
-  useEffect(() => { fetch(); }, [activeCompanyId, month, year]);
-
-  const generate = async () => {
-    setGenerating(true);
     try {
-      await apiClient.post('/hkd/generate', { month, year });
-      fetch();
+      const res = await apiClient.get<{ data: HkdDeclaration[] }>(`/hkd/declarations?year=${year}`);
+      setDeclarations(res.data.data);
     } catch {
       // ignore
     } finally {
-      setGenerating(false);
+      setLoading(false);
     }
-  };
+  }, [year]);
 
-  const saveSettings = async () => {
-    setSavingSettings(true);
-    setSettingsMsg('');
+  useEffect(() => { void load(); }, [load]);
+
+  const calculate = async () => {
+    setCalculating(true);
+    setShowCalcModal(false);
     try {
-      await apiClient.patch('/hkd/settings', settings);
-      setSettingsMsg('Đã lưu cài đặt thuế.');
-      fetch();
+      await apiClient.post('/hkd/declarations', { quarter: calcQuarter, year: calcYear });
+      toast.success('Đã tính tờ khai HKD thành công');
+      setYear(calcYear);
+      await load();
     } catch {
-      setSettingsMsg('Lỗi khi lưu cài đặt.');
+      toast.error('Lỗi tính tờ khai. Vui lòng thử lại.');
     } finally {
-      setSavingSettings(false);
+      setCalculating(false);
     }
   };
 
-  const isHkd = ['HKD', 'HND', 'CA_NHAN'].includes(settings.business_type);
+  const handleDelete = async (decl: HkdDeclaration) => {
+    setDeletingId(decl.id);
+    setConfirmDelete(null);
+    try {
+      await apiClient.delete(`/hkd/declarations/${decl.id}`);
+      toast.success('Đã xóa tờ khai.');
+      setDeclarations(prev => prev.filter(d => d.id !== decl.id));
+    } catch {
+      toast.error('Lỗi xóa tờ khai.');
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  const downloadXml = async (decl: HkdDeclaration) => {
+    try {
+      const res = await apiClient.get(`/hkd/declarations/${decl.id}/xml`, { responseType: 'blob' });
+      const url = URL.createObjectURL(new Blob([res.data as BlobPart], { type: 'application/xml' }));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `TT40_Q${decl.period_quarter}_${decl.period_year}.xml`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      toast.error('Lỗi tải XML.');
+    }
+  };
+
+  const downloadExport = async (decl: HkdDeclaration, format: 'excel' | 'pdf') => {
+    try {
+      const mime = format === 'excel'
+        ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        : 'application/pdf';
+      const ext = format === 'excel' ? 'xlsx' : 'pdf';
+      const res = await apiClient.get(`/hkd/declarations/${decl.id}/export?format=${format}`, { responseType: 'blob' });
+      const url = URL.createObjectURL(new Blob([res.data as BlobPart], { type: mime }));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `TT40_Q${decl.period_quarter}_${decl.period_year}.${ext}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      toast.error(`Lỗi tải ${format === 'excel' ? 'Excel' : 'PDF'}.`);
+    }
+  };
+
+  const m1OfQ = (q: number) => (q - 1) * 3 + 1;
 
   return (
-    <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto space-y-5">
-      <div>
-        <h1 className="text-2xl font-bold text-gray-900">Hộ Kinh Doanh / Cá Nhân KD</h1>
-        <p className="text-sm text-gray-500">Tính thuế khoán VAT & TNCN theo doanh thu</p>
-      </div>
-
-      {/* Tax settings card */}
-      <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-3">
-        <h2 className="font-semibold text-gray-800">⚙️ Cài đặt loại hình & chế độ thuế</h2>
-        <div className="grid sm:grid-cols-3 gap-3">
-          <div>
-            <label className="text-xs text-gray-500 mb-1 block">Loại hình kinh doanh</label>
-            <select value={settings.business_type}
-              onChange={(e) => setSettings({ ...settings, business_type: e.target.value })}
-              className="w-full border rounded-lg px-3 py-2 text-sm">
-              {BUSINESS_TYPES.map((t) => (
-                <option key={t.value} value={t.value}>{t.label}</option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label className="text-xs text-gray-500 mb-1 block">Chế độ tính thuế</label>
-            <select value={settings.tax_regime}
-              onChange={(e) => setSettings({ ...settings, tax_regime: e.target.value })}
-              className="w-full border rounded-lg px-3 py-2 text-sm">
-              {TAX_REGIMES.map((r) => (
-                <option key={r.value} value={r.value}>{r.label}</option>
-              ))}
-            </select>
-          </div>
-          {isHkd && settings.tax_regime === 'khoan' && (
-            <div>
-              <label className="text-xs text-gray-500 mb-1 block">Tỷ lệ VAT khoán (%)</label>
-              <input type="number" min={0} max={15} step={0.1}
-                value={settings.vat_rate_hkd}
-                onChange={(e) => setSettings({ ...settings, vat_rate_hkd: Number(e.target.value) })}
-                className="w-full border rounded-lg px-3 py-2 text-sm" />
-            </div>
-          )}
+    <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto">
+      <div className="flex items-center justify-between mb-6">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">Tờ Khai Thuế HKD</h1>
+          <p className="text-sm text-gray-500 mt-1">TT40/2021 — Hộ kinh doanh / cá nhân kinh doanh</p>
         </div>
-        <div className="flex items-center gap-3">
-          <button onClick={saveSettings} disabled={savingSettings}
-            className="px-4 py-2 bg-gray-800 text-white rounded-lg text-sm disabled:opacity-50">
-            {savingSettings ? 'Đang lưu...' : 'Lưu cài đặt'}
-          </button>
-          {settingsMsg && <span className="text-sm text-green-700">{settingsMsg}</span>}
-        </div>
-      </div>
-
-      {/* Period selector */}
-      <div className="flex gap-2 flex-wrap">
-        <select value={month} onChange={(e) => setMonth(Number(e.target.value))}
-          className="border rounded-lg px-2 py-1 text-sm">
-          {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
-            <option key={m} value={m}>Tháng {m}</option>
-          ))}
-        </select>
-        <select value={year} onChange={(e) => setYear(Number(e.target.value))}
-          className="border rounded-lg px-2 py-1 text-sm">
-          {[2023, 2024, 2025, 2026].map((y) => (
-            <option key={y} value={y}>{y}</option>
-          ))}
-        </select>
-        <button onClick={generate} disabled={generating}
-          className="px-4 py-1 bg-blue-600 text-white rounded-lg text-sm disabled:opacity-50">
-          {generating ? 'Đang tính...' : '📋 Tạo tờ khai'}
+        <button
+          onClick={() => setShowCalcModal(true)}
+          disabled={calculating}
+          className="bg-primary-600 text-white px-4 py-2 rounded-lg text-sm font-medium disabled:opacity-50"
+        >
+          {calculating ? 'Đang tính...' : '+ Tính Mới'}
         </button>
       </div>
 
+      {/* Loại tờ khai toggle */}
+      <div className="flex rounded-xl border border-gray-200 overflow-hidden mb-5 w-full max-w-xs">
+        <Link href="/declarations"
+          className="flex-1 py-2 text-sm font-medium text-center text-gray-600 hover:bg-gray-50 transition-colors">
+          Doanh Nghiệp (01/GTGT)
+        </Link>
+        <span className="flex-1 py-2 text-sm font-semibold text-center bg-primary-600 text-white">
+          Hộ KD / CNKD (TT40)
+        </span>
+      </div>
+
+      {/* Year selector */}
+      <div className="flex gap-2 mb-4">
+        <select value={year} onChange={e => setYear(Number(e.target.value))}
+          className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm bg-white">
+          {[currentYear - 1, currentYear, currentYear + 1].map(y => (
+            <option key={y} value={y}>{y}</option>
+          ))}
+        </select>
+      </div>
+
       {loading ? (
-        <div className="text-center py-12 text-gray-400">Đang tải...</div>
-      ) : statement && (
-        <>
-          {/* Must declare alert */}
-          {statement.must_declare && (
-            <div className="bg-red-50 border border-red-300 rounded-xl p-4 text-sm text-red-800">
-              ⚠️ <strong>Bắt buộc kê khai!</strong> Doanh thu tháng này vượt ngưỡng{' '}
-              {formatVND(statement.threshold)}/tháng theo quy định.
-            </div>
-          )}
-
-          {/* Tax statement breakdown */}
-          {isHkd ? (
-            <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-3">
-              <h2 className="font-semibold">📄 Tờ khai thuế hộ kinh doanh — T{month}/{year}</h2>
-              <div className="space-y-2 text-sm">
-                {[
-                  { label: 'Doanh thu trong kỳ', val: statement.revenue, color: 'text-green-700' },
-                  { label: `Thuế VAT khoán (${statement.vat_rate_hkd}%)`, val: statement.vat_payable, color: 'text-orange-700' },
-                  { label: 'Thuế TNCN (0.5%)', val: statement.pit_payable, color: 'text-orange-700' },
-                  { label: 'Tổng phải nộp', val: statement.total_payable, color: 'text-red-700 font-bold text-base' },
-                ].map((row) => (
-                  <div key={row.label} className="flex justify-between border-b border-gray-100 pb-2 last:border-0">
-                    <span className="text-gray-600">{row.label}</span>
-                    <span className={row.color}>{formatVND(row.val)}</span>
+        <div className="flex justify-center py-12">
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600" />
+        </div>
+      ) : declarations.length === 0 ? (
+        <div className="text-center py-12 text-gray-400">
+          <p className="text-lg mb-2">Chưa có tờ khai nào</p>
+          <p className="text-sm">Nhấn &quot;+ Tính Mới&quot; để tính tờ khai quý</p>
+        </div>
+      ) : (
+        <div className="space-y-3 lg:grid lg:grid-cols-2 lg:gap-4 lg:space-y-0">
+          {declarations.map((decl) => {
+            const statusInfo = STATUS_LABELS[decl.submission_status] ?? { label: decl.submission_status, color: 'bg-gray-100 text-gray-700' };
+            const isExpanded = expandedId === decl.id;
+            const m1 = m1OfQ(decl.period_quarter);
+            const m2 = m1 + 1;
+            const m3 = m1 + 2;
+            return (
+              <div key={decl.id} className="bg-white rounded-xl shadow-sm p-4">
+                <div className="flex items-center justify-between mb-3">
+                  <div>
+                    <p className="font-bold text-gray-900">
+                      Quý {decl.period_quarter}/{decl.period_year}
+                      <span className="ml-2 text-xs font-normal text-gray-400">({QUARTER_MONTHS[decl.period_quarter]})</span>
+                    </p>
+                    <p className="text-xs text-gray-400">
+                      Tạo: {new Date(decl.created_at).toLocaleDateString('vi-VN')}
+                    </p>
                   </div>
-                ))}
+                  <div className="flex items-center gap-2">
+                    <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${statusInfo.color}`}>
+                      {statusInfo.label}
+                    </span>
+                    <button
+                      onClick={() => setConfirmDelete(decl)}
+                      disabled={deletingId === decl.id}
+                      className="p-1.5 rounded-lg text-gray-400 hover:text-red-500 hover:bg-red-50 transition-colors disabled:opacity-40"
+                      title="Xóa tờ khai"
+                    >
+                      {deletingId === decl.id
+                        ? <span className="text-xs">...</span>
+                        : <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                      }
+                    </button>
+                  </div>
+                </div>
+                <div className="grid grid-cols-3 gap-2 mb-3">
+                  <div className="text-center">
+                    <p className="text-xs text-gray-400">Doanh thu</p>
+                    <p className="font-bold text-sm text-blue-600">{formatVND(decl.revenue_total)}</p>
+                  </div>
+                  <div className="text-center">
+                    <p className="text-xs text-gray-400">Thuế GTGT</p>
+                    <p className="font-bold text-sm text-orange-600">{formatVND(decl.vat_total)}</p>
+                  </div>
+                  <div className="text-center">
+                    <p className="text-xs text-gray-400">Tổng phải nộp</p>
+                    <p className="font-bold text-sm text-red-600">{formatVND(decl.total_payable)}</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setExpandedId(isExpanded ? null : decl.id)}
+                  className="w-full text-xs text-gray-500 hover:text-gray-800 py-1 mb-2"
+                >
+                  {isExpanded ? '▲ Ẩn chi tiết tháng' : '▼ Xem chi tiết tháng'}
+                </button>
+                {isExpanded && (
+                  <div className="mb-3 text-xs border border-gray-100 rounded-lg overflow-hidden">
+                    <table className="w-full">
+                      <thead>
+                        <tr className="bg-gray-50">
+                          <th className="text-left p-2 font-medium text-gray-600">Chỉ tiêu</th>
+                          <th className="text-right p-2 font-medium">T{m1}</th>
+                          <th className="text-right p-2 font-medium">T{m2}</th>
+                          <th className="text-right p-2 font-medium">T{m3}</th>
+                          <th className="text-right p-2 font-medium">Tổng</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr className="border-t border-gray-100">
+                          <td className="p-2 text-gray-600">DT GTGT</td>
+                          <td className="p-2 text-right">{formatVND(decl.revenue_m1)}</td>
+                          <td className="p-2 text-right">{formatVND(decl.revenue_m2)}</td>
+                          <td className="p-2 text-right">{formatVND(decl.revenue_m3)}</td>
+                          <td className="p-2 text-right font-semibold">{formatVND(decl.revenue_total)}</td>
+                        </tr>
+                        <tr className="border-t border-gray-100">
+                          <td className="p-2 text-gray-600">Thuế GTGT ({decl.vat_rate}%)</td>
+                          <td className="p-2 text-right">{formatVND(decl.vat_m1)}</td>
+                          <td className="p-2 text-right">{formatVND(decl.vat_m2)}</td>
+                          <td className="p-2 text-right">{formatVND(decl.vat_m3)}</td>
+                          <td className="p-2 text-right font-semibold text-orange-600">{formatVND(decl.vat_total)}</td>
+                        </tr>
+                        <tr className="border-t border-gray-100">
+                          <td className="p-2 text-gray-600">Thuế TNCN (0.5%)</td>
+                          <td className="p-2 text-right">{formatVND(decl.pit_m1)}</td>
+                          <td className="p-2 text-right">{formatVND(decl.pit_m2)}</td>
+                          <td className="p-2 text-right">{formatVND(decl.pit_m3)}</td>
+                          <td className="p-2 text-right font-semibold">{formatVND(decl.pit_total)}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+                <div className="flex rounded-lg border border-gray-300 overflow-hidden text-xs text-gray-700 font-medium divide-x divide-gray-300">
+                  <button onClick={() => void downloadXml(decl)} className="flex-1 py-2 hover:bg-gray-50">📄 XML</button>
+                  <button onClick={() => void downloadExport(decl, 'excel')} className="flex-1 py-2 hover:bg-gray-50">📊 Excel</button>
+                  <button onClick={() => void downloadExport(decl, 'pdf')} className="flex-1 py-2 hover:bg-gray-50">🖨️ PDF</button>
+                </div>
               </div>
-              <p className="text-xs text-gray-400 mt-2">
-                * Sử dụng mẫu 04/GTGT khi nộp cho Cơ quan Thuế (thay vì 01/GTGT)
-              </p>
-            </div>
-          ) : (
-            <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 text-sm text-blue-800">
-              <p>Đây là doanh nghiệp (<strong>{settings.business_type}</strong>), sử dụng tờ khai 01/GTGT theo phương pháp khấu trừ.</p>
-              <p className="mt-1">→ Xem mục <strong>Tờ khai 01/GTGT</strong> trong Khai báo thuế.</p>
-            </div>
-          )}
+            );
+          })}
+        </div>
+      )}
 
-          {statement.saved_statement && (
-            <div className="bg-green-50 border border-green-200 rounded-lg p-3 text-xs text-green-700">
-              ✅ Đã lưu tờ khai kỳ T{month}/{year}
+      {confirmDelete && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-4">
+          <div className="bg-white rounded-2xl w-full max-w-sm shadow-xl p-5 space-y-4">
+            <h2 className="font-bold text-gray-900 text-lg">Xóa tờ khai?</h2>
+            <p className="text-sm text-gray-600">
+              Bạn có chắc chắn muốn xóa tờ khai{' '}
+              <strong>Quý {confirmDelete.period_quarter}/{confirmDelete.period_year}</strong>?
+              Hành động này không thể hoàn tác.
+            </p>
+            <div className="flex gap-3 pt-1">
+              <button onClick={() => setConfirmDelete(null)}
+                className="flex-1 border border-gray-300 rounded-lg py-2.5 text-sm font-medium text-gray-700">
+                Hủy
+              </button>
+              <button onClick={() => void handleDelete(confirmDelete)}
+                className="flex-1 bg-red-600 text-white rounded-lg py-2.5 text-sm font-medium">
+                Xóa
+              </button>
             </div>
-          )}
-        </>
+          </div>
+        </div>
+      )}
+
+      {showCalcModal && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-4">
+          <div className="bg-white rounded-2xl w-full max-w-sm shadow-xl p-5 space-y-4">
+            <div className="flex items-center justify-between">
+              <h2 className="font-bold text-gray-900">Tính tờ khai HKD mới</h2>
+              <button onClick={() => setShowCalcModal(false)} className="text-gray-400 hover:text-gray-700 text-xl">✕</button>
+            </div>
+            <div className="space-y-3">
+              <div>
+                <label className="text-xs font-medium text-gray-600 block mb-1">Quý</label>
+                <select value={calcQuarter} onChange={e => setCalcQuarter(Number(e.target.value))}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white">
+                  <option value={1}>Quý 1 (Tháng 1–3)</option>
+                  <option value={2}>Quý 2 (Tháng 4–6)</option>
+                  <option value={3}>Quý 3 (Tháng 7–9)</option>
+                  <option value={4}>Quý 4 (Tháng 10–12)</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-xs font-medium text-gray-600 block mb-1">Năm</label>
+                <select value={calcYear} onChange={e => setCalcYear(Number(e.target.value))}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white">
+                  {[currentYear - 1, currentYear, currentYear + 1].map(y => (
+                    <option key={y} value={y}>{y}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="flex gap-3">
+              <button onClick={() => setShowCalcModal(false)}
+                className="flex-1 border border-gray-300 rounded-xl py-2.5 text-sm">Hủy</button>
+              <button onClick={() => void calculate()}
+                className="flex-1 bg-primary-600 text-white rounded-xl py-2.5 text-sm font-medium">Tính toán</button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
