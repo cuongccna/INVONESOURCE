@@ -42,8 +42,20 @@ export class VatReconciliationService {
   async calculatePeriod(
     companyId: string,
     month: number,
-    year: number
+    year: number,
+    validIds?: { inputIds?: string[]; outputIds?: string[] }
   ): Promise<VatSummary> {
+    // BUG FIX: Use direction-specific ID filters to prevent input-only IDs from being
+    // applied to output queries (which would zero out ct40a).
+    // Each query direction uses its own validated ID list independently.
+    const hasValidInput  = (validIds?.inputIds?.length  ?? 0) > 0;
+    const hasValidOutput = (validIds?.outputIds?.length ?? 0) > 0;
+
+    const inputIdFilter  = hasValidInput  ? `AND id = ANY($4::uuid[])` : '';
+    const outputIdFilter = hasValidOutput ? `AND id = ANY($4::uuid[])` : '';
+
+    const inputBaseParams  = () => hasValidInput  ? [companyId, month, year, validIds!.inputIds]  : [companyId, month, year];
+    const outputBaseParams = () => hasValidOutput ? [companyId, month, year, validIds!.outputIds] : [companyId, month, year];
     // ============================================================
     // [22] Total input VAT — all non-cancelled input invoices
     // ============================================================
@@ -60,8 +72,9 @@ export class VatReconciliationService {
          AND deleted_at IS NULL
          AND EXTRACT(MONTH FROM invoice_date) = $2
          AND EXTRACT(YEAR FROM invoice_date) = $3
+         ${inputIdFilter}
        GROUP BY vat_rate`,
-      [companyId, month, year]
+      inputBaseParams()
     );
 
     const ct22 = inputAll.reduce((sum, row) => sum + parseFloat(row.vat_sum || '0'), 0);
@@ -95,8 +108,9 @@ export class VatReconciliationService {
            total_amount <= 20000000
            OR payment_method IS DISTINCT FROM 'cash'
          )
+         ${inputIdFilter}
        GROUP BY vat_rate`,
-      [companyId, month, year]
+      inputBaseParams()
     );
 
     const ct23 = inputDeductible.reduce((sum, row) => sum + parseFloat(row.vat_sum || '0'), 0);
@@ -118,8 +132,9 @@ export class VatReconciliationService {
          AND deleted_at IS NULL
          AND EXTRACT(MONTH FROM invoice_date) = $2
          AND EXTRACT(YEAR FROM invoice_date) = $3
+         ${outputIdFilter}
        GROUP BY vat_rate`,
-      [companyId, month, year]
+      outputBaseParams()
     );
 
     // Build output breakdown by rate
@@ -235,11 +250,21 @@ export class VatReconciliationService {
     companyId: string,
     quarter: number,
     year: number,
+    validIds?: { inputIds?: string[]; outputIds?: string[] }
   ): Promise<VatSummary> {
     const m1 = (quarter - 1) * 3 + 1;
     const m2 = m1 + 1;
     const m3 = m1 + 2;
     const months = [m1, m2, m3];
+
+    const hasValidInput  = (validIds?.inputIds?.length  ?? 0) > 0;
+    const hasValidOutput = (validIds?.outputIds?.length ?? 0) > 0;
+
+    const inputIdFilter  = hasValidInput  ? `AND id = ANY($4::uuid[])` : '';
+    const outputIdFilter = hasValidOutput ? `AND id = ANY($4::uuid[])` : '';
+
+    const inputBaseParams  = () => hasValidInput  ? [companyId, year, months, validIds!.inputIds]  : [companyId, year, months];
+    const outputBaseParams = () => hasValidOutput ? [companyId, year, months, validIds!.outputIds] : [companyId, year, months];
 
     const { rows: inputAll } = await pool.query<{ vat_rate: string; vat_sum: string; subtotal_sum: string }>(
       `SELECT vat_rate, SUM(vat_amount) AS vat_sum, SUM(subtotal) AS subtotal_sum
@@ -250,8 +275,9 @@ export class VatReconciliationService {
          AND deleted_at IS NULL
          AND EXTRACT(YEAR FROM invoice_date) = $2
          AND EXTRACT(MONTH FROM invoice_date) = ANY($3::int[])
+         ${inputIdFilter}
        GROUP BY vat_rate`,
-      [companyId, year, months],
+      inputBaseParams(),
     );
 
     const ct22 = inputAll.reduce((s, r) => s + parseFloat(r.vat_sum || '0'), 0);
@@ -270,8 +296,9 @@ export class VatReconciliationService {
            (COALESCE(invoice_group, 5) = 5 AND gdt_validated = true)
            OR (invoice_group IN (6, 8))
          )
+         ${inputIdFilter}
        GROUP BY vat_rate`,
-      [companyId, year, months],
+      inputBaseParams(),
     );
 
     const ct23 = inputDeductible.reduce((s, r) => s + parseFloat(r.vat_sum || '0'), 0);
@@ -286,8 +313,9 @@ export class VatReconciliationService {
          AND deleted_at IS NULL
          AND EXTRACT(YEAR FROM invoice_date) = $2
          AND EXTRACT(MONTH FROM invoice_date) = ANY($3::int[])
+         ${outputIdFilter}
        GROUP BY vat_rate`,
-      [companyId, year, months],
+      outputBaseParams(),
     );
 
     const outputMap: Record<string, { subtotal: number; vat: number }> = {};

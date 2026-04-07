@@ -1121,6 +1121,9 @@ async function _batchUpsertInvoices(
   const serialHasCqts:  (boolean | null)[] = [];
   const hasLineItemsArr: boolean[]         = [];
   const isScos:         boolean[]          = [];
+  const tcHdons:        (number | null)[]  = [];
+  const khhdClQuans:    (string | null)[]  = [];
+  const soHdClQuans:    (string | null)[]  = [];
 
   for (const inv of invoices) {
     const { invoiceGroup, serialHasCqt, hasLineItems } = _classifySerial(inv.serial_number);
@@ -1141,6 +1144,9 @@ async function _batchUpsertInvoices(
     serialHasCqts.push(serialHasCqt);
     hasLineItemsArr.push(hasLineItems);
     isScos.push(inv.is_sco ?? false);
+    tcHdons.push(inv.tc_hdon ?? null);
+    khhdClQuans.push(inv.khhd_cl_quan ?? null);
+    soHdClQuans.push(inv.so_hd_cl_quan ?? null);
   }
 
   const dirArr  = Array(invoices.length).fill(direction) as string[];
@@ -1151,24 +1157,28 @@ async function _batchUpsertInvoices(
      (id, company_id, invoice_number, serial_number, invoice_date, direction, status,
       seller_name, seller_tax_code, buyer_name, buyer_tax_code,
       subtotal, total_amount, vat_amount, vat_rate, gdt_validated, source, provider,
-      invoice_group, serial_has_cqt, has_line_items, is_sco, created_at)
+      invoice_group, serial_has_cqt, has_line_items, is_sco,
+      tc_hdon, khhd_cl_quan, so_hd_cl_quan, created_at)
      SELECT
        t.id, t.company_id, t.invoice_number, t.serial_number,
        COALESCE(t.invoice_date::date, CURRENT_DATE), t.direction, t.status,
        t.seller_name, COALESCE(t.seller_tax_code, ''), t.buyer_name, t.buyer_tax_code,
        t.subtotal, t.total_amount, t.vat_amount, t.vat_rate,
        true, 'gdt_bot', 'gdt_bot',
-       t.invoice_group, t.serial_has_cqt, t.has_line_items, t.is_sco, NOW()
+       t.invoice_group, t.serial_has_cqt, t.has_line_items, t.is_sco,
+       t.tc_hdon, t.khhd_cl_quan, t.so_hd_cl_quan, NOW()
      FROM UNNEST(
        $1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::text[], $6::invoice_direction[], $7::invoice_status[],
        $8::text[], $9::text[], $10::text[], $11::text[],
        $12::numeric[], $13::numeric[], $14::numeric[], $15::numeric[],
-       $16::int[], $17::boolean[], $18::boolean[], $19::boolean[]
+       $16::int[], $17::boolean[], $18::boolean[], $19::boolean[],
+       $20::smallint[], $21::text[], $22::text[]
      ) AS t(
        id, company_id, invoice_number, serial_number, invoice_date, direction, status,
        seller_name, seller_tax_code, buyer_name, buyer_tax_code,
        subtotal, total_amount, vat_amount, vat_rate,
-       invoice_group, serial_has_cqt, has_line_items, is_sco
+       invoice_group, serial_has_cqt, has_line_items, is_sco,
+       tc_hdon, khhd_cl_quan, so_hd_cl_quan
      )
      ON CONFLICT (company_id, provider, invoice_number,
        COALESCE(seller_tax_code, ''), COALESCE(serial_number, '')) DO UPDATE SET
@@ -1188,6 +1198,9 @@ async function _batchUpsertInvoices(
        serial_has_cqt = COALESCE(EXCLUDED.serial_has_cqt, invoices.serial_has_cqt),
        has_line_items = COALESCE(EXCLUDED.has_line_items, invoices.has_line_items),
        is_sco         = EXCLUDED.is_sco,
+       tc_hdon        = COALESCE(EXCLUDED.tc_hdon,        invoices.tc_hdon),
+       khhd_cl_quan   = COALESCE(EXCLUDED.khhd_cl_quan,   invoices.khhd_cl_quan),
+       so_hd_cl_quan  = COALESCE(EXCLUDED.so_hd_cl_quan,  invoices.so_hd_cl_quan),
        updated_at     = NOW()
      RETURNING id,
        invoice_number,
@@ -1198,6 +1211,7 @@ async function _batchUpsertInvoices(
       sellerNames, sellerTaxes, buyerNames, buyerTaxes,
       subtotals, totals, vatAmounts, vatRates,
       invoiceGroups, serialHasCqts, hasLineItemsArr, isScos,
+      tcHdons, khhdClQuans, soHdClQuans,
     ],
   );
 
@@ -1242,9 +1256,10 @@ async function _upsertInvoice(
      (id, company_id, invoice_number, serial_number, invoice_date, direction, status,
       seller_name, seller_tax_code, buyer_name, buyer_tax_code,
       subtotal, total_amount, vat_amount, vat_rate, gdt_validated, source, provider,
-      invoice_group, serial_has_cqt, has_line_items, is_sco, created_at)
+      invoice_group, serial_has_cqt, has_line_items, is_sco,
+      tc_hdon, khhd_cl_quan, so_hd_cl_quan, created_at)
      VALUES ($1,$2,$3,$4,COALESCE($5, CURRENT_DATE),$6,$7,$8,COALESCE($9,''),$10,$11,$12,$13,$14,$15,true,'gdt_bot','gdt_bot',
-      $16,$17,$18,$19,NOW())
+      $16,$17,$18,$19,$20,$21,$22,NOW())
      ON CONFLICT (company_id, provider, invoice_number, COALESCE(seller_tax_code, ''), COALESCE(serial_number, '')) DO UPDATE SET
        direction       = EXCLUDED.direction,
        status          = EXCLUDED.status,
@@ -1262,6 +1277,9 @@ async function _upsertInvoice(
        serial_has_cqt  = COALESCE(EXCLUDED.serial_has_cqt, invoices.serial_has_cqt),
        has_line_items  = COALESCE(EXCLUDED.has_line_items, invoices.has_line_items),
        is_sco          = EXCLUDED.is_sco,
+       tc_hdon         = COALESCE(EXCLUDED.tc_hdon,       invoices.tc_hdon),
+       khhd_cl_quan    = COALESCE(EXCLUDED.khhd_cl_quan,  invoices.khhd_cl_quan),
+       so_hd_cl_quan   = COALESCE(EXCLUDED.so_hd_cl_quan, invoices.so_hd_cl_quan),
        updated_at      = NOW()
      RETURNING id`,
     [
@@ -1273,6 +1291,7 @@ async function _upsertInvoice(
       inv.buyer_name, inv.buyer_tax_code,
       computedSubtotal, inv.total_amount, inv.vat_amount, inv.vat_rate,
       invoiceGroup, serialHasCqt, hasLineItems, inv.is_sco,
+      inv.tc_hdon ?? null, inv.khhd_cl_quan ?? null, inv.so_hd_cl_quan ?? null,
     ]
   );
   return res.rows[0].id as string;

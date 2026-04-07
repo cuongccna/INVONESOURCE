@@ -34,7 +34,9 @@ router.post('/login', async (req: Request, res: Response, next: NextFunction) =>
               uc.role, uc.company_id
        FROM users u
        LEFT JOIN user_companies uc ON uc.user_id = u.id
+       LEFT JOIN companies c ON c.id = uc.company_id AND c.deleted_at IS NULL
        WHERE u.email = $1 AND u.is_active = true
+       ORDER BY c.name ASC NULLS LAST
        LIMIT 1`,
       [email]
     );
@@ -100,7 +102,10 @@ router.post('/refresh', async (req: Request, res: Response, next: NextFunction) 
        FROM refresh_tokens rt
        JOIN users u ON u.id = rt.user_id AND u.is_active = true
        LEFT JOIN user_companies uc ON uc.user_id = rt.user_id
-       WHERE rt.token_hash = $1 AND rt.expires_at > NOW() AND rt.revoked_at IS NULL`,
+       LEFT JOIN companies c ON c.id = uc.company_id AND c.deleted_at IS NULL
+       WHERE rt.token_hash = $1 AND rt.expires_at > NOW() AND rt.revoked_at IS NULL
+       ORDER BY c.name ASC NULLS LAST
+       LIMIT 1`,
       [hashToken(token)]
     );
 
@@ -150,7 +155,10 @@ router.get('/me', authenticate, async (req: Request, res: Response, next: NextFu
               uc.role, uc.company_id
        FROM users u
        LEFT JOIN user_companies uc ON uc.user_id = u.id
-       WHERE u.id = $1`,
+       LEFT JOIN companies c ON c.id = uc.company_id AND c.deleted_at IS NULL
+       WHERE u.id = $1
+       ORDER BY c.name ASC NULLS LAST
+       LIMIT 1`,
       [req.user!.userId]
     );
     const user = result.rows[0];

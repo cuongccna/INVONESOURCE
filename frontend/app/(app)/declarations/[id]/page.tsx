@@ -115,7 +115,9 @@ export default function DeclarationDetailPage() {
   const load = useCallback(async () => {
     try {
       const res = await apiClient.get<{ data: Declaration }>(`/declarations/${params.id}`);
-      setDecl(res.data.data);
+      const d = res.data.data;
+      console.log('[DETAIL-DEBUG] declaration loaded:', { id: d.id, ct40a: d.ct40a_total_output_vat, ct23: d.ct23_deductible_input_vat, ct41: d.ct41_payable_vat, ct43: d.ct43_carry_forward_vat });
+      setDecl(d);
     } catch {
       router.replace('/declarations');
     } finally {
@@ -242,8 +244,24 @@ export default function DeclarationDetailPage() {
     }
   };
 
+  // For quarterly: period_month = quarter (1-4). Deadline = 20th of month after quarter end.
+  // Q1 ends March (3) → Apr 20; Q2→Jul 20; Q3→Oct 20; Q4→Jan 20 next year.
+  // JS Date handles month overflow: new Date(year, 12, 20) → Jan 20 next year.
   const deadline20 = decl
-    ? new Date(decl.period_year, decl.period_month, 20) // 20th of NEXT month
+    ? decl.period_type === 'quarterly'
+      ? new Date(decl.period_year, decl.period_month * 3, 20)  // endMonth=Q*3, then +1 implicit via index
+      : new Date(decl.period_year, decl.period_month, 20)       // monthly: period_month=month, next month
+    : null;
+  // Display month for deadline warning (1-based)
+  const deadlineDisplayMonth = decl
+    ? decl.period_type === 'quarterly'
+      ? (decl.period_month * 3 + 1) > 12 ? 1 : decl.period_month * 3 + 1
+      : decl.period_month + 1 > 12 ? 1 : decl.period_month + 1
+    : null;
+  const deadlineDisplayYear = decl
+    ? decl.period_type === 'quarterly'
+      ? (decl.period_month * 3 + 1) > 12 ? decl.period_year + 1 : decl.period_year
+      : decl.period_month + 1 > 12 ? decl.period_year + 1 : decl.period_year
     : null;
   const daysLeft = deadline20
     ? Math.ceil((deadline20.getTime() - Date.now()) / 86_400_000)
@@ -291,7 +309,7 @@ export default function DeclarationDetailPage() {
         <div className="bg-orange-50 border border-orange-200 rounded-xl px-4 py-3 flex items-center gap-2">
           <span className="text-lg">📅</span>
           <p className="text-sm text-orange-700">
-            <strong>Sắp đến hạn!</strong> Còn {daysLeft} ngày đến hạn nộp (ngày 20/{decl.period_month + 1 > 12 ? 1 : decl.period_month + 1}/{decl.period_month + 1 > 12 ? decl.period_year + 1 : decl.period_year}).
+            <strong>Sắp đến hạn!</strong> Còn {daysLeft} ngày đến hạn nộp (ngày 20/{deadlineDisplayMonth}/{deadlineDisplayYear}).
           </p>
         </div>
       )}

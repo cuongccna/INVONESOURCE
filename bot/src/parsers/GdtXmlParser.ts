@@ -46,6 +46,15 @@ export interface RawInvoice {
    * false = fetched from /query (HĐ điện tử thông thường).
    */
   is_sco:          boolean;
+  /**
+   * Tính chất hóa đơn: 1 = hóa đơn thay thế, 2 = hóa đơn điều chỉnh, 0/null = gốc.
+   * Derived from: shdgoc non-null → 1, else 0.
+   */
+  tc_hdon:         number | null;
+  /** Ký hiệu hóa đơn bị thay thế/điều chỉnh (khhdon của hóa đơn gốc). */
+  khhd_cl_quan:    string | null;
+  /** Số hóa đơn bị thay thế/điều chỉnh (shdon của hóa đơn gốc). */
+  so_hd_cl_quan:   string | null;
 }
 
 export interface LineItem {
@@ -158,6 +167,10 @@ export class GdtXmlParser {
       xml_available:   true,
       // XML-parsed invoices come from direct upload, not sco-query endpoint
       is_sco:          false,
+      // TT80/2021 replacement / adjustment fields
+      tc_hdon:         this._num(ttchung, 'TCHDon', 'tcHDon', 'LHDCLQuan') ?? 0,
+      khhd_cl_quan:    this._str(ttchung, 'KHHDCLQuan', 'KHHDon_goc', 'kHHDCLQuan'),
+      so_hd_cl_quan:   this._str(ttchung, 'SHDCLQuan',  'SHDon_goc',  'sHDCLQuan'),
     };
   }
 

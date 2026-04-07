@@ -2,9 +2,15 @@ import { pool } from '../db/pool';
 import { VatReconciliationService } from './VatReconciliationService';
 import { v4 as uuidv4 } from 'uuid';
 import { TaxDeclaration } from 'shared';
+import { InvoiceValidationPipeline } from '../tax/validation/invoice-validation.pipeline';
+import type { InvoiceRow, PipelineValidationOutput } from '../tax/validation/types';
 
 export interface TaxDeclarationOptions {
   includeUncashPayments?: boolean;  // default false
+}
+
+export interface TaxDeclarationWithValidation extends TaxDeclaration {
+  _validation?: PipelineValidationOutput;
 }
 
 /**
@@ -13,15 +19,77 @@ export interface TaxDeclarationOptions {
  */
 export class TaxDeclarationEngine {
   private vatService = new VatReconciliationService();
+  private pipeline = new InvoiceValidationPipeline();
+
+  /**
+   * Fetch the raw invoices for a company+period needed by the validation pipeline.
+   */
+  private async fetchInvoicesForPeriod(
+    companyId: string,
+    startDate: Date,
+    endDate: Date
+  ): Promise<InvoiceRow[]> {
+    const { rows } = await pool.query<InvoiceRow>(
+      `SELECT id, company_id, direction, status, invoice_number, serial_number,
+              invoice_date, seller_tax_code, seller_name, buyer_tax_code, buyer_name,
+              total_amount, vat_amount, payment_method, gdt_validated,
+              invoice_group, serial_has_cqt, has_line_items,
+              mccqt, tc_hdon, lhd_cl_quan, khhd_cl_quan, so_hd_cl_quan
+       FROM invoices
+       WHERE company_id = $1
+         AND deleted_at IS NULL
+         AND invoice_date >= $2
+         AND invoice_date < $3`,
+      [companyId, startDate, endDate]
+    );
+    return rows;
+  }
+
+  /** Lookup the tax_code (MST) for a companyId. */
+  private async getCompanyMst(companyId: string): Promise<string> {
+    const { rows } = await pool.query<{ tax_code: string }>(
+      `SELECT tax_code FROM companies WHERE id = $1`,
+      [companyId]
+    );
+    return rows[0]?.tax_code ?? '';
+  }
 
   async calculateDeclaration(
     companyId: string,
     month: number,
     year: number,
     options: TaxDeclarationOptions = {}
-  ): Promise<TaxDeclaration> {
-    // Step 1: Get VAT summary for this period
-    const vat = await this.vatService.calculatePeriod(companyId, month, year);
+  ): Promise<TaxDeclarationWithValidation> {
+    // Step 0: Run invoice validation pipeline to pre-filter invoices.
+    // Only valid invoices from the pipeline are included in tax calculations.
+    const startDate = new Date(year, month - 1, 1);
+    const endDate   = new Date(year, month, 1);
+
+    const [invoices, mst] = await Promise.all([
+      this.fetchInvoicesForPeriod(companyId, startDate, endDate),
+      this.getCompanyMst(companyId),
+    ]);
+
+    const periodStr = `${year}-${String(month).padStart(2, '0')}`;
+    const validationOutput = await this.pipeline.validate(invoices, {
+      mst,
+      declaration_period: periodStr,
+      declaration_type: 'monthly',
+      direction: 'both',
+    });
+
+    const validInvoiceIds = validationOutput.valid_invoices;
+
+    // Split valid IDs by direction — critical to prevent input-only IDs from filtering
+    // output queries (and zeroing out ct40a). Each direction is filtered independently.
+    const validIdSet = new Set(validInvoiceIds);
+    const validInputIds  = invoices.filter(inv => inv.direction === 'input'  && validIdSet.has(inv.id)).map(inv => inv.id);
+    const validOutputIds = invoices.filter(inv => inv.direction === 'output' && validIdSet.has(inv.id)).map(inv => inv.id);
+
+    // Step 1: Get VAT summary — restricted to validated invoice IDs by direction
+    const vat = await this.vatService.calculatePeriod(companyId, month, year,
+      validInvoiceIds.length > 0 ? { inputIds: validInputIds, outputIds: validOutputIds } : undefined
+    );
 
     // Step 2: Get carry-forward from previous period [24]
     const ct24 = await this.getCarryForward(companyId, month, year);
@@ -107,7 +175,7 @@ export class TaxDeclarationEngine {
       ]
     );
 
-    // Fetch and return the upserted row
+    // Fetch and return the upserted row, augmented with validation output
     const { rows } = await pool.query<TaxDeclaration>(
       `SELECT * FROM tax_declarations
        WHERE company_id = $1 AND period_month = $2 AND period_year = $3
@@ -115,7 +183,7 @@ export class TaxDeclarationEngine {
       [companyId, month, year]
     );
 
-    return rows[0]!;
+    return { ...rows[0]!, _validation: validationOutput };
   }
 
   /**
@@ -126,8 +194,34 @@ export class TaxDeclarationEngine {
     companyId: string,
     quarter: number,
     year: number,
-  ): Promise<TaxDeclaration> {
-    const vat  = await this.vatService.calculateQuarter(companyId, quarter, year);
+  ): Promise<TaxDeclarationWithValidation> {
+    // Step 0: Run validation pipeline for the full quarter date range
+    const startMonth = (quarter - 1) * 3 + 1;
+    const startDate  = new Date(year, startMonth - 1, 1);
+    const endDate    = new Date(year, startMonth + 2, 1);
+
+    const [invoices, mst] = await Promise.all([
+      this.fetchInvoicesForPeriod(companyId, startDate, endDate),
+      this.getCompanyMst(companyId),
+    ]);
+
+    const validationOutput = await this.pipeline.validate(invoices, {
+      mst,
+      declaration_period: `${year}-Q${quarter}`,
+      declaration_type: 'quarterly',
+      direction: 'both',
+    });
+
+    const validInvoiceIds = validationOutput.valid_invoices;
+
+    // Split valid IDs by direction
+    const validIdSet = new Set(validInvoiceIds);
+    const validInputIds  = invoices.filter(inv => inv.direction === 'input'  && validIdSet.has(inv.id)).map(inv => inv.id);
+    const validOutputIds = invoices.filter(inv => inv.direction === 'output' && validIdSet.has(inv.id)).map(inv => inv.id);
+
+    const vat  = await this.vatService.calculateQuarter(companyId, quarter, year,
+      validInvoiceIds.length > 0 ? { inputIds: validInputIds, outputIds: validOutputIds } : undefined
+    );
     const ct24 = await this.getCarryForwardQuarterly(companyId, quarter, year);
     const ct25 = vat.ct23_deductible_input_vat + ct24;
 
@@ -203,7 +297,7 @@ export class TaxDeclarationEngine {
          AND form_type = '01/GTGT' AND period_type = 'quarterly'`,
       [companyId, quarter, year]
     );
-    return rows[0]!;
+    return { ...rows[0]!, _validation: validationOutput };
   }
 
   /**

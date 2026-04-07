@@ -11,10 +11,14 @@ import { TaxDeclarationExporter } from '../services/TaxDeclarationExporter';
 import { ValidationError, NotFoundError } from '../utils/AppError';
 import { sendSuccess, sendPaginated } from '../utils/response';
 import type { TaxDeclaration } from 'shared';
+import validationRouter from '../tax/validation/validation.controller';
 
 const router = Router();
 router.use(authenticate);
 router.use(requireCompany);
+
+// Mount invoice validation pipeline routes under /declarations
+router.use('/', validationRouter);
 
 const calcSchema = z.object({
   month:   z.number().int().min(1).max(12).optional(),
@@ -76,6 +80,8 @@ router.post(
       const parsed = calcSchema.safeParse(req.body);
       if (!parsed.success) throw new ValidationError(parsed.error.issues[0]?.message ?? 'Invalid input');
 
+      console.log('[CALC-DEBUG] companyId from JWT/header:', req.user!.companyId, '| body:', JSON.stringify(req.body), '| x-company-id header:', req.headers['x-company-id']);
+
       const engine = new TaxDeclarationEngine();
       let declaration;
       const month = parsed.data.quarter !== undefined ? parsed.data.quarter * 3 : parsed.data.month!;
@@ -92,6 +98,7 @@ router.post(
       const warnings = await engine.getCT23Warnings(
         req.user!.companyId!, month, parsed.data.year
       ).catch(() => null);
+      console.log('[CALC-DEBUG] result:', { id: declaration.id, companyId: declaration.company_id, ct40a: declaration.ct40a_total_output_vat, ct23: declaration.ct23_deductible_input_vat, ct41: declaration.ct41_payable_vat, ct43: declaration.ct43_carry_forward_vat });
       sendSuccess(res, { ...declaration, _warnings: warnings });
     } catch (err) {
       next(err);

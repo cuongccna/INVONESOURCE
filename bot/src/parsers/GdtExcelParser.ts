@@ -124,6 +124,10 @@ export class GdtExcelParser {
       xml_available:   true,
       // Excel-parsed invoices are not from sco-query endpoint
       is_sco:          false,
+      // Excel exports don't carry replacement fields — default to no-replacement
+      tc_hdon:         0,
+      khhd_cl_quan:    null,
+      so_hd_cl_quan:   null,
     };
   }
 

@@ -423,6 +423,16 @@ function mapInvoice(
     gdt_validated:   true,
     xml_available:   xmlAvailable,
     is_sco:          isSco ?? false,
+    // Hóa đơn thay thế / điều chỉnh: shdgoc = số HĐ gốc, khhdgoc = ký hiệu HĐ gốc
+    // Nếu shdgoc có giá trị → đây là HĐ thay thế (tc_hdon=1) hoặc điều chỉnh (tc_hdon=2)
+    tc_hdon:      (() => {
+                    const goc  = String(pick(r, 'shdgoc',   'shdon_goc',   'soHdonGoc',   'sHdonGoc')   ?? '').trim() || null;
+                    const tcRaw = num(pick(r, 'tcHDon', 'tcHdon', 'tCHDon', 'loaiHDon'));
+                    if (tcRaw != null && tcRaw > 0) return tcRaw;
+                    return goc ? 1 : 0;
+                  })(),
+    khhd_cl_quan: String(pick(r, 'khhdgoc', 'khhdon_goc', 'kyHieuGoc', 'KHHDCLQuan') ?? '').trim() || null,
+    so_hd_cl_quan: String(pick(r, 'shdgoc',  'shdon_goc',  'soHdonGoc', 'SHDCLQuan')  ?? '').trim() || null,
   };
 }
 

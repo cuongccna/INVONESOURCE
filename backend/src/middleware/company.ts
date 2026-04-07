@@ -28,7 +28,40 @@ export const requireCompany: RequestHandler = async (req, _res, next) => {
   if (viewMode !== 'single') return next();
 
   const headerCompanyId = req.headers['x-company-id'] as string | undefined;
-  if (!headerCompanyId || headerCompanyId === req.user.companyId) return next();
+
+  // If header is absent (or same as JWT claim), validate that the JWT companyId
+  // is still active for this user.  Stale JWTs can carry a soft-deleted company.
+  if (!headerCompanyId || headerCompanyId === req.user.companyId) {
+    try {
+      const { rows } = await pool.query<{ role: UserRole }>(
+        `SELECT uc.role
+         FROM user_companies uc
+         JOIN companies c ON c.id = uc.company_id
+         WHERE uc.user_id = $1 AND uc.company_id = $2 AND c.deleted_at IS NULL`,
+        [req.user.userId, req.user.companyId]
+      );
+      if (rows.length) {
+        req.user.role = rows[0].role;
+        return next();
+      }
+      // JWT companyId is stale (deleted) → fall back to user's first valid company
+      const { rows: fallback } = await pool.query<{ company_id: string; role: UserRole }>(
+        `SELECT uc.company_id, uc.role
+         FROM user_companies uc
+         JOIN companies c ON c.id = uc.company_id
+         WHERE uc.user_id = $1 AND c.deleted_at IS NULL
+         ORDER BY c.name ASC
+         LIMIT 1`,
+        [req.user.userId]
+      );
+      if (!fallback.length) throw new ForbiddenError('No active company found for this user');
+      req.user.companyId = fallback[0].company_id;
+      req.user.role = fallback[0].role;
+    } catch (err) {
+      return next(err);
+    }
+    return next();
+  }
 
   try {
     const { rows } = await pool.query<{ role: UserRole }>(

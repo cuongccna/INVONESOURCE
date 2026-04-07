@@ -87,6 +87,12 @@ export interface Invoice {
   invoice_group: 5 | 6 | 8 | null;
   serial_has_cqt: boolean | null;
   has_line_items: boolean;
+  // GROUP 28: GDT XML replacement tracking fields
+  mccqt: string | null;
+  tc_hdon: 0 | 1 | null;
+  lhd_cl_quan: number | null;
+  khhd_cl_quan: string | null;
+  so_hd_cl_quan: string | null;
   created_at: Date;
 }
 

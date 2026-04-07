@@ -37,10 +37,20 @@ export default function DeclarationsPage() {
   const [showCalcModal, setShowCalcModal] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<Declaration | null>(null);
-  const [calcType, setCalcType]     = useState<'monthly' | 'quarterly'>('monthly');
-  const [calcMonth, setCalcMonth]   = useState(() => new Date().getMonth() + 1);
-  const [calcQuarter, setCalcQuarter] = useState(() => Math.ceil((new Date().getMonth() + 1) / 3));
-  const [calcYear, setCalcYear]     = useState(() => new Date().getFullYear());
+  const [calcType, setCalcType]     = useState<'monthly' | 'quarterly'>('quarterly');
+  const [calcMonth, setCalcMonth]   = useState(() => {
+    const m = new Date().getMonth(); // 0-indexed: current month index
+    return m === 0 ? 12 : m;         // default = previous month (Jan → Dec of prior year)
+  });
+  const [calcQuarter, setCalcQuarter] = useState(() => {
+    const q = Math.ceil((new Date().getMonth() + 1) / 3);
+    return q === 1 ? 4 : q - 1;      // default = previous quarter
+  });
+  const [calcYear, setCalcYear]     = useState(() => {
+    const d = new Date();
+    // If current month is Jan (monthly) or Q1 (quarterly), previous period is prior year
+    return d.getMonth() < 3 ? d.getFullYear() - 1 : d.getFullYear();
+  });
 
   const load = useCallback(async () => {
     try {
@@ -62,9 +72,13 @@ export default function DeclarationsPage() {
       const body = calcType === 'quarterly'
         ? { quarter: calcQuarter, year: calcYear }
         : { month: calcMonth,  year: calcYear };
-      await apiClient.post('/declarations/calculate', body);
-      toast.success('\u0110ã tính toán tờ khai thành công');
-      await load();
+      const { getApiCompanyId, getApiViewContext } = await import('../../../lib/apiClient');
+      console.log('[CALC-DEBUG] sending calculate | activeCompanyId:', getApiCompanyId(), '| viewContext:', JSON.stringify(getApiViewContext()), '| body:', JSON.stringify(body));
+      const res = await apiClient.post<{ data: Declaration & { id: string } }>('/declarations/calculate', body);
+      console.log('[CALC-DEBUG] response id:', res.data.data.id, '| ct40a:', (res.data.data as unknown as Record<string, unknown>).ct40a_total_output_vat);
+      toast.success('Đã tính toán tờ khai thành công');
+      // Navigate to detail page so user immediately sees full calculated values
+      router.push(`/declarations/${res.data.data.id}`);
     } catch {
       toast.error('Lỗi tính toán tờ khai. Vui lòng thử lại.');
     } finally {
