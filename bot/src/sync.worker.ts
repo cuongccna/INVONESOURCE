@@ -989,6 +989,9 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
             companyId,
             provider: 'GDT Bot',
             count: totalSynced,
+            // Truyền khoảng thời gian để backend tự xác định quý cần recalc
+            fromDate: jobFromDate,
+            toDate: jobToDate,
           });
         } catch (notifErr) {
           logger.warn('[SyncWorker] Failed to enqueue notification (non-fatal)', { companyId, err: notifErr });

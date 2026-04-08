@@ -38,32 +38,29 @@ function jitter(minMs: number, maxMs: number): Promise<void> {
 export class TracuunntCrawler {
   private sessionId: string;
   private client: AxiosInstance;
+  // FIX-3: lưu proxyUrl một lần, tránh gọi nextForSession hai lần khi proxy đã xoay
+  private readonly proxyUrl: string | null;
 
   constructor(sessionId: string) {
     this.sessionId = sessionId;
-    this.client = this.buildClient();
+    this.proxyUrl  = proxyManager.nextForSession(sessionId);  // gọi một lần, lưu lại
+    this.client    = this.buildClient();                       // dùng this.proxyUrl
   }
 
   private buildClient(): AxiosInstance {
-    const proxyUrl = proxyManager.nextForSession(this.sessionId);
     const profile  = getProfileForSession(this.sessionId);
     const headers  = getSessionHeaders(profile);
 
-    // Override some headers for form-based scraping
+    // Ghi đè một số header cho form scraping
     headers['Content-Type']  = 'application/x-www-form-urlencoded';
     headers['Referer']       = 'http://tracuunnt.gdt.gov.vn/';
     headers['Origin']        = 'http://tracuunnt.gdt.gov.vn';
 
-    const instance = axios.create({
-      timeout: 15_000,
-      headers,
-      maxRedirects: 3,
-    });
+    const instance = axios.create({ timeout: 15_000, headers, maxRedirects: 3 });
 
-    if (proxyUrl) {
-      // tracuunnt.gdt.gov.vn is plain HTTP (port 80) — use plainHttp:true so the
-      // tunnel agent returns the raw TCP socket instead of wrapping a TLS layer.
-      const agent = createTunnelAgent({ proxyUrl, plainHttp: true });
+    if (this.proxyUrl) {
+      // tracuunnt.gdt.gov.vn là plain HTTP (port 80) — dùng plainHttp:true
+      const agent = createTunnelAgent({ proxyUrl: this.proxyUrl, plainHttp: true });
       instance.defaults.httpAgent  = agent;
       instance.defaults.httpsAgent = agent;
     }
@@ -71,21 +68,49 @@ export class TracuunntCrawler {
     return instance;
   }
 
-  /** Look up a single tax code. Returns parsed company info. */
+  /** Tra cứu một mã số thuế. Thử 2 lần trước khi dùng fallback masothue. */
   async lookup(taxCode: string): Promise<CompanyLookupResult> {
-    // Human-like jitter: 2–5 seconds before request
-    await jitter(2_000, 5_000);
+    this.refreshProxyIfNeeded();
 
-    try {
-      const response = await this.client.post(
-        GDT_TRACUUNNT_URL,
-        new URLSearchParams({ mst: taxCode.trim() }).toString(),
-      );
-      return this.parseResponse(taxCode, response.data as string);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.warn(`[TracuunntCrawler] GDT lookup failed for ${taxCode}: ${msg} — falling back to masothue`);
-      return this.lookupMasothue(taxCode);
+    const MAX_GDT_ATTEMPTS = 2;
+    for (let attempt = 0; attempt < MAX_GDT_ATTEMPTS; attempt++) {
+      await jitter(attempt === 0 ? 2_000 : 4_000, attempt === 0 ? 5_000 : 9_000);
+      try {
+        const response = await this.client.post(
+          GDT_TRACUUNNT_URL,
+          new URLSearchParams({ mst: taxCode.trim() }).toString(),
+        );
+        const html = response.data as string;
+        // HTML rỗng hoặc quá ngắn = GDT đang throttle — thử lại
+        if (!html || html.trim().length < 200) {
+          logger.warn('[TracuunntCrawler] GDT trả về HTML rỗng — thử lại', {
+            taxCode, attempt,
+          });
+          continue;
+        }
+        return this.parseResponse(taxCode, html);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn('[TracuunntCrawler] GDT lookup lỗi — thử lại', { taxCode, attempt, msg });
+        if (attempt < MAX_GDT_ATTEMPTS - 1) continue;
+      }
+    }
+    // Tất cả lần thử GDT thất bại → chuyển sang masothue
+    logger.warn('[TracuunntCrawler] GDT lookup thất bại sau tất cả lần thử — chuyển masothue', { taxCode });
+    return this.lookupMasothue(taxCode);
+  }
+
+  /** Làm mới proxy nếu slot đã xoay IP (TMProxy ~45 phút) — gọi trước mỗi lookup(). */
+  refreshProxyIfNeeded(): void {
+    const fresh = proxyManager.nextForSession(this.sessionId);
+    if (fresh && fresh !== this.proxyUrl) {
+      logger.info('[TracuunntCrawler] Proxy đã được làm mới', {
+        sessionId: this.sessionId.slice(0, 8),
+        old: (this.proxyUrl ?? 'none').replace(/:([^@:]+)@/, ':****@'),
+        new: fresh.replace(/:([^@:]+)@/, ':****@'),
+      });
+      (this as unknown as { proxyUrl: string | null }).proxyUrl = fresh;
+      this.client = this.buildClient();
     }
   }
 
@@ -135,12 +160,14 @@ export class TracuunntCrawler {
   }
 
   private async lookupMasothue(taxCode: string): Promise<CompanyLookupResult> {
-    // masothue.com is an HTTPS fallback — must also go through proxy.
-    const proxyUrl = proxyManager.nextForSession(this.sessionId);
+    // masothue.com là HTTPS fallback — cũng dùng proxy để tránh leak IP thật
     const masothueClient = axios.create({
       headers: { 'User-Agent': getSessionHeaders(getProfileForSession(this.sessionId))['User-Agent'] },
       timeout: 10_000,
-      ...(proxyUrl ? { httpAgent: createTunnelAgent({ proxyUrl }), httpsAgent: createTunnelAgent({ proxyUrl }) } : {}),
+      ...(this.proxyUrl ? {
+        httpAgent:  createTunnelAgent({ proxyUrl: this.proxyUrl }),
+        httpsAgent: createTunnelAgent({ proxyUrl: this.proxyUrl }),
+      } : {}),
     });
     try {
       const res = await masothueClient.get(

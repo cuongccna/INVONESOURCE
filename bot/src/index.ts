@@ -2,7 +2,6 @@
  * BOT-01 entry point
  */
 import 'dotenv/config';
-import { worker, manualWorker, autoWorker, flushStaleLocks } from './sync.worker';
 import { proxyManager } from './proxy-manager';
 import { logger } from './logger';
 import { runGdtHealthCheck } from './cron/gdt-health-check';
@@ -13,37 +12,47 @@ logger.info('[Bot] GDT Crawler Bot starting', {
   nodeEnv:     process.env['NODE_ENV'] ?? 'development',
 });
 
-// Flush any locks left by a previous crashed/killed process
-void flushStaleLocks();
+// Đợi ít nhất một slot proxy sẵn sàng trước khi workers được tạo/resume.
+// Tránh race condition khởi động: tất cả slot trả null trong 2–5 giây đầu
+void (async () => {
+  await proxyManager.waitUntilReady();
 
-// Legacy worker (gdt-bot-sync) — processes older queued jobs from sync.ts /start
-worker.on('ready', () => {
-  logger.info('[Bot] Legacy worker ready — gdt-bot-sync queue');
-});
+  // Dynamic import workers AFTER proxy is ready so they won't accept jobs
+  const sw = await import('./sync.worker');
+  const { worker, manualWorker, autoWorker, flushStaleLocks } = sw;
 
-// Manual worker — user-triggered syncs, high concurrency + priority
-manualWorker.on('ready', () => {
-  logger.info('[Bot] Manual worker ready — gdt-sync-manual queue (concurrency 10)');
-});
+  // Flush locks cũ chỉ sau khi proxy xác nhận sẵn sàng
+  void flushStaleLocks();
 
-// Auto worker — background scheduled syncs, conservative concurrency
-autoWorker.on('ready', () => {
-  logger.info('[Bot] Auto worker ready — gdt-sync-auto queue (concurrency 2)');
-});
+  // Legacy worker (gdt-bot-sync) — processes older queued jobs from sync.ts /start
+  worker.on('ready', () => {
+    logger.info('[Bot] Legacy worker ready — gdt-bot-sync queue');
+  });
 
-// Graceful shutdown — drain all three workers before exiting
-async function shutdown(signal: string): Promise<void> {
-  logger.info(`[Bot] ${signal} received, graceful shutdown...`);
-  await Promise.all([
-    worker.close(),
-    manualWorker.close(),
-    autoWorker.close(),
-  ]);
-  process.exit(0);
-}
+  // Manual worker — user-triggered syncs, high concurrency + priority
+  manualWorker.on('ready', () => {
+    logger.info('[Bot] Manual worker ready — gdt-sync-manual queue (concurrency 10)');
+  });
 
-process.on('SIGTERM', () => void shutdown('SIGTERM'));
-process.on('SIGINT',  () => void shutdown('SIGINT'));
+  // Auto worker — background scheduled syncs, conservative concurrency
+  autoWorker.on('ready', () => {
+    logger.info('[Bot] Auto worker ready — gdt-sync-auto queue (concurrency 2)');
+  });
+
+  // Graceful shutdown — drain all three workers before exiting
+  async function shutdown(signal: string): Promise<void> {
+    logger.info(`[Bot] ${signal} received, graceful shutdown...`);
+    await Promise.all([
+      worker.close(),
+      manualWorker.close(),
+      autoWorker.close(),
+    ]);
+    process.exit(0);
+  }
+
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT',  () => void shutdown('SIGINT'));
+})();
 
 // Phase 7: GDT canary health check every 15 minutes
 // Runs prefetchCount on dedicated canary account — no DB writes.

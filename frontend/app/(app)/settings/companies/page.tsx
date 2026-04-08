@@ -127,8 +127,10 @@ export default function CompaniesSettingsPage() {
         // New company: go to onboarding
         const newId = res.data?.data?.id;
         if (newId) {
-          await refreshCompanies();
-          setActiveCompanyId(newId);
+          // Pass newId directly so refreshCompanies sets it as active.
+          // Do NOT call setActiveCompanyId(newId) separately — it uses a stale
+          // closure where companies doesn't yet include the newly created company.
+          await refreshCompanies(newId);
           router.push('/onboarding');
           return;
         }

@@ -259,8 +259,12 @@ function parseInvoiceDate(raw: unknown): string | null {
 /** Normalise VAT rate → numeric string or null */
 function parseVatRate(raw: unknown): string | null {
   if (raw == null) return null;
-  const s = String(raw).replace('%', '').trim();
-  if (s === 'kct' || s === 'kkktt' || s === '') return null;
+  const s = String(raw).replace('%', '').trim().toLowerCase();
+  if (s === '') return null;
+  // KCT (không chịu thuế) / KKKTT (không kê khai không tính thuế) = 0% VAT-exempt.
+  // Must return '0' (not null) so they appear in ct30 (exempt revenue) rather than
+  // silently inflating ct40_total_output_revenue with an untracked NaN bucket.
+  if (s === 'kct' || s === 'kkktt') return '0';
   const n = parseFloat(s);
   return isNaN(n) ? null : String(n);
 }

@@ -268,11 +268,14 @@ async function _fetchDeductibleInputSubtotal(
        AND direction = 'input'
        AND status = 'valid'
        AND (
-         (COALESCE(invoice_group, 5) = 5 AND gdt_validated = true)
+         (invoice_group = 5 AND gdt_validated = true)
          OR (invoice_group IN (6, 8))
        )
        AND deleted_at IS NULL
-       AND (total_amount <= 20000000 OR payment_method IS DISTINCT FROM 'cash')
+       AND (
+         total_amount <= 20000000
+         OR (payment_method IS NOT NULL AND LOWER(payment_method) <> 'cash')
+       )
        AND ${dateFilter}`,
     params
   );

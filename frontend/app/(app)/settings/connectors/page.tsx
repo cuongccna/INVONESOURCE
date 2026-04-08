@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
-import apiClient from '../../../../lib/apiClient';
+import apiClient, { setApiCompanyId } from '../../../../lib/apiClient';
 import { useToast } from '../../../../components/ToastProvider';
 import { useCompany } from '../../../../contexts/CompanyContext';
 import { useSyncContext } from '../../../../contexts/SyncContext';
@@ -95,6 +95,8 @@ export default function ConnectorsPage() {
   const [expandedRunError, setExpandedRunError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
+    if (!activeCompanyId) return;
+    setApiCompanyId(activeCompanyId);
     try {
       const [botRes, importRes] = await Promise.all([
         apiClient.get<{ data: { config: BotConfig | null; lastRuns: BotRun[] } }>('/bot/status'),
@@ -108,12 +110,13 @@ export default function ConnectorsPage() {
     } catch { /* silent */ } finally {
       setLoading(false);
     }
-  }, []);
+  }, [activeCompanyId]);
 
   useEffect(() => { void load(); }, [load]);
 
   const handleSetup = async () => {
-    if (!password.trim() || !tosAccepted) return;
+    if (!password.trim() || !tosAccepted || !activeCompanyId) return;
+    setApiCompanyId(activeCompanyId);
     setSaving(true);
     try {
       await apiClient.post('/bot/setup', {
@@ -133,7 +136,8 @@ export default function ConnectorsPage() {
   };
 
   const handleChangePassword = async () => {
-    if (!newPassword.trim()) return;
+    if (!newPassword.trim() || !activeCompanyId) return;
+    setApiCompanyId(activeCompanyId);
     setSaving(true);
     try {
       await apiClient.post('/bot/setup', {
@@ -152,6 +156,8 @@ export default function ConnectorsPage() {
   };
 
   const handleDelete = async () => {
+    if (!activeCompanyId) return;
+    setApiCompanyId(activeCompanyId);
     setDeleting(true);
     try {
       await apiClient.delete('/bot/config');

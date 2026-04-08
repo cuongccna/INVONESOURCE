@@ -32,7 +32,7 @@ interface CompanyContextValue {
   activeCompany: CompanyInfo | null;
   activeCompanyId: string | null;
   setActiveCompanyId: (id: string) => void;
-  refreshCompanies: () => Promise<void>;
+  refreshCompanies: (overridePreferredId?: string) => Promise<void>;
   loading: boolean;
 }
 
@@ -41,7 +41,7 @@ const CompanyContext = createContext<CompanyContextValue>({
   activeCompany: null,
   activeCompanyId: null,
   setActiveCompanyId: () => undefined,
-  refreshCompanies: async () => undefined,
+  refreshCompanies: async (_overridePreferredId?: string) => undefined,
   loading: true,
 });
 
@@ -52,15 +52,15 @@ export function CompanyProvider({ children }: { children: ReactNode }) {
   const [activeCompanyId, setActiveCompanyIdState] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const refreshCompanies = useCallback(async () => {
+  const refreshCompanies = useCallback(async (overridePreferredId?: string) => {
     try {
       const res = await apiClient.get<{ data: CompanyInfo[] }>('/companies');
       const list = res.data.data;
       setCompanies(list);
 
       if (list.length > 0) {
-        const stored =
-          typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY) : null;
+        const stored = overridePreferredId ??
+          (typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY) : null);
         const preferred = list.find((c) => c.id === stored) ?? list[0];
         setActiveCompanyIdState(preferred.id);
         setApiCompanyId(preferred.id);

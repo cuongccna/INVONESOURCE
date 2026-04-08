@@ -210,10 +210,17 @@ export class ProxyManager extends EventEmitter {
       const slotIdx = this._hashToIndex(sessionSuffix, this.slots.length);
       const slot    = this.slots[slotIdx]!;
       if (!slot.currentUrl) {
-        // Slot still initialising — fall back to first available slot
-        const fallback = this.slots.find(s => s.currentUrl);
-        if (!fallback) return null;
-        logger.debug('[ProxyManager] Slot not ready, using fallback', {
+        // Slot đang khởi tạo — thử slot sẵn sàng khác (không đang refreshing)
+        const fallback = this.slots.find(s => s.currentUrl && !s.refreshing);
+        if (!fallback) {
+          // Tất cả slot đang khởi tạo — caller cần xử lý null
+          logger.warn('[ProxyManager] Tất cả slot đang khởi tạo, chờ slot đầu tiên sẵn sàng', {
+            sessionSuffix:   sessionSuffix.slice(0, 8),
+            refreshingSlots: this.slots.filter(s => s.refreshing).length,
+          });
+          return null; // caller phải xử lý null một cách an toàn
+        }
+        logger.debug('[ProxyManager] Slot chưa sẵn sàng, dùng fallback', {
           wantedSlot: slotIdx, fallbackKey: fallback.apiKey.slice(0, 8) + '…',
         });
         return fallback.currentUrl;
@@ -320,6 +327,26 @@ export class ProxyManager extends EventEmitter {
       const slot = this.slots.find(s => s.currentUrl === url);
       if (slot) {
         slot.failedUrls.add(url);
+        // Nullify ngay lập tức để nextForCompany không trả về URL lỗi trong thời gian xoay IP
+        slot.currentUrl       = null;
+        slot.currentSocks5Url = null;
+        logger.warn('[ProxyManager] Slot bị đánh dấu lỗi — đang xoay IP mới', {
+          apiKey:    slot.apiKey.slice(0, 8) + '…',
+          failedUrl: url.replace(/:([^@:]+)@/, ':****@'),
+        });
+        // Clear any tenant affinity that points to this failed proxy so tenants
+        // don't get re-assigned the broken URL.
+        for (const [tenantId, assigned] of this.tenantProxyMap.entries()) {
+          if (assigned === url) {
+            this.tenantProxyMap.delete(tenantId);
+            logger.info('[ProxyManager] Xóa affinity proxy cho tenant do proxy lỗi', {
+              tenantId: tenantId.slice(0, 8),
+              proxy:    url.replace(/:([^@:]+)@/, ':****@'),
+            });
+          }
+        }
+        // Emit proxyFailed for TMProxy mode (parity with IPRoyal/static branches)
+        this.emit('proxyFailed', url);
         this._rotateSlot(slot);
       }
       return;
@@ -434,6 +461,28 @@ export class ProxyManager extends EventEmitter {
     this.index = 0;
   }
 
+  /**
+   * Chờ đến khi ít nhất một slot TMProxy có currentUrl !== null.
+   * Gọi khi khởi động server để tránh sync chạy trước khi proxy sẵn sàng.
+   * Không áp dụng cho IPRoyal (luôn sẵn sàng) hoặc static pool.
+   */
+  async waitUntilReady(timeoutMs = 15_000): Promise<void> {
+    if (this.slots.length === 0) return; // IPRoyal / static pool — luôn sẵn sàng
+    const deadline = Date.now() + timeoutMs;
+    const POLL_MS  = 300;
+    while (Date.now() < deadline) {
+      if (this.slots.some(s => s.currentUrl !== null)) {
+        logger.info('[ProxyManager] Tất cả slot proxy đã sẵn sàng');
+        return;
+      }
+      await new Promise<void>(r => setTimeout(r, POLL_MS));
+    }
+    logger.warn('[ProxyManager] Chờ proxy quá thời gian — tiếp tục không có proxy sẵn sàng', {
+      timeoutMs,
+    });
+    // Không throw — graceful degradation
+  }
+
   get size(): number {
     if (this.iproyalSlots.length > 0) return this.iproyalSlots.length;
     return this.slots.length > 0 ? this.slots.length : this.proxies.length;
@@ -442,10 +491,33 @@ export class ProxyManager extends EventEmitter {
 
   // ── Private helpers ───────────────────────────────────────────────────────
 
-  /** Deterministic hash of string → index in range [0, len) */
+  /** Hash chuỗi → chỉ số trong [0, len) — FNV-1a, phân bố đều hơn djb2 cho UUID */
   private _hashToIndex(s: string, len: number): number {
-    const h = [...s].reduce((acc, c) => (acc * 31 + c.charCodeAt(0)) >>> 0, 0);
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = (Math.imul(h, 0x01000193)) >>> 0;
+    }
     return h % len;
+  }
+
+  /**
+   * Phân bố company theo slot — dùng cho admin dashboard / giám sát.
+   * companyCount = 0 ở đây; caller tự populate từ DB:
+   *   SELECT proxy_slot_idx, count(*) FROM gdt_bot_configs GROUP BY proxy_slot_idx
+   */
+  getSlotDistribution(): Array<{ apiKey: string; companyCount: number; publicIp: string | null }> {
+    return this.slots.map(slot => {
+      let publicIp: string | null = null;
+      if (slot.currentUrl) {
+        try { publicIp = new URL(slot.currentUrl).hostname; } catch { /* URL không hợp lệ */ }
+      }
+      return {
+        apiKey:       slot.apiKey.slice(0, 8) + '…',
+        publicIp,
+        companyCount: 0,
+      };
+    });
   }
 
   /** Seed a slot with its current TMProxy IP (no rotation). */
@@ -491,11 +563,11 @@ export class ProxyManager extends EventEmitter {
         this.emit('proxyRotated', session.url);
       })
       .catch(err => {
-        logger.error('[ProxyManager] TMProxy slot rotation failed', {
+        logger.error('[ProxyManager] Xoay IP thất bại — slot sẽ bị bỏ qua cho đến khi xoay thành công', {
           apiKey: slot.apiKey.slice(0, 8) + '…',
           error:  (err as Error).message,
         });
-        slot.currentUrl       = null;
+        slot.currentUrl       = null;  // đã null từ markFailed, giữ nguyên để skip slot này
         slot.currentSocks5Url = null;
       })
       .finally(() => { slot.refreshing = false; });

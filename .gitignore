@@ -59,3 +59,8 @@ dump.rdb
 scripts/check-missing-tables.js
 backend/tmp/check_col.js
 backend/tmp/run_024.js
+backend/scripts/check-replaced-plugin.js
+backend/scripts/inspect-declaration.js
+backend/tmp/calc-replaced.js
+backend/tmp/check-migration.js
+backend/tests/tax/htkk-vat-quarter.test.ts

@@ -98,15 +98,18 @@ export class VatReconciliationService {
          AND EXTRACT(MONTH FROM invoice_date) = $2
          AND EXTRACT(YEAR FROM invoice_date) = $3
          AND (
-           -- Group 5: requires GDT validation
-           (COALESCE(invoice_group, 5) = 5 AND gdt_validated = true)
+           -- Group 5: có mã CQT → phải gdt_validated; NULL group không tự động coi là group 5
+           (invoice_group = 5 AND gdt_validated = true)
            OR
-           -- Group 6 & 8: no CQT code, deductible without gdt_validated
+           -- Group 6 & 8: không có mã CQT, được khấu trừ không cần gdt_validated
            (invoice_group IN (6, 8))
+           OR
+           -- NULL group + gdt_validated: serial format không nhận dạng được nhưng GDT đã xác nhận
+           (invoice_group IS NULL AND gdt_validated = true)
          )
          AND (
            total_amount <= 20000000
-           OR payment_method IS DISTINCT FROM 'cash'
+           OR (payment_method IS NOT NULL AND LOWER(payment_method) <> 'cash')
          )
          ${inputIdFilter}
        GROUP BY vat_rate`,
@@ -137,13 +140,18 @@ export class VatReconciliationService {
       outputBaseParams()
     );
 
-    // Build output breakdown by rate
+    // Build output breakdown by rate.
+    // NaN keys occur when vat_rate is NULL or non-numeric in DB (e.g. KCT stored before
+    // the parseVatRate fix).  Merge them into '0' (tax-exempt bucket → ct30) so they
+    // show up in [26] instead of silently inflating ct40 with no matching breakdown row.
     const outputMap: Record<string, { subtotal: number; vat: number }> = {};
     for (const row of outputByRate) {
-      const rate = String(parseFloat(row.vat_rate));
+      const rateParsed = parseFloat(row.vat_rate);
+      const rate = isNaN(rateParsed) ? '0' : String(rateParsed);
+      const existing = outputMap[rate] ?? { subtotal: 0, vat: 0 };
       outputMap[rate] = {
-        subtotal: parseFloat(row.subtotal_sum || '0'),
-        vat: parseFloat(row.vat_sum || '0'),
+        subtotal: existing.subtotal + parseFloat(row.subtotal_sum || '0'),
+        vat:      existing.vat     + parseFloat(row.vat_sum     || '0'),
       };
     }
 
@@ -291,10 +299,17 @@ export class VatReconciliationService {
          AND deleted_at IS NULL
          AND EXTRACT(YEAR FROM invoice_date) = $2
          AND EXTRACT(MONTH FROM invoice_date) = ANY($3::int[])
-         AND (total_amount <= 20000000 OR payment_method IS DISTINCT FROM 'cash')
          AND (
-           (COALESCE(invoice_group, 5) = 5 AND gdt_validated = true)
+           total_amount <= 20000000
+           OR (payment_method IS NOT NULL AND LOWER(payment_method) <> 'cash')
+         )
+         AND (
+           -- Group 5: có mã CQT → phải gdt_validated; NULL group không tự động coi là group 5
+           (invoice_group = 5 AND gdt_validated = true)
            OR (invoice_group IN (6, 8))
+           OR
+           -- NULL group + gdt_validated: serial format không nhận dạng được nhưng GDT đã xác nhận
+           (invoice_group IS NULL AND gdt_validated = true)
          )
          ${inputIdFilter}
        GROUP BY vat_rate`,
@@ -318,19 +333,27 @@ export class VatReconciliationService {
       outputBaseParams(),
     );
 
+    // Build output breakdown — merge NaN/NULL vat_rate into '0' (exempt bucket = ct30).
     const outputMap: Record<string, { subtotal: number; vat: number }> = {};
     for (const row of outputByRate) {
-      const rate = String(parseFloat(row.vat_rate));
+      const rateParsed = parseFloat(row.vat_rate);
+      const rate = isNaN(rateParsed) ? '0' : String(rateParsed);
+      const existing = outputMap[rate] ?? { subtotal: 0, vat: 0 };
       outputMap[rate] = {
-        subtotal: parseFloat(row.subtotal_sum || '0'),
-        vat: parseFloat(row.vat_sum || '0'),
+        subtotal: existing.subtotal + parseFloat(row.subtotal_sum || '0'),
+        vat:      existing.vat     + parseFloat(row.vat_sum     || '0'),
       };
     }
 
     const inputMap: Record<string, { subtotal: number; vat: number }> = {};
     for (const row of inputDeductible) {
-      const rate = String(parseFloat(row.vat_rate));
-      inputMap[rate] = { subtotal: parseFloat(row.subtotal_sum || '0'), vat: parseFloat(row.vat_sum || '0') };
+      const rateParsed = parseFloat(row.vat_rate);
+      const rate = isNaN(rateParsed) ? '0' : String(rateParsed);
+      const existing = inputMap[rate] ?? { subtotal: 0, vat: 0 };
+      inputMap[rate] = {
+        subtotal: existing.subtotal + parseFloat(row.subtotal_sum || '0'),
+        vat:      existing.vat     + parseFloat(row.vat_sum     || '0'),
+      };
     }
 
     const ct29 = Object.values(outputMap).reduce((s, v) => s + v.subtotal, 0);
@@ -349,6 +372,26 @@ export class VatReconciliationService {
         10: { output_subtotal: ct36,  output_vat: ct37, input_subtotal: inputMap['10']?.subtotal ?? 0, input_vat: inputMap['10']?.vat ?? 0 },
       },
     };
+
+    // Upsert to vat_reconciliations for the quarterly period (period_month stores quarter)
+    await pool.query(
+      `INSERT INTO vat_reconciliations (
+        id, company_id, period_month, period_year,
+        output_vat, input_vat, payable_vat, breakdown, generated_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+      ON CONFLICT (company_id, period_month, period_year)
+      DO UPDATE SET
+        output_vat = EXCLUDED.output_vat,
+        input_vat = EXCLUDED.input_vat,
+        payable_vat = EXCLUDED.payable_vat,
+        breakdown = EXCLUDED.breakdown,
+        generated_at = NOW()`,
+      [
+        uuidv4(), companyId, quarter, year,
+        ct40a, ct23, Math.max(0, ct40a - ct23),
+        JSON.stringify(breakdown),
+      ]
+    );
 
     return {
       companyId, periodMonth: quarter, periodYear: year,
