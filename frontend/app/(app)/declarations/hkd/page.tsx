@@ -5,6 +5,8 @@ import Link from 'next/link';
 import apiClient from '../../../../lib/apiClient';
 import { useToast } from '../../../../components/ToastProvider';
 import { formatVND } from '../../../../utils/formatCurrency';
+import { useRouter } from 'next/navigation';
+import { useCompany } from '../../../../contexts/CompanyContext';
 
 interface HkdDeclaration {
   id: string;
@@ -67,6 +69,16 @@ export default function HkdDeclarationsPage() {
   }, [year]);
 
   useEffect(() => { void load(); }, [load]);
+
+  const { activeCompany, loading: companyLoading } = useCompany();
+  const router = useRouter();
+
+  // If active company is NOT household, redirect to DN declarations
+  useEffect(() => {
+    if (!companyLoading && activeCompany && activeCompany.company_type !== 'household') {
+      void router.push('/declarations');
+    }
+  }, [activeCompany, companyLoading, router]);
 
   const calculate = async () => {
     setCalculating(true);
@@ -147,16 +159,7 @@ export default function HkdDeclarationsPage() {
         </button>
       </div>
 
-      {/* Loại tờ khai toggle */}
-      <div className="flex rounded-xl border border-gray-200 overflow-hidden mb-5 w-full max-w-xs">
-        <Link href="/declarations"
-          className="flex-1 py-2 text-sm font-medium text-center text-gray-600 hover:bg-gray-50 transition-colors">
-          Doanh Nghiệp (01/GTGT)
-        </Link>
-        <span className="flex-1 py-2 text-sm font-semibold text-center bg-primary-600 text-white">
-          Hộ KD / CNKD (TT40)
-        </span>
-      </div>
+      {/* Form type is implied by active company; toggle removed */}
 
       {/* Year selector */}
       <div className="flex gap-2 mb-4">

@@ -13,26 +13,32 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const companyId = req.user!.companyId;
     const now = new Date();
-    const month = req.query['month'] ? parseInt(String(req.query['month']), 10) : now.getMonth() + 1;
-    const year  = req.query['year']  ? parseInt(String(req.query['year']),  10) : now.getFullYear();
+    const month     = req.query['month']      ? parseInt(String(req.query['month']),      10) : now.getMonth() + 1;
+    const year      = req.query['year']       ? parseInt(String(req.query['year']),       10) : now.getFullYear();
+    const monthFrom = req.query['month_from'] ? parseInt(String(req.query['month_from']), 10) : month;
+    const monthTo   = req.query['month_to']   ? parseInt(String(req.query['month_to']),   10) : month;
+    // Convert to date range for flexible monthly/quarterly/yearly filtering
+    const periodStart = new Date(year, monthFrom - 1, 1);
+    const periodEnd   = new Date(year, monthTo, 1); // exclusive upper bound (first day of month AFTER range)
 
-    const [invoiceStats, vatStats, syncStats] = await Promise.all([
+    const [invoiceStats, vatStats, syncStats, ytdStats, riskStats] = await Promise.all([
       pool.query<{
         total: string; output_count: string; input_count: string;
-        invalid_count: string; unvalidated_count: string;
+        invalid_count: string; unvalidated_count: string; input_above_20m_count: string;
       }>(
         `SELECT
            COUNT(*) as total,
            COUNT(*) FILTER (WHERE direction = 'output') as output_count,
            COUNT(*) FILTER (WHERE direction = 'input') as input_count,
            COUNT(*) FILTER (WHERE status = 'cancelled') as invalid_count,
-           COUNT(*) FILTER (WHERE gdt_validated = false AND status = 'valid') as unvalidated_count
+           COUNT(*) FILTER (WHERE gdt_validated = false AND status = 'valid') as unvalidated_count,
+           COUNT(*) FILTER (WHERE direction = 'input' AND total_amount > 20000000) as input_above_20m_count
          FROM invoices
          WHERE company_id = $1
-           AND EXTRACT(MONTH FROM invoice_date) = $2
-           AND EXTRACT(YEAR FROM invoice_date) = $3
+           AND invoice_date >= $2
+           AND invoice_date <  $3
            AND deleted_at IS NULL`,
-        [companyId, month, year]
+        [companyId, periodStart.toISOString(), periodEnd.toISOString()]
       ),
       // Calculate VAT directly from invoices (not from vat_reconciliations which requires manual trigger)
       pool.query(
@@ -45,10 +51,10 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
            ) AS payable_vat
          FROM invoices
          WHERE company_id = $1
-           AND EXTRACT(MONTH FROM invoice_date) = $2
-           AND EXTRACT(YEAR FROM invoice_date) = $3
+           AND invoice_date >= $2
+           AND invoice_date <  $3
            AND deleted_at IS NULL`,
-        [companyId, month, year]
+        [companyId, periodStart.toISOString(), periodEnd.toISOString()]
       ),
       pool.query(
         `SELECT provider, errors_count, error_detail, started_at
@@ -56,14 +62,81 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
          ORDER BY started_at DESC LIMIT 10`,
         [companyId]
       ),
+      // YTD revenue & cost for CIT estimate
+      pool.query<{ ytd_revenue: string; ytd_cost: string }>(
+        `SELECT
+           COALESCE(SUM(total_amount) FILTER (WHERE direction = 'output' AND status != 'cancelled'), 0) AS ytd_revenue,
+           COALESCE(SUM(total_amount) FILTER (WHERE direction = 'input'  AND status != 'cancelled'), 0) AS ytd_cost
+         FROM invoices
+         WHERE company_id = $1
+           AND EXTRACT(YEAR FROM invoice_date) = $2
+           AND deleted_at IS NULL`,
+        [companyId, year]
+      ),
+      // Risk score from unacknowledged flags
+      pool.query<{ critical: string; high: string; medium: string }>(
+        `SELECT
+           COUNT(*) FILTER (WHERE risk_level = 'critical') AS critical,
+           COUNT(*) FILTER (WHERE risk_level = 'high')     AS high,
+           COUNT(*) FILTER (WHERE risk_level = 'medium')   AS medium
+         FROM company_risk_flags
+         WHERE company_id = $1 AND is_acknowledged = false`,
+        [companyId]
+      ).catch(() => ({ rows: [{ critical: '0', high: '0', medium: '0' }] })),
     ]);
 
+    // CIT estimate: YTD gross profit × 20%
+    const ytd = ytdStats.rows[0];
+    const ytdRevenue = Number(ytd?.ytd_revenue ?? 0);
+    const ytdCost    = Number(ytd?.ytd_cost    ?? 0);
+    const ytdProfit  = ytdRevenue - ytdCost;
+    const citEstimate = Math.max(0, ytdProfit * 0.20);
+
+    // Risk score: weighted, capped at 100
+    const riskRow = riskStats.rows[0] ?? { critical: '0', high: '0', medium: '0' };
+    const riskScore = Math.min(100,
+      Number(riskRow.critical) * 40 +
+      Number(riskRow.high)     * 20 +
+      Number(riskRow.medium)   *  5
+    );
+
+    // Tax deadlines: next 3 upcoming filing dates (sorted by days remaining)
+    const now2 = new Date();
+    const daysUntil = (d: Date) => Math.ceil((d.getTime() - now2.getTime()) / 86_400_000);
+    const q = Math.ceil(month / 3);
+    const taxDeadlines = [
+      {
+        label: `Thuế GTGT T${month}/${year}`,
+        due:   new Date(year, month, 20).toISOString().split('T')[0],
+        days_left: daysUntil(new Date(year, month, 20)),
+        type: 'gtgt',
+      },
+      {
+        label: `Tạm nộp TNDN Q${q}/${year}`,
+        due:   new Date(year, q * 3, 30).toISOString().split('T')[0],
+        days_left: daysUntil(new Date(year, q * 3, 30)),
+        type: 'cit_provisional',
+      },
+      {
+        label: `Quyết toán TNDN ${year}`,
+        due:   `${year + 1}-03-31`,
+        days_left: daysUntil(new Date(year + 1, 2, 31)),
+        type: 'cit_annual',
+      },
+    ].sort((a, b) => a.days_left - b.days_left);
+
     sendSuccess(res, {
-      period: { month, year },
+      period: { month, monthFrom, monthTo, year },
       invoices: invoiceStats.rows[0],
       // vatStats always returns exactly 1 row (aggregate), ensure non-null
       vat: vatStats.rows[0] ?? { output_vat: '0', input_vat: '0', payable_vat: '0' },
       recentSyncs: syncStats.rows,
+      cit_estimate: citEstimate,
+      ytd_revenue: ytdRevenue,
+      ytd_cost: ytdCost,
+      ytd_profit: ytdProfit,
+      risk_score: riskScore,
+      tax_deadlines: taxDeadlines,
     });
   } catch (err) {
     next(err);

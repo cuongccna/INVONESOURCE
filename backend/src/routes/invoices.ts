@@ -95,18 +95,37 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
         [...params, pageSize, offset]
       ),
       pool.query(
-        `SELECT COUNT(*) AS count,
+        `SELECT status,
+                COUNT(*)                      AS count,
                 COALESCE(SUM(subtotal), 0)    AS total_subtotal,
                 COALESCE(SUM(vat_amount), 0)  AS total_vat
-         FROM invoices WHERE ${where}`,
+         FROM invoices WHERE ${where}
+         GROUP BY status`,
         params
       ),
     ]);
 
+    // Build per-status breakdown
+    type StatusRow = { status: string; count: string; total_subtotal: string; total_vat: string };
+    const byStatus: Record<string, { count: number; subtotal: number; vat: number }> = {};
+    let totalCount = 0;
+    let totalSubtotal = 0;
+    let totalVat = 0;
+    for (const row of (summaryResult.rows as StatusRow[])) {
+      const cnt  = Number(row.count);
+      const sub  = Number(row.total_subtotal);
+      const vat  = Number(row.total_vat);
+      byStatus[row.status] = { count: cnt, subtotal: sub, vat };
+      totalCount    += cnt;
+      totalSubtotal += sub;
+      totalVat      += vat;
+    }
+
     const summary = {
-      count:    Number(summaryResult.rows[0].count),
-      subtotal: Number(summaryResult.rows[0].total_subtotal),
-      vat:      Number(summaryResult.rows[0].total_vat),
+      count:    totalCount,
+      subtotal: totalSubtotal,
+      vat:      totalVat,
+      by_status: byStatus,
     };
 
     const total = Number(countResult.rows[0].count);

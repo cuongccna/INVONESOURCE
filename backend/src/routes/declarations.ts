@@ -80,7 +80,21 @@ router.post(
       const parsed = calcSchema.safeParse(req.body);
       if (!parsed.success) throw new ValidationError(parsed.error.issues[0]?.message ?? 'Invalid input');
 
-      console.log('[CALC-DEBUG] companyId from JWT/header:', req.user!.companyId, '| body:', JSON.stringify(req.body), '| x-company-id header:', req.headers['x-company-id']);
+// Block HKD/household companies — use /api/hkd endpoints instead
+      const compRes = await pool.query<{ company_type: string; business_type: string }>(
+        `SELECT COALESCE(company_type, 'private') AS company_type,
+                COALESCE(business_type, 'DN')     AS business_type
+         FROM companies WHERE id = $1`,
+        [req.user!.companyId]
+      );
+      const companyType  = compRes.rows[0]?.company_type  ?? 'private';
+      const businessType = compRes.rows[0]?.business_type ?? 'DN';
+      const isHousehold  = companyType === 'household' || ['HKD', 'HND', 'CA_NHAN'].includes(String(businessType));
+      if (isHousehold) {
+          throw new ValidationError('Công ty thuộc loại Hộ kinh doanh/Cá nhân kinh doanh — sử dụng form HKD (TT40) để tính tờ khai');
+        }
+
+        console.log('[CALC-DEBUG] companyId from JWT/header:', req.user!.companyId, '| body:', JSON.stringify(req.body), '| x-company-id header:', req.headers['x-company-id']);
 
       const engine = new TaxDeclarationEngine();
       let declaration;

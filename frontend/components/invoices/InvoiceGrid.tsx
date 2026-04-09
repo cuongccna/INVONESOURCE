@@ -37,7 +37,12 @@ export interface GridMeta {
   page: number;
   pageSize: number;
   totalPages: number;
-  summary?: { count: number; subtotal: number; vat: number };
+  summary?: {
+    count: number;
+    subtotal: number;
+    vat: number;
+    by_status?: Record<string, { count: number; subtotal: number; vat: number }>;
+  };
 }
 
 interface Props {
@@ -65,10 +70,19 @@ const STATUS_LABELS: Record<string, { label: string; color: string }> = {
 const PAGE_SIZES = [15, 30, 50, 100];
 
 function rowBg(inv: GridInvoice): string {
-  if (inv.status === 'cancelled' || inv.status === 'invalid') return 'bg-red-50/50';
-  if (!inv.payment_method && Number(inv.total_amount) >= 5_000_000 && inv.direction === 'input') return 'bg-yellow-50/60';
+  if (inv.status === 'cancelled' || inv.status === 'invalid') return 'bg-red-50/60';
+  if (inv.status === 'replaced')  return 'bg-yellow-50/60';
+  if (inv.status === 'adjusted')  return 'bg-blue-50/50';
+  if (!inv.payment_method && Number(inv.total_amount) >= 5_000_000 && inv.direction === 'input') return 'bg-amber-50/40';
   return '';
 }
+
+const STATUS_LEFT_BORDER: Record<string, string> = {
+  cancelled: 'border-l-2 border-l-red-400',
+  invalid:   'border-l-2 border-l-red-400',
+  replaced:  'border-l-2 border-l-yellow-400',
+  adjusted:  'border-l-2 border-l-blue-400',
+};
 
 function fmtVND(n: string | number | null | undefined): string {
   if (n == null) return '—';
@@ -127,23 +141,62 @@ export default function InvoiceGrid({
   return (
     <div className="space-y-2">
       {/* ── Summary Bar ── */}
-      {sum && (
-        <div className="flex items-center justify-between bg-gray-50 border border-gray-200 rounded-xl px-4 py-2.5 text-sm flex-wrap gap-2">
-          <div className="flex items-center gap-4 text-gray-600 flex-wrap gap-y-1">
-            <span>Tổng: <strong className="text-gray-900">{sum.count.toLocaleString('vi-VN')}</strong> HĐ</span>
-            <span>Tiền hàng: <strong className="text-gray-900">{fmtVND(sum.subtotal)}đ</strong></span>
-            <span>Thuế VAT: <strong className="text-gray-900">{fmtVND(sum.vat)}đ</strong></span>
+      {sum && (() => {
+        const bs = sum.by_status ?? {};
+        const valid      = bs['valid']     ?? { count: 0, subtotal: 0, vat: 0 };
+        const cancelled  = bs['cancelled'] ?? { count: 0, subtotal: 0, vat: 0 };
+        const replaced   = bs['replaced']  ?? { count: 0, subtotal: 0, vat: 0 };
+        const adjusted   = bs['adjusted']  ?? { count: 0, subtotal: 0, vat: 0 };
+        const invalid    = bs['invalid']   ?? { count: 0, subtotal: 0, vat: 0 };
+        const nonValidCount = cancelled.count + replaced.count + adjusted.count + invalid.count;
+        return (
+          <div className="bg-white border border-gray-200 rounded-xl px-4 py-3 text-sm shadow-sm space-y-2">
+            {/* Dòng 1: Tổng + Hợp lệ */}
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div className="flex items-center gap-3 flex-wrap gap-y-1">
+                <span className="text-gray-500">Tổng: <strong className="text-gray-900">{sum.count.toLocaleString('vi-VN')}</strong> HĐ</span>
+                <span className="text-green-700 font-semibold">
+                  Hợp lệ: <strong>{valid.count.toLocaleString('vi-VN')}</strong> HĐ
+                  {valid.subtotal > 0 && (
+                    <> &mdash; <span className="font-normal">{fmtVND(valid.subtotal)}đ</span> | VAT: <span className="font-normal">{fmtVND(valid.vat)}đ</span></>
+                  )}
+                </span>
+              </div>
+              {onExcelExport && (
+                <button onClick={onExcelExport}
+                  className="text-xs border border-gray-300 rounded-lg px-3 py-1.5 text-gray-600 hover:bg-gray-100 flex items-center gap-1 shrink-0">
+                  📊 Xuất Excel
+                </button>
+              )}
+            </div>
+            {/* Dòng 2: Breakdown cho trạng thái không hợp lệ — chỉ hiện khi có */}
+            {nonValidCount > 0 && (
+              <div className="flex items-center gap-x-4 gap-y-1 flex-wrap text-xs border-t border-gray-100 pt-2">
+                {cancelled.count > 0 && (
+                  <span className="flex items-center gap-1 text-red-600 bg-red-50 px-2 py-0.5 rounded-full">
+                    ⛔ Hủy: <strong>{cancelled.count}</strong> HĐ &middot; {fmtVND(cancelled.subtotal)}đ
+                  </span>
+                )}
+                {replaced.count > 0 && (
+                  <span className="flex items-center gap-1 text-yellow-700 bg-yellow-50 px-2 py-0.5 rounded-full">
+                    ↺ Thay thế: <strong>{replaced.count}</strong> HĐ &middot; {fmtVND(replaced.subtotal)}đ
+                  </span>
+                )}
+                {adjusted.count > 0 && (
+                  <span className="flex items-center gap-1 text-blue-700 bg-blue-50 px-2 py-0.5 rounded-full">
+                    ✏ Điều chỉnh: <strong>{adjusted.count}</strong> HĐ &middot; {fmtVND(adjusted.subtotal)}đ
+                  </span>
+                )}
+                {invalid.count > 0 && (
+                  <span className="flex items-center gap-1 text-orange-700 bg-orange-50 px-2 py-0.5 rounded-full">
+                    ⚠ Không hợp lệ: <strong>{invalid.count}</strong> HĐ
+                  </span>
+                )}
+              </div>
+            )}
           </div>
-          {onExcelExport && (
-            <button
-              onClick={onExcelExport}
-              className="text-xs border border-gray-300 rounded-lg px-3 py-1.5 text-gray-600 hover:bg-gray-100 flex items-center gap-1"
-            >
-              📊 Xuất Excel
-            </button>
-          )}
-        </div>
-      )}
+        );
+      })()}
 
       {/* ── Bulk Action Bar ── */}
       {someSelected && (
@@ -194,6 +247,7 @@ export default function InvoiceGrid({
                 const isSelected = selectedIds.includes(inv.id);
                 const isExpanded = expandedId === inv.id;
                 const bg = rowBg(inv);
+                const leftBorder = STATUS_LEFT_BORDER[inv.status] ?? '';
                 const statusInfo = STATUS_LABELS[inv.status] ?? { label: inv.status, color: 'bg-gray-100 text-gray-700' };
                 const partyName    = direction === 'output' ? inv.buyer_name  : direction === 'input' ? inv.seller_name  : (inv.direction === 'output' ? inv.buyer_name : inv.seller_name);
                 const partyTaxCode = direction === 'output' ? inv.buyer_tax_code : direction === 'input' ? inv.seller_tax_code : (inv.direction === 'output' ? inv.buyer_tax_code : inv.seller_tax_code);
@@ -201,7 +255,7 @@ export default function InvoiceGrid({
                 return (
                   <React.Fragment key={inv.id}>
                     <tr
-                      className={`border-b border-gray-100 cursor-pointer hover:bg-blue-50/30 transition-colors ${bg} ${isSelected ? 'bg-primary-50/40' : ''} ${isExpanded ? 'bg-blue-50/40' : ''}`}
+                      className={`border-b border-gray-100 cursor-pointer hover:bg-blue-50/30 transition-colors ${bg} ${leftBorder} ${isSelected ? 'bg-primary-50/40' : ''} ${isExpanded ? 'bg-blue-50/40' : ''}`}
                     >
                       <td className="px-3 py-3" onClick={e => { e.stopPropagation(); toggleOne(inv.id); }}>
                         <input
@@ -232,6 +286,15 @@ export default function InvoiceGrid({
                           <span className="font-medium text-gray-900">{inv.invoice_number}</span>
                           {inv.has_line_items === false && (
                             <span className="ml-1 text-xs bg-gray-100 text-gray-500 px-1 rounded">Thiếu CT</span>
+                          )}
+                          {inv.status === 'cancelled' && (
+                            <span className="ml-1 text-xs bg-red-100 text-red-600 px-1 rounded" title="Hóa đơn đã bị hủy">⛔ Hủy</span>
+                          )}
+                          {inv.status === 'replaced' && (
+                            <span className="ml-1 text-xs bg-yellow-100 text-yellow-700 px-1 rounded" title="Hóa đơn đã bị thay thế bởi hóa đơn khác">↺ Thay thế</span>
+                          )}
+                          {inv.status === 'adjusted' && (
+                            <span className="ml-1 text-xs bg-blue-100 text-blue-700 px-1 rounded" title="Hóa đơn điều chỉnh cho hóa đơn khác">✏ Điều chỉnh</span>
                           )}
                         </div>
                       </td>

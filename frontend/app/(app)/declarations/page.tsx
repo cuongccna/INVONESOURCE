@@ -6,6 +6,7 @@ import Link from 'next/link';
 import apiClient from '../../../lib/apiClient';
 import { useToast } from '../../../components/ToastProvider';
 import { formatVND } from '../../../utils/formatCurrency';
+import { useCompany } from '../../../contexts/CompanyContext';
 
 interface Declaration {
   id: string;
@@ -63,7 +64,16 @@ export default function DeclarationsPage() {
     }
   }, []);
 
+  const { activeCompany, loading: companyLoading } = useCompany();
+
   useEffect(() => { void load(); }, [load]);
+
+  // Redirect to HKD page when the active company is a household (Hộ KD)
+  useEffect(() => {
+    if (!companyLoading && activeCompany && activeCompany.company_type === 'household') {
+      void router.push('/declarations/hkd');
+    }
+  }, [activeCompany, companyLoading, router]);
 
   const calculate = async () => {
     setCalculating(true);
@@ -148,16 +158,7 @@ export default function DeclarationsPage() {
         </button>
       </div>
 
-      {/* Loại tờ khai toggle */}
-      <div className="flex rounded-xl border border-gray-200 overflow-hidden mb-5 w-full max-w-xs">
-        <span className="flex-1 py-2 text-sm font-semibold text-center bg-primary-600 text-white">
-          Doanh Nghiệp (01/GTGT)
-        </span>
-        <Link href="/declarations/hkd"
-          className="flex-1 py-2 text-sm font-medium text-center text-gray-600 hover:bg-gray-50 transition-colors">
-          Hộ KD / CNKD (TT40)
-        </Link>
-      </div>
+      {/* Form type is implied by active company; toggle removed */}
 
       {loading ? (
         <div className="flex justify-center py-12">

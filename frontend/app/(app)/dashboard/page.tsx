@@ -10,16 +10,43 @@ import apiClient from '../../../lib/apiClient';
 import { useCompany } from '../../../contexts/CompanyContext';
 
 /* ─── Types ───────────────────────────────────────────────────────────────── */
+interface TaxDeadline {
+  label: string; due: string; days_left: number; type: string;
+}
+
 interface KpiData {
   period: { month: number; year: number };
   invoices: {
     total: string; output_count: string; input_count: string;
-    invalid_count: string; unvalidated_count: string;
+    invalid_count: string; unvalidated_count: string; input_above_20m_count?: string;
   };
   vat: { output_vat: string; input_vat: string; payable_vat: string } | null;
   recentSyncs: Array<{
     provider: string; errors_count: number; started_at: string; error_detail: string | null;
   }>;
+  cit_estimate?: number;
+  ytd_revenue?: number;
+  ytd_cost?: number;
+  ytd_profit?: number;
+  risk_score?: number;
+  tax_deadlines?: TaxDeadline[];
+}
+
+interface HkdKpiData {
+  period: { month: number; year: number };
+  revenue: number;
+  input_purchases: number;
+  input_invoice_count: number;
+  input_above_20m: number;
+  khoan_tax: number;
+  pit_tax: number;
+  total_tax: number;
+  mon_bai: number;
+  profit_estimate: number;
+  profit_margin: number;
+  vat_rate_hkd: number;
+  tax_regime: string;
+  tax_deadlines: TaxDeadline[];
 }
 
 interface ChartData {
@@ -64,12 +91,19 @@ function timeAgo(iso: string) {
 }
 
 /* ─── Sub-components ─────────────────────────────────────────────────────── */
-function KCard({ label, value, sub, color = 'text-gray-900' }: {
-  label: string; value: string; sub?: string; color?: string;
+function KCard({ label, value, sub, color = 'text-gray-900', badge, badgeColor }: {
+  label: string; value: string; sub?: string; color?: string; badge?: string; badgeColor?: string;
 }) {
   return (
     <div className="bg-white rounded-xl shadow-sm p-4">
-      <p className="text-xs text-gray-500 mb-1">{label}</p>
+      <div className="flex items-start justify-between mb-1">
+        <p className="text-xs text-gray-500 leading-snug">{label}</p>
+        {badge && (
+          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full shrink-0 ml-1 ${badgeColor ?? 'bg-gray-100 text-gray-600'}`}>
+            {badge}
+          </span>
+        )}
+      </div>
       <p className={`text-2xl font-bold ${color}`}>{value}</p>
       {sub && <p className="text-xs text-gray-400 mt-0.5">{sub}</p>}
     </div>
@@ -112,7 +146,8 @@ interface QuickAction {
 }
 
 export default function DashboardPage() {
-  const { activeCompanyId } = useCompany();
+  const { activeCompanyId, activeCompany } = useCompany();
+  const isHousehold = activeCompany?.company_type === 'household';
   const [kpi, setKpi] = useState<KpiData | null>(null);
   const [chart, setChart] = useState<ChartData | null>(null);
   const [anomalies, setAnomalies] = useState<AnomalyReport | null>(null);
@@ -122,7 +157,9 @@ export default function DashboardPage() {
   const [ghostSummary, setGhostSummary] = useState<GhostSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [quickActions, setQuickActions] = useState<QuickAction[]>([]);
-  const [vatViewMode, setVatViewMode] = useState<'monthly' | 'quarterly'>('monthly');
+  const [vatViewMode, setVatViewMode] = useState<'monthly' | 'quarterly' | 'yearly'>('monthly');
+  const [hkdKpi, setHkdKpi] = useState<HkdKpiData | null>(null);
+  const [esgExpanded, setEsgExpanded] = useState(false);
 
   // Period navigator: default to current month/year
   const now = new Date();
@@ -132,16 +169,20 @@ export default function DashboardPage() {
   const quarterOf     = (m: number) => Math.ceil(m / 3);
   const quarterStart  = (q: number) => (q - 1) * 3 + 1;
 
-  const handleVatViewMode = (mode: 'monthly' | 'quarterly') => {
+  const handleVatViewMode = (mode: 'monthly' | 'quarterly' | 'yearly') => {
     setVatViewMode(mode);
     if (mode === 'quarterly') {
-      // Snap periodMonth to the first month of the current quarter
       setPeriodMonth(quarterStart(quarterOf(periodMonth)));
+    } else if (mode === 'yearly') {
+      setPeriodMonth(1);
     }
   };
 
   const navigatePeriod = (delta: number) => {
-    if (vatViewMode === 'quarterly') {
+    if (vatViewMode === 'yearly') {
+      setPeriodYear(periodYear + delta);
+      setPeriodMonth(1);
+    } else if (vatViewMode === 'quarterly') {
       let q = quarterOf(periodMonth) + delta;
       let y = periodYear;
       if (q < 1) { y -= 1; q = 4; }
@@ -158,10 +199,14 @@ export default function DashboardPage() {
     }
   };
 
-  const load = useCallback(async (month = periodMonth, year = periodYear) => {
+  const load = useCallback(async (month = periodMonth, year = periodYear, mode = vatViewMode) => {
+    const qOf2 = (m: number) => Math.ceil(m / 3);
+    const qStart2 = (q: number) => (q - 1) * 3 + 1;
+    const mFrom = mode === 'yearly' ? 1 : mode === 'quarterly' ? qStart2(qOf2(month)) : month;
+    const mTo   = mode === 'yearly' ? 12 : mode === 'quarterly' ? qStart2(qOf2(month)) + 2 : month;
     try {
       const [kpiRes, chartRes, forecastRes] = await Promise.all([
-        apiClient.get<{ data: KpiData }>(`/dashboard/kpi?month=${month}&year=${year}`),
+        apiClient.get<{ data: KpiData }>(`/dashboard/kpi?month_from=${mFrom}&month_to=${mTo}&year=${year}`),
         apiClient.get<{ data: ChartData }>(`/dashboard/charts?month=${month}&year=${year}`),
         apiClient.get<{ data: VatForecast }>('/forecast/vat').catch(() => ({ data: { data: null } })),
       ]);
@@ -173,15 +218,32 @@ export default function DashboardPage() {
     } finally {
       setLoading(false);
     }
-  }, [periodMonth, periodYear]);
+  }, [periodMonth, periodYear, vatViewMode]);
 
   useEffect(() => { void load(); }, [load, activeCompanyId]);
 
   useEffect(() => {
     setLoading(true);
-    void load(periodMonth, periodYear);
+    void load(periodMonth, periodYear, vatViewMode);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [periodMonth, periodYear]);
+  }, [periodMonth, periodYear, vatViewMode]);
+
+  const loadHkd = useCallback(async (month = periodMonth, year = periodYear) => {
+    if (!isHousehold) return;
+    try {
+      const res = await apiClient.get<{ data: HkdKpiData }>(`/hkd/dashboard/kpi?month=${month}&year=${year}`);
+      setHkdKpi(res.data.data);
+    } catch {
+      // silent
+    }
+  }, [isHousehold, periodMonth, periodYear]);
+
+  useEffect(() => { void loadHkd(); }, [loadHkd, activeCompanyId]);
+
+  useEffect(() => {
+    void loadHkd(periodMonth, periodYear);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isHousehold, periodMonth, periodYear]);
 
   useEffect(() => {
     apiClient.get<{ data: { actions: QuickAction[] } }>('/dashboard/quick-actions')
@@ -273,6 +335,37 @@ export default function DashboardPage() {
     );
   }
 
+  /* ── Derived period values ── */
+  const periodLabel = vatViewMode === 'yearly' ? `Năm ${periodYear}`
+    : vatViewMode === 'quarterly' ? `Quý ${quarterOf(periodMonth)} / ${periodYear}`
+    : `Tháng ${periodMonth} / ${periodYear}`;
+
+  const periodDeadline = (() => {
+    if (vatViewMode === 'yearly') return `31/3/${periodYear + 1}`;
+    if (vatViewMode === 'quarterly') {
+      const q = quarterOf(periodMonth);
+      const dm = q * 3 + 1;
+      return dm > 12 ? `20/1/${periodYear + 1}` : `20/${dm}/${periodYear}`;
+    }
+    const nextM = periodMonth === 12 ? 1 : periodMonth + 1;
+    const nextY = periodMonth === 12 ? periodYear + 1 : periodYear;
+    return `20/${nextM}/${nextY}`;
+  })();
+
+  const isCurrentPeriod = vatViewMode === 'yearly'
+    ? periodYear === now.getFullYear()
+    : vatViewMode === 'quarterly'
+    ? (quarterOf(periodMonth) === quarterOf(now.getMonth() + 1) && periodYear === now.getFullYear())
+    : (periodMonth === now.getMonth() + 1 && periodYear === now.getFullYear());
+
+  const resetPeriod = () => {
+    const m = now.getMonth() + 1;
+    setPeriodYear(now.getFullYear());
+    if (vatViewMode === 'yearly') { setPeriodMonth(1); }
+    else if (vatViewMode === 'quarterly') { setPeriodMonth(quarterStart(quarterOf(m))); }
+    else { setPeriodMonth(m); }
+  };
+
   return (
     <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto space-y-5">
       {/* ── Header ── */}
@@ -289,92 +382,231 @@ export default function DashboardPage() {
         </button>
       </div>
 
+      {/* ── Alert: input invoices >20M (DN only) ── */}
+      {!isHousehold && kpi && Number(kpi.invoices.input_above_20m_count ?? '0') > 0 && (
+        <div className="flex items-center justify-between gap-3 bg-amber-50 border border-amber-200 rounded-xl px-4 py-2.5">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="text-amber-500 text-base shrink-0">⚠</span>
+            <p className="text-sm text-amber-800 truncate">
+              <strong>{kpi.invoices.input_above_20m_count}</strong> hóa đơn mua vào &gt;20Tr cần thanh toán phi tiền mặt để được khấu trừ
+              {kpi.tax_deadlines?.[0]?.days_left != null && (
+                <> — hạn chốt <strong>còn {kpi.tax_deadlines[0].days_left} ngày</strong></>
+              )}
+            </p>
+          </div>
+          <Link href="/invoices?direction=input" className="text-xs text-amber-700 font-semibold whitespace-nowrap hover:underline shrink-0">
+            Xem danh sách →
+          </Link>
+        </div>
+      )}
+
       {/* ── Period Navigator ── */}
-      <div className="bg-white rounded-xl shadow-sm px-4 py-2.5 flex items-center justify-between gap-2">
-        <button
-          onClick={() => navigatePeriod(-1)}
-          className="text-gray-500 hover:text-gray-900 text-lg font-bold px-2 py-0.5 rounded hover:bg-gray-100 transition-colors"
-          aria-label="Kỳ trước"
-        >
-          ‹
-        </button>
-        <div className="flex flex-col items-center gap-1">
-          <p className="text-sm font-semibold text-gray-800">
-            Kỳ kê khai:{' '}
-            {vatViewMode === 'quarterly'
-              ? `Quý ${quarterOf(periodMonth)}/${periodYear}`
-              : `Tháng ${periodMonth}/${periodYear}`}
-          </p>
-          {/* Tháng / Quý toggle — shared with bottom chart */}
+      <div className="bg-white rounded-xl shadow-sm px-4 py-3">
+        <div className="flex items-center justify-between">
+          <button
+            onClick={() => navigatePeriod(-1)}
+            className="text-gray-400 hover:text-gray-900 text-xl font-bold w-9 h-9 flex items-center justify-center rounded-lg hover:bg-gray-100 transition-colors"
+            aria-label="Kỳ trước"
+          >
+            ‹
+          </button>
+          <div className="text-center">
+            <p className="text-xl font-bold text-gray-900">{periodLabel}</p>
+            <p className="text-xs text-gray-400 mt-0.5">
+              Kỳ kê khai{isCurrentPeriod ? ' hiện tại' : ''} · Hạn nộp: {periodDeadline}
+            </p>
+          </div>
+          <button
+            onClick={() => navigatePeriod(1)}
+            className="text-gray-400 hover:text-gray-900 text-xl font-bold w-9 h-9 flex items-center justify-center rounded-lg hover:bg-gray-100 transition-colors"
+            aria-label="Kỳ sau"
+          >
+            ›
+          </button>
+        </div>
+        <div className="flex items-center justify-center gap-3 mt-2.5">
           <div className="flex gap-0.5 bg-gray-100 rounded-lg p-0.5">
-            {(['monthly', 'quarterly'] as const).map((mode) => (
+            {(['monthly', 'quarterly', 'yearly'] as const).map((mode) => (
               <button
                 key={mode}
                 onClick={() => handleVatViewMode(mode)}
-                className={`text-xs px-2.5 py-0.5 rounded-md font-medium transition-colors ${
+                className={`text-xs px-3 py-1 rounded-md font-medium transition-colors ${
                   vatViewMode === mode ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'
                 }`}
               >
-                {mode === 'monthly' ? 'Tháng' : 'Quý'}
+                {mode === 'monthly' ? 'Tháng' : mode === 'quarterly' ? 'Quý' : 'Năm'}
               </button>
             ))}
           </div>
-          {(() => {
-            const nowQ = quarterOf(now.getMonth() + 1);
-            const curQ = quarterOf(periodMonth);
-            const isCurrentPeriod = vatViewMode === 'quarterly'
-              ? (curQ === nowQ && periodYear === now.getFullYear())
-              : (periodMonth === now.getMonth() + 1 && periodYear === now.getFullYear());
-            const resetPeriod = () => {
-              const m = now.getMonth() + 1;
-              setPeriodYear(now.getFullYear());
-              setPeriodMonth(vatViewMode === 'quarterly' ? quarterStart(quarterOf(m)) : m);
-            };
-            return isCurrentPeriod ? (
-              <p className="text-xs text-gray-400">
-                {vatViewMode === 'quarterly' ? 'Quý hiện tại' : 'Tháng hiện tại'}
-              </p>
-            ) : (
-              <button onClick={resetPeriod} className="text-xs text-primary-600 hover:underline">
-                {vatViewMode === 'quarterly' ? 'Về quý hiện tại' : 'Về tháng hiện tại'}
-              </button>
-            );
-          })()}
+          {!isCurrentPeriod && (
+            <button onClick={resetPeriod} className="text-xs text-primary-600 hover:underline">
+              Về kỳ hiện tại
+            </button>
+          )}
         </div>
-        <button
-          onClick={() => navigatePeriod(1)}
-          className="text-gray-500 hover:text-gray-900 text-lg font-bold px-2 py-0.5 rounded hover:bg-gray-100 transition-colors"
-          aria-label="Kỳ sau"
-        >
-          ›
-        </button>
       </div>
 
-      {/* ── KPI Cards ── */}
-      {kpi && (
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+      {/* ── KPI Cards (DN) ── */}
+      {!isHousehold && kpi && (
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           <KCard
-            label="Tổng Hóa Đơn"
+            label="Tổng hóa đơn kỳ này"
             value={full(kpi.invoices.total)}
             sub={`Ra: ${kpi.invoices.output_count} · Vào: ${kpi.invoices.input_count}`}
           />
           <KCard
-            label="Thuế GTGT Phải Nộp"
+            label="Thuế GTGT phải nộp"
             value={kpi.vat ? `${compact(kpi.vat.payable_vat)} ₫` : '—'}
-            sub="Hạn: ngày 20 tháng sau"
+            sub={kpi.vat ? `Đầu ra ${compact(kpi.vat.output_vat)}₫ — Đầu vào ${compact(kpi.vat.input_vat)}₫` : ''}
             color={kpi.vat && Number(kpi.vat.payable_vat) > 0 ? 'text-red-600' : 'text-gray-400'}
+            badge={`Hạn ${periodDeadline}`}
+            badgeColor="bg-red-50 text-red-500"
           />
           <KCard
-            label="Thuế Đầu Vào"
+            label="Thuế đầu vào lũy kế"
             value={kpi.vat ? `${compact(kpi.vat.input_vat)} ₫` : '—'}
-            sub="Được khấu trừ kỳ này"
+            sub={forecast?.carry_forward ? `Chuyển kỳ: ${compact(forecast.carry_forward)}₫` : 'Được khấu trừ kỳ này'}
             color="text-green-600"
+            badge="Khấu trừ"
+            badgeColor="bg-green-50 text-green-600"
+          />
+          <KCard
+            label="Thuế TNDN ước tính"
+            value={kpi.cit_estimate != null ? `${compact(kpi.cit_estimate)} ₫` : '—'}
+            sub={kpi.ytd_profit != null ? `Lãi gộp YTD: ${compact(kpi.ytd_profit)}₫` : 'Thuế suất 20%'}
+            color="text-amber-600"
+            badge="Ước tính"
+            badgeColor="bg-amber-50 text-amber-600"
           />
         </div>
       )}
 
-      {/* ── Charts grid — side by side on desktop ── */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      {/* ── KPI Cards (HKD) ── */}
+      {isHousehold && hkdKpi && (
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <KCard
+            label="Doanh Thu Ước Tính"
+            value={`${compact(hkdKpi.revenue)} ₫`}
+            sub="Hóa đơn bán ra kỳ này"
+            color="text-blue-600"
+          />
+          <KCard
+            label="Chi Phí Mua Vào"
+            value={`${compact(hkdKpi.input_purchases)} ₫`}
+            sub={`${hkdKpi.input_invoice_count} HĐ${hkdKpi.input_above_20m > 0 ? ` · ${hkdKpi.input_above_20m} >20Tr ⚠` : ''}`}
+            color="text-gray-700"
+          />
+          <KCard
+            label="Thuế GTGT Khoán"
+            value={`${compact(hkdKpi.khoan_tax)} ₫`}
+            sub={`Tỷ lệ ${hkdKpi.vat_rate_hkd}% · PIT: ${compact(hkdKpi.pit_tax)}₫`}
+            color="text-red-600"
+          />
+          <KCard
+            label="Thuế Môn Bài"
+            value={`${compact(hkdKpi.mon_bai)} ₫`}
+            sub="Nộp trước 30/01 hàng năm"
+            color="text-purple-600"
+          />
+        </div>
+      )}
+
+      {/* ── HKD: Revenue chart + Tax Calendar ── */}
+      {isHousehold && (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          {plChartData.length > 0 && (
+            <div className="bg-white rounded-xl shadow-sm p-4">
+              <h2 className="text-sm font-semibold text-gray-700 mb-3">📊 Doanh Thu / Chi Phí / Lãi Gộp</h2>
+              <ResponsiveContainer width="100%" height={200}>
+                <ComposedChart data={plChartData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
+                  <XAxis dataKey="name" tick={{ fontSize: 10 }} />
+                  <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v * 1_000_000)} />
+                  <Tooltip formatter={(val: number) => formatVNDFull(Number(val) * 1_000_000)} />
+                  <Legend wrapperStyle={{ fontSize: 11 }} />
+                  <Bar dataKey="Doanh Thu" fill="#3b82f6" radius={[3, 3, 0, 0]} maxBarSize={18} />
+                  <Bar dataKey="Chi Phí" fill="#f87171" radius={[3, 3, 0, 0]} maxBarSize={18} />
+                  <Line type="monotone" dataKey="Lãi Gộp" stroke="#10b981" strokeWidth={2} dot={{ r: 3 }} />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+          <div className="bg-white rounded-xl shadow-sm p-4">
+            <h2 className="text-sm font-semibold text-gray-700 mb-3">📅 Lịch Thuế Khoán</h2>
+            {hkdKpi?.tax_deadlines && hkdKpi.tax_deadlines.length > 0 ? (
+              <div className="space-y-3">
+                {hkdKpi.tax_deadlines.map((d, i) => (
+                  <div key={i} className="flex items-center justify-between">
+                    <span className="text-sm text-gray-600">{d.label}</span>
+                    <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
+                      d.days_left < 0      ? 'bg-red-100 text-red-700'
+                      : d.days_left <= 7  ? 'bg-orange-100 text-orange-700'
+                      : d.days_left <= 20 ? 'bg-amber-100 text-amber-700'
+                      : 'bg-green-100 text-green-700'
+                    }`}>
+                      {d.days_left < 0 ? 'Quá hạn' : `Còn ${d.days_left}d`}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-gray-400">Đang tải lịch thuế...</p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── HKD: Invoice Summary + Profit Estimate ── */}
+      {isHousehold && hkdKpi && (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <div className="bg-white rounded-xl shadow-sm p-4">
+            <h2 className="text-sm font-semibold text-gray-700 mb-3">🧾 Hóa Đơn Mua Vào</h2>
+            <div className="space-y-2 text-sm">
+              <div className="flex justify-between">
+                <span className="text-gray-500">Tổng hóa đơn</span>
+                <span className="font-medium">{hkdKpi.input_invoice_count} hóa đơn</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">Tổng giá trị</span>
+                <span className="font-medium">{compact(hkdKpi.input_purchases)} ₫</span>
+              </div>
+              {hkdKpi.input_above_20m > 0 && (
+                <div className="flex justify-between text-amber-700 bg-amber-50 rounded px-2 py-1">
+                  <span>⚠ HĐ &gt;20Tr cần thanh toán phi tiền mặt</span>
+                  <span className="font-medium">{hkdKpi.input_above_20m} HĐ</span>
+                </div>
+              )}
+              <div className="pt-1 border-t border-gray-100 flex justify-between">
+                <span className="text-gray-500">Tổng thuế khoán phải nộp</span>
+                <span className="font-semibold text-red-600">{compact(hkdKpi.total_tax)} ₫</span>
+              </div>
+            </div>
+          </div>
+          <div className="bg-white rounded-xl shadow-sm p-4">
+            <h2 className="text-sm font-semibold text-gray-700 mb-3">💼 Lợi Nhuận Ước Tính</h2>
+            <div className="space-y-2 text-sm">
+              <div className="flex justify-between">
+                <span className="text-gray-500">Doanh thu bán ra</span>
+                <span className="font-medium text-blue-700">{compact(hkdKpi.revenue)} ₫</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">Chi phí mua vào</span>
+                <span className="font-medium text-gray-700">- {compact(hkdKpi.input_purchases)} ₫</span>
+              </div>
+              <div className={`pt-1 border-t border-gray-100 flex justify-between font-semibold ${
+                hkdKpi.profit_estimate >= 0 ? 'text-green-700' : 'text-red-700'
+              }`}>
+                <span>Lãi gộp ước tính</span>
+                <span>{compact(hkdKpi.profit_estimate)} ₫ ({hkdKpi.profit_margin}%)</span>
+              </div>
+            </div>
+            <p className="text-xs text-gray-400 mt-3">⚠️ Chưa trừ lương, khấu hao, chi phí vận hành</p>
+          </div>
+        </div>
+      )}
+
+      {/* ── DN Charts grid — side by side on desktop ── */}
+      {!isHousehold && <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
       {/* ── VAT Trend ── */}
       {vatChartData.length > 0 && (
         <div className="bg-white rounded-xl shadow-sm p-4">
@@ -413,10 +645,10 @@ export default function DashboardPage() {
           </ResponsiveContainer>
         </div>
       )}
-      </div>{/* end charts grid */}
+      </div>}{/* end DN charts grid */}
 
-      {/* ── VAT Payable Monthly/Quarterly ── */}
-      {(vatChartData.length > 0 || vatQuarterlyData.length > 0) && (
+      {/* ── VAT Payable Monthly/Quarterly (DN only) ── */}
+      {!isHousehold && (vatChartData.length > 0 || vatQuarterlyData.length > 0) && (
         <div className="bg-white rounded-xl shadow-sm p-4">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-sm font-semibold text-gray-700">💰 Thuế GTGT Phải Nộp</h2>
@@ -437,8 +669,8 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {/* ── CIT Annual Estimate ── */}
-      {citYearData.length > 0 && (
+      {/* ── CIT Annual Estimate (DN only) ── */}
+      {!isHousehold && citYearData.length > 0 && (
         <div className="bg-white rounded-xl shadow-sm p-4">
           <div className="flex items-center justify-between mb-1">
             <h2 className="text-sm font-semibold text-gray-700">🏗️ Thuế TNDN Ước Tính Năm {periodYear}</h2>
@@ -688,8 +920,8 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {/* ── VAT Forecast + Tax Calendar ── */}
-      {forecast && forecast.periods_used > 0 && (() => {
+      {/* ── VAT Forecast + Tax Calendar (DN only) ── */}
+      {!isHousehold && forecast && forecast.periods_used > 0 && (() => {
         const now2 = new Date();
         const deadlineDay = 20;
         const nextMonth = new Date(now2.getFullYear(), now2.getMonth() + 1, deadlineDay);
@@ -763,28 +995,43 @@ export default function DashboardPage() {
         );
       })()}
 
-      {/* ── ESG Quick Widget ── */}
-      {esg && (
-        <div className="bg-white rounded-xl shadow-sm p-4">
-          <div className="flex items-center justify-between mb-2">
-            <h2 className="text-sm font-semibold text-gray-700">Ước Tính Phát Thải Carbon (ESG)</h2>
-            <Link href="/insights/seasonal" className="text-xs text-primary-600 hover:underline">
-              Phân Tích Mùa Vụ →
-            </Link>
-          </div>
-          <p className="text-2xl font-bold text-emerald-700">
-            {esg.total_tco2e.toLocaleString('vi-VN', { maximumFractionDigits: 2 })} tCO2e
-          </p>
-          <p className="text-xs text-gray-400 mt-1">Lượng CO₂ tương đương ước tính từ hóa đơn mua vào năm nay</p>
-          <p className="text-xs text-amber-600 mt-1">⚠️ Chỉ mang tính tham khảo — chưa qua kiểm toán ESG chính thức</p>
-          <div className="mt-3 space-y-1.5">
-            {esg.by_category.slice(0, 3).map((c, i) => (
-              <div key={`${c.category_name}-${i}`} className="flex items-center justify-between text-xs">
-                <span className="text-gray-600 truncate">{c.category_name}</span>
-                <span className="font-semibold text-gray-800">{c.tco2e.toFixed(2)} t</span>
+      {/* ── ESG Quick Widget (DN only, collapsible) ── */}
+      {!isHousehold && esg && (
+        <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+          <button
+            onClick={() => setEsgExpanded(prev => !prev)}
+            className="w-full flex items-center justify-between px-4 py-3 text-left hover:bg-gray-50 transition-colors"
+          >
+            <div className="flex items-center gap-2">
+              <h2 className="text-sm font-semibold text-gray-700">Ước Tính Phát Thải Carbon (ESG)</h2>
+              <span className="text-xs text-emerald-600 font-medium">
+                {esg.total_tco2e.toLocaleString('vi-VN', { maximumFractionDigits: 1 })} tCO2e
+              </span>
+            </div>
+            <span className="text-xs text-gray-400 shrink-0">{esgExpanded ? '▲ Thu gọn' : '▼ Xem chi tiết'}</span>
+          </button>
+          {esgExpanded && (
+            <div className="px-4 pb-4 border-t border-gray-100">
+              <div className="flex items-center justify-between mt-3 mb-1">
+                <p className="text-2xl font-bold text-emerald-700">
+                  {esg.total_tco2e.toLocaleString('vi-VN', { maximumFractionDigits: 2 })} tCO2e
+                </p>
+                <Link href="/insights/seasonal" className="text-xs text-primary-600 hover:underline">
+                  Phân Tích Mùa Vụ →
+                </Link>
               </div>
-            ))}
-          </div>
+              <p className="text-xs text-gray-400">Lượng CO₂ tương đương ước tính từ hóa đơn mua vào năm nay</p>
+              <p className="text-xs text-amber-600 mt-1">⚠️ Chỉ mang tính tham khảo — chưa qua kiểm toán ESG chính thức</p>
+              <div className="mt-3 space-y-1.5">
+                {esg.by_category.slice(0, 3).map((c, i) => (
+                  <div key={`${c.category_name}-${i}`} className="flex items-center justify-between text-xs">
+                    <span className="text-gray-600 truncate">{c.category_name}</span>
+                    <span className="font-semibold text-gray-800">{c.tco2e.toFixed(2)} t</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 

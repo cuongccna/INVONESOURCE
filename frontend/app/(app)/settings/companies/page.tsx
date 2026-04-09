@@ -233,8 +233,11 @@ export default function CompaniesSettingsPage() {
                         {c.role}
                       </span>
                       {!c.onboarded && (
-                        <span className="text-xs bg-orange-100 text-orange-600 px-2 py-0.5 rounded-full">
-                          Chưa cài đặt
+                        <span
+                          className="text-xs bg-orange-100 text-orange-600 px-2 py-0.5 rounded-full cursor-help"
+                          title="Công ty chưa hoàn tất thiết lập kết nối với nhà cung cấp hóa đơn (MISA / Viettel / GDT). Nhấn biểu tượng chỉnh sửa để tiếp tục cài đặt."
+                        >
+                          Chưa kết nối
                         </span>
                       )}
                       {c.id === activeCompanyId && (
