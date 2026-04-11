@@ -698,9 +698,12 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
     // ── 5. Fetch invoices via Direct API ─────────────────────────────────────────
     const runner = gdtApi;
-    let outputCount  = 0;
-    let inputCount   = 0;
-    let skippedCount = 0; // FIX-PERF-01
+    let outputCount     = 0;
+    let inputCount      = 0;
+    let skippedCount    = 0; // FIX-PERF-01
+    // Only NEWLY inserted invoices count against quota — updates are free.
+    // outputCount/inputCount track total fetched (display), newInvoiceCount tracks billing.
+    let newInvoiceCount = 0;
 
     try {
       // Date range priority:
@@ -721,27 +724,33 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
         const maxBackMs = toDate.getTime() - 31 * 24 * 60 * 60_000;
         fromDate = new Date(Math.max(lastRunMs, maxBackMs));
       } else {
-        // First run: start of current month
-        fromDate = new Date(toDate.getFullYear(), toDate.getMonth(), 1);
+        // First run ever (no last_run_at): search last 31 days so a newly-onboarded
+        // company captures all recent invoices, not just the current calendar month.
+        // (GDT 31-day hard limit is respected — the clamp below enforces it regardless.)
+        fromDate = new Date(toDate.getTime() - 31 * 24 * 60 * 60_000);
       }
 
       // Enforce GDT max 31-day rule: nếu range vượt quá, co lại từ toDate về đủ 31 ngày.
       // Normalize về 00:00:00 đầu ngày để tránh kiệu T23:59:59 bị kế thừa từ toDate.
+      // Helper: format Date as local YYYY-MM-DD (avoids UTC shift from toISOString)
+      const fmtLocal = (d: Date) =>
+        `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
       const MAX_RANGE_MS = 31 * 24 * 60 * 60 * 1000;
       if (toDate.getTime() - fromDate.getTime() > MAX_RANGE_MS) {
         const clampedDate = new Date(toDate.getTime() - MAX_RANGE_MS);
-        // Normalize: lấy YYYY-MM-DD rồi parse lại để đảm bảo giờ = 00:00:00
-        const clampedStr = clampedDate.toISOString().slice(0, 10);
+        // Normalize using local getters so the date string matches Vietnam timezone
+        const clampedStr = fmtLocal(clampedDate);
         logger.warn('[SyncWorker] Date range exceeds 31 days — clamping fromDate', {
-          original: fromDate.toISOString().slice(0, 10),
+          original: fmtLocal(fromDate),
           clamped:  clampedStr,
         });
         fromDate = new Date(`${clampedStr}T00:00:00`);
       }
 
       logger.info('[SyncWorker] Date range', {
-        from: fromDate.toISOString().slice(0, 10),
-        to:   toDate.toISOString().slice(0, 10),
+        from: fmtLocal(fromDate),
+        to:   fmtLocal(toDate),
         source: jobFromDate ? 'job' : 'default',
       });
 
@@ -824,8 +833,9 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
           // Batch upsert (UNNEST — 1 DB round-trip for up to 50 invoices)
           for (let b = 0; b < toUpsertOut.length; b += BATCH_SIZE) {
             const slice = toUpsertOut.slice(b, b + BATCH_SIZE);
-            const idMap = await _batchUpsertInvoices(slice.map(x => x.inv), companyId, 'output');
-            outputCount += slice.length;
+            const { map: idMap, newCount: outNew } = await _batchUpsertInvoices(slice.map(x => x.inv), companyId, 'output');
+            outputCount     += slice.length;
+            newInvoiceCount += outNew;
 
             // Batch dedup markSeen
             await _lockRedis.pipeline()
@@ -895,8 +905,9 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
         if (toUpsertIn.length > 0) {
           for (let b = 0; b < toUpsertIn.length; b += BATCH_SIZE) {
             const slice = toUpsertIn.slice(b, b + BATCH_SIZE);
-            const idMap = await _batchUpsertInvoices(slice.map(x => x.inv), companyId, 'input');
-            inputCount += slice.length;
+            const { map: idMap, newCount: inNew } = await _batchUpsertInvoices(slice.map(x => x.inv), companyId, 'input');
+            inputCount      += slice.length;
+            newInvoiceCount += inNew;
 
             await _lockRedis.pipeline()
               .sadd(inDedupSetKey, ...slice.map(x => x.dk))
@@ -968,7 +979,9 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
       // ── Quota consumption ───────────────────────────────────────────────────────
       const totalSynced = outputCount + inputCount;
-      await _consumeQuota(companyId, totalSynced);
+      // Charge only NEWLY inserted invoices — updates of existing invoices are free.
+      // This prevents quota inflation from date-range overlaps that re-fetch known invoices.
+      await _consumeQuota(companyId, newInvoiceCount);
 
       // ── Schedule next auto-sync with jitter (BOT-ENT-01) ────────────────────────
       // Migration 026 confirmed applied — no fallback wrapper needed.
@@ -1104,8 +1117,8 @@ async function _batchUpsertInvoices(
   invoices: import('./parsers/GdtXmlParser').RawInvoice[],
   companyId: string,
   direction: 'output' | 'input',
-): Promise<Map<string, string>> {
-  if (invoices.length === 0) return new Map();
+): Promise<{ map: Map<string, string>; newCount: number }> {
+  if (invoices.length === 0) return { map: new Map(), newCount: 0 };
 
   const ids:            string[]           = [];
   const invNums:        (string | null)[]  = [];
@@ -1208,7 +1221,8 @@ async function _batchUpsertInvoices(
      RETURNING id,
        invoice_number,
        COALESCE(serial_number,    '') AS serial_number,
-       COALESCE(seller_tax_code,  '') AS seller_tax_code`,
+       COALESCE(seller_tax_code,  '') AS seller_tax_code,
+       (xmax = 0) AS is_new`,
     [
       ids, compArr, invNums, serials, dates, dirArr, statuses,
       sellerNames, sellerTaxes, buyerNames, buyerTaxes,
@@ -1219,12 +1233,43 @@ async function _batchUpsertInvoices(
   );
 
   const resultMap = new Map<string, string>();
+  let newCount = 0;
   for (const row of res.rows as Array<{
-    id: string; invoice_number: string; serial_number: string; seller_tax_code: string;
+    id: string; invoice_number: string; serial_number: string; seller_tax_code: string; is_new: boolean;
   }>) {
     resultMap.set(`${row.invoice_number}|${row.serial_number}|${row.seller_tax_code}`, row.id);
+    if (row.is_new) newCount++;
   }
-  return resultMap;
+
+  // Mark original invoices as replaced/adjusted for any replacement/adjustment invoices in this batch.
+  // Uses UNNEST for a single UPDATE round-trip instead of N queries.
+  const replacements = invoices.filter(
+    inv => (inv.tc_hdon === 1 || inv.tc_hdon === 2) && inv.khhd_cl_quan && inv.so_hd_cl_quan
+  );
+  if (replacements.length > 0) {
+    const newStatuses:  string[]           = [];
+    const cids:         string[]           = [];
+    const khhdArr:      string[]           = [];
+    const soHdArr:      string[]           = [];
+    for (const inv of replacements) {
+      newStatuses.push(inv.tc_hdon === 1 ? 'replaced' : 'adjusted');
+      cids.push(companyId);
+      khhdArr.push(inv.khhd_cl_quan!);
+      soHdArr.push(inv.so_hd_cl_quan!);
+    }
+    await pool.query(
+      `UPDATE invoices
+       SET status = t.new_status, updated_at = NOW()
+       FROM UNNEST($1::invoice_status[], $2::uuid[], $3::text[], $4::text[]) AS t(new_status, cid, khhd, so_hd)
+       WHERE invoices.company_id    = t.cid
+         AND invoices.serial_number = t.khhd
+         AND invoices.invoice_number = t.so_hd
+         AND invoices.status NOT IN ('cancelled', 'replaced', 'adjusted')`,
+      [newStatuses, cids, khhdArr, soHdArr]
+    ).catch(err => logger.warn('[SyncWorker] mark-original batch failed', { err }));
+  }
+
+  return { map: resultMap, newCount };
 }
 
 /** Upsert invoice header. Returns the actual DB row UUID (via RETURNING id). */
@@ -1297,7 +1342,22 @@ async function _upsertInvoice(
       inv.tc_hdon ?? null, inv.khhd_cl_quan ?? null, inv.so_hd_cl_quan ?? null,
     ]
   );
-  return res.rows[0].id as string;
+  const invoiceDbId = res.rows[0].id as string;
+
+  // Mark original invoice as replaced/adjusted when this one references it
+  if ((inv.tc_hdon === 1 || inv.tc_hdon === 2) && inv.khhd_cl_quan && inv.so_hd_cl_quan) {
+    const newStatus = inv.tc_hdon === 1 ? 'replaced' : 'adjusted';
+    await pool.query(
+      `UPDATE invoices SET status = $1, updated_at = NOW()
+       WHERE company_id    = $2
+         AND serial_number  = $3
+         AND invoice_number = $4
+         AND status NOT IN ('cancelled', 'replaced', 'adjusted')`,
+      [newStatus, companyId, inv.khhd_cl_quan, inv.so_hd_cl_quan]
+    ).catch(err => logger.warn('[SyncWorker] mark-original single failed', { err }));
+  }
+
+  return invoiceDbId;
 }
 
 /**

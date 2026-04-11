@@ -29,6 +29,14 @@ export const requireCompany: RequestHandler = async (req, _res, next) => {
 
   const headerCompanyId = req.headers['x-company-id'] as string | undefined;
 
+  console.debug(
+    `[requireCompany] userId=${req.user.companyId ? req.user.userId : 'n/a'}` +
+    ` jwtCompanyId=${req.user.companyId ?? 'null'}` +
+    ` headerCompanyId=${headerCompanyId ?? 'null'}` +
+    ` match=${headerCompanyId === req.user.companyId}` +
+    ` url=${req.method} ${req.originalUrl}`
+  );
+
   // If header is absent (or same as JWT claim), validate that the JWT companyId
   // is still active for this user.  Stale JWTs can carry a soft-deleted company.
   if (!headerCompanyId || headerCompanyId === req.user.companyId) {
@@ -75,6 +83,7 @@ export const requireCompany: RequestHandler = async (req, _res, next) => {
 
     req.user.companyId = headerCompanyId;
     req.user.role = rows[0].role;
+    console.debug(`[requireCompany] switched to header company → ${req.user.companyId}`);
   } catch (err) {
     return next(err);
   }

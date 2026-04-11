@@ -1,26 +1,12 @@
 /**
  * HkdHtkkXmlGenerator — tạo XML HTKK chuẩn TT40/2021 cho tờ khai HKD/CNKD (maTKhai=473).
  *
- * Cấu trúc XML theo đúng mẫu TT40/2021/TT-BTC:
- *   <HSoThueDTu>
- *     <HSoKhaiThue>
- *       <TTinChung> TTinDVu + TTinTKhaiThue (NNT) </TTinChung>
- *       <CTieuTKhaiChinh>
- *         <Header> hkdcnkdnopkekhai=1 ... </Header>
- *         <KKThueGTGT_TNCN>
- *           DoanhThuThueGTGT / SoThueGTGT / DoanhThuThueTNCN / SoThueTNCN
- *           (ct28=tháng1, ct29=tháng2, ct30=tháng3, ct31=miễn, ct32=tổng)
- *         </KKThueGTGT_TNCN>
- *         <KKhaiThueTTDB/> <KKhaiTBVMT_TN/>
- *       </CTieuTKhaiChinh>
- *       <PLuc>
- *         <PLuc_01_2_BK_HDKD>
- *           VlieuDcuSPHH (bảng kê hàng hóa bán ra)
- *           ChiPhiQL (chi phí quản lý)
- *         </PLuc_01_2_BK_HDKD>
- *       </PLuc>
- *     </HSoKhaiThue>
- *   </HSoThueDTu>
+ * ct28..ct31 = nhóm ngành (KHÔNG phải tháng):
+ *   ct28 = [28] Phân phối, cung cấp hàng hóa        → GTGT 1%, TNCN 0.5%
+ *   ct29 = [29] Dịch vụ, xây dựng không bao thầu NVL → GTGT 5%, TNCN 2%
+ *   ct30 = [30] Sản xuất, vận tải, XD có bao thầu NVL→ GTGT 3%, TNCN 1.5%
+ *   ct31 = [31] Hoạt động kinh doanh khác            → GTGT 2%, TNCN 1%
+ *   ct32 = Tổng cộng
  */
 import { pool } from '../db/pool';
 import { HkdDeclaration } from './HkdDeclarationEngine';
@@ -72,6 +58,15 @@ export class HkdHtkkXmlGenerator {
          AND i.deleted_at IS NULL
          AND EXTRACT(YEAR  FROM i.invoice_date) = $2
          AND EXTRACT(MONTH FROM i.invoice_date) BETWEEN $3 AND $4
+         AND NOT EXISTS (
+           SELECT 1 FROM invoices _r
+           WHERE _r.tc_hdon = 1
+             AND _r.deleted_at IS NULL
+             AND _r.company_id      = i.company_id
+             AND _r.khhd_cl_quan    = i.serial_number
+             AND _r.so_hd_cl_quan   = i.invoice_number
+             AND COALESCE(_r.seller_tax_code, '') = COALESCE(i.seller_tax_code, '')
+         )
        GROUP BY 1, 2
        ORDER BY SUM(ili.subtotal) DESC
        LIMIT 20`,
@@ -104,6 +99,7 @@ export class HkdHtkkXmlGenerator {
 
     // ── 4. Chỉ tiêu XML ─────────────────────────────────────────────────────
     const d = declaration;
+    const g = Number(d.industry_group) || 28; // nhóm ngành: 28, 29, 30, 31
 
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <HSoThueDTu xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://kekhaithue.gdt.gov.vn/TKhaiThue">
@@ -230,31 +226,31 @@ export class HkdHtkkXmlGenerator {
       </Header>
       <KKThueGTGT_TNCN>
         <DoanhThuThueGTGT>
-          <ct28>${d.revenue_m1}</ct28>
-          <ct29>${d.revenue_m2}</ct29>
-          <ct30>${d.revenue_m3}</ct30>
-          <ct31>${d.revenue_exempt}</ct31>
+          <ct28>${g === 28 ? d.revenue_total : 0}</ct28>
+          <ct29>${g === 29 ? d.revenue_total : 0}</ct29>
+          <ct30>${g === 30 ? d.revenue_total : 0}</ct30>
+          <ct31>${g === 31 ? d.revenue_total : 0}</ct31>
           <ct32>${d.revenue_total}</ct32>
         </DoanhThuThueGTGT>
         <SoThueGTGT>
-          <ct28>${d.vat_m1}</ct28>
-          <ct29>${d.vat_m2}</ct29>
-          <ct30>${d.vat_m3}</ct30>
-          <ct31>0</ct31>
+          <ct28>${g === 28 ? d.vat_total : 0}</ct28>
+          <ct29>${g === 29 ? d.vat_total : 0}</ct29>
+          <ct30>${g === 30 ? d.vat_total : 0}</ct30>
+          <ct31>${g === 31 ? d.vat_total : 0}</ct31>
           <ct32>${d.vat_total}</ct32>
         </SoThueGTGT>
         <DoanhThuThueTNCN>
-          <ct28>${d.revenue_m1}</ct28>
-          <ct29>${d.revenue_m2}</ct29>
-          <ct30>${d.revenue_m3}</ct30>
-          <ct31>0</ct31>
+          <ct28>${g === 28 ? d.revenue_total : 0}</ct28>
+          <ct29>${g === 29 ? d.revenue_total : 0}</ct29>
+          <ct30>${g === 30 ? d.revenue_total : 0}</ct30>
+          <ct31>${g === 31 ? d.revenue_total : 0}</ct31>
           <ct32>${d.revenue_total}</ct32>
         </DoanhThuThueTNCN>
         <SoThueTNCN>
-          <ct28>${d.pit_m1}</ct28>
-          <ct29>${d.pit_m2}</ct29>
-          <ct30>${d.pit_m3}</ct30>
-          <ct31>0</ct31>
+          <ct28>${g === 28 ? d.pit_total : 0}</ct28>
+          <ct29>${g === 29 ? d.pit_total : 0}</ct29>
+          <ct30>${g === 30 ? d.pit_total : 0}</ct30>
+          <ct31>${g === 31 ? d.pit_total : 0}</ct31>
           <ct32>${d.pit_total}</ct32>
         </SoThueTNCN>
       </KKThueGTGT_TNCN>

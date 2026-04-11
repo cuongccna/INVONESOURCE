@@ -53,27 +53,50 @@ export default function DeclarationsPage() {
     return d.getMonth() < 3 ? d.getFullYear() - 1 : d.getFullYear();
   });
 
+  const { activeCompany, loading: companyLoading } = useCompany();
+
   const load = useCallback(async () => {
+    // Guard: don't fire before CompanyContext has resolved. Without this, the initial
+    // render fires with activeCompany=null and _viewContext still holds the stale
+    // localStorage company from ViewContext's init effect.
+    if (!activeCompany?.id) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.debug('[declarations] load skipped: activeCompany not resolved yet');
+      }
+      setLoading(false);
+      return;
+    }
+    if (process.env.NODE_ENV !== 'production') {
+      console.debug('[declarations] load start activeCompanyId=', activeCompany.id);
+    }
+    setLoading(true);
     try {
       const res = await apiClient.get<{ data: Declaration[] }>('/declarations');
+      if (process.env.NODE_ENV !== 'production') {
+        console.debug('[declarations] load done count=', res.data.data.length);
+      }
       setDeclarations(res.data.data);
     } catch (err) {
       console.error(err);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [activeCompany?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const { activeCompany, loading: companyLoading } = useCompany();
+  // Reset list when user switches company so stale data from old company is
+  // never briefly shown before the new load completes.
+  useEffect(() => {
+    setDeclarations([]);
+    setLoading(true);
+  }, [activeCompany?.id]);
 
   useEffect(() => { void load(); }, [load]);
 
   // Redirect to HKD page when the active company is a household (Hộ KD)
+  const isHkd = !companyLoading && activeCompany?.company_type === 'household';
   useEffect(() => {
-    if (!companyLoading && activeCompany && activeCompany.company_type === 'household') {
-      void router.push('/declarations/hkd');
-    }
-  }, [activeCompany, companyLoading, router]);
+    if (isHkd) void router.push('/declarations/hkd');
+  }, [isHkd, router]);
 
   const calculate = async () => {
     setCalculating(true);
@@ -89,8 +112,11 @@ export default function DeclarationsPage() {
       toast.success('Đã tính toán tờ khai thành công');
       // Navigate to detail page so user immediately sees full calculated values
       router.push(`/declarations/${res.data.data.id}`);
-    } catch {
-      toast.error('Lỗi tính toán tờ khai. Vui lòng thử lại.');
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { error?: { message?: string } } } })?.response?.data?.error?.message
+        ?? 'Lỗi tính toán tờ khai. Vui lòng thử lại.';
+      toast.error(msg);
     } finally {
       setCalculating(false);
     }
@@ -160,7 +186,12 @@ export default function DeclarationsPage() {
 
       {/* Form type is implied by active company; toggle removed */}
 
-      {loading ? (
+      {isHkd ? (
+        <div className="flex justify-center py-12">
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600" />
+          <p className="ml-3 text-sm text-gray-500">Đang chuyển trang HKD...</p>
+        </div>
+      ) : loading ? (
         <div className="flex justify-center py-12">
           <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600" />
         </div>

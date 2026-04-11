@@ -39,26 +39,35 @@ export class ReplacedFilterPlugin implements IInvoiceValidationPlugin {
     // Build lookup keys for batch query:
     // For each candidate invoice, we need to find if a replacement invoice exists.
     // We query once with all (serial_number, invoice_number, seller_tax_code) combos.
+    // Normalize NULL seller_tax_code to '' to avoid SQL NULL = NULL → unknown comparison.
     const candidates = invoices.map(inv => ({
       id: inv.id,
-      khhd: inv.serial_number,
-      so_hd: inv.invoice_number,
-      mst_nban: inv.seller_tax_code,
+      khhd:     inv.serial_number    ?? '',
+      so_hd:    inv.invoice_number   ?? '',
+      mst_nban: inv.seller_tax_code  ?? '',
     }));
 
     // Single batch query: find any invoice that is a replacement referencing our candidates.
-    // Using unnest for efficient multi-value IN check.
+    // COALESCE to '' so NULL seller_tax_code values match correctly across both sides.
     const { rows: replacements } = await db.query<{
       khhd_cl_quan: string;
       so_hd_cl_quan: string;
       seller_tax_code: string;
       invoice_number: string;
     }>(
-      `SELECT DISTINCT khhd_cl_quan, so_hd_cl_quan, seller_tax_code, invoice_number
+      `SELECT DISTINCT
+          khhd_cl_quan,
+          so_hd_cl_quan,
+          COALESCE(seller_tax_code, '') AS seller_tax_code,
+          invoice_number
        FROM invoices
        WHERE tc_hdon = 1
          AND deleted_at IS NULL
-         AND (khhd_cl_quan, so_hd_cl_quan, seller_tax_code) IN (
+         AND (
+           COALESCE(khhd_cl_quan, ''),
+           COALESCE(so_hd_cl_quan, ''),
+           COALESCE(seller_tax_code, '')
+         ) IN (
            SELECT * FROM unnest($1::text[], $2::text[], $3::text[])
          )`,
       [
@@ -70,7 +79,7 @@ export class ReplacedFilterPlugin implements IInvoiceValidationPlugin {
 
     if (replacements.length === 0) return results;
 
-    // Build a lookup set for O(1) checks
+    // Build a lookup set for O(1) checks (keys are COALESCE-normalized)
     type ReplacementKey = string;
     const replacedSet = new Set<ReplacementKey>();
     for (const r of replacements) {
@@ -100,7 +109,8 @@ export class ReplacedFilterPlugin implements IInvoiceValidationPlugin {
       }
 
       // Fallback B: another invoice in the batch references this one as the original
-      const key = `${inv.serial_number}||${inv.invoice_number}||${inv.seller_tax_code}`;
+      // Normalize to '' to match the COALESCE-normalized replacedSet keys
+      const key = `${inv.serial_number ?? ''}||${inv.invoice_number ?? ''}||${inv.seller_tax_code ?? ''}`;
       if (replacedSet.has(key)) {
         const replacingSoHd = replacementNumberMap.get(key) ?? '(không rõ)';
         results.set(inv.id, {

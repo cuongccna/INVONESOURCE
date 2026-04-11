@@ -47,6 +47,7 @@ interface TmproxySlot {
   currentExpiresAt:     Date | null;    // when the current IP expires
   refreshing:           boolean;
   failedUrls:           Set<string>;
+  permanentlyDead:      boolean;        // true when API key is expired/cancelled — skip forever
 }
 
 // ── One slot = one IPRoyal sticky session ────────────────────────────────────
@@ -138,6 +139,7 @@ export class ProxyManager extends EventEmitter {
         currentSocks5Url: null,
         refreshing:       false,
         failedUrls:       new Set<string>(),
+        permanentlyDead:  false,
       }));
 
       logger.info('[ProxyManager] TMProxy multi-key pool initialising', {
@@ -207,11 +209,15 @@ export class ProxyManager extends EventEmitter {
 
     // Mode A: TMProxy
     if (this.slots.length > 0) {
-      const slotIdx = this._hashToIndex(sessionSuffix, this.slots.length);
-      const slot    = this.slots[slotIdx]!;
+      // Exclude permanently dead slots (expired API keys) from hash pool
+      const liveSlots = this.slots.filter(s => !s.permanentlyDead);
+      const pool      = liveSlots.length > 0 ? liveSlots : this.slots; // fallback: use all
+      const slotIdx   = this._hashToIndex(sessionSuffix, pool.length);
+      const slot      = pool[slotIdx]!;
       if (!slot.currentUrl) {
         // Slot đang khởi tạo — thử slot sẵn sàng khác (không đang refreshing)
-        const fallback = this.slots.find(s => s.currentUrl && !s.refreshing);
+        const fallback = pool.find(s => s.currentUrl && !s.refreshing)
+                      ?? this.slots.find(s => s.currentUrl && !s.refreshing);
         if (!fallback) {
           // Tất cả slot đang khởi tạo — caller cần xử lý null
           logger.warn('[ProxyManager] Tất cả slot đang khởi tạo, chờ slot đầu tiên sẵn sàng', {
@@ -472,7 +478,18 @@ export class ProxyManager extends EventEmitter {
     const POLL_MS  = 300;
     while (Date.now() < deadline) {
       if (this.slots.some(s => s.currentUrl !== null)) {
-        logger.info('[ProxyManager] Tất cả slot proxy đã sẵn sàng');
+        const readyCount = this.slots.filter(s => s.currentUrl !== null).length;
+        const deadCount  = this.slots.length - readyCount;
+        if (deadCount > 0) {
+          logger.warn('[ProxyManager] Một số slot proxy bị lỗi — bot chạy với proxy bị suy giảm', {
+            readySlots: readyCount,
+            deadSlots:  deadCount,
+            totalSlots: this.slots.length,
+            hint: 'Kiểm tra TMProxy key hết hạn hoặc lỗi API',
+          });
+        } else {
+          logger.info('[ProxyManager] Tất cả slot proxy đã sẵn sàng');
+        }
         return;
       }
       await new Promise<void>(r => setTimeout(r, POLL_MS));
@@ -534,6 +551,16 @@ export class ProxyManager extends EventEmitter {
         });
         session = await slot.refresher.getNew();
       } else {
+        // Check if the error message indicates an expired/cancelled package (code=6).
+        // These are permanent failures — no point retrying this key ever.
+        const msg = (err as Error).message ?? '';
+        if (msg.includes('code=6') || msg.includes('Hết hạn') || msg.includes('Gói Hết hạn')) {
+          slot.permanentlyDead = true;
+          logger.error('[ProxyManager] TMProxy key hết hạn — slot bị loại khỏi vòng xúy', {
+            apiKey: slot.apiKey.slice(0, 8) + '…',
+            hint:   'Gia hạn hoặc thay API key mới tại tmproxy.com',
+          });
+        }
         throw err;
       }
     }

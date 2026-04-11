@@ -61,6 +61,15 @@ apiClient.interceptors.request.use((config) => {
   if (singleCompanyId) {
     config.headers['X-Company-Id'] = singleCompanyId;
   }
+
+  if (process.env.NODE_ENV !== 'production') {
+    console.debug(
+      `[apiClient] ${String(config.method ?? 'GET').toUpperCase()} ${config.url ?? ''}` +
+      ` X-Company-Id=${singleCompanyId ?? 'MISSING'}` +
+      ` (_viewCtx=${_viewContext.companyId ?? 'null'} _active=${_activeCompanyId ?? 'null'})`
+    );
+  }
+
   return config;
 });
 

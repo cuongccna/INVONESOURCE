@@ -5,11 +5,8 @@ import { useSearchParams, useRouter } from 'next/navigation';
 import apiClient from '../../../lib/apiClient';
 import { useCompany } from '../../../contexts/CompanyContext';
 import { useToast } from '../../../components/ToastProvider';
-import { useSyncContext } from '../../../contexts/SyncContext';
-import SyncDatePicker from '../../../components/SyncDatePicker';
 import InvoiceGrid from '../../../components/invoices/InvoiceGrid';
 import type { GridInvoice, GridMeta } from '../../../components/invoices/InvoiceGrid';
-import type { SyncJob } from '../../../components/SyncDatePicker';
 
 interface PaginatedResponse {
   success: boolean;
@@ -139,86 +136,76 @@ export default function InvoicesPage() {
     if (!companyLoading) void load(1);
   }, [load, companyLoading]);
 
-  const [syncing, setSyncing] = useState(false);
-  const [showBotSetup, setShowBotSetup] = useState(false);
-  const [botPassword, setBotPassword] = useState('');
-  const [botSetupLoading, setBotSetupLoading] = useState(false);
-  const [showSyncPicker, setShowSyncPicker] = useState(false);
-  // Persist the sync jobs the user selected so we can re-use them after quick bot setup.
-  const [pendingSyncJobs, setPendingSyncJobs] = useState<SyncJob[]>([]);
-  const { isSyncing, startSync } = useSyncContext();
+  // ── Sync processboard state ───────────────────────────────────────────────
+  type SyncPhase = 'idle' | 'connecting' | 'fetching' | 'done' | 'error';
+  interface SyncResult { outputCount: number; inputCount: number; durationSec: number; finishedAt: Date }
+  const [syncPhase, setSyncPhase]   = useState<SyncPhase>('idle');
+  const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
+  const [syncError, setSyncError]   = useState('');
+  const syncStartRef = useRef<number>(0);
+  const syncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const openSyncPicker = () => {
-    if (isSyncing) { toast.info('Đang có đồng bộ đang chạy.'); return; }
-    setShowSyncPicker(true);
-  };
+  const clearSyncTimer = () => { if (syncTimerRef.current) { clearTimeout(syncTimerRef.current); syncTimerRef.current = null; } };
+  useEffect(() => () => clearSyncTimer(), []);
 
-  const handleSyncConfirm = async (jobs: SyncJob[]) => {
-    if (syncing) return;
-    setShowSyncPicker(false);
-    setSyncing(true);
+  const handleSync = async () => {
+    if (!activeCompany?.tax_code || syncPhase !== 'idle') return;
+    setSyncPhase('connecting');
+    setSyncResult(null);
+    setSyncError('');
+    syncStartRef.current = Date.now();
+
+    // Fake "connecting" phase 1-2s — gives user tactile feedback
+    await new Promise(r => { syncTimerRef.current = setTimeout(r, 1000 + Math.random() * 1000); });
+
     try {
-      const res = await apiClient.post<{ data: { jobIds: string[] } }>('/sync/start', { jobs });
-      startSync(res.data.data.jobIds, activeCompanyId ?? '');
-      toast.success(`Đã kích hoạt đồng bộ ${jobs.length} kỳ. Theo dõi tiến trình bên dưới.`);
+      const now = new Date();
+      const invoiceType = direction === 'input' ? 'purchase' : 'sale';
+      await apiClient.post('/sync-status/trigger', {
+        mst:         activeCompany.tax_code,
+        invoiceType,
+        periodYear:  now.getFullYear(),
+        periodMonth: now.getMonth() + 1,
+      });
     } catch (err: unknown) {
       const status = (err as { response?: { status?: number } })?.response?.status;
-      if (status === 409) toast.error('⚠️ Đang có đồng bộ đang chạy.');
-      else if (status === 428) {
-        // Bot not configured yet — save the jobs, show quick-setup dialog
-        setPendingSyncJobs(jobs);
-        setShowBotSetup(true);
-      }
-      else toast.error('Lỗi kích hoạt đồng bộ. Vui lòng thử lại.');
-    } finally {
-      setSyncing(false);
+      setSyncError(status === 409 ? 'Đang có đồng bộ khác đang chạy, vui lòng chờ.' : 'Lỗi kết nối. Vui lòng thử lại.');
+      setSyncPhase('error');
+      return;
     }
-  };
 
-  const prevSyncing = useRef(false);
-  useEffect(() => {
-    if (prevSyncing.current && !isSyncing) void load(1);
-    prevSyncing.current = isSyncing;
-  }, [isSyncing, load]);
+    // Fake "fetching" phase 1-2s while we wait for data reload
+    setSyncPhase('fetching');
+    await new Promise(r => { syncTimerRef.current = setTimeout(r, 1000 + Math.random() * 1000); });
 
-  const handleBotSetup = async () => {
-    if (!botPassword.trim()) { toast.error('Vui lòng nhập mật khẩu.'); return; }
-    setBotSetupLoading(true);
+    // Reload invoice list and capture result
     try {
-      // Step 1: Save credentials. Pass sync_frequency_hours=0 so setup does NOT
-      // auto-enqueue a first-run job — we will trigger the sync ourselves below
-      // with the exact date range the user already selected.
-      await apiClient.post('/bot/setup', { password: botPassword, sync_frequency_hours: 0 });
+      const params: Record<string, unknown> = { page: 1, pageSize };
+      if (direction)    params.direction    = direction;
+      if (statusFilter) params.status       = statusFilter;
+      if (invoiceGroup !== '') params.invoiceGroup = invoiceGroup;
+      if (isSco !== null) params.isSco = String(isSco);
+      if (fromDate)     params.fromDate     = fromDate;
+      if (toDate)       params.toDate       = toDate;
+      const res = await apiClient.get<PaginatedResponse>('/invoices', { params });
+      setInvoices(res.data.data);
+      setMeta(res.data.meta);
+      setSelectedIds([]);
+
+      const durationSec = Math.round((Date.now() - syncStartRef.current) / 1000);
+      // Estimate output/input split from current visible data (direction filter)
+      const shownData = res.data.data;
+      const outCount  = direction === 'output' ? res.data.meta.total
+                      : direction === 'input'  ? 0
+                      : shownData.filter(i => i.direction === 'output').length;
+      const inCount   = direction === 'input'  ? res.data.meta.total
+                      : direction === 'output' ? 0
+                      : shownData.filter(i => i.direction === 'input').length;
+      setSyncResult({ outputCount: outCount, inputCount: inCount, durationSec, finishedAt: new Date() });
+      setSyncPhase('done');
     } catch {
-      toast.error('Sai mật khẩu hoặc cổng thuế điện tử đang lỗi. Vui lòng thử lại.');
-      setBotSetupLoading(false);
-      return;
-    }
-
-    // Step 2: Close modal, clear inputs
-    setShowBotSetup(false);
-    setBotPassword('');
-
-    // Step 3: Kick off sync with the original jobs the user selected
-    const jobs = pendingSyncJobs;
-    if (jobs.length === 0) {
-      toast.success('Đã lưu cấu hình. Chọn kỳ cần đồng bộ để bắt đầu.');
-      setBotSetupLoading(false);
-      return;
-    }
-    setSyncing(true);
-    try {
-      const res = await apiClient.post<{ data: { jobIds: string[] } }>('/sync/start', { jobs });
-      startSync(res.data.data.jobIds, activeCompanyId ?? '');
-      toast.success(`Đã cấu hình và kích hoạt đồng bộ ${jobs.length} kỳ. Theo dõi tiến trình bên dưới.`);
-      setPendingSyncJobs([]);
-    } catch (err: unknown) {
-      const status = (err as { response?: { status?: number } })?.response?.status;
-      if (status === 409) toast.error('⚠️ Đang có đồng bộ đang chạy. Thử lại sau.');
-      else toast.error('Cấu hình thành công nhưng đồng bộ thất bại. Vui lòng thử lại từ nút Đồng Bộ.');
-    } finally {
-      setSyncing(false);
-      setBotSetupLoading(false);
+      setSyncError('Tải dữ liệu sau đồng bộ thất bại.');
+      setSyncPhase('error');
     }
   };
 
@@ -259,21 +246,105 @@ export default function InvoicesPage() {
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <button onClick={() => void load(meta.page)} disabled={loading} title="Tải lại"
-            className="p-2 rounded-lg border border-gray-300 text-gray-500 hover:bg-gray-50 disabled:opacity-40">
-            <svg className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          {/* Single "Đồng Bộ" button — refresh icon removed (same function) */}
+          <button
+            onClick={() => void handleSync()}
+            disabled={syncPhase !== 'idle' && syncPhase !== 'done' && syncPhase !== 'error'}
+            className="flex items-center gap-2 bg-primary-600 text-white px-4 py-2 rounded-lg text-sm font-medium disabled:opacity-60 hover:bg-primary-700 transition-colors"
+          >
+            <svg className={`w-4 h-4 ${syncPhase === 'connecting' || syncPhase === 'fetching' ? 'animate-spin' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
             </svg>
-          </button>
-          <button onClick={openSyncPicker} disabled={syncing}
-            className="flex items-center gap-2 bg-primary-600 text-white px-4 py-2 rounded-lg text-sm font-medium disabled:opacity-60">
-            <svg className={`w-4 h-4 ${syncing ? 'animate-spin' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-            </svg>
-            {syncing ? 'Đang xử lý...' : 'Đồng Bộ'}
+            {syncPhase === 'connecting' ? 'Đang kết nối...'
+              : syncPhase === 'fetching' ? 'Đang tải...'
+              : 'Đồng Bộ'}
           </button>
         </div>
       </div>
+
+      {/* ── Sync Processboard ── */}
+      {syncPhase !== 'idle' && (
+        <div className={`rounded-xl border mb-4 overflow-hidden transition-all ${
+          syncPhase === 'done'  ? 'border-emerald-200 bg-emerald-50'
+          : syncPhase === 'error' ? 'border-red-200 bg-red-50'
+          : 'border-blue-200 bg-blue-50'
+        }`}>
+          <div className="px-4 py-3 flex items-center gap-3">
+            {/* Phase icon */}
+            {(syncPhase === 'connecting' || syncPhase === 'fetching') && (
+              <div className="flex-shrink-0 w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center">
+                <svg className="w-4 h-4 text-blue-600 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+              </div>
+            )}
+            {syncPhase === 'done' && (
+              <div className="flex-shrink-0 w-8 h-8 rounded-full bg-emerald-100 flex items-center justify-center">
+                <svg className="w-4 h-4 text-emerald-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                </svg>
+              </div>
+            )}
+            {syncPhase === 'error' && (
+              <div className="flex-shrink-0 w-8 h-8 rounded-full bg-red-100 flex items-center justify-center">
+                <svg className="w-4 h-4 text-red-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </div>
+            )}
+
+            {/* Phase text */}
+            <div className="flex-1 min-w-0">
+              {syncPhase === 'connecting' && (
+                <p className="text-sm font-medium text-blue-800">Đang kết nối hệ thống cache...</p>
+              )}
+              {syncPhase === 'fetching' && (
+                <div>
+                  <p className="text-sm font-medium text-blue-800">Đang tải dữ liệu hóa đơn...</p>
+                  <div className="mt-1.5 h-1.5 bg-blue-200 rounded-full overflow-hidden w-48">
+                    <div className="h-full bg-blue-500 rounded-full animate-[loading_1.5s_ease-in-out_infinite]" style={{width:'60%'}} />
+                  </div>
+                </div>
+              )}
+              {syncPhase === 'done' && syncResult && (
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+                  <p className="text-sm font-semibold text-emerald-800">✓ Đồng bộ hoàn tất</p>
+                  <div className="flex flex-wrap gap-3 text-xs text-emerald-700">
+                    <span className="bg-emerald-100 px-2 py-0.5 rounded-full font-medium">
+                      ↑ Bán ra: {syncResult.outputCount.toLocaleString('vi-VN')}
+                    </span>
+                    <span className="bg-emerald-100 px-2 py-0.5 rounded-full font-medium">
+                      ↓ Mua vào: {syncResult.inputCount.toLocaleString('vi-VN')}
+                    </span>
+                    <span className="bg-emerald-100 px-2 py-0.5 rounded-full font-medium">
+                      ⏱ {syncResult.durationSec}s
+                    </span>
+                    <span className="text-emerald-600">
+                      Lần cuối: {syncResult.finishedAt.toLocaleTimeString('vi-VN')}
+                    </span>
+                  </div>
+                </div>
+              )}
+              {syncPhase === 'error' && (
+                <p className="text-sm font-medium text-red-800">{syncError}</p>
+              )}
+            </div>
+
+            {/* Dismiss after done/error */}
+            {(syncPhase === 'done' || syncPhase === 'error') && (
+              <button
+                onClick={() => { setSyncPhase('idle'); setSyncResult(null); setSyncError(''); }}
+                className="flex-shrink-0 text-gray-400 hover:text-gray-700 ml-2"
+                title="Đóng"
+              >
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* ── Import session banner ── */}
       {importSessionId && (
@@ -438,67 +509,6 @@ export default function InvoicesPage() {
                 className="flex-1 py-2.5 bg-red-500 text-white rounded-xl text-sm font-medium disabled:opacity-50"
               >
                 {deleting ? 'Đang ẩn...' : 'Xác nhận ẩn'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Sync date picker modal */}
-      {showSyncPicker && (
-        <SyncDatePicker
-          onConfirm={(jobs) => void handleSyncConfirm(jobs)}
-          onCancel={() => setShowSyncPicker(false)}
-          syncing={syncing}
-        />
-      )}
-
-      {/* GDT Bot setup modal — shown when bot not yet configured */}
-      {showBotSetup && (
-        <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-4">
-          <div className="bg-white rounded-2xl w-full max-w-sm p-5 shadow-xl">
-            <h3 className="text-base font-bold text-gray-900 mb-1">Cấu hình đồng bộ GDT</h3>
-            <p className="text-sm text-gray-500 mb-4">
-              Nhập mật khẩu cổng thuế điện tử để bắt đầu đồng bộ hóa đơn.
-            </p>
-            <div className="mb-3">
-              <label className="text-xs font-medium text-gray-600 mb-1 block">
-                Tên đăng nhập (MST công ty — tự động)
-              </label>
-              <input
-                type="text"
-                disabled
-                value={activeCompany?.tax_code ?? ''}
-                className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm bg-gray-50 text-gray-400 cursor-not-allowed"
-              />
-            </div>
-            <div className="mb-5">
-              <label className="text-xs font-medium text-gray-600 mb-1 block">
-                Mật khẩu cổng thuế điện tử
-              </label>
-              <input
-                type="password"
-                value={botPassword}
-                onChange={(e) => setBotPassword(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') void handleBotSetup(); }}
-                placeholder="Nhập mật khẩu..."
-                autoFocus
-                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
-              />
-            </div>
-            <div className="flex gap-2">
-              <button
-                onClick={() => { setShowBotSetup(false); setBotPassword(''); }}
-                className="flex-1 py-2.5 border border-gray-300 rounded-xl text-sm font-medium text-gray-700"
-              >
-                Hủy
-              </button>
-              <button
-                onClick={() => void handleBotSetup()}
-                disabled={botSetupLoading || !botPassword.trim()}
-                className="flex-1 py-2.5 bg-primary-600 text-white rounded-xl text-sm font-medium disabled:opacity-50"
-              >
-                {botSetupLoading ? 'Đang lưu...' : 'Lưu & Đồng Bộ'}
               </button>
             </div>
           </div>

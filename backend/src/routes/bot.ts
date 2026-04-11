@@ -13,7 +13,7 @@ import { env } from '../config/env';
 
 const _redis = new IORedis(env.REDIS_URL, { maxRetriesPerRequest: 3 });
 const MANUAL_COOLDOWN_PREFIX  = 'bot:manual:cooldown:';
-const MANUAL_COOLDOWN_TTL_SEC = 5 * 60;  // 5 minutes between manual syncs per company
+const MANUAL_COOLDOWN_TTL_SEC = 6 * 60;  // 6 minutes between manual syncs per company
 
 const router = Router();
 router.use(authenticate);
@@ -105,14 +105,10 @@ router.post(
         [uuidv4(), companyId, taxCode, encryptedCreds, has_otp, otp_method, sync_frequency_hours]
       );
 
-      // Enqueue first run if frequency > 0
-      if (sync_frequency_hours > 0) {
-        await getBotQueue().add('sync', { companyId }, {
-          jobId:   `gdt-bot-first-${companyId}`,
-          attempts: 3,
-          backoff:  { type: 'exponential', delay: 60000 },
-        });
-      }
+      // NOTE: No auto-enqueue on setup — user triggers first sync via "Lấy từ GDT" button.
+      // Auto-enqueuing caused a LOCK_CONFLICT race: the first-run job (legacy queue) and the
+      // user's manual-trigger job (manual queue) would both start simultaneously for the same
+      // company, resulting in one job wasting a GDT login and the other failing with LOCK_CONFLICT.
 
       sendSuccess(res, { configured: true, taxCode });
     } catch (err) {
@@ -143,9 +139,14 @@ router.get(
         [companyId]
       );
 
+      // Expose remaining manual-trigger cooldown so the frontend can sync state on mount/refresh
+      const cooldownKey = `${MANUAL_COOLDOWN_PREFIX}${companyId}`;
+      const cooldownTtl = cfgRes.rows.length > 0 ? await _redis.ttl(cooldownKey) : -1;
+
       sendSuccess(res, {
-        config:   cfgRes.rows[0] ?? null,
-        lastRuns: runsRes.rows,
+        config:            cfgRes.rows[0] ?? null,
+        lastRuns:          runsRes.rows,
+        manualCooldownSec: cooldownTtl > 0 ? cooldownTtl : 0,
       });
     } catch (err) {
       next(err);
@@ -183,8 +184,8 @@ router.post(
         return;
       }
 
-      // Enforce same 15-minute login cooldown as sync.worker — give user a clear message
-      const MIN_LOGIN_INTERVAL_MS = 15 * 60 * 1000;
+      // Enforce same 6-minute login cooldown as sync.worker — give user a clear message
+      const MIN_LOGIN_INTERVAL_MS = 6 * 60 * 1000;
       if (cfgRes.rows[0].last_run_at) {
         const elapsedMs = Date.now() - new Date(cfgRes.rows[0].last_run_at as string).getTime();
         if (elapsedMs < MIN_LOGIN_INTERVAL_MS) {
@@ -199,6 +200,21 @@ router.post(
           });
           return;
         }
+      }
+
+      // Check if a job is currently RUNNING for this company (Redis lock held by worker).
+      // If so, return 409 immediately — no point enqueuing a job that will fail with LOCK_CONFLICT.
+      const syncLockKey = `bot:sync:lock:${companyId}`;
+      const isLocked = await _redis.exists(syncLockKey);
+      if (isLocked) {
+        res.status(409).json({
+          success: false,
+          error: {
+            code:    'ALREADY_RUNNING',
+            message: 'Bot đang chạy job đồng bộ cho công ty này. Vui lòng đợi hoàn tất rồi thử lại.',
+          },
+        });
+        return;
       }
 
       const parsed = runNowSchema.safeParse(req.body);

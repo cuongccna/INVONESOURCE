@@ -1,9 +1,11 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import apiClient from '../../../../lib/apiClient';
 import BackButton from '../../../../components/BackButton';
 import { useToast } from '../../../../components/ToastProvider';
+import { useCompany } from '../../../../contexts/CompanyContext';
 
 interface BotConfig {
   id:                    string;
@@ -22,8 +24,9 @@ interface BotConfig {
 }
 
 interface BotStatus {
-  config:    BotConfig | null;
-  lastRuns:  BotRun[];
+  config:            BotConfig | null;
+  lastRuns:          BotRun[];
+  manualCooldownSec: number;
 }
 
 interface BotRun {
@@ -55,6 +58,10 @@ const STATUS_LABEL: Record<string, string> = {
 
 export default function BotSettingsPage() {
   const toast = useToast();
+  const router = useRouter();
+  const { activeCompany } = useCompany();
+  const isAdmin = activeCompany?.role === 'OWNER' || activeCompany?.role === 'ADMIN';
+  const [importTotal, setImportTotal] = useState<number | null>(null);
   const [status, setStatus]       = useState<BotStatus | null>(null);
   const [loading, setLoading]     = useState(true);
   const [showSetup, setShowSetup] = useState(false);
@@ -66,6 +73,32 @@ export default function BotSettingsPage() {
   const [runFrom, setRunFrom]         = useState('');
   const [runTo, setRunTo]             = useState('');
   const [dateError, setDateError]     = useState('');
+
+  // Progressive cooldown: starts at 5 min, doubles each time (cap 60 min)
+  // cooldownEndsAt persisted to localStorage so page refresh preserves the countdown.
+  const [cooldownEndsAt, setCooldownEndsAt] = useState<number | null>(null);
+  const [cooldownSec, setCooldownSec]       = useState(0);
+  const cooldownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const startCooldown = (durationSec: number, endsAtOverride?: number) => {
+    const endsAt = endsAtOverride ?? Date.now() + durationSec * 1000;
+    const lsEndsKey = `bot_cooldown_ends_${activeCompany?.id ?? 'default'}`;
+    localStorage.setItem(lsEndsKey, String(endsAt));
+    setCooldownEndsAt(endsAt);
+    if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
+    cooldownTimerRef.current = setInterval(() => {
+      const rem = Math.max(0, Math.round((endsAt - Date.now()) / 1000));
+      setCooldownSec(rem);
+      if (rem <= 0) {
+        clearInterval(cooldownTimerRef.current!);
+        setCooldownEndsAt(null);
+        localStorage.removeItem(lsEndsKey);
+      }
+    }, 1000);
+    setCooldownSec(Math.max(0, Math.round((endsAt - Date.now()) / 1000)));
+  };
+
+  useEffect(() => () => { if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current); }, []);
 
   /** Format Date → YYYY-MM-DD dùng giờ địa phương (không bị lệch múi giờ UTC). */
   const toLocalDateStr = (d: Date): string => {
@@ -124,27 +157,60 @@ export default function BotSettingsPage() {
 
   const load = useCallback(async () => {
     try {
-      const res = await apiClient.get<{ data: BotStatus }>('/bot/status');
-      setStatus(res.data.data);
+      const [botRes, importRes] = await Promise.all([
+        apiClient.get<{ data: BotStatus }>('/bot/status'),
+        apiClient.get<{ meta: { total: number } }>('/invoices', { params: { provider: 'manual', pageSize: 1 } }).catch(() => null),
+      ]);
+      const botData = botRes.data.data;
+      setStatus(botData);
+      if (importRes) setImportTotal(importRes.data.meta?.total ?? 0);
+
+      // Sync cooldown state from two sources (highest remaining time wins):
+      // 1. localStorage — persisted from previous click on this browser.
+      // 2. Backend Redis key — authoritative, survives cross-tab / cross-device.
+      const compId = botData?.config?.company_id;
+      if (compId) {
+        const lsEndsKey = `bot_cooldown_ends_${compId}`;
+        const lsEndsAt  = parseInt(localStorage.getItem(lsEndsKey) ?? '0', 10);
+        const backendEndsAt = botData.manualCooldownSec > 0
+          ? Date.now() + botData.manualCooldownSec * 1000
+          : 0;
+        const bestEndsAt = Math.max(lsEndsAt, backendEndsAt);
+        if (bestEndsAt > Date.now() + 2000) { // >2s remaining
+          startCooldown(0, bestEndsAt);
+        }
+      }
     } catch { /* silent */ } finally {
       setLoading(false);
     }
-  }, []);
+  // activeCompany.id must be a dep so the page reloads when company switches
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeCompany?.id]);
+
+  // Reset status when company changes — prevents stale data flash
+  useEffect(() => {
+    setStatus(null);
+    setLoading(true);
+    if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
+    setCooldownEndsAt(null);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeCompany?.id]);
 
   useEffect(() => { void load(); }, [load]);
 
-  // Auto-poll every 5 s while the bot is actively running
-  const isRunning = status?.config?.last_run_status === 'running';
+  // Auto-poll every 5 s while the bot is running OR queued (pending)
+  const isActivelySyncing = status?.config?.last_run_status === 'running'
+                         || status?.config?.last_run_status === 'pending';
   useEffect(() => {
-    if (!isRunning) return;
+    if (!isActivelySyncing) return;
     const interval = setInterval(() => void load(), 5000);
     return () => clearInterval(interval);
-  }, [isRunning, load]);
+  }, [isActivelySyncing, load]);
 
   const saveConfig = async () => {
     try {
       await apiClient.post('/bot/setup', form);
-      toast.success('✅ Đã lưu cấu hình GDT Bot. Đang chạy lần đầu...');
+      toast.success('✅ Đã lưu cấu hình GDT Bot. Nhấn "Lấy từ GDT" để bắt đầu đồng bộ.');
       setShowSetup(false);
       setForm(p => ({ ...p, password: '' }));
       await load();
@@ -155,6 +221,7 @@ export default function BotSettingsPage() {
   };
 
   const runNow = async (fromDate?: string, toDate?: string) => {
+    if (running || cooldownEndsAt) return;
     setRunning(true);
     try {
       const body: Record<string, string> = {};
@@ -162,12 +229,27 @@ export default function BotSettingsPage() {
       if (toDate)   body['to_date']   = toDate;
       await apiClient.post('/bot/run-now', body);
       toast.success(fromDate ? `Đã xếp hàng lấy dữ liệu từ ${fromDate}` : 'Đã thêm vào hàng đợi đồng bộ');
+      // Progressive cooldown: read previous from localStorage, double it each time (cap 60 min)
+      const lsKey = `bot_cooldown_level_${activeCompany?.id ?? 'default'}`;
+      const prevLevel = parseInt(localStorage.getItem(lsKey) ?? '0', 10);
+      const newLevel  = Math.min(prevLevel + 1, 5);
+      localStorage.setItem(lsKey, String(newLevel));
+      // Level 0→5 min, 1→10 min, 2→20 min, 3→30 min, 4→45 min, 5→60 min
+      const cooldownMinutes = [5, 10, 20, 30, 45, 60][newLevel] ?? 60;
+      // endsAt is computed here then passed to startCooldown so localStorage & state stay in sync
+      const endsAt = Date.now() + cooldownMinutes * 60 * 1000;
+      startCooldown(cooldownMinutes * 60, endsAt);
       setTimeout(() => void load(), 2000);
     } catch (err: unknown) {
       const e = err as { response?: { data?: { error?: { code?: string; waitMinutes?: number; message?: string } } } };
       const apiErr = e?.response?.data?.error;
       if (apiErr?.code === 'COOLDOWN') {
+        const waitSec = (apiErr.waitMinutes ?? 5) * 60;
+        startCooldown(waitSec);
         toast.error(`⏳ Bot đang trong thời gian nghỉ. Vui lòng chờ thêm ${apiErr.waitMinutes} phút.`);
+      } else if (apiErr?.code === 'ALREADY_RUNNING') {
+        toast.error('⏳ Bot đang chạy job đồng bộ. Chờ hoàn tất rồi thử lại.');
+        void load(); // refresh status display
       } else {
         toast.error(apiErr?.message ?? 'Lỗi kích hoạt đồng bộ');
       }
@@ -202,6 +284,8 @@ export default function BotSettingsPage() {
 
   const cfg = status?.config;
   const lastStatus = cfg?.last_run_status ?? null;
+  // Block all interactions when bot job is actively running
+  const isJobRunning = lastStatus === 'running' || running;
 
   if (loading) return (
     <div className="flex justify-center py-24">
@@ -241,10 +325,14 @@ export default function BotSettingsPage() {
           <p className="text-4xl">🤖</p>
           <p className="font-semibold text-gray-900">Chưa thiết lập GDT Bot</p>
           <p className="text-sm text-gray-500">Cần thông tin đăng nhập hoadondientu.gdt.gov.vn</p>
-          <button onClick={() => setShowSetup(true)}
-            className="bg-blue-600 text-white text-sm px-6 py-2.5 rounded-xl font-medium hover:bg-blue-700">
-            🔧 Thiết lập ngay
-          </button>
+          {isAdmin ? (
+            <button onClick={() => setShowSetup(true)}
+              className="bg-blue-600 text-white text-sm px-6 py-2.5 rounded-xl font-medium hover:bg-blue-700">
+              🔧 Thiết lập ngay
+            </button>
+          ) : (
+            <p className="text-xs text-gray-400 italic">Liên hệ OWNER/ADMIN để thiết lập bot.</p>
+          )}
         </div>
       )}
 
@@ -293,32 +381,65 @@ export default function BotSettingsPage() {
           )}
 
           <div className="flex gap-2">
-            <button
-              onClick={() => {
-                const today = new Date();
-                const todayStr = toLocalDateStr(today);
-                const firstOfMonth = toLocalDateStr(new Date(today.getFullYear(), today.getMonth(), 1));
-                // Pre-select current month in month-picker
-                const ym = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}`;
-                setSelectedMonth(ym);
-                setRunFrom(firstOfMonth);
-                setRunTo(todayStr);
-                setDateError('');
-                setShowDatePicker(true);
-              }}
-              disabled={running}
-              className="flex-1 bg-blue-600 text-white rounded-xl py-2.5 text-sm font-medium disabled:opacity-50 hover:bg-blue-700"
-            >
-              {running ? '⏳ Đang xử lý...' : '▶ Đồng bộ hóa đơn'}
-            </button>
-            <button onClick={() => setShowSetup(true)} disabled={running}
-              className="border border-gray-300 text-gray-700 rounded-xl px-4 py-2.5 text-sm hover:bg-gray-50 disabled:opacity-50">
-              ✏️ Sửa
-            </button>
-            <button onClick={deleteConfig}
-              className="border border-red-200 text-red-600 rounded-xl px-4 py-2.5 text-sm hover:bg-red-50">
-              🗑
-            </button>
+            {isAdmin ? (
+              <>
+                {/* "Lấy từ GDT" — disabled while job running OR cooldown active */}
+                <button
+                  onClick={() => {
+                    if (isJobRunning || cooldownEndsAt) return;
+                    const today = new Date();
+                    const todayStr = toLocalDateStr(today);
+                    const firstOfMonth = toLocalDateStr(new Date(today.getFullYear(), today.getMonth(), 1));
+                    const ym = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}`;
+                    setSelectedMonth(ym);
+                    setRunFrom(firstOfMonth);
+                    setRunTo(todayStr);
+                    setDateError('');
+                    setShowDatePicker(true);
+                  }}
+                  disabled={isJobRunning || !!cooldownEndsAt}
+                  title={
+                    isJobRunning ? 'Đang có job đang chạy — chờ hoàn tất'
+                    : cooldownEndsAt ? `Chờ thêm ${Math.ceil(cooldownSec / 60)} phút nữa`
+                    : 'Lấy hóa đơn từ GDT'
+                  }
+                  className="flex-1 bg-blue-600 text-white rounded-xl py-2.5 text-sm font-medium disabled:opacity-50 hover:bg-blue-700 transition-colors flex items-center justify-center gap-2"
+                >
+                  {isJobRunning ? (
+                    <>
+                      <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                      </svg>
+                      Đang chạy...
+                    </>
+                  ) : cooldownEndsAt ? (
+                    <>
+                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
+                      Chờ {cooldownSec >= 60
+                        ? `${Math.floor(cooldownSec / 60)}p${cooldownSec % 60 > 0 ? String(cooldownSec % 60).padStart(2, '0') + 's' : ''}`
+                        : `${cooldownSec}s`}
+                    </>
+                  ) : (
+                    <>▶ Lấy từ GDT</>
+                  )}
+                </button>
+                {/* Sửa — disabled while job running */}
+                <button onClick={() => setShowSetup(true)} disabled={isJobRunning}
+                  title={isJobRunning ? 'Không thể sửa khi bot đang chạy' : 'Sửa cấu hình'}
+                  className="border border-gray-300 text-gray-700 rounded-xl px-4 py-2.5 text-sm hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
+                  ✏️ Sửa
+                </button>
+                <button onClick={deleteConfig} disabled={isJobRunning}
+                  title={isJobRunning ? 'Không thể xóa khi bot đang chạy' : 'Xóa cấu hình'}
+                  className="border border-red-200 text-red-600 rounded-xl px-4 py-2.5 text-sm hover:bg-red-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
+                  🗑
+                </button>
+              </>
+            ) : (
+              <p className="text-xs text-gray-400 italic">Chỉ OWNER/ADMIN mới có thể thao tác bot.</p>
+            )}
           </div>
         </div>
       )}
@@ -354,6 +475,16 @@ export default function BotSettingsPage() {
                 <h2 className="font-bold text-gray-900">Cấu hình GDT Bot</h2>
                 <button onClick={() => setShowSetup(false)} className="text-gray-400 hover:text-gray-700 text-xl">✕</button>
               </div>
+
+              {/* Warning if job running */}
+              {isJobRunning && (
+                <div className="bg-amber-50 border border-amber-300 rounded-lg px-3 py-2 text-xs text-amber-800 flex items-center gap-2">
+                  <svg className="w-4 h-4 animate-pulse flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  Bot đang chạy job — không thể lưu cấu hình lúc này. Chờ job hoàn tất.
+                </div>
+              )}
 
               <div className="bg-blue-50 rounded-lg p-3 text-xs text-blue-800">
                 ℹ️ <strong>Mật khẩu cổng thuế</strong> — là mật khẩu đăng nhập{' '}
@@ -417,8 +548,8 @@ export default function BotSettingsPage() {
                   className="flex-1 border border-gray-300 rounded-xl py-2.5 text-sm">
                   Hủy
                 </button>
-                <button onClick={saveConfig} disabled={!form.password}
-                  className="flex-1 bg-blue-600 text-white rounded-xl py-2.5 text-sm font-medium disabled:opacity-50">
+                <button onClick={saveConfig} disabled={!form.password || isJobRunning}
+                  className="flex-1 bg-blue-600 text-white rounded-xl py-2.5 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed">
                   Lưu & Kết nối
                 </button>
               </div>
@@ -533,6 +664,33 @@ export default function BotSettingsPage() {
           </div>
         </div>
       )}
+
+      {/* ── Import Hóa Đơn Thủ Công ── */}
+      <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+        <div className="p-5">
+          <div className="flex items-center gap-3 mb-3">
+            <span className="text-2xl">📁</span>
+            <div>
+              <h2 className="font-bold text-gray-900">Import Hóa Đơn Thủ Công</h2>
+              <p className="text-xs text-gray-500">
+                Tải file từ hoadondientu.gdt.gov.vn và import vào hệ thống.
+                Hỗ trợ: XML (chi tiết), ZIP (chứa nhiều file XML).
+              </p>
+            </div>
+          </div>
+          {importTotal != null && importTotal > 0 && (
+            <p className="text-xs text-gray-500 mb-3">
+              Đã import {importTotal.toLocaleString('vi-VN')} hóa đơn qua import thủ công.
+            </p>
+          )}
+          <button
+            onClick={() => router.push('/import')}
+            className="w-full bg-primary-600 text-white rounded-xl py-2.5 text-sm font-medium hover:bg-primary-700"
+          >
+            Đi đến trang Import
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

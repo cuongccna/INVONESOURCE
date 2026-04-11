@@ -33,6 +33,22 @@ export interface VatSummary {
 }
 
 /**
+ * Loại các hóa đơn bị thay thế bởi hóa đơn khác (tc_hdon=1) — khớp số hiệu + serial.
+ * Dùng alias tên bảng đang query (vd: 'invoices').
+ */
+function _notReplacedClause(alias: string): string {
+  return `AND NOT EXISTS (
+       SELECT 1 FROM invoices _r
+       WHERE _r.tc_hdon = 1
+         AND _r.deleted_at IS NULL
+         AND _r.company_id = ${alias}.company_id
+         AND TRIM(COALESCE(_r.khhd_cl_quan,  '')) = TRIM(COALESCE(${alias}.serial_number,  ''))
+         AND TRIM(COALESCE(_r.so_hd_cl_quan, '')) = TRIM(COALESCE(${alias}.invoice_number, ''))
+         AND COALESCE(_r.seller_tax_code, '') = COALESCE(${alias}.seller_tax_code, '')
+     )`;
+}
+
+/**
  * VatReconciliationService — calculates and persists VAT reconciliation data
  * for a company in a given period following Vietnam Tax Law.
  *
@@ -68,7 +84,7 @@ export class VatReconciliationService {
        FROM invoices
        WHERE company_id = $1
          AND direction = 'input'
-         AND status != 'cancelled'
+         AND status NOT IN ('cancelled', 'replaced', 'adjusted')
          AND deleted_at IS NULL
          AND EXTRACT(MONTH FROM invoice_date) = $2
          AND EXTRACT(YEAR FROM invoice_date) = $3
@@ -111,6 +127,7 @@ export class VatReconciliationService {
            total_amount <= 20000000
            OR (payment_method IS NOT NULL AND LOWER(payment_method) <> 'cash')
          )
+         ${_notReplacedClause('invoices')}
          ${inputIdFilter}
        GROUP BY vat_rate`,
       inputBaseParams()
@@ -120,7 +137,7 @@ export class VatReconciliationService {
     const ct23_input_subtotal = inputDeductible.reduce((sum, row) => sum + parseFloat(row.subtotal_sum || '0'), 0);
 
     // ============================================================
-    // Output invoices — valid only
+    // Output invoices — valid only, excluding logically-replaced invoices
     // ============================================================
     const { rows: outputByRate } = await pool.query<{
       vat_rate: string;
@@ -135,6 +152,7 @@ export class VatReconciliationService {
          AND deleted_at IS NULL
          AND EXTRACT(MONTH FROM invoice_date) = $2
          AND EXTRACT(YEAR FROM invoice_date) = $3
+         ${_notReplacedClause('invoices')}
          ${outputIdFilter}
        GROUP BY vat_rate`,
       outputBaseParams()
@@ -279,7 +297,7 @@ export class VatReconciliationService {
        FROM invoices
        WHERE company_id = $1
          AND direction = 'input'
-         AND status != 'cancelled'
+         AND status NOT IN ('cancelled', 'replaced', 'adjusted')
          AND deleted_at IS NULL
          AND EXTRACT(YEAR FROM invoice_date) = $2
          AND EXTRACT(MONTH FROM invoice_date) = ANY($3::int[])
@@ -311,6 +329,7 @@ export class VatReconciliationService {
            -- NULL group + gdt_validated: serial format không nhận dạng được nhưng GDT đã xác nhận
            (invoice_group IS NULL AND gdt_validated = true)
          )
+         ${_notReplacedClause('invoices')}
          ${inputIdFilter}
        GROUP BY vat_rate`,
       inputBaseParams(),
@@ -328,6 +347,7 @@ export class VatReconciliationService {
          AND deleted_at IS NULL
          AND EXTRACT(YEAR FROM invoice_date) = $2
          AND EXTRACT(MONTH FROM invoice_date) = ANY($3::int[])
+         ${_notReplacedClause('invoices')}
          ${outputIdFilter}
        GROUP BY vat_rate`,
       outputBaseParams(),

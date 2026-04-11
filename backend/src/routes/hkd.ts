@@ -11,7 +11,7 @@ import { sendSuccess } from '../utils/response';
 import { AppError } from '../utils/AppError';
 import ExcelJS from 'exceljs';
 import puppeteer from 'puppeteer';
-import { HkdDeclarationEngine } from '../services/HkdDeclarationEngine';
+import { HkdDeclarationEngine, INDUSTRY_GROUP_RATES } from '../services/HkdDeclarationEngine';
 import { HkdHtkkXmlGenerator } from '../services/HkdHtkkXmlGenerator';
 
 const router = Router();
@@ -29,11 +29,12 @@ router.get('/tax-statement', async (req: Request, res: Response) => {
 
   // Fetch company tax settings
   const compAny = await pool.query<{
-    business_type: string; tax_regime: string; vat_rate_hkd: string;
+    business_type: string; tax_regime: string; vat_rate_hkd: string; hkd_industry_group: string;
   }>(
     `SELECT COALESCE(business_type,'DN') AS business_type,
             COALESCE(tax_regime,'khau_tru') AS tax_regime,
-            COALESCE(vat_rate_hkd,1.0) AS vat_rate_hkd
+            COALESCE(vat_rate_hkd,1.0) AS vat_rate_hkd,
+            COALESCE(hkd_industry_group,28) AS hkd_industry_group
      FROM companies WHERE id=$1`,
     [companyId],
   );
@@ -58,10 +59,13 @@ if (!comp) throw new AppError('Company not found', 404, 'NOT_FOUND');
     [companyId, startDate, endDate],
   );
   const revenue = Number(revRes.rows[0]?.total ?? 0);
-  const vatRate = Number(comp.vat_rate_hkd);
+  const industryGroup = Number(comp.hkd_industry_group);
+  const groupRates = INDUSTRY_GROUP_RATES[industryGroup] ?? INDUSTRY_GROUP_RATES[28];
+  const vatRate = groupRates.vat;
+  const pitRate = groupRates.pit;
   const vatPayable = comp.tax_regime === 'khoan' ? Math.round(revenue * vatRate / 100) : 0;
   const pitPayable = ['HKD','HND','CA_NHAN'].includes(comp.business_type)
-    ? Math.round(revenue * 0.005)
+    ? Math.round(revenue * pitRate / 100)
     : 0;
   const totalPayable = vatPayable + pitPayable;
   const mustDeclare = revenue > HKD_MONTHLY_THRESHOLD;
@@ -71,6 +75,8 @@ if (!comp) throw new AppError('Company not found', 404, 'NOT_FOUND');
     company_type: comp.business_type,
     tax_regime: comp.tax_regime,
     vat_rate_hkd: vatRate,
+    pit_rate_hkd: pitRate,
+    industry_group: industryGroup,
     revenue,
     vat_payable: vatPayable,
     pit_payable: pitPayable,
@@ -92,11 +98,13 @@ router.get('/dashboard/kpi', async (req: Request, res: Response) => {
   // Guard: household only
   const compRes = await pool.query<{
     company_type: string; business_type: string; vat_rate_hkd: string; tax_regime: string;
+    hkd_industry_group: string;
   }>(
     `SELECT company_type,
             COALESCE(business_type, 'DN') AS business_type,
             COALESCE(vat_rate_hkd, 1.0)  AS vat_rate_hkd,
-            COALESCE(tax_regime, 'khoan') AS tax_regime
+            COALESCE(tax_regime, 'khoan') AS tax_regime,
+            COALESCE(hkd_industry_group, 28) AS hkd_industry_group
      FROM companies WHERE id = $1`,
     [companyId]
   );
@@ -129,9 +137,11 @@ router.get('/dashboard/kpi', async (req: Request, res: Response) => {
 
   const revenue      = Number(outputRes.rows[0]?.total    ?? 0);
   const inputTotal   = Number(inputRes.rows[0]?.total     ?? 0);
-  const vatRate      = Number(comp.vat_rate_hkd);
+  const industryGroupKpi = Number(comp.hkd_industry_group);
+  const kpiRates     = INDUSTRY_GROUP_RATES[industryGroupKpi] ?? INDUSTRY_GROUP_RATES[28];
+  const vatRate      = kpiRates.vat;
   const khoaNTax     = comp.tax_regime === 'khoan' ? Math.round(revenue * vatRate / 100) : 0;
-  const pitTax       = Math.round(revenue * 0.005);
+  const pitTax       = Math.round(revenue * kpiRates.pit / 100);
   const profitEst    = revenue - inputTotal;
   const profitMargin = revenue > 0 ? Math.round((profitEst / revenue) * 100) : 0;
 
@@ -198,10 +208,11 @@ router.post('/generate', async (req: Request, res: Response) => {
   const endDate = new Date(y, m, 0).toISOString().split('T')[0];
 
   const [compAny, revRes] = await Promise.all([
-    pool.query<{ vat_rate_hkd: string; tax_regime: string; business_type: string }>(
+    pool.query<{ vat_rate_hkd: string; tax_regime: string; business_type: string; hkd_industry_group: string }>(
       `SELECT COALESCE(vat_rate_hkd,1.0) AS vat_rate_hkd,
               COALESCE(tax_regime,'khoan') AS tax_regime,
-              COALESCE(business_type,'HKD') AS business_type
+              COALESCE(business_type,'HKD') AS business_type,
+              COALESCE(hkd_industry_group,28) AS hkd_industry_group
        FROM companies WHERE id=$1`,
       [companyId],
     ),
@@ -217,9 +228,10 @@ router.post('/generate', async (req: Request, res: Response) => {
   const comp = compAny.rows[0];
   if (!comp) throw new AppError('Company not found', 404, 'NOT_FOUND');
   const revenue = Number(revRes.rows[0]?.total ?? 0);
-  const vatRate = Number(comp.vat_rate_hkd);
+  const genGroupRates = INDUSTRY_GROUP_RATES[Number(comp.hkd_industry_group)] ?? INDUSTRY_GROUP_RATES[28];
+  const vatRate = genGroupRates.vat;
   const vatPayable = comp.tax_regime === 'khoan' ? Math.round(revenue * vatRate / 100) : 0;
-  const pitPayable = Math.round(revenue * 0.005);
+  const pitPayable = Math.round(revenue * genGroupRates.pit / 100);
   const totalPayable = vatPayable + pitPayable;
 
   const { rows } = await pool.query(
@@ -238,7 +250,7 @@ router.post('/generate', async (req: Request, res: Response) => {
 // PATCH /api/hkd/settings  — update company tax type settings
 router.patch('/settings', async (req: Request, res: Response) => {
   const companyId = req.user!.companyId!;
-  const { business_type, tax_regime, vat_rate_hkd } = req.body as Record<string, unknown>;
+  const { business_type, tax_regime, vat_rate_hkd, hkd_industry_group } = req.body as Record<string, unknown>;
 
   const validBusinessTypes = ['DN','HKD','HND','CA_NHAN'];
   const validTaxRegimes = ['khoan','thuc_te','khau_tru'];
@@ -252,19 +264,24 @@ router.patch('/settings', async (req: Request, res: Response) => {
   if (vat_rate_hkd !== undefined && (Number(vat_rate_hkd) < 0 || Number(vat_rate_hkd) > 100)) {
     throw new AppError('vat_rate_hkd must be 0-100', 400, 'VALIDATION');
   }
+  if (hkd_industry_group !== undefined && ![28, 29, 30, 31].includes(Number(hkd_industry_group))) {
+    throw new AppError('hkd_industry_group must be 28, 29, 30, or 31', 400, 'VALIDATION');
+  }
 
   const { rows } = await pool.query(
     `UPDATE companies SET
        business_type=COALESCE($2::business_type_enum, business_type),
        tax_regime=COALESCE($3::tax_regime_enum, tax_regime),
        vat_rate_hkd=COALESCE($4, vat_rate_hkd),
+       hkd_industry_group=COALESCE($5, hkd_industry_group),
        updated_at=NOW()
      WHERE id=$1
-     RETURNING id, name, business_type, tax_regime, vat_rate_hkd`,
+     RETURNING id, name, business_type, tax_regime, vat_rate_hkd, hkd_industry_group`,
     [companyId,
      business_type ? String(business_type) : null,
      tax_regime ? String(tax_regime) : null,
-     vat_rate_hkd !== undefined ? Number(vat_rate_hkd) : null],
+     vat_rate_hkd !== undefined ? Number(vat_rate_hkd) : null,
+     hkd_industry_group !== undefined ? Number(hkd_industry_group) : null],
   );
   if (!rows.length) throw new AppError('Company not found', 404, 'NOT_FOUND');
   sendSuccess(res, rows[0]);
@@ -425,7 +442,7 @@ router.get('/declarations/:id/export', requireRole('OWNER', 'ADMIN', 'ACCOUNTANT
       ['Doanh thu chịu thuế GTGT', d.revenue_m1, d.revenue_m2, d.revenue_m3, d.revenue_total],
       [`Thuế GTGT khoán (${d.vat_rate}%)`, d.vat_m1, d.vat_m2, d.vat_m3, d.vat_total],
       ['Doanh thu chịu thuế TNCN', d.revenue_m1, d.revenue_m2, d.revenue_m3, d.revenue_total],
-      ['Thuế TNCN (0.5%)', d.pit_m1, d.pit_m2, d.pit_m3, d.pit_total],
+      [`Thuế TNCN (${d.pit_rate ?? 0.5}%)`, d.pit_m1, d.pit_m2, d.pit_m3, d.pit_total],
     ];
 
     for (const [label, v1, v2, v3, total] of rows) {
@@ -481,7 +498,7 @@ router.get('/declarations/:id/export', requireRole('OWNER', 'ADMIN', 'ACCOUNTANT
     <tr><td>Doanh thu chịu thuế GTGT</td><td class="num">${fmtVND(d.revenue_m1)}</td><td class="num">${fmtVND(d.revenue_m2)}</td><td class="num">${fmtVND(d.revenue_m3)}</td><td class="num">${fmtVND(d.revenue_total)}</td></tr>
     <tr><td>Thuế GTGT khoán (${d.vat_rate}%)</td><td class="num">${fmtVND(d.vat_m1)}</td><td class="num">${fmtVND(d.vat_m2)}</td><td class="num">${fmtVND(d.vat_m3)}</td><td class="num">${fmtVND(d.vat_total)}</td></tr>
     <tr><td>Doanh thu chịu thuế TNCN</td><td class="num">${fmtVND(d.revenue_m1)}</td><td class="num">${fmtVND(d.revenue_m2)}</td><td class="num">${fmtVND(d.revenue_m3)}</td><td class="num">${fmtVND(d.revenue_total)}</td></tr>
-    <tr><td>Thuế TNCN (0.5%)</td><td class="num">${fmtVND(d.pit_m1)}</td><td class="num">${fmtVND(d.pit_m2)}</td><td class="num">${fmtVND(d.pit_m3)}</td><td class="num">${fmtVND(d.pit_total)}</td></tr>
+    <tr><td>Thuế TNCN (${d.pit_rate ?? 0.5}%)</td><td class="num">${fmtVND(d.pit_m1)}</td><td class="num">${fmtVND(d.pit_m2)}</td><td class="num">${fmtVND(d.pit_m3)}</td><td class="num">${fmtVND(d.pit_total)}</td></tr>
     <tr class="total-row"><td colspan="4">TỔNG PHẢI NỘP</td><td class="num">${fmtVND(d.total_payable)}</td></tr>
   </tbody>
 </table>

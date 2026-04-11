@@ -8,7 +8,21 @@ import {
   useCallback,
   ReactNode,
 } from 'react';
-import apiClient, { setApiCompanyId } from '../lib/apiClient';
+import apiClient, { setApiCompanyId, setApiViewContext, getApiViewContext } from '../lib/apiClient';
+
+/**
+ * Synchronously update BOTH _activeCompanyId and _viewContext.companyId in the
+ * apiClient module so every subsequent request gets the correct X-Company-Id
+ * header without waiting for React's ViewContext sync effect (which requires
+ * 2+ render cycles and causes company data cross-contamination).
+ */
+function _syncApiCompany(id: string): void {
+  setApiCompanyId(id);
+  const ctx = getApiViewContext();
+  if (ctx.mode === 'single') {
+    setApiViewContext({ ...ctx, companyId: id });
+  }
+}
 
 export interface CompanyInfo {
   id: string;
@@ -63,7 +77,7 @@ export function CompanyProvider({ children }: { children: ReactNode }) {
           (typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY) : null);
         const preferred = list.find((c) => c.id === stored) ?? list[0];
         setActiveCompanyIdState(preferred.id);
-        setApiCompanyId(preferred.id);
+        _syncApiCompany(preferred.id);
         if (typeof window !== 'undefined') {
           localStorage.setItem(STORAGE_KEY, preferred.id);
         }
@@ -84,7 +98,7 @@ export function CompanyProvider({ children }: { children: ReactNode }) {
       const company = companies.find((c) => c.id === id);
       if (!company) return;
       setActiveCompanyIdState(id);
-      setApiCompanyId(id);
+      _syncApiCompany(id);
       if (typeof window !== 'undefined') {
         localStorage.setItem(STORAGE_KEY, id);
       }

@@ -1,15 +1,17 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { pool } from '../../db/pool';
-import { authenticate, requireRole } from '../../middleware/auth';
-import { requireCompany } from '../../middleware/company';
+import { requireRole } from '../../middleware/auth';
 import { ValidationError, ForbiddenError } from '../../utils/AppError';
 import { sendSuccess, sendPaginated } from '../../utils/response';
 import { InvoiceValidationPipeline } from './invoice-validation.pipeline';
 import type { InvoiceRow } from './types';
 
 const router = Router();
-router.use(authenticate);
+// NOTE: Do NOT add router.use(authenticate) or router.use(requireCompany) here.
+// This router is mounted inside the declarations router which already applies both.
+// Adding authenticate here would re-decode the JWT and overwrite req.user.companyId
+// that requireCompany set from the X-Company-Id header — causing cross-company data leaks.
 
 // ─── Schemas ──────────────────────────────────────────────────────────────────
 
@@ -43,7 +45,6 @@ const updatePluginConfigSchema = z.array(z.object({
  */
 router.post(
   '/validate-invoices',
-  requireCompany,
   requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -121,7 +122,6 @@ router.post(
  */
 router.get(
   '/validation-log',
-  requireCompany,
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const mst = String(req.query.mst ?? '');

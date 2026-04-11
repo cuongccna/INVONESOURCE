@@ -79,7 +79,7 @@ const syncStartLimiter = rateLimit({
   message: { success: false, error: { code: 'RATE_LIMIT', message: 'Quá nhiều lần đồng bộ. Vui lòng thử lại sau.' } },
 });
 
-router.post('/start', syncStartLimiter, requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/start', syncStartLimiter, requireRole('OWNER', 'ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const companyId = req.user!.companyId;
     if (!companyId) throw new ValidationError('Company not associated');

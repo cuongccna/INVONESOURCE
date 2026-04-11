@@ -37,9 +37,10 @@ export const gdtValidateWorker = new Worker<GdtValidateJobPayload>(
     const { invoiceId, invoiceNumber, serialNumber, sellerTaxCode, issuedDate, companyId } = job.data;
 
     try {
-    // Viettel invoices have serial starting with 'C' (không có mã CQT).
-    // These cannot be individually validated via GDT portal.
-    // Viettel is a licensed e-invoice provider — mark as validated by default.
+    // Serial prefix 'C' = group 5 (CÓ mã CQT — invoices stamped with GDT code).
+    // Viettel pushes these directly to GDT during issuance; CQT code is embedded
+    // at creation time, so portal probing returns inconsistent results for Viettel.
+    // Skip individual portal validation and trust the CQT code on the invoice.
     if (serialNumber?.startsWith('C')) {
       await pool.query(
         `UPDATE invoices SET gdt_validated = true, gdt_validated_at = NOW(), updated_at = NOW()

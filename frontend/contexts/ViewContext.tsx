@@ -63,14 +63,12 @@ export function ViewProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (mode !== 'single') return;
-
-    const isValidStoredCompany = companyId && companies.some((c) => c.id === companyId);
-    if (isValidStoredCompany) return;
-
-    if (activeCompanyId) {
-      setCompanyId(activeCompanyId);
-    }
-  }, [mode, companyId, companies, activeCompanyId]);
+    // In single mode, ViewContext.companyId MUST track CompanyContext.activeCompanyId.
+    // Previous logic allowed a valid-but-stale localStorage company to block the sync,
+    // causing every API request to send the wrong X-Company-Id header.
+    if (!activeCompanyId || companyId === activeCompanyId) return;
+    setCompanyId(activeCompanyId);
+  }, [mode, companyId, activeCompanyId]);
 
   useEffect(() => {
     if (mode === 'group' && !orgId && companyId) {
@@ -80,14 +78,30 @@ export function ViewProvider({ children }: { children: ReactNode }) {
   }, [mode, orgId, companyId, companies]);
 
   useEffect(() => {
+    // localStorage stores the local companyId (used for UI restoration on next load).
     const payload: StoredViewContext = { mode, orgId, companyId };
-
     if (typeof window !== 'undefined') {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
     }
 
-    setApiViewContext({ mode, orgId, companyId });
-  }, [mode, orgId, companyId]);
+    // API routing MUST use the CONFIRMED activeCompanyId from CompanyContext in single mode.
+    // NEVER fall back to the local `companyId` state here — it may be stale from localStorage
+    // and belongs to a different company. When activeCompanyId is null (not yet resolved),
+    // pass null so the interceptor falls back to _activeCompanyId (set synchronously by
+    // CompanyContext._syncApiCompany before this effect ever fires with a non-null value).
+    const apiCompanyId = mode === 'single' ? activeCompanyId : companyId;
+
+    if (process.env.NODE_ENV !== 'production') {
+      console.debug(
+        `[ViewContext] persist mode=${mode}` +
+        ` local=${companyId ?? 'null'}` +
+        ` active=${activeCompanyId ?? 'null'}` +
+        ` apiId=${apiCompanyId ?? 'null'}`
+      );
+    }
+
+    setApiViewContext({ mode, orgId, companyId: apiCompanyId });
+  }, [mode, orgId, companyId, activeCompanyId]);
 
   const setMode = useCallback(
     (nextMode: ViewMode, options?: { orgId?: string | null; companyId?: string | null }) => {

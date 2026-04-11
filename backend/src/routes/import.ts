@@ -10,6 +10,7 @@ import { authenticate, requireRole } from '../middleware/auth';
 import { requireCompany } from '../middleware/company';
 import { ValidationError, NotFoundError } from '../utils/AppError';
 import { sendSuccess, sendPaginated } from '../utils/response';
+import { parseInvoiceSerial } from '../utils/InvoiceSerialParser';
 
 const router = Router();
 router.use(authenticate);
@@ -77,6 +78,11 @@ interface PreviewRow {
   status:         string | null;
   error:          string | null;
   line_items:     LineItem[];
+  // GROUP 28: GDT XML replacement/adjustment tracking (TTHDLQuan block)
+  tc_hdon:        number | null;   // 1=thay thế, 2=điều chỉnh, null=bình thường
+  lhd_cl_quan:    number | null;   // LHDCLQuan
+  khhd_cl_quan:   string | null;   // KHHDCLQuan — ký hiệu HĐ bị thay thế/điều chỉnh
+  so_hd_cl_quan:  string | null;   // SHDCLQuan  — số HĐ bị thay thế/điều chỉnh
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -247,6 +253,16 @@ function parseGdtXml(buffer: Buffer): PreviewRow[] {
       else if (n === 6) status = 'adjusted';
     }
 
+    // Parse GDT XML replacement/adjustment relationship block: TTChung > TTHDLQuan
+    const tthd = (ttchung['TTHDLQuan'] ?? ttchung['ttHDLQuan'] ?? {}) as Record<string, unknown>;
+    const tcHDon     = tthd['TCHDon']     ?? tthd['tcHDon']     ?? null;
+    const lhdClQuan  = tthd['LHDCLQuan']  ?? tthd['lHDCLQuan']  ?? null;
+    const khhdClQuan = tthd['KHHDCLQuan'] ?? tthd['kHHDCLQuan'] ?? null;
+    const shdClQuan  = tthd['SHDCLQuan']  ?? tthd['sHDCLQuan']  ?? null;
+
+    const tcHDonNum    = tcHDon    != null ? Number(tcHDon)    : null;
+    const lhdClQuanNum = lhdClQuan != null ? Number(lhdClQuan) : null;
+
     const invNum = ttchung['SHDon'] ?? ttchung['sHDon'];
     const invDate = parseDate(ttchung['NLap'] ?? ttchung['nLap']);
     const totalAmt    = toNumber(ttoan['TgTTTBSo'] ?? ttoan['tgTTTBSo'] ?? ndhdon['TgTTTBSo'] ?? null);
@@ -279,6 +295,10 @@ function parseGdtXml(buffer: Buffer): PreviewRow[] {
       status,
       error,
       line_items:      lineItems,
+      tc_hdon:        tcHDonNum,
+      lhd_cl_quan:    lhdClQuanNum,
+      khhd_cl_quan:   khhdClQuan != null ? String(khhdClQuan) : null,
+      so_hd_cl_quan:  shdClQuan  != null ? String(shdClQuan)  : null,
     });
   }
 
@@ -340,6 +360,7 @@ function parseExcelOrCsv(buffer: Buffer, isCsv: boolean): PreviewRow[] {
       payment_method: null,
       status: 'valid', error: null,
       line_items: [],
+      tc_hdon: null, lhd_cl_quan: null, khhd_cl_quan: null, so_hd_cl_quan: null,
     };
 
     for (const [col, field] of Object.entries(colMap)) {
@@ -493,6 +514,7 @@ function parseGdtListExcel(buffer: Buffer): PreviewRow[] {
       status,
       error,
       line_items:      [], // List format — no line item detail
+      tc_hdon: null, lhd_cl_quan: null, khhd_cl_quan: null, so_hd_cl_quan: null,
     });
   }
 
@@ -735,6 +757,9 @@ router.post(
             continue;
           }
 
+          // Derive invoice classification fields from serial number (TT78/2021)
+          const serialInfo = parseInvoiceSerial(row.serial_number ?? '');
+
           if (existingId && duplicatePolicy === 'skip') {
             dupCount++;
           } else if (existingId && duplicatePolicy === 'overwrite') {
@@ -745,7 +770,10 @@ router.post(
                  seller_name = $4, seller_tax_code = $5,
                  buyer_name = $6, buyer_tax_code = $7,
                  subtotal = $8, total_amount = $9, vat_amount = $10, vat_rate = $11,
-                 payment_method = $12, import_session_id = $13, updated_at = NOW()
+                 payment_method = $12, import_session_id = $13,
+                 tc_hdon = $15, lhd_cl_quan = $16, khhd_cl_quan = $17, so_hd_cl_quan = $18,
+                 invoice_group = $19, serial_has_cqt = $20, has_line_items = $21,
+                 updated_at = NOW()
                WHERE id = $14`,
               [
                 row.serial_number,
@@ -754,6 +782,9 @@ router.post(
                 row.buyer_name, row.buyer_tax_code,
                 rowSubtotalOvr, row.total_amount, row.vat_amount, vatRate,
                 row.payment_method, sessionId, existingId,
+                row.tc_hdon ?? null, row.lhd_cl_quan ?? null,
+                row.khhd_cl_quan ?? null, row.so_hd_cl_quan ?? null,
+                serialInfo.invoiceGroup, serialInfo.hasCqtCode, serialInfo.isDetailAvailable,
               ]
             );
             // Replace line items on overwrite
@@ -768,6 +799,18 @@ router.post(
                 );
               }
             }
+            // Mark original invoice as replaced/adjusted when this invoice references it
+            if (row.tc_hdon != null && row.khhd_cl_quan && row.so_hd_cl_quan) {
+              const newStatus = row.tc_hdon === 1 ? 'replaced' : 'adjusted';
+              await pool.query(
+                `UPDATE invoices SET status = $1, updated_at = NOW()
+                 WHERE company_id = $2
+                   AND serial_number = $3
+                   AND invoice_number = $4
+                   AND status NOT IN ('cancelled', 'replaced', 'adjusted')`,
+                [newStatus, companyId, row.khhd_cl_quan, row.so_hd_cl_quan]
+              );
+            }
             successCount++;
           } else {
             const rowSubtotal = row.subtotal ?? ((row.total_amount ?? 0) - (row.vat_amount ?? 0));
@@ -776,8 +819,10 @@ router.post(
                (id, company_id, invoice_number, serial_number, invoice_date, direction, status,
                 seller_name, seller_tax_code, buyer_name, buyer_tax_code,
                 subtotal, total_amount, vat_amount, vat_rate, payment_method,
+                tc_hdon, lhd_cl_quan, khhd_cl_quan, so_hd_cl_quan,
+                invoice_group, serial_has_cqt, has_line_items,
                 gdt_validated, source, import_session_id, provider, created_at)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,true,'manual_import',$17,'manual',NOW())`,
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,true,'manual_import',$24,'manual',NOW())`,
               [
                 invoiceId, companyId,
                 row.invoice_number, row.serial_number,
@@ -787,6 +832,9 @@ router.post(
                 row.buyer_name, row.buyer_tax_code,
                 rowSubtotal, row.total_amount, row.vat_amount, vatRate,
                 row.payment_method,
+                row.tc_hdon ?? null, row.lhd_cl_quan ?? null,
+                row.khhd_cl_quan ?? null, row.so_hd_cl_quan ?? null,
+                serialInfo.invoiceGroup, serialInfo.hasCqtCode, serialInfo.isDetailAvailable,
                 sessionId,
               ]
             );
@@ -797,6 +845,18 @@ router.post(
                  (id, invoice_id, company_id, line_number, item_code, item_name, unit, quantity, unit_price, subtotal, vat_rate, vat_amount, total, created_at)
                  VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())`,
                 [invoiceId, companyId, li.line_number, li.item_code, li.item_name, li.unit, li.quantity, li.unit_price, li.subtotal, li.vat_rate, li.vat_amount, li.total]
+              );
+            }
+            // Mark original invoice as replaced/adjusted when this invoice references it
+            if (row.tc_hdon != null && row.khhd_cl_quan && row.so_hd_cl_quan) {
+              const newStatus = row.tc_hdon === 1 ? 'replaced' : 'adjusted';
+              await pool.query(
+                `UPDATE invoices SET status = $1, updated_at = NOW()
+                 WHERE company_id = $2
+                   AND serial_number = $3
+                   AND invoice_number = $4
+                   AND status NOT IN ('cancelled', 'replaced', 'adjusted')`,
+                [newStatus, companyId, row.khhd_cl_quan, row.so_hd_cl_quan]
               );
             }
             successCount++;
@@ -907,6 +967,9 @@ router.post(
           const existingRow = dupRes.rows[0] ?? null;
           const existingId: string | null = existingRow?.id ?? null;
 
+          // Derive invoice classification fields from serial number (TT78/2021)
+          const serialInfo = parseInvoiceSerial(row.serial_number ?? '');
+
           if (existingRow?.is_permanently_ignored) {
             dupCount++;
           } else if (existingId && duplicatePolicy === 'skip') {
@@ -919,7 +982,10 @@ router.post(
                  seller_name = $4, seller_tax_code = $5,
                  buyer_name = $6, buyer_tax_code = $7,
                  subtotal = $8, total_amount = $9, vat_amount = $10, vat_rate = $11,
-                 payment_method = $12, import_session_id = $13, updated_at = NOW()
+                 payment_method = $12, import_session_id = $13,
+                 tc_hdon = $15, lhd_cl_quan = $16, khhd_cl_quan = $17, so_hd_cl_quan = $18,
+                 invoice_group = $19, serial_has_cqt = $20, has_line_items = $21,
+                 updated_at = NOW()
                WHERE id = $14`,
               [
                 row.serial_number,
@@ -928,6 +994,9 @@ router.post(
                 row.buyer_name, row.buyer_tax_code,
                 rowSubtotalOvr, row.total_amount, row.vat_amount, vatRate,
                 row.payment_method, sessionId, existingId,
+                row.tc_hdon ?? null, row.lhd_cl_quan ?? null,
+                row.khhd_cl_quan ?? null, row.so_hd_cl_quan ?? null,
+                serialInfo.invoiceGroup, serialInfo.hasCqtCode, serialInfo.isDetailAvailable,
               ]
             );
             if (row.line_items.length > 0) {
@@ -941,6 +1010,18 @@ router.post(
                 );
               }
             }
+            // Mark original invoice as replaced/adjusted when this invoice references it
+            if (row.tc_hdon != null && row.khhd_cl_quan && row.so_hd_cl_quan) {
+              const newStatus = row.tc_hdon === 1 ? 'replaced' : 'adjusted';
+              await pool.query(
+                `UPDATE invoices SET status = $1, updated_at = NOW()
+                 WHERE company_id = $2
+                   AND serial_number = $3
+                   AND invoice_number = $4
+                   AND status NOT IN ('cancelled', 'replaced', 'adjusted')`,
+                [newStatus, companyId, row.khhd_cl_quan, row.so_hd_cl_quan]
+              );
+            }
             successCount++;
           } else {
             const rowSubtotal = row.subtotal ?? ((row.total_amount ?? 0) - (row.vat_amount ?? 0));
@@ -949,8 +1030,10 @@ router.post(
                (id, company_id, invoice_number, serial_number, invoice_date, direction, status,
                 seller_name, seller_tax_code, buyer_name, buyer_tax_code,
                 subtotal, total_amount, vat_amount, vat_rate, payment_method,
+                tc_hdon, lhd_cl_quan, khhd_cl_quan, so_hd_cl_quan,
+                invoice_group, serial_has_cqt, has_line_items,
                 gdt_validated, source, import_session_id, provider, created_at)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,true,'manual_import',$17,'manual',NOW())`,
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,true,'manual_import',$24,'manual',NOW())`,
               [
                 invoiceId, companyId,
                 row.invoice_number, row.serial_number,
@@ -960,6 +1043,9 @@ router.post(
                 row.buyer_name, row.buyer_tax_code,
                 rowSubtotal, row.total_amount, row.vat_amount, vatRate,
                 row.payment_method,
+                row.tc_hdon ?? null, row.lhd_cl_quan ?? null,
+                row.khhd_cl_quan ?? null, row.so_hd_cl_quan ?? null,
+                serialInfo.invoiceGroup, serialInfo.hasCqtCode, serialInfo.isDetailAvailable,
                 sessionId,
               ]
             );
@@ -969,6 +1055,18 @@ router.post(
                  (id, invoice_id, company_id, line_number, item_code, item_name, unit, quantity, unit_price, subtotal, vat_rate, vat_amount, total, created_at)
                  VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())`,
                 [invoiceId, companyId, li.line_number, li.item_code, li.item_name, li.unit, li.quantity, li.unit_price, li.subtotal, li.vat_rate, li.vat_amount, li.total]
+              );
+            }
+            // Mark original invoice as replaced/adjusted when this invoice references it
+            if (row.tc_hdon != null && row.khhd_cl_quan && row.so_hd_cl_quan) {
+              const newStatus = row.tc_hdon === 1 ? 'replaced' : 'adjusted';
+              await pool.query(
+                `UPDATE invoices SET status = $1, updated_at = NOW()
+                 WHERE company_id = $2
+                   AND serial_number = $3
+                   AND invoice_number = $4
+                   AND status NOT IN ('cancelled', 'replaced', 'adjusted')`,
+                [newStatus, companyId, row.khhd_cl_quan, row.so_hd_cl_quan]
               );
             }
             successCount++;
@@ -1030,10 +1128,14 @@ router.get(
       const [countRes, dataRes] = await Promise.all([
         pool.query(`SELECT COUNT(*) FROM import_sessions WHERE company_id = $1`, [companyId]),
         pool.query(
-          `SELECT id, filename, format, direction, total_rows, success_count, duplicate_count, error_count,
-                  created_at, imported_by
-           FROM import_sessions WHERE company_id = $1
-           ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+          `SELECT s.id, s.filename, s.format, s.direction,
+            NULL::int AS period_month, NULL::int AS period_year,
+            s.total_rows, s.success_count, s.duplicate_count, s.error_count,
+            s.created_at, u.full_name AS user_name
+             FROM import_sessions s
+             LEFT JOIN users u ON u.id = s.imported_by
+             WHERE s.company_id = $1
+             ORDER BY s.created_at DESC LIMIT $2 OFFSET $3`,
           [companyId, pageSize, offset]
         ),
       ]);

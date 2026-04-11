@@ -12,6 +12,7 @@ interface HkdDeclaration {
   id: string;
   period_quarter: number;
   period_year: number;
+  industry_group?: number;
   revenue_m1: number;
   revenue_m2: number;
   revenue_m3: number;
@@ -21,6 +22,7 @@ interface HkdDeclaration {
   vat_m2: number;
   vat_m3: number;
   vat_total: number;
+  pit_rate?: number;
   pit_m1: number;
   pit_m2: number;
   pit_m3: number;
@@ -56,7 +58,11 @@ export default function HkdDeclarationsPage() {
   const [calcYear, setCalcYear] = useState(currentYear);
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
+  const { activeCompany, loading: companyLoading } = useCompany();
+  const router = useRouter();
+
   const load = useCallback(async () => {
+    if (!activeCompany?.id) { setLoading(false); return; }
     setLoading(true);
     try {
       const res = await apiClient.get<{ data: HkdDeclaration[] }>(`/hkd/declarations?year=${year}`);
@@ -66,12 +72,15 @@ export default function HkdDeclarationsPage() {
     } finally {
       setLoading(false);
     }
-  }, [year]);
+  }, [year, activeCompany?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Reset list when user switches company
+  useEffect(() => {
+    setDeclarations([]);
+    setLoading(true);
+  }, [activeCompany?.id]);
 
   useEffect(() => { void load(); }, [load]);
-
-  const { activeCompany, loading: companyLoading } = useCompany();
-  const router = useRouter();
 
   // If active company is NOT household, redirect to DN declarations
   useEffect(() => {
@@ -88,8 +97,11 @@ export default function HkdDeclarationsPage() {
       toast.success('Đã tính tờ khai HKD thành công');
       setYear(calcYear);
       await load();
-    } catch {
-      toast.error('Lỗi tính tờ khai. Vui lòng thử lại.');
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { error?: { message?: string } } } })?.response?.data?.error?.message
+        ?? 'Lỗi tính tờ khai. Vui lòng thử lại.';
+      toast.error(msg);
     } finally {
       setCalculating(false);
     }
@@ -265,7 +277,7 @@ export default function HkdDeclarationsPage() {
                           <td className="p-2 text-right font-semibold text-orange-600">{formatVND(decl.vat_total)}</td>
                         </tr>
                         <tr className="border-t border-gray-100">
-                          <td className="p-2 text-gray-600">Thuế TNCN (0.5%)</td>
+                          <td className="p-2 text-gray-600">Thuế TNCN ({decl.pit_rate ?? 0.5}%)</td>
                           <td className="p-2 text-right">{formatVND(decl.pit_m1)}</td>
                           <td className="p-2 text-right">{formatVND(decl.pit_m2)}</td>
                           <td className="p-2 text-right">{formatVND(decl.pit_m3)}</td>

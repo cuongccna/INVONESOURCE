@@ -77,9 +77,9 @@ const PROVIDER_LABELS: Record<string, string> = {
   misa: 'MISA', viettel: 'Viettel', bkav: 'BKAV', gdt_intermediary: 'GDT',
 };
 /* ─── Formatters ──────────────────────────────────────────────────────────── */
-import { formatVND, formatVNDShort, formatVNDFull } from '../../../utils/formatCurrency';
+import { formatVND, formatVNDShort, formatVNDFull, formatVNDCompact } from '../../../utils/formatCurrency';
 
-const compact = formatVND;
+const compact = (n: number | string) => formatVNDCompact(n).replace(/\s*₫$/, '');
 const full = (n: string | number) => Number(n).toLocaleString('vi-VN');
 function timeAgo(iso: string) {
   const diff = Math.floor((Date.now() - new Date(iso).getTime()) / 60_000);
@@ -544,7 +544,7 @@ export default function DashboardPage() {
                       : d.days_left <= 20 ? 'bg-amber-100 text-amber-700'
                       : 'bg-green-100 text-green-700'
                     }`}>
-                      {d.days_left < 0 ? 'Quá hạn' : `Còn ${d.days_left}d`}
+                      {d.days_left < 0 ? 'Quá hạn' : `Còn ${d.days_left} Ngày`}
                     </span>
                   </div>
                 ))}

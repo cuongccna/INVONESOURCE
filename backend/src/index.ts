@@ -53,8 +53,11 @@ import { scheduleRepurchaseAlertJob } from './jobs/RepurchaseAlertJob';
 import { scheduleGdtBotSync, gdtBotSchedulerWorker } from './jobs/GdtBotSchedulerJob';
 import { scheduleQuotaReset } from './jobs/QuotaResetJob';
 import { syncNotificationWorker } from './jobs/SyncNotificationWorker';
+import { gdtRawCacheSyncWorker } from './jobs/GdtRawCacheSyncWorker';
+import { gdtRawCacheSchedulerWorker, scheduleGdtRawCacheSync } from './jobs/GdtRawCacheScheduler';
 import adminRouter from './routes/admin';
 import toolsRouter from './routes/tools';
+import syncStatusRouter from './routes/syncStatus';
 
 const app = express();
 
@@ -144,6 +147,7 @@ app.use('/api/reports/profit-loss', profitLossRouter);
 app.use('/api/hkd', hkdRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/tools', toolsRouter);
+app.use('/api/sync-status', syncStatusRouter);
 
 // Health check (unauthenticated)
 app.get('/health', (_req, res) => {
@@ -183,6 +187,10 @@ async function start(): Promise<void> {
   await scheduleTaxDeadlineReminder();
   await scheduleRepurchaseAlertJob();
   await scheduleQuotaReset();
+  // GDT Raw Cache layer — background pre-fetch + change detection
+  void gdtRawCacheSyncWorker;         // auto-started on import
+  void gdtRawCacheSchedulerWorker;    // auto-started on import
+  await scheduleGdtRawCacheSync();
   console.info('[Jobs] BullMQ workers started');
 
   app.listen(env.API_PORT, () => {

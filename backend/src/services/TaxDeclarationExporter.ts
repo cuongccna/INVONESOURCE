@@ -101,7 +101,7 @@ export class TaxDeclarationExporter {
        WHERE company_id = $1
          AND EXTRACT(YEAR FROM invoice_date)::INT = $2
          AND EXTRACT(MONTH FROM invoice_date)::INT = ANY($3)
-         AND status != 'cancelled'
+         AND status NOT IN ('cancelled', 'replaced', 'adjusted')
        ORDER BY invoice_date ASC, invoice_number ASC`,
       [companyId, decl.period_year, months],
     );

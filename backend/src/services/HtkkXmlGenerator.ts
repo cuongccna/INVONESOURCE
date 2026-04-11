@@ -48,7 +48,8 @@ interface PlucOutputRow {
  *   ct40_total_output_revenue  → TongDThuVaThueGTGTHHDVBRa/ct34
  *   ct40a_total_output_vat     → ct35  (trước NQ142)
  *   plucOutputSumReduction     → ct36  (giảm theo NQ142/NQ204 = 2% × DT đầu ra 8%)
- *   ct40a - ct36               → ct40a, ct40  (sau NQ142)
+ *   MAX(0, ct35-ct36-ct25)     → ct40a, ct40  (phải nộp — 0 khi đầu vào > đầu ra)
+ *   MAX(0, ct25-(ct35-ct36))   → ct41, ct43   (kết chuyển — 0 khi đầu ra > đầu vào)
  *   ct41_payable_vat           → ct41
  *   ct43_carry_forward_vat     → ct43
  */
@@ -101,11 +102,17 @@ export class HtkkXmlGenerator {
 
     // ct36 = giảm thuế GTGT theo NQ142 = 2% × doanh thu bán ra 8% (từ PLuc)
     const xml_ct36_nq142 = plucOutputSumReduction;
-    // ct40a (xml) = tổng thuế đầu ra - giảm NQ142
-    const xml_ct40a = n(d.ct40a_total_output_vat) - xml_ct36_nq142;
-    // ct41/ct43: tính lại từ xml_ct40a để tránh xung đột làm lỗi công thức tờ khai GDT
-    const xml_ct41 = Math.max(0, xml_ct40a - n(d.ct25_total_deductible));
-    const xml_ct43 = Math.max(0, n(d.ct25_total_deductible) - xml_ct40a);
+    // Tổng thuế đầu ra sau giảm NQ142 (giá trị trung gian)
+    const outputVatAfterNQ142 = n(d.ct40a_total_output_vat) - xml_ct36_nq142;
+    // Số thuế phải nộp NET = đầu ra sau NQ142 - tổng được khấu trừ [25]
+    // (ct25_total_deductible đã bao gồm kết chuyển kỳ trước [22])
+    const netPayable = outputVatAfterNQ142 - n(d.ct25_total_deductible);
+    // ct40a/ct40: phải nộp — chỉ > 0 khi đầu ra > đầu vào
+    const xml_ct40a = Math.max(0, netPayable);
+    // ct41: còn được khấu trừ chưa hết — chỉ > 0 khi đầu vào > đầu ra
+    const xml_ct41  = Math.max(0, -netPayable);
+    // ct43: kết chuyển sang kỳ sau = ct41 - ct42 (ct42 = 0)
+    const xml_ct43  = xml_ct41;
 
     // ── 4. Ngày kỳ khai ──────────────────────────────────────────────────────
     const period = buildPeriod(declaration.period_month, declaration.period_year, isQuarterly);
@@ -276,6 +283,7 @@ async function _fetchDeductibleInputSubtotal(
          total_amount <= 20000000
          OR (payment_method IS NOT NULL AND LOWER(payment_method) <> 'cash')
        )
+       ${_notReplacedClause('invoices')}
        AND ${dateFilter}`,
     params
   );
@@ -283,6 +291,23 @@ async function _fetchDeductibleInputSubtotal(
 }
 
 // ── Helpers: period date filter ───────────────────────────────────────────────
+
+/**
+ * Điều kiện NOT EXISTS để loại hóa đơn bị thay thế logic (tc_hdon=1).
+ * Dùng COALESCE cho seller_tax_code để tránh lỗi NULL = NULL → unknown trong SQL.
+ * @param alias tên alias của bảng invoices trong câu query chính
+ */
+function _notReplacedClause(alias: string): string {
+  return `AND NOT EXISTS (
+       SELECT 1 FROM invoices _r
+       WHERE _r.tc_hdon = 1
+         AND _r.deleted_at IS NULL
+         AND _r.company_id = ${alias}.company_id
+         AND TRIM(COALESCE(_r.khhd_cl_quan,  '')) = TRIM(COALESCE(${alias}.serial_number,  ''))
+         AND TRIM(COALESCE(_r.so_hd_cl_quan, '')) = TRIM(COALESCE(${alias}.invoice_number, ''))
+         AND COALESCE(_r.seller_tax_code, '') = COALESCE(${alias}.seller_tax_code, '')
+     )`;
+}
 /** Trả về điều kiện WHERE + params cho lọc kỳ kê khai theo ngày hoá đơn. */
 function _buildPeriodFilter(
   periodMonth: number,
@@ -339,6 +364,7 @@ async function _fetchPluc8InputItems(
        AND i.status = 'valid'
        AND i.deleted_at IS NULL
        AND ili.vat_rate = $2
+       ${_notReplacedClause('i')}
        AND ${pf.clause}
      GROUP BY 1
      ORDER BY SUM(ili.subtotal) DESC`,
@@ -380,6 +406,7 @@ async function _fetchPluc8InputItems(
        )
        AND status = 'valid'
        AND deleted_at IS NULL
+       ${_notReplacedClause('invoices')}
        AND ${pf2.clause}
      GROUP BY 1
      ORDER BY SUM(subtotal) DESC`,
@@ -416,6 +443,7 @@ async function _fetchPluc8OutputItems(
        AND i.status = 'valid'
        AND i.deleted_at IS NULL
        AND ili.vat_rate = $2
+       ${_notReplacedClause('i')}
        AND ${pf.clause}
      GROUP BY 1
      ORDER BY SUM(ili.subtotal) DESC`,
@@ -451,6 +479,7 @@ async function _fetchPluc8OutputItems(
        )
        AND status = 'valid'
        AND deleted_at IS NULL
+       ${_notReplacedClause('invoices')}
        AND ${pf2.clause}
      GROUP BY 1
      ORDER BY SUM(subtotal) DESC`,
