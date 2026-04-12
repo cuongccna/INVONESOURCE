@@ -66,3 +66,5 @@ backend/tmp/check-migration.js
 backend/tests/tax/htkk-vat-quarter.test.ts
 frontend/__tests__/apiClient.company-switch.test.ts
 backend/tests/tax/htkk-excluded-invoices.test.ts
+backend/src/scripts/test-gemini.ts
+.gitignore

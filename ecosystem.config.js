@@ -11,7 +11,7 @@ module.exports = {
       name: 'invone-backend',
       cwd: '/opt/INVONESOURCE/backend',
       script: 'node',
-      args: 'dist/index.js',
+      args: '-r dotenv/config dist/index.js',
       instances: 1,
       exec_mode: 'fork',
       autorestart: true,
