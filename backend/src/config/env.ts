@@ -2,8 +2,14 @@ import { z } from 'zod';
 import * as path from 'path';
 import * as dotenv from 'dotenv';
 
-// Load .env from project root
-dotenv.config({ path: path.resolve(__dirname, '../../../.env') });
+// Load .env from project root.
+// __dirname differs between ts-node (src/config) and compiled (dist/src/config):
+//   ts-node  : backend/src/config  → ../../.. → project root  ✓
+//   compiled : backend/dist/src/config → ../../../.. → project root  ✓
+const _envFile = __dirname.split(path.sep).includes('dist')
+  ? path.resolve(__dirname, '../../../../.env')  // compiled: dist/src/config → root
+  : path.resolve(__dirname, '../../../.env');    // ts-node:  src/config      → root
+dotenv.config({ path: _envFile });
 
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
