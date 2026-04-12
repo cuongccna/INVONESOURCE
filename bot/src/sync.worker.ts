@@ -1674,7 +1674,16 @@ export const manualWorker = new Worker<SyncJobData>(
       processGdtSync(job),
       new Promise<never>((_, reject) =>
         setTimeout(
-          () => reject(new Error('MANUAL_SYNC_TIMEOUT: Sync exceeded 3-minute limit — will retry')),
+          () => {
+            // Release the company lock before rejecting so BullMQ retries are not stuck
+            // with LOCK_CONFLICT. processGdtSync may still be running in background
+            // (Node.js cannot cancel async operations), so we force-release here.
+            const companyId = job.data.companyId;
+            if (companyId) {
+              _lockRedis.del(`${BOT_LOCK_PREFIX}${companyId}`).catch(() => {});
+            }
+            reject(new Error('MANUAL_SYNC_TIMEOUT: Sync exceeded 3-minute limit — will retry'));
+          },
           MANUAL_SYNC_TIMEOUT_MS,
         ),
       ),

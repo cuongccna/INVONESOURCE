@@ -220,6 +220,14 @@ export class ProxyManager extends EventEmitter {
                       ?? this.slots.find(s => s.currentUrl && !s.refreshing);
         if (!fallback) {
           // Tất cả slot đang khởi tạo — caller cần xử lý null
+          // Auto-recovery: nếu slot bị stuck (null + not refreshing), kick off rotation lại
+          const stuckSlots = this.slots.filter(s => !s.currentUrl && !s.refreshing && !s.permanentlyDead);
+          for (const stuckSlot of stuckSlots) {
+            logger.info('[ProxyManager] Auto-recovering stuck slot — retrying rotation', {
+              apiKey: stuckSlot.apiKey.slice(0, 8) + '…',
+            });
+            this._rotateSlot(stuckSlot);
+          }
           logger.warn('[ProxyManager] Tất cả slot đang khởi tạo, chờ slot đầu tiên sẵn sàng', {
             sessionSuffix:   sessionSuffix.slice(0, 8),
             refreshingSlots: this.slots.filter(s => s.refreshing).length,

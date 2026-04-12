@@ -511,6 +511,8 @@ export default function BotSettingsPage() {
                     onChange={e => setForm(p => ({ ...p, sync_frequency_hours: Number(e.target.value) }))}
                     className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white"
                   >
+                    <option value={1}>Mỗi 1 giờ</option>
+                    <option value={3}>Mỗi 3 giờ</option>
                     <option value={6}>Mỗi 6 giờ (khuyến nghị)</option>
                     <option value={12}>Mỗi 12 giờ</option>
                     <option value={24}>Mỗi 24 giờ</option>
