@@ -197,18 +197,6 @@ export default function BotSettingsPage() {
       // 2. Backend Redis key — authoritative, survives cross-tab / cross-device.
       const compId = botData?.config?.company_id;
       if (compId) {
-        // ── Auto-reset progressive cooldown level after 2 hours idle ────────────
-        // If the user hasn't triggered a manual sync in the last 2 hours, the
-        // progressive level (5→10→20→30→45→60 min) is reset to 0 so the next
-        // click starts again at 5 minutes instead of staying stuck at 60 min.
-        const COOLDOWN_IDLE_RESET_MS = 2 * 60 * 60 * 1000; // 2 hours
-        const lsTriggerKey  = `bot_cooldown_last_trigger_${compId}`;
-        const lastTriggerMs = parseInt(localStorage.getItem(lsTriggerKey) ?? '0', 10);
-        if (lastTriggerMs > 0 && Date.now() - lastTriggerMs >= COOLDOWN_IDLE_RESET_MS) {
-          const lsLevelKey = `bot_cooldown_level_${compId}`;
-          localStorage.removeItem(lsLevelKey);
-          localStorage.removeItem(lsTriggerKey);
-        }
 
         // Full-sync cooldown
         const lsEndsKey = `bot_cooldown_ends_${compId}`;
@@ -279,20 +267,10 @@ export default function BotSettingsPage() {
       if (toDate)   body['to_date']   = toDate;
       await apiClient.post('/bot/run-now', body);
       toast.success(fromDate ? `Đã xếp hàng lấy dữ liệu từ ${fromDate}` : 'Đã thêm vào hàng đợi đồng bộ');
-      // Progressive cooldown: read previous level, increment (cap 5 = 60 min).
-      // Level auto-resets to 0 after 2 hours idle (see load() above).
-      const companyIdForCd = activeCompany?.id ?? 'default';
-      const lsKey = `bot_cooldown_level_${companyIdForCd}`;
-      const prevLevel = parseInt(localStorage.getItem(lsKey) ?? '0', 10);
-      const newLevel  = Math.min(prevLevel + 1, 5);
-      localStorage.setItem(lsKey, String(newLevel));
-      // Save trigger timestamp — used by load() to detect 2-hour idle and reset level.
-      localStorage.setItem(`bot_cooldown_last_trigger_${companyIdForCd}`, String(Date.now()));
-      // Level 0→5 min, 1→10 min, 2→20 min, 3→30 min, 4→45 min, 5→60 min
-      const cooldownMinutes = [5, 10, 20, 30, 45, 60][newLevel] ?? 60;
-      // endsAt is computed here then passed to startCooldown so localStorage & state stay in sync
-      const endsAt = Date.now() + cooldownMinutes * 60 * 1000;
-      startCooldown(cooldownMinutes * 60, endsAt);
+      // Random cooldown 1–3 phút sau mỗi lần click (không tăng lũy tiến).
+      const cooldownSec = Math.floor(Math.random() * 120) + 60; // 60–180 giây
+      const endsAt = Date.now() + cooldownSec * 1000;
+      startCooldown(cooldownSec, endsAt);
       setTimeout(() => void load(), 2000);
     } catch (err: unknown) {
       const e = err as { response?: { data?: { error?: { code?: string; waitMinutes?: number; message?: string } } } };

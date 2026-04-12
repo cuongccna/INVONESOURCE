@@ -13,7 +13,7 @@ import { env } from '../config/env';
 
 const _redis = new IORedis(env.REDIS_URL, { maxRetriesPerRequest: 3 });
 const MANUAL_COOLDOWN_PREFIX       = 'bot:manual:cooldown:';
-const MANUAL_COOLDOWN_TTL_SEC      = 6 * 60;  // 6 minutes between manual syncs per company
+const MANUAL_COOLDOWN_TTL_SEC      = 3 * 60;  // max 3 minutes between manual syncs per company
 const QUICK_SYNC_COOLDOWN_PREFIX   = 'bot:manual:quickcooldown:';
 const QUICK_SYNC_COOLDOWN_TTL_SEC  = 5 * 60;  // 5 minutes cooldown for quick-sync (today only)
 
