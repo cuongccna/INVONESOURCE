@@ -9,7 +9,16 @@ export const logger = createLogger({
     format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
     format.errors({ stack: true }),
     format.printf(({ timestamp, level, message, ...meta }) => {
-      const metaStr = Object.keys(meta).length ? ' ' + JSON.stringify(meta) : '';
+      // Serialize meta: convert Error objects to { message, stack } so they don't appear as {}
+      const serializedMeta = Object.fromEntries(
+        Object.entries(meta).map(([k, v]) => [
+          k,
+          v instanceof Error
+            ? { message: v.message, stack: v.stack }
+            : v,
+        ])
+      );
+      const metaStr = Object.keys(serializedMeta).length ? ' ' + JSON.stringify(serializedMeta) : '';
       return `[${timestamp}] ${level.toUpperCase().padEnd(5)} ${String(message)}${metaStr}`;
     })
   ),

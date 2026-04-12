@@ -621,6 +621,16 @@ export class GdtDirectApiService {
     while (attempts < maxRetries) {
       // Step 1: Get fresh captcha
       const captchaRes = await this.http.get<CaptchaResponse>(captchaPath);
+      // Guard: log raw response if structure is unexpected (helps diagnose GDT API changes)
+      const rawData = captchaRes.data as unknown as Record<string, unknown>;
+      if (!rawData?.['content'] || typeof rawData['content'] !== 'string') {
+        logger.error('[GdtDirect] Unexpected captcha response — missing content field', {
+          status: captchaRes.status,
+          keys:   Object.keys(rawData ?? {}),
+          sample: JSON.stringify(rawData).slice(0, 300),
+        });
+        throw new Error(`GDT captcha API returned unexpected structure (missing 'content'). Keys: ${Object.keys(rawData ?? {}).join(', ')}`);
+      }
       const { key: ckey, content: svgContent } = captchaRes.data;
 
       // Step 2: SVG → PNG → base64 → 2captcha
@@ -642,7 +652,8 @@ export class GdtDirectApiService {
         lastCaptchaId = result.captchaId;
         logger.info('[GdtDirect] Captcha giải xong', { captchaId: lastCaptchaId, cvalue, captchaElapsedMs });
       } catch (err) {
-        logger.warn('[GdtDirect] Lỗi captcha', { attempts, err });
+        const errMsg = err instanceof Error ? err.message : String(err);
+        logger.warn('[GdtDirect] Lỗi captcha', { attempts, errMsg });
         attempts++;
         await sleep(retryDelayMs);
         continue;
