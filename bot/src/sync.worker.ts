@@ -184,12 +184,38 @@ const BOT_LOCK_PREFIX   = 'bot:sync:lock:';
 const BOT_LOCK_TTL      = 45 * 60; // 45 min — upper bound for any single sync run
 const BOT_CANCEL_PREFIX = 'bot:sync:cancel:';
 
-async function acquireCompanyLock(companyId: string): Promise<boolean> {
-  const result = await _lockRedis.set(`${BOT_LOCK_PREFIX}${companyId}`, Date.now().toString(), 'EX', BOT_LOCK_TTL, 'NX');
-  return result === 'OK';
+// Fenced-lock Lua script: only DELETE if value matches our token.
+// Prevents cross-job unlock race when manualWorker timeout fires and a new job
+// re-acquires the lock before the background processGdtSync finishes.
+const LOCK_RELEASE_LUA = `
+  if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+  else
+    return 0
+  end
+`;
+
+// Module-level map: job.id → lockToken.
+// Populated by processGdtSync after lock acquired; read by manualWorker timeout handler.
+const _activeLockTokens = new Map<string, string>();
+
+/**
+ * Acquire per-company Redis lock.
+ * Returns the lock token (UUID) on success, or null if already locked.
+ * Store the token and pass to releaseCompanyLock() so no other job can release it.
+ */
+async function acquireCompanyLock(companyId: string): Promise<string | null> {
+  const token  = uuidv4();
+  const result = await _lockRedis.set(`${BOT_LOCK_PREFIX}${companyId}`, token, 'EX', BOT_LOCK_TTL, 'NX');
+  return result === 'OK' ? token : null;
 }
-async function releaseCompanyLock(companyId: string): Promise<void> {
-  await _lockRedis.del(`${BOT_LOCK_PREFIX}${companyId}`);
+
+/**
+ * Release per-company Redis lock — ONLY if the stored value matches `token`.
+ * Safe to call even after a timeout handler has already deleted the lock: Lua returns 0 (no-op).
+ */
+async function releaseCompanyLock(companyId: string, token: string): Promise<void> {
+  await _lockRedis.eval(LOCK_RELEASE_LUA, 1, `${BOT_LOCK_PREFIX}${companyId}`, token);
 }
 
 /** Flush ALL bot locks on startup — if the process restarted, no locks are legitimately held. */
@@ -461,11 +487,15 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
   // Throw regular Error → BullMQ retries with the job's configured backoff.
   // (moveToDelayed requires Redis 6.2+; our Redis 5.0.14 doesn't support it.)
   // This throw is BEFORE the inner try/catch, so _failRun() is NOT called.
-  const lockAcquired = await acquireCompanyLock(companyId);
-  if (!lockAcquired) {
+  // Fenced lock: returns token on success, null if already locked.
+  const lockToken = await acquireCompanyLock(companyId);
+  if (!lockToken) {
     logger.warn('[SyncWorker] Company already syncing — will retry via backoff', { jobId: job.id, companyId });
     throw new Error(`LOCK_CONFLICT: company ${companyId} already syncing`);
   }
+  // Register token so manualWorker timeout handler can do a fenced release.
+  if (job.id) _activeLockTokens.set(job.id, lockToken);
+
   // FIX-3: Lock heartbeat — renews the 45-minute TTL every 10 minutes.
   // Prevents lock expiry during 100k+ invoice runs (2–30h) which would allow
   // a second job to acquire the lock and cause concurrent DB writes.
@@ -481,7 +511,8 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     // ── 1. Load config ──────────────────────────────────────────────────────────
     const cfgRes = await pool.query(
       `SELECT encrypted_credentials, has_otp, otp_method, tax_code,
-              blocked_until, proxy_session_id, consecutive_failures, last_run_at
+              blocked_until, proxy_session_id, consecutive_failures, last_run_at,
+              sync_frequency_hours
        FROM gdt_bot_configs WHERE company_id = $1 AND is_active = true`,
       [companyId]
     );
@@ -497,6 +528,7 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       proxy_session_id: string | null;
       consecutive_failures: number;
       last_run_at: string | null;
+      sync_frequency_hours: number;
     };
 
     // Manual sync: clear the auto-block so the user can force a re-run.
@@ -984,13 +1016,20 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       await _consumeQuota(companyId, newInvoiceCount);
 
       // ── Schedule next auto-sync with jitter (BOT-ENT-01) ────────────────────────
-      // Migration 026 confirmed applied — no fallback wrapper needed.
+      // Tôn trọng sync_frequency_hours mà end-user đã cài đặt.
+      // Jitter ±12–30 phút (random trong range này, sign ngẫu nhiên) để tránh
+      // nhiều công ty hit GDT cùng lúc và mô phỏng hành vi con người.
+      // Ví dụ: 1h → next = 30–90 phút | 6h → next = 5h30–6h30 | 24h → next = 23h30–24h30
+      const freqHours = cfg.sync_frequency_hours > 0 ? cfg.sync_frequency_hours : 6;
       await pool.query(
         `UPDATE gdt_bot_configs
-         SET next_auto_sync_at = NOW() + INTERVAL '5 hours'
-           + (FLOOR(RANDOM() * 180) || ' minutes')::INTERVAL
-         WHERE company_id = $1`,
-        [companyId],
+         SET next_auto_sync_at = NOW()
+           + ($1 || ' hours')::INTERVAL
+           + ((FLOOR(RANDOM() * 19) + 12)
+              * (CASE WHEN RANDOM() < 0.5 THEN 1 ELSE -1 END)
+              || ' minutes')::INTERVAL
+         WHERE company_id = $2`,
+        [freqHours, companyId],
       );
 
       logger.info('[SyncWorker] Done', { companyId, outputCount, inputCount, durationMs });
@@ -1076,9 +1115,10 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     } finally {
     clearInterval(lockHeartbeat);   // FIX-3: dừng heartbeat TRƯỚC khi giải phóng lock
     // Release both locks:
-    // 1. Bot worker lock (bot:sync:lock:) — prevents concurrent bot jobs
+    // 1. Bot worker lock (bot:sync:lock:) — fenced release prevents cross-job unlock race
     // 2. HTTP route lock (sync:lock:) — prevents double-click from UI
-    await releaseCompanyLock(companyId);
+    await releaseCompanyLock(companyId, lockToken);
+    _activeLockTokens.delete(job.id ?? '');
     await _lockRedis.del(`sync:lock:${companyId}`);
   }
 }
@@ -1662,10 +1702,10 @@ export const worker = new Worker<SyncJobData>(
 );
 
 // ── Manual worker (concurrency 10 — user-triggered syncs) ────────────────────
-// Wraps processGdtSync with a 170-second hard timeout (safety margin under 3 min).
+// Wraps processGdtSync with a 350-second hard timeout (5m50s — 10s headroom under 6 min).
 // If a manual job stalls (e.g. GDT rate-limit, slow proxy), it fails fast and
-// retries with backoff rather than blocking the queue for a full manual sync window.
-const MANUAL_SYNC_TIMEOUT_MS = 170_000; // 2m50s — leaves 10s headroom under 3 min
+// retries with backoff rather than blocking the queue indefinitely.
+const MANUAL_SYNC_TIMEOUT_MS = 350_000; // 5m50s — leaves 10s headroom under 6 min
 
 export const manualWorker = new Worker<SyncJobData>(
   'gdt-sync-manual',
@@ -1675,14 +1715,22 @@ export const manualWorker = new Worker<SyncJobData>(
       new Promise<never>((_, reject) =>
         setTimeout(
           () => {
-            // Release the company lock before rejecting so BullMQ retries are not stuck
-            // with LOCK_CONFLICT. processGdtSync may still be running in background
-            // (Node.js cannot cancel async operations), so we force-release here.
+            // Fenced release: only delete lock if OUR token matches the stored value.
+            // Prevents cross-job unlock: if a new job already re-acquired the lock
+            // while this background processGdtSync was still running, we don't delete
+            // the new job's lock (Lua returns 0 silently when token doesn't match).
             const companyId = job.data.companyId;
             if (companyId) {
-              _lockRedis.del(`${BOT_LOCK_PREFIX}${companyId}`).catch(() => {});
+              const token = _activeLockTokens.get(job.id ?? '');
+              if (token) {
+                _lockRedis.eval(LOCK_RELEASE_LUA, 1, `${BOT_LOCK_PREFIX}${companyId}`, token).catch(() => {});
+                _activeLockTokens.delete(job.id ?? '');
+              } else {
+                // Fallback: no token recorded yet (lock wasn't acquired before timeout)
+                _lockRedis.del(`${BOT_LOCK_PREFIX}${companyId}`).catch(() => {});
+              }
             }
-            reject(new Error('MANUAL_SYNC_TIMEOUT: Sync exceeded 3-minute limit — will retry'));
+            reject(new Error('MANUAL_SYNC_TIMEOUT: Sync exceeded 6-minute limit — will retry'));
           },
           MANUAL_SYNC_TIMEOUT_MS,
         ),

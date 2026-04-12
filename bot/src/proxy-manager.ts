@@ -155,6 +155,8 @@ export class ProxyManager extends EventEmitter {
           });
         });
       }
+      // Auto-recovery timer: thử khôi phục slot hết hạn sau mỗi 30 phút
+      this._startDeadSlotRetryTimer();
     }
 
     if (this.iproyalSlots.length === 0 && allKeys.length === 0) {
@@ -598,14 +600,52 @@ export class ProxyManager extends EventEmitter {
         this.emit('proxyRotated', session.url);
       })
       .catch(err => {
-        logger.error('[ProxyManager] Xoay IP thất bại — slot sẽ bị bỏ qua cho đến khi xoay thành công', {
-          apiKey: slot.apiKey.slice(0, 8) + '…',
-          error:  (err as Error).message,
-        });
-        slot.currentUrl       = null;  // đã null từ markFailed, giữ nguyên để skip slot này
+        const msg = (err as Error).message ?? '';
+        // code=6 = gói hết hạn / key bị huỷ — đánh dấu permanentlyDead để ngừng retry tức thì.
+        // _startDeadSlotRetryTimer() sẽ thử lại mỗi 30 phút khi người dùng gia hạn.
+        if (msg.includes('code=6') || msg.includes('Hết hạn') || msg.includes('Gói Hết hạn')) {
+          slot.permanentlyDead = true;
+          logger.error('[ProxyManager] TMProxy key hết hạn khi xoay IP — slot bị loại khỏi vòng quay', {
+            apiKey: slot.apiKey.slice(0, 8) + '…',
+            hint:   'Gia hạn tại tmproxy.com → bot tự phục hồi trong vòng 30 phút',
+          });
+        } else {
+          logger.error('[ProxyManager] Xoay IP thất bại — slot sẽ được thử lại qua timer', {
+            apiKey: slot.apiKey.slice(0, 8) + '…',
+            error:  msg,
+          });
+        }
+        slot.currentUrl       = null;
         slot.currentSocks5Url = null;
       })
       .finally(() => { slot.refreshing = false; });
+  }
+
+  /**
+   * Chạy một timer mỗi 30 phút để thử khôi phục các slot bị permanentlyDead.
+   * Khi người dùng gia hạn gói TMProxy (cùng API key), slot sẽ tự phục hồi
+   * mà không cần restart bot.
+   */
+  private _startDeadSlotRetryTimer(): void {
+    const RETRY_INTERVAL_MS = 30 * 60 * 1000; // 30 phút
+    setInterval(async () => {
+      const deadSlots = this.slots.filter(s => s.permanentlyDead);
+      if (deadSlots.length === 0) return;
+      logger.info('[ProxyManager] Kiểm tra slot hết hạn — thử khôi phục', {
+        count: deadSlots.length,
+      });
+      for (const slot of deadSlots) {
+        try {
+          slot.permanentlyDead = false; // tạm thời mở để thử
+          await this._initSlot(slot);
+          logger.info('[ProxyManager] Slot đã phục hồi sau khi gia hạn', {
+            apiKey: slot.apiKey.slice(0, 8) + '…',
+          });
+        } catch {
+          slot.permanentlyDead = true; // vẫn chết — giữ nguyên
+        }
+      }
+    }, RETRY_INTERVAL_MS);
   }
 }
 

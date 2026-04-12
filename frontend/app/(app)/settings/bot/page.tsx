@@ -24,9 +24,10 @@ interface BotConfig {
 }
 
 interface BotStatus {
-  config:            BotConfig | null;
-  lastRuns:          BotRun[];
-  manualCooldownSec: number;
+  config:               BotConfig | null;
+  lastRuns:             BotRun[];
+  manualCooldownSec:    number;
+  quickSyncCooldownSec: number;
 }
 
 interface BotRun {
@@ -73,6 +74,32 @@ export default function BotSettingsPage() {
   const [runFrom, setRunFrom]         = useState('');
   const [runTo, setRunTo]             = useState('');
   const [dateError, setDateError]     = useState('');
+  const [quickRunning, setQuickRunning]       = useState(false);
+  const [quickCooldownEndsAt, setQuickCooldownEndsAt] = useState<number | null>(null);
+  const [quickCooldownSec, setQuickCooldownSec]       = useState(0);
+  const quickCooldownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const startQuickCooldown = (durationSec: number, endsAtOverride?: number) => {
+    const endsAt = endsAtOverride ?? Date.now() + durationSec * 1000;
+    const lsKey = `bot_qcooldown_ends_${activeCompany?.id ?? 'default'}`;
+    localStorage.setItem(lsKey, String(endsAt));
+    setQuickCooldownEndsAt(endsAt);
+    if (quickCooldownTimerRef.current) clearInterval(quickCooldownTimerRef.current);
+    quickCooldownTimerRef.current = setInterval(() => {
+      const rem = Math.max(0, Math.round((endsAt - Date.now()) / 1000));
+      setQuickCooldownSec(rem);
+      if (rem <= 0) {
+        clearInterval(quickCooldownTimerRef.current!);
+        setQuickCooldownEndsAt(null);
+        localStorage.removeItem(lsKey);
+      }
+    }, 1000);
+    setQuickCooldownSec(Math.max(0, Math.round((endsAt - Date.now()) / 1000)));
+  };
+
+  useEffect(() => () => {
+    if (quickCooldownTimerRef.current) clearInterval(quickCooldownTimerRef.current);
+  }, []);
 
   // Progressive cooldown: starts at 5 min, doubles each time (cap 60 min)
   // cooldownEndsAt persisted to localStorage so page refresh preserves the countdown.
@@ -170,15 +197,23 @@ export default function BotSettingsPage() {
       // 2. Backend Redis key — authoritative, survives cross-tab / cross-device.
       const compId = botData?.config?.company_id;
       if (compId) {
+        // Full-sync cooldown
         const lsEndsKey = `bot_cooldown_ends_${compId}`;
         const lsEndsAt  = parseInt(localStorage.getItem(lsEndsKey) ?? '0', 10);
         const backendEndsAt = botData.manualCooldownSec > 0
           ? Date.now() + botData.manualCooldownSec * 1000
           : 0;
         const bestEndsAt = Math.max(lsEndsAt, backendEndsAt);
-        if (bestEndsAt > Date.now() + 2000) { // >2s remaining
-          startCooldown(0, bestEndsAt);
-        }
+        if (bestEndsAt > Date.now() + 2000) startCooldown(0, bestEndsAt);
+
+        // Quick-sync cooldown
+        const lsQKey = `bot_qcooldown_ends_${compId}`;
+        const lsQEndsAt  = parseInt(localStorage.getItem(lsQKey) ?? '0', 10);
+        const backendQEndsAt = (botData.quickSyncCooldownSec ?? 0) > 0
+          ? Date.now() + botData.quickSyncCooldownSec * 1000
+          : 0;
+        const bestQEndsAt = Math.max(lsQEndsAt, backendQEndsAt);
+        if (bestQEndsAt > Date.now() + 2000) startQuickCooldown(0, bestQEndsAt);
       }
     } catch { /* silent */ } finally {
       setLoading(false);
@@ -193,6 +228,8 @@ export default function BotSettingsPage() {
     setLoading(true);
     if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
     setCooldownEndsAt(null);
+    if (quickCooldownTimerRef.current) clearInterval(quickCooldownTimerRef.current);
+    setQuickCooldownEndsAt(null);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeCompany?.id]);
 
@@ -268,6 +305,44 @@ export default function BotSettingsPage() {
       await load();
     } catch {
       toast.error('OTP không hợp lệ hoặc đã hết hạn');
+    }
+  };
+
+  /**
+   * Quick-sync: chỉ lấy HĐ trong ngày hôm nay (và hôm qua để dự phòng).
+   * Cooldown riêng 5 phút — độc lập với cooldown full-sync.
+   * Dùng khi người dùng muốn kiểm tra HĐ mới nhất ngay mà không cần đợi lịch định kỳ.
+   */
+  const runQuickSync = async () => {
+    if (quickRunning || quickCooldownEndsAt || isJobRunning) return;
+    setQuickRunning(true);
+    try {
+      const today     = toLocalDateStr(new Date());
+      const yesterday = toLocalDateStr(new Date(Date.now() - 24 * 60 * 60 * 1000));
+      await apiClient.post('/bot/run-now', {
+        from_date: yesterday,
+        to_date:   today,
+        quick:     true,
+      });
+      toast.success('⚡ Đã xếp hàng đồng bộ hôm nay — HĐ mới nhất sẽ cập nhật sau vài phút');
+      const endsAt = Date.now() + 5 * 60 * 1000;
+      startQuickCooldown(5 * 60, endsAt);
+      setTimeout(() => void load(), 2000);
+    } catch (err: unknown) {
+      const e = err as { response?: { data?: { error?: { code?: string; waitMinutes?: number; message?: string } } } };
+      const apiErr = e?.response?.data?.error;
+      if (apiErr?.code === 'COOLDOWN') {
+        const waitSec = (apiErr.waitMinutes ?? 5) * 60;
+        startQuickCooldown(waitSec);
+        toast.error(`⏳ Vui lòng chờ thêm ${apiErr.waitMinutes} phút.`);
+      } else if (apiErr?.code === 'ALREADY_RUNNING') {
+        toast.error('⏳ Bot đang chạy. Chờ hoàn tất rồi thử lại.');
+        void load();
+      } else {
+        toast.error(apiErr?.message ?? 'Lỗi kích hoạt đồng bộ nhanh');
+      }
+    } finally {
+      setQuickRunning(false);
     }
   };
 
@@ -425,6 +500,32 @@ export default function BotSettingsPage() {
                     <>▶ Lấy từ GDT</>
                   )}
                 </button>
+
+                {/* ⚡ Đồng bộ hôm nay — quick sync: lấy HĐ 48h gần nhất, cooldown riêng 5 phút */}
+                <button
+                  onClick={() => void runQuickSync()}
+                  disabled={isJobRunning || !!quickCooldownEndsAt}
+                  title={
+                    isJobRunning ? 'Đang có job đang chạy — chờ hoàn tất'
+                    : quickCooldownEndsAt ? `Vừa đồng bộ nhanh — chờ ${Math.ceil(quickCooldownSec / 60)} phút`
+                    : 'Đồng bộ nhanh: lấy HĐ hôm nay và hôm qua ngay lập tức'
+                  }
+                  className="border border-amber-300 text-amber-700 rounded-xl px-3 py-2.5 text-sm hover:bg-amber-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-1 whitespace-nowrap"
+                >
+                  {quickRunning ? (
+                    <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                  ) : quickCooldownEndsAt ? (
+                    <span className="text-xs">{quickCooldownSec >= 60
+                      ? `${Math.floor(quickCooldownSec / 60)}p`
+                      : `${quickCooldownSec}s`}</span>
+                  ) : (
+                    <span>⚡</span>
+                  )}
+                  <span className="hidden sm:inline">Hôm nay</span>
+                </button>
+
                 {/* Sửa — disabled while job running */}
                 <button onClick={() => setShowSetup(true)} disabled={isJobRunning}
                   title={isJobRunning ? 'Không thể sửa khi bot đang chạy' : 'Sửa cấu hình'}

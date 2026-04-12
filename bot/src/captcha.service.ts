@@ -18,12 +18,19 @@ export class CaptchaService {
     if (!this.apiKey) throw new Error('TWO_CAPTCHA_API_KEY is not set');
   }
 
+  /** Trả về API key hiện hành — luôn đọc từ env để phản ánh key mới sau PM2 reload. */
+  private get _key(): string {
+    // Nếu key bị truyền vào constructor thì dùng cố định.
+    // Nếu không (env-driven), luôn đọc fresh để hỗ trợ đổi key không cần restart process.
+    return this.apiKey || process.env['TWO_CAPTCHA_API_KEY'] || '';
+  }
+
   /** Submit base64 image captcha and poll for result */
   async solve(imageBase64: string): Promise<{ text: string; captchaId: string }> {
     // Must send as form-encoded body — NOT as URL query params — because
     // base64 can be tens of KB which causes 414 URI Too Long in query string
     const formBody = new URLSearchParams({
-      key:    this.apiKey,
+      key:    this._key,
       method: 'base64',
       body:   imageBase64,
       json:   '1',
@@ -59,7 +66,7 @@ export class CaptchaService {
   async reportBad(captchaId: string): Promise<void> {
     try {
       await axios.get(`${API_URL}/res.php`, {
-        params: { key: this.apiKey, action: 'reportbad', id: captchaId },
+        params: { key: this._key, action: 'reportbad', id: captchaId },
         timeout: 10_000,
       });
       logger.warn('[Captcha] Reported bad captcha', { captchaId });
@@ -75,7 +82,7 @@ export class CaptchaService {
     while (Date.now() < deadline) {
       await _sleep(POLL_MS);
       const res = await axios.get<{ status: number; request: string }>(`${API_URL}/res.php`, {
-        params: { key: this.apiKey, action: 'get', id: captchaId, json: 1 },
+        params: { key: this._key, action: 'get', id: captchaId, json: 1 },
         timeout: 15_000,
         responseType: 'json',
       });

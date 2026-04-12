@@ -12,8 +12,10 @@ import IORedis from 'ioredis';
 import { env } from '../config/env';
 
 const _redis = new IORedis(env.REDIS_URL, { maxRetriesPerRequest: 3 });
-const MANUAL_COOLDOWN_PREFIX  = 'bot:manual:cooldown:';
-const MANUAL_COOLDOWN_TTL_SEC = 6 * 60;  // 6 minutes between manual syncs per company
+const MANUAL_COOLDOWN_PREFIX       = 'bot:manual:cooldown:';
+const MANUAL_COOLDOWN_TTL_SEC      = 6 * 60;  // 6 minutes between manual syncs per company
+const QUICK_SYNC_COOLDOWN_PREFIX   = 'bot:manual:quickcooldown:';
+const QUICK_SYNC_COOLDOWN_TTL_SEC  = 5 * 60;  // 5 minutes cooldown for quick-sync (today only)
 
 const router = Router();
 router.use(authenticate);
@@ -54,6 +56,7 @@ const setupSchema = z.object({
 const runNowSchema = z.object({
   from_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   to_date:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  quick:     z.boolean().optional().default(false),  // true = Đồng bộ hôm nay (5-min cooldown riêng)
 }).refine(data => {
   if (!data.from_date || !data.to_date) return true;
   const diffMs = new Date(data.to_date).getTime() - new Date(data.from_date).getTime();
@@ -140,13 +143,17 @@ router.get(
       );
 
       // Expose remaining manual-trigger cooldown so the frontend can sync state on mount/refresh
-      const cooldownKey = `${MANUAL_COOLDOWN_PREFIX}${companyId}`;
-      const cooldownTtl = cfgRes.rows.length > 0 ? await _redis.ttl(cooldownKey) : -1;
+      const cooldownKey      = `${MANUAL_COOLDOWN_PREFIX}${companyId}`;
+      const quickCooldownKey = `${QUICK_SYNC_COOLDOWN_PREFIX}${companyId}`;
+      const [cooldownTtl, quickCooldownTtl] = cfgRes.rows.length > 0
+        ? await Promise.all([_redis.ttl(cooldownKey), _redis.ttl(quickCooldownKey)])
+        : [-1, -1];
 
       sendSuccess(res, {
-        config:            cfgRes.rows[0] ?? null,
-        lastRuns:          runsRes.rows,
-        manualCooldownSec: cooldownTtl > 0 ? cooldownTtl : 0,
+        config:                cfgRes.rows[0] ?? null,
+        lastRuns:              runsRes.rows,
+        manualCooldownSec:     cooldownTtl      > 0 ? cooldownTtl      : 0,
+        quickSyncCooldownSec:  quickCooldownTtl > 0 ? quickCooldownTtl : 0,
       });
     } catch (err) {
       next(err);
@@ -162,6 +169,10 @@ router.post(
     try {
       const companyId = req.user!.companyId;
 
+      const parsed = runNowSchema.safeParse(req.body);
+      if (!parsed.success) throw new ValidationError(parsed.error.issues[0]?.message ?? 'Invalid input');
+      const { from_date, to_date, quick } = parsed.data;
+
       const cfgRes = await pool.query(
         `SELECT id, is_active, last_run_at FROM gdt_bot_configs WHERE company_id = $1`,
         [companyId]
@@ -169,8 +180,14 @@ router.post(
       if (cfgRes.rows.length === 0) throw new NotFoundError('GDT Bot chưa được cấu hình');
       if (!cfgRes.rows[0].is_active) throw new ValidationError('GDT Bot hiện đang tắt');
 
-      // 5-minute manual trigger cooldown (Redis key per company)
-      const cooldownKey = `${MANUAL_COOLDOWN_PREFIX}${companyId}`;
+      // ── Quick-sync (Đồng bộ hôm nay) uses a separate, shorter cooldown ────────
+      // Cooldown riêng 5 phút so với full-sync 6 phút, cho phép người dùng
+      // lấy HĐ mới nhất mà không ảnh hưởng đến lịch đồng bộ toàn bộ.
+      const cooldownKey = quick
+        ? `${QUICK_SYNC_COOLDOWN_PREFIX}${companyId}`
+        : `${MANUAL_COOLDOWN_PREFIX}${companyId}`;
+      const cooldownTtlSec = quick ? QUICK_SYNC_COOLDOWN_TTL_SEC : MANUAL_COOLDOWN_TTL_SEC;
+
       const cooldownTtl = await _redis.ttl(cooldownKey);
       if (cooldownTtl > 0) {
         res.status(429).json({
@@ -182,24 +199,6 @@ router.post(
           },
         });
         return;
-      }
-
-      // Enforce same 6-minute login cooldown as sync.worker — give user a clear message
-      const MIN_LOGIN_INTERVAL_MS = 6 * 60 * 1000;
-      if (cfgRes.rows[0].last_run_at) {
-        const elapsedMs = Date.now() - new Date(cfgRes.rows[0].last_run_at as string).getTime();
-        if (elapsedMs < MIN_LOGIN_INTERVAL_MS) {
-          const waitMinutes = Math.ceil((MIN_LOGIN_INTERVAL_MS - elapsedMs) / 60_000);
-          res.status(429).json({
-            success: false,
-            error: {
-              code:    'COOLDOWN',
-              waitMinutes,
-              message: `Bot vừa chạy xong. Vui lòng chờ thêm ${waitMinutes} phút trước khi đồng bộ lại.`,
-            },
-          });
-          return;
-        }
       }
 
       // Check if a job is currently RUNNING for this company (Redis lock held by worker).
@@ -217,19 +216,17 @@ router.post(
         return;
       }
 
-      const parsed = runNowSchema.safeParse(req.body);
-      if (!parsed.success) throw new ValidationError(parsed.error.issues[0]?.message ?? 'Invalid input');
-      const { from_date, to_date } = parsed.data;
-
       // BOT-ENT-01: Reset block state — manual sync = user explicitly wants to sync now.
       // Clears consecutive_failures + blocked_until so the job can proceed even after auto-blocks.
-      await pool.query(
-        `UPDATE gdt_bot_configs
-         SET consecutive_failures = 0,
-             blocked_until        = NULL
-         WHERE company_id = $1`,
-        [companyId],
-      );
+      if (!quick) {
+        await pool.query(
+          `UPDATE gdt_bot_configs
+           SET consecutive_failures = 0,
+               blocked_until        = NULL
+           WHERE company_id = $1`,
+          [companyId],
+        );
+      }
 
       const jobId = `gdt-bot-manual-${companyId}-${Date.now()}`;
       // BOT-ENT-01: Push to dedicated manual queue (high priority, concurrency=10)
@@ -237,7 +234,7 @@ router.post(
         companyId,
         ...(from_date ? { fromDate: from_date } : {}),
         ...(to_date   ? { toDate:   to_date   } : {}),
-        triggeredBy: 'user_manual',
+        triggeredBy: quick ? 'user_quick_sync' : 'user_manual',
       }, {
         jobId,
         priority: 1,           // highest priority in manual queue
@@ -245,10 +242,10 @@ router.post(
         backoff:  { type: 'exponential', delay: 30_000 },
       });
 
-      // Set 5-minute manual-trigger cooldown key
-      await _redis.set(`${MANUAL_COOLDOWN_PREFIX}${companyId}`, '1', 'EX', MANUAL_COOLDOWN_TTL_SEC);
+      // Set cooldown key
+      await _redis.set(cooldownKey, '1', 'EX', cooldownTtlSec);
 
-      sendSuccess(res, { queued: true, jobId });
+      sendSuccess(res, { queued: true, jobId, quick: quick ?? false });
     } catch (err) {
       next(err);
     }
