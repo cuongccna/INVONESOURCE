@@ -844,14 +844,9 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       // Each page (~50 invoices) is deduped + upserted as it arrives — lower memory,
       // earlier progress updates, and streaming naturally fits our UNNEST batch size.
       //
-      // EARLY EXIT: If GDT's pre-flight count returned exactly 0 for BOTH output and
-      // input, there is nothing new in the requested date range — skip all fetching.
-      // We only skip when both counts are confirmed-zero (not -1 = call failed).
-      if (outEst === 0 && inEst === 0) {
-        logger.info('[SyncWorker] Bỏ qua tải dữ liệu — GDT báo 0 HĐ trong kỳ', {
-          outEst, inEst, fromDate, toDate,
-        });
-      } else {
+      // NOTE: GDT's pre-flight count (outEst/inEst) is NOT reliable — it can return 0
+      // while the actual paginated fetch still returns invoices. Do NOT skip fetching
+      // based on the estimate alone. The estimate is used only for progress/warning UI.
       const BATCH_SIZE = 50;
       const outDedupSetKey = `gdt:dedup:${companyId}:${yyyymm}:output`;
       let outPageIdx = 0;
@@ -990,8 +985,6 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
           batchSize: toUpsertIn.length,
         } as Record<string, unknown>);
       }
-
-      } // end else (outEst !== 0 || inEst !== 0)
 
       if (proxyUrl) proxyManager.markHealthy(proxyUrl);
 
