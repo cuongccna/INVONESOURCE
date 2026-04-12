@@ -13,6 +13,7 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 import type { Element as DomElement } from 'domhandler';
 import { pool } from '../db/pool';
+import { tmproxyHelper } from './TmproxyHelper';
 
 export interface CompanyInfo {
   taxCode:          string;
@@ -66,10 +67,13 @@ export class CompanyVerificationService {
   /** Lookup company status via GDT tracuunnt HTML scrape */
   private async lookupFromGdt(taxCode: string): Promise<CompanyInfo> {
     try {
+      // Use residential proxy when TMPROXY_API_KEYS is configured to avoid
+      // the server's real IP being blocked by GDT rate limiting.
+      const proxy = await tmproxyHelper.getProxyConfig();
       const response = await axios.post(
         GDT_LOOKUP_URL,
         new URLSearchParams({ mst: taxCode.trim() }).toString(),
-        { headers: SCRAPE_HEADERS, timeout: 15_000 },
+        { headers: SCRAPE_HEADERS, timeout: 15_000, ...(proxy ? { proxy } : {}) },
       );
 
       const $ = cheerio.load(response.data as string);
