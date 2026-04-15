@@ -327,24 +327,13 @@ export default function InvoiceGrid({
                         {openMenuId === inv.id && (
                           <div className="absolute right-0 top-8 bg-white rounded-xl shadow-lg border border-gray-100 z-30 py-1 min-w-[160px]">
                             <button onClick={e => { e.stopPropagation(); router.push(`/invoices/${inv.id}`); }} className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50">Xem chi tiết</button>
-                            <button onClick={e => { e.stopPropagation(); setOpenMenuId(null); setExpandedId(inv.id); }} className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50">Gán mã hàng / KH</button>
                             <button onClick={e => { e.stopPropagation(); setOpenMenuId(null); onDelete(inv.id); }} className="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50">Ẩn hóa đơn</button>
                             <button onClick={e => { e.stopPropagation(); setOpenMenuId(null); onPermanentIgnore(inv.id); }} className="w-full text-left px-4 py-2 text-sm text-red-700 hover:bg-red-50">Bỏ qua vĩnh viễn</button>
                           </div>
                         )}
                       </td>
                     </tr>
-                    {isExpanded && (
-                      <tr key={`${inv.id}-panel`}>
-                        <td colSpan={11} className="p-0 bg-blue-50/20 border-b border-blue-200">
-                          <InvoiceEditPanel
-                            invoice={inv}
-                            onClose={() => setExpandedId(null)}
-                            onSaved={onRefresh}
-                          />
-                        </td>
-                      </tr>
-                    )}
+
                   </React.Fragment>
                 );
               })}

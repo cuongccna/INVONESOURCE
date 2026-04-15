@@ -25,6 +25,7 @@ import { logger } from './logger';
 import type { RawInvoice } from './parsers/GdtXmlParser';
 import type { CrawlerRecipe, RecipeFields } from './types/recipe.types';
 import { SyncCheckpoint } from './crawl-cache/SyncCheckpoint';
+import type { ProxyManager } from './proxy-manager';
 
 // ── Human-like browser simulation ───────────────────────────────────────────
 // Realistic Chrome User-Agents observed on Vietnamese ISPs (Viettel / VNPT / FPT).
@@ -99,6 +100,42 @@ const REQUEST_TIMEOUT = 30_000;
 // Binary downloads (XML ZIP, XLSX) can be large and GDT server is slow to generate them.
 // TMProxy and residential proxies have short idle timeouts — give generous room.
 const BINARY_TIMEOUT = 120_000; // 2 min — override with recipe.timing.binaryTimeoutMs
+
+// VĐ2: Per-endpoint timeouts — /sco-query/ endpoints are significantly slower than /query/
+const ENDPOINT_TIMEOUTS: Record<string, number> = {
+  '/query/invoices/sold':                   30_000,
+  '/query/invoices/purchase':               30_000,
+  '/query/invoices/detail':                 45_000,
+  '/sco-query/invoices/sold':               60_000,   // sco chậm hơn
+  '/sco-query/invoices/purchase':           60_000,
+  '/sco-query/invoices/detail':             60_000,
+  '/captcha':                               15_000,
+  '/security-taxpayer/authenticate':        20_000,
+};
+
+/**
+ * VĐ1: Detect network-level TCP failures (proxy drop) as distinct from GDT HTTP errors.
+ * These should trigger proxy rotation rather than counting toward GDT retry budget.
+ */
+function isNetworkLevelError(error: unknown): boolean {
+  if (!axios.isAxiosError(error)) return false;
+  const msg  = error.message.toLowerCase();
+  const code = error.code ?? '';
+  return (
+    error.response === undefined &&  // No HTTP response = network drop
+    (
+      msg.includes('stream has been aborted') ||
+      msg.includes('econnreset') ||
+      msg.includes('econnrefused') ||
+      msg.includes('socket hang up') ||
+      msg.includes('socket disconnected') ||
+      code === 'ECONNABORTED' ||
+      code === 'ERR_STREAM_DESTROYED' ||
+      code === 'ECONNRESET' ||
+      code === 'ECONNREFUSED'
+    )
+  );
+}
 
 // ── GDT API types ──────────────────────────────────────────────────────────────
 
@@ -469,6 +506,12 @@ export class GdtDirectApiService {
    */
   private binaryHttp:     AxiosInstance | null = null;
   private recipe:         CrawlerRecipe | null = null;
+  // VĐ1: Proxy swap on network-level failures
+  private _currentProxyUrl:      string | null = null;
+  private _proxyManager:         ProxyManager | null = null;
+  private _proxySessionSuffix:   string | null = null;
+  // VĐ2: Cached headers for hot-swap axios recreate
+  private _commonHeaders:        Record<string, string> = {};
 
   constructor(
     proxyUrl?:     string | null,
@@ -507,6 +550,8 @@ export class GdtDirectApiService {
       'sec-fetch-mode':            'cors',
       'sec-fetch-dest':            'empty',
     };
+    this._commonHeaders = commonHeaders;
+    this._currentProxyUrl = proxyUrl ?? null;
     this.http = axios.create({
       // With proxy: use http:// so axios uses http.request + our httpAgent
       // (our httpAgent.createConnection does tunnel+TLS, so HTTP goes over TLS).
@@ -519,6 +564,7 @@ export class GdtDirectApiService {
       paramsSerializer: serializeParams,  // BUG-1: raw FIQL values, encoded keys only
       ...(httpAgent ? { httpAgent } : {}),
     });
+    this._addTimeoutInterceptor(this.http);
     // SOCKS5 client for binary downloads (XML ZIP / XLSX).
     // Pure TCP relay → no content filtering by proxy → binary always works.
     // When socks5ProxyUrl is null: binaryHttp stays null → _getBinaryWithRetry uses this.http.
@@ -537,6 +583,49 @@ export class GdtDirectApiService {
   /** Returns the recipe currently active in this service instance (or null if using built-in defaults). */
   get activeRecipe(): CrawlerRecipe | null {
     return this.recipe;
+  }
+
+  /**
+   * VĐ1: Wire up ProxyManager for mid-request proxy swap on TCP drops.
+   * Call immediately after construction in sync.worker before any fetches.
+   */
+  setProxyManager(pm: ProxyManager, sessionSuffix: string): void {
+    this._proxyManager      = pm;
+    this._proxySessionSuffix = sessionSuffix;
+  }
+
+  /** VĐ2: Attach per-endpoint timeout override interceptor to an axios instance. */
+  private _addTimeoutInterceptor(instance: AxiosInstance): void {
+    instance.interceptors.request.use(config => {
+      const url = config.url ?? '';
+      for (const [path, ms] of Object.entries(ENDPOINT_TIMEOUTS)) {
+        if (url.includes(path)) {
+          config.timeout = ms;
+          break;
+        }
+      }
+      return config;
+    });
+  }
+
+  /**
+   * VĐ1: Recreate this.http with a new proxy URL after a TCP drop.
+   * Reuses stored _commonHeaders so session fingerprint stays consistent.
+   */
+  private _recreateHttpClient(newProxyUrl: string): void {
+    const httpAgent = createTunnelAgent({ proxyUrl: newProxyUrl });
+    this._currentProxyUrl = newProxyUrl;
+    this.http = axios.create({
+      baseURL:          this.recipe?.api.baseUrlHttp ?? GDT_API_HTTP,
+      timeout:          REQUEST_TIMEOUT,
+      headers:          this._commonHeaders,
+      paramsSerializer: serializeParams,
+      httpAgent,
+    });
+    this._addTimeoutInterceptor(this.http);
+    logger.info('[GdtDirect] Proxy swapped — new axios instance created', {
+      newProxy: newProxyUrl.replace(/:([^@:]+)@/, ':****@').slice(0, 50),
+    });
   }
 
   // ── Phase 3: Pre-flight count ──────────────────────────────────────────────
@@ -1236,9 +1325,13 @@ export class GdtDirectApiService {
   }
 
   /** GET JSON with auto-retry on transient errors (5xx, timeout) */
-  private async _getWithRetry<T>(url: string, params: Record<string, unknown>) {    const maxRetries   = this.recipe?.timing.maxRetries   ?? MAX_RETRIES;
+  private async _getWithRetry<T>(url: string, params: Record<string, unknown>) {
+    const maxRetries   = this.recipe?.timing.maxRetries   ?? MAX_RETRIES;
     const retryDelayMs = this.recipe?.timing.retryDelayMs ?? RETRY_DELAY;
     let lastErr: Error | null = null;
+    // VĐ1: Track proxy swaps separately — they don't consume the GDT retry budget
+    let proxySwaps = 0;
+    const MAX_PROXY_SWAPS = 2;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
         return await this.http.get<T>(url, {
@@ -1267,6 +1360,30 @@ export class GdtDirectApiService {
             throw new Error(`GDT API ${status}: ${body}`);
           }
           if (status >= 500 || !err.response) {
+            // VĐ1: Network-level failure (proxy TCP drop) — swap proxy, don't count retry
+            if (
+              isNetworkLevelError(err) &&
+              this._proxyManager &&
+              this._proxySessionSuffix &&
+              proxySwaps < MAX_PROXY_SWAPS
+            ) {
+              const oldUrl = this._currentProxyUrl;
+              if (oldUrl) this._proxyManager.markFailed(oldUrl);
+              const newProxyUrl = this._proxyManager.nextForCompany(this._proxySessionSuffix);
+              if (newProxyUrl && newProxyUrl !== oldUrl) {
+                proxySwaps++;
+                logger.warn('[GdtDirect] Proxy TCP drop — swapping proxy (infra fail, not GDT retry)', {
+                  url,
+                  proxySwap: proxySwaps,
+                  errMsg: err.message.slice(0, 80),
+                  newProxy: newProxyUrl.replace(/:([^@:]+)@/, ':****@').slice(0, 40),
+                });
+                this._recreateHttpClient(newProxyUrl);
+                attempt--; // proxy swap doesn't consume GDT retry budget
+                await humanDelay(500, 1_500);
+                continue;
+              }
+            }
             lastErr = err as Error;
             logger.warn('[GdtDirect] Retrying after error', { url, attempt, status });
             // Jittered exponential back-off: base * (attempt+1) ± 20%
@@ -1426,5 +1543,86 @@ export class GdtDirectApiService {
           reject(e);
         });
     });
+  }
+
+  /**
+   * VĐ5: Fetch invoice details with controlled concurrency (semaphore pattern).
+   *
+   * Sequential detail calls at 9–10s each become 30×10s=300s for 30 invoices.
+   * With concurrency=3: 10 batches × ~10s = ~100s (67% reduction).
+   *
+   * Limits:
+   *   /query/ endpoints:     max 3 concurrent
+   *   /sco-query/ endpoints: max 2 concurrent (slower, avoid overload)
+   *
+   * Returns a Map from invoice key (invoice_number|serial) → detail JSON.
+   * Errors per-invoice are caught individually and logged; one failure won't
+   * abort the batch.
+   */
+  async fetchDetailsWithConcurrency(
+    invoices: Array<{
+      nbmst:    string;
+      khhdon:   string;
+      shdon:    string | number;
+      khmshdon?: string | number;
+      isSco?:   boolean;
+    }>,
+    concurrency = 3,
+  ): Promise<Map<string, GdtInvoiceDetail>> {
+    const results = new Map<string, GdtInvoiceDetail>();
+    if (invoices.length === 0) return results;
+
+    // Reduce concurrency for sco-query (slower endpoint)
+    const hasSco = invoices.some(i => i.isSco);
+    const effectiveConcurrency = hasSco ? Math.min(concurrency, 2) : concurrency;
+
+    // Simple semaphore: maintain a pool of slots
+    let active = 0;
+    const queue: Array<() => void> = [];
+    const acquire = (): Promise<() => void> =>
+      new Promise(resolve => {
+        const tryAcquire = () => {
+          if (active < effectiveConcurrency) {
+            active++;
+            resolve(() => {
+              active--;
+              const next = queue.shift();
+              if (next) next();
+            });
+          } else {
+            queue.push(tryAcquire);
+          }
+        };
+        tryAcquire();
+      });
+
+    const INTER_CALL_DELAY_MS = 500;
+
+    await Promise.all(
+      invoices.map(async (inv) => {
+        const release = await acquire();
+        try {
+          await sleep(INTER_CALL_DELAY_MS + Math.random() * 500);
+          const detail = await this.fetchInvoiceDetail(inv);
+          const key = `${inv.shdon}|${inv.khhdon}`;
+          results.set(key, detail);
+        } catch (err) {
+          logger.warn('[GdtDirect] fetchDetailsWithConcurrency: single detail failed (non-fatal)', {
+            shdon:  inv.shdon,
+            khhdon: inv.khhdon,
+            err:    err instanceof Error ? err.message : String(err),
+          });
+        } finally {
+          release();
+        }
+      }),
+    );
+
+    logger.info('[GdtDirect] fetchDetailsWithConcurrency complete', {
+      requested:   invoices.length,
+      fetched:     results.size,
+      concurrency: effectiveConcurrency,
+    });
+    return results;
   }
 }

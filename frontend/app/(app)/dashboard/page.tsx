@@ -400,37 +400,29 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {/* ── Period Navigator ── */}
-      <div className="bg-white rounded-xl shadow-sm px-4 py-3">
-        <div className="flex items-center justify-between">
+      {/* ── KPI Cards (DN) ── */}
+      {!isHousehold && kpi && (
+        <>
+        {/* Compact period nav */}
+        <div className="flex items-center gap-1.5 bg-white rounded-xl shadow-sm px-3 py-2">
           <button
             onClick={() => navigatePeriod(-1)}
-            className="text-gray-400 hover:text-gray-900 text-xl font-bold w-9 h-9 flex items-center justify-center rounded-lg hover:bg-gray-100 transition-colors"
+            className="text-gray-400 hover:text-gray-900 w-7 h-7 flex items-center justify-center rounded hover:bg-gray-100 font-bold text-lg transition-colors shrink-0"
             aria-label="Kỳ trước"
-          >
-            ‹
-          </button>
-          <div className="text-center">
-            <p className="text-xl font-bold text-gray-900">{periodLabel}</p>
-            <p className="text-xs text-gray-400 mt-0.5">
-              Kỳ kê khai{isCurrentPeriod ? ' hiện tại' : ''} · Hạn nộp: {periodDeadline}
-            </p>
+          >‹</button>
+          <div className="flex-1 text-center min-w-0">
+            <span className="text-sm font-bold text-gray-900">{periodLabel}</span>
+            <span className="text-xs text-gray-400 ml-1.5 hidden xs:inline">· Hạn {periodDeadline}</span>
+            {!isCurrentPeriod && (
+              <button onClick={resetPeriod} className="ml-2 text-xs text-primary-600 hover:underline">↩</button>
+            )}
           </div>
-          <button
-            onClick={() => navigatePeriod(1)}
-            className="text-gray-400 hover:text-gray-900 text-xl font-bold w-9 h-9 flex items-center justify-center rounded-lg hover:bg-gray-100 transition-colors"
-            aria-label="Kỳ sau"
-          >
-            ›
-          </button>
-        </div>
-        <div className="flex items-center justify-center gap-3 mt-2.5">
-          <div className="flex gap-0.5 bg-gray-100 rounded-lg p-0.5">
+          <div className="flex gap-0.5 bg-gray-100 rounded-md p-0.5 shrink-0">
             {(['monthly', 'quarterly', 'yearly'] as const).map((mode) => (
               <button
                 key={mode}
                 onClick={() => handleVatViewMode(mode)}
-                className={`text-xs px-3 py-1 rounded-md font-medium transition-colors ${
+                className={`text-[10px] px-2 py-0.5 rounded font-medium transition-colors ${
                   vatViewMode === mode ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'
                 }`}
               >
@@ -438,16 +430,12 @@ export default function DashboardPage() {
               </button>
             ))}
           </div>
-          {!isCurrentPeriod && (
-            <button onClick={resetPeriod} className="text-xs text-primary-600 hover:underline">
-              Về kỳ hiện tại
-            </button>
-          )}
+          <button
+            onClick={() => navigatePeriod(1)}
+            className="text-gray-400 hover:text-gray-900 w-7 h-7 flex items-center justify-center rounded hover:bg-gray-100 font-bold text-lg transition-colors shrink-0"
+            aria-label="Kỳ sau"
+          >›</button>
         </div>
-      </div>
-
-      {/* ── KPI Cards (DN) ── */}
-      {!isHousehold && kpi && (
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           <KCard
             label="Tổng hóa đơn kỳ này"
@@ -479,10 +467,31 @@ export default function DashboardPage() {
             badgeColor="bg-amber-50 text-amber-600"
           />
         </div>
+        </>
       )}
 
       {/* ── KPI Cards (HKD) ── */}
       {isHousehold && hkdKpi && (
+        <>
+        {/* Compact period nav */}
+        <div className="flex items-center gap-1.5 bg-white rounded-xl shadow-sm px-3 py-2">
+          <button
+            onClick={() => navigatePeriod(-1)}
+            className="text-gray-400 hover:text-gray-900 w-7 h-7 flex items-center justify-center rounded hover:bg-gray-100 font-bold text-lg transition-colors shrink-0"
+            aria-label="Kỳ trước"
+          >‹</button>
+          <div className="flex-1 text-center min-w-0">
+            <span className="text-sm font-bold text-gray-900">{periodLabel}</span>
+            {!isCurrentPeriod && (
+              <button onClick={resetPeriod} className="ml-2 text-xs text-primary-600 hover:underline">↩</button>
+            )}
+          </div>
+          <button
+            onClick={() => navigatePeriod(1)}
+            className="text-gray-400 hover:text-gray-900 w-7 h-7 flex items-center justify-center rounded hover:bg-gray-100 font-bold text-lg transition-colors shrink-0"
+            aria-label="Kỳ sau"
+          >›</button>
+        </div>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           <KCard
             label="Doanh Thu Ước Tính"
@@ -509,6 +518,7 @@ export default function DashboardPage() {
             color="text-purple-600"
           />
         </div>
+        </>
       )}
 
       {/* ── HKD: Revenue chart + Tax Calendar ── */}
@@ -652,7 +662,19 @@ export default function DashboardPage() {
         <div className="bg-white rounded-xl shadow-sm p-4">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-sm font-semibold text-gray-700">💰 Thuế GTGT Phải Nộp</h2>
-            <span className="text-xs text-gray-400">{vatViewMode === 'quarterly' ? 'Theo quý' : 'Theo tháng'}</span>
+            <div className="flex gap-0.5 bg-gray-100 rounded-md p-0.5">
+              {(['monthly', 'quarterly', 'yearly'] as const).map((mode) => (
+                <button
+                  key={mode}
+                  onClick={() => handleVatViewMode(mode)}
+                  className={`text-[10px] px-2 py-0.5 rounded font-medium transition-colors ${
+                    vatViewMode === mode ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+                  }`}
+                >
+                  {mode === 'monthly' ? 'Tháng' : mode === 'quarterly' ? 'Quý' : 'Năm'}
+                </button>
+              ))}
+            </div>
           </div>
           <ResponsiveContainer width="100%" height={200}>
             <BarChart data={activeVatData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>

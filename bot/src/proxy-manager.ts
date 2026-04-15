@@ -157,6 +157,8 @@ export class ProxyManager extends EventEmitter {
       }
       // Auto-recovery timer: thử khôi phục slot hết hạn sau mỗi 30 phút
       this._startDeadSlotRetryTimer();
+      // VĐ3: Proactive refresh — rotate IPs that will expire in < 10 minutes
+      this._startProactiveRefreshTimer();
     }
 
     if (this.iproyalSlots.length === 0 && allKeys.length === 0) {
@@ -646,6 +648,82 @@ export class ProxyManager extends EventEmitter {
         }
       }
     }, RETRY_INTERVAL_MS);
+  }
+
+  /**
+   * VĐ3: Proactive IP refresh — rotate slots that will expire within 10 minutes.
+   * Runs every 5 minutes. Prevents mid-session proxy expiry that causes status:0 TCP drops.
+   *
+   * Background: TMProxy IPs have ~45-min TTL. When a company session is running and
+   * the assigned IP expires, the connection drops with "stream has been aborted" (status:0).
+   * Proactive refresh before expiry eliminates this failure class entirely.
+   */
+  private _startProactiveRefreshTimer(): void {
+    const INTERVAL_MS      = 5 * 60_000;   // check every 5 minutes
+    const PROACTIVE_TTL_MS = 10 * 60_000;  // refresh if < 10 minutes remaining
+
+    setInterval(async () => {
+      try {
+        await this._checkAndRefreshExpiring(PROACTIVE_TTL_MS);
+      } catch (err) {
+        logger.warn('[ProxyManager] Proactive refresh timer error (non-fatal)', {
+          err: (err as Error).message,
+        });
+      }
+    }, INTERVAL_MS);
+  }
+
+  /**
+   * VĐ3: Check all slots and proactively refresh those expiring within ttlThresholdMs.
+   * Public for external callers (e.g. health check, tests).
+   */
+  async checkAndRefreshExpiring(ttlThresholdMs = 10 * 60_000): Promise<void> {
+    return this._checkAndRefreshExpiring(ttlThresholdMs);
+  }
+
+  private async _checkAndRefreshExpiring(ttlThresholdMs: number): Promise<void> {
+    for (const slot of this.slots) {
+      if (slot.permanentlyDead || slot.refreshing || !slot.currentExpiresAt) continue;
+      const ttlMs = slot.currentExpiresAt.getTime() - Date.now();
+      if (ttlMs < ttlThresholdMs) {
+        const minsLeft = Math.max(0, Math.floor(ttlMs / 60_000));
+        logger.info('[ProxyManager] Proactive refresh: slot expires soon', {
+          apiKey:   slot.apiKey.slice(0, 8) + '…',
+          minsLeft,
+        });
+        await this.refreshSlot(slot.apiKey);
+      }
+    }
+  }
+
+  /**
+   * VĐ3: Refresh a specific slot by API key (awaitable, unlike _rotateSlot which is fire-and-forget).
+   * Emits 'slot:refreshed' so active sessions can detect the URL change.
+   * Sessions detect the drop (status:0) → read new slot URL → continue without failing the job.
+   */
+  async refreshSlot(apiKey: string): Promise<void> {
+    const slot = this.slots.find(s => s.apiKey === apiKey);
+    if (!slot || slot.refreshing || slot.permanentlyDead) return;
+    slot.refreshing = true;
+    try {
+      const session = await slot.refresher.getNew();
+      slot.currentUrl       = session.url;
+      slot.currentSocks5Url = session.socks5Url;
+      slot.currentExpiresAt = session.expiresAt;
+      logger.info('[ProxyManager] Slot refreshed proactively', {
+        apiKey:    slot.apiKey.slice(0, 8) + '…',
+        publicIp:  session.publicIp,
+        expiresAt: session.expiresAt.toISOString(),
+      });
+      this.emit('slot:refreshed', { apiKey, newUrl: session.url, newSocks5Url: session.socks5Url });
+    } catch (err) {
+      logger.warn('[ProxyManager] Slot proactive refresh failed', {
+        apiKey: slot.apiKey.slice(0, 8) + '…',
+        err:    (err as Error).message,
+      });
+    } finally {
+      slot.refreshing = false;
+    }
   }
 }
 

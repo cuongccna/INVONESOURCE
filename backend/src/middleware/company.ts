@@ -83,7 +83,7 @@ export const requireCompany: RequestHandler = async (req, _res, next) => {
 
     req.user.companyId = headerCompanyId;
     req.user.role = rows[0].role;
-    console.debug(`[requireCompany] switched to header company → ${req.user.companyId}`);
+    //console.debug(`[requireCompany] switched to header company → ${req.user.companyId}`);
   } catch (err) {
     return next(err);
   }

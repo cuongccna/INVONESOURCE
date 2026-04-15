@@ -88,6 +88,53 @@ const READ_PAUSE_MAX = 30_000;
 
 const FREE_TIER_MONTHLY_QUOTA = 100;
 
+// ── VĐ4: Dynamic job timeout based on estimated invoice volume ────────────────
+const VOLUME_ESTIMATE_KEY_PREFIX = 'gdt:volume:';
+const VOLUME_ESTIMATE_TTL_SEC    = 7 * 24 * 3600; // 7 days
+
+/**
+ * Persist last-known invoice count after a successful sync.
+ * Used by the next enqueueSync call to set an appropriate BullMQ job timeout.
+ */
+async function storeVolumeEstimate(
+  redis: import('ioredis').default,
+  companyId: string,
+  outCount: number,
+  inCount: number,
+): Promise<void> {
+  try {
+    await redis.set(
+      `${VOLUME_ESTIMATE_KEY_PREFIX}${companyId}`,
+      JSON.stringify({ outCount, inCount, storedAt: Date.now() }),
+      'EX', VOLUME_ESTIMATE_TTL_SEC,
+    );
+  } catch { /* non-fatal */ }
+}
+
+/**
+ * VĐ4: Calculate BullMQ job timeout from estimated invoice volume.
+ * Based on real-world benchmarks:
+ *   - List fetch:   ~1s / page (50 invoices)
+ *   - Detail /query/:     ~9s / invoice
+ *   - Detail /sco-query/: ~12s / invoice (worst case — assume sco)
+ *   - Login + captcha:    ~16s fixed
+ * Returns between 3 minutes (minimum) and 30 minutes (cap).
+ */
+function calculateJobTimeout(estimate: { outCount: number; inCount: number }): number {
+  const total      = Math.max(0, estimate.outCount) + Math.max(0, estimate.inCount);
+  const LOGIN_TIME = 16_000;
+  const LIST_TIME  = Math.ceil(total / 50) * 1_000;
+  const DETAIL_TIME = total * 12_000;   // worst case: sco-query
+  const BUFFER      = 60_000;
+  const ms = LOGIN_TIME + LIST_TIME + DETAIL_TIME + BUFFER;
+  const result = Math.min(Math.max(ms, 3 * 60_000), 30 * 60_000);
+  logger.info('[SyncWorker] Dynamic timeout calculated', {
+    total,
+    timeoutMin: Math.round(result / 60_000),
+  });
+  return result;
+}
+
 /** Returns the OWNER user_id for a company, or null if none found. */
 async function _getCompanyOwner(companyId: string): Promise<string | null> {
   const res = await pool.query<{ user_id: string }>(
@@ -277,6 +324,8 @@ interface SyncJobData {
   fromDate?: string; // YYYY-MM-DD, optional — job-specific override
   toDate?:   string; // YYYY-MM-DD, optional
   label?:    string; // display label (e.g. 'Tháng 1')
+  // VĐ4: Dynamic job deadline stored in job data (BullMQ v3 has no per-job timeout option)
+  dynamicTimeoutMs?: number;
   // Sequential chaining fields (quarter sync)
   groupId?:   string;
   jobIndex?:  number; // 0-based index in the group
@@ -438,7 +487,17 @@ export async function enqueueSync(
 
     // 3. No conflict — enqueue normally
     const queue = type === 'manual' ? manualQueue : autoQueue;
-    const addedJob = await queue.add('sync', jobData, type === 'manual' ? { priority: 1 } : {});
+    // VĐ4: Embed dynamic timeout in job data (BullMQ v3 has no per-job timeout field)
+    const enrichedJobData: SyncJobData = { ...jobData };
+    try {
+      const raw = await _lockRedis.get(`${VOLUME_ESTIMATE_KEY_PREFIX}${companyId}`).catch(() => null);
+      if (raw) {
+        const est = JSON.parse(raw) as { outCount: number; inCount: number };
+        enrichedJobData.dynamicTimeoutMs = calculateJobTimeout(est);
+      }
+    } catch { /* non-fatal */ }
+    const jobOptions = type === 'manual' ? { priority: 1 } : {};
+    const addedJob = await queue.add('sync', enrichedJobData, jobOptions);
     const jobId = addedJob.id ?? uuidv4();
     await _lockRedis.set(`${BOT_PENDING_PREFIX}${companyId}`, jobId, 'EX', 3600);
     return { status: 'enqueued', jobId };
@@ -457,7 +516,22 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
   const runId     = uuidv4();
   const startedAt = Date.now();
 
-  logger.info('[SyncWorker] Starting job', { jobId: job.id, companyId });
+  // VĐ4: Enforce dynamic deadline from job data (set by enqueueSync based on volume estimate)
+  const jobDeadlineMs = job.data.dynamicTimeoutMs
+    ? startedAt + job.data.dynamicTimeoutMs
+    : startedAt + 30 * 60_000; // hard cap: 30 minutes
+  function checkDeadline(): void {
+    if (Date.now() > jobDeadlineMs) {
+      const ranMin = Math.round((Date.now() - startedAt) / 60_000);
+      throw new Error(`DEADLINE_EXCEEDED: Job exceeded dynamic timeout after ${ranMin}m`);
+    }
+  }
+
+  logger.info('[SyncWorker] Starting job', {
+    jobId: job.id,
+    companyId,
+    timeoutMin: Math.round((jobDeadlineMs - startedAt) / 60_000),
+  });
 
   // Detect whether this job came from the user-triggered manual queue.
   // Manual jobs get: no off-hours delay, reduced thinkTime, proxy probe, strict timeout.
@@ -665,6 +739,10 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     await thinkTime(isManual ? 500 : 3_000, isManual ? 2_000 : 15_000);
 
     const gdtApi = new GdtDirectApiService(proxyUrl, socks5ProxyUrl, undefined, companyId, _checkpoint);
+    // VĐ1: Wire proxy manager for mid-request proxy swap on TCP drops
+    if (proxyUrl && proxySessionId) {
+      gdtApi.setProxyManager(proxyManager, proxySessionId);
+    }
 
     // FIX-PERF-01: Check session cache — skip captcha+login if we have a valid token.
     let cachedToken: string | null = null;
@@ -818,6 +896,15 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
         runner.prefetchCount('sold', fromDate, toDate).catch(() => -1),
         runner.prefetchCount('purchase', fromDate, toDate).catch(() => -1),
       ]);
+      // VĐ4: Persist volume estimate so next enqueueSync can set accurate job timeout
+      if (outEst >= 0 || inEst >= 0) {
+        await storeVolumeEstimate(
+          _lockRedis,
+          companyId,
+          outEst >= 0 ? outEst : 0,
+          inEst  >= 0 ? inEst  : 0,
+        );
+      }
       if (outEst >= 0 || inEst >= 0) {
         const estimatedMs = GdtDirectApiService.estimateSyncDurationMs(
           outEst >= 0 ? outEst : 0,
@@ -893,7 +980,8 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
         outPageIdx++;
 
-        // Cancellation + YIELD_TO_MANUAL check per page batch (every page ≈ JITTER_EVERY invoices)
+        // Cancellation + YIELD_TO_MANUAL + deadline check per page batch
+        checkDeadline(); // VĐ4: abort if dynamic timeout exceeded
         if (await checkCancellationRequested(companyId)) {
           logger.info('[SyncWorker] Hủy đồng bộ giữa chừng (HĐ đầu ra)', { companyId, outPageIdx });
           throw new Error('CANCEL_SKIP: sync cancelled by user');
@@ -963,6 +1051,8 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
         inPageIdx++;
 
+        // VĐ4: Deadline + cancellation check per input page
+        checkDeadline();
         if (await checkCancellationRequested(companyId)) {
           logger.info('[SyncWorker] Hủy đồng bộ giữa chừng (HĐ đầu vào)', { companyId, inPageIdx });
           throw new Error('CANCEL_SKIP: sync cancelled by user');

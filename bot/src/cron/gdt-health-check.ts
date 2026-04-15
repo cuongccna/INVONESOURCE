@@ -89,9 +89,14 @@ export async function runGdtHealthCheck(): Promise<void> {
     );
 
     if (cfgRes.rows.length === 0) {
-      logger.warn('[GdtHealthCheck] Không tìm thấy config cho canary company', {
-        companyId: GDT_CANARY_COMPANY_ID,
-      });
+      // VĐ6: Only warn when canary is explicitly enabled; log debug otherwise
+      if (process.env['CANARY_ENABLED'] === 'true') {
+        logger.warn('[GdtHealthCheck] Không tìm thấy config cho canary company', {
+          companyId: GDT_CANARY_COMPANY_ID,
+        });
+      } else {
+        logger.debug('[GdtHealthCheck] Canary disabled \u2014 skipping health check');
+      }
       return;
     }
 
