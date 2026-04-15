@@ -546,13 +546,15 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
   const isDev = process.env['NODE_ENV'] !== 'production';
   const isFirstRun = (job.id ?? '').startsWith('gdt-bot-first-');
   if (!isDev && !isFirstRun && !isManual) {
-    const vnHour = new Date(Date.now() + 7 * 3600_000).getUTCHours();
-    if (vnHour < 7 || vnHour >= 20) {
-      const delayMs = 5 * 60_000 + Math.floor(Math.random() * 25 * 60_000); // 5-30 min
-      logger.info('[SyncWorker] Off-hours delay (VN time)', { vnHour, delayMs });
-      await new Promise(r => setTimeout(r, delayMs));
-    } else if (vnHour === 7 || vnHour === 19) {
-      const delayMs = 60_000 + Math.floor(Math.random() * 4 * 60_000); // 1-5 min
+    const vnNow  = new Date(Date.now() + 7 * 3600_000);
+    const vnHour = vnNow.getUTCHours();
+    const vnMin  = vnNow.getUTCMinutes();
+    // Only block during 2:00–4:00 AM Vietnam time.
+    // Sleep until 4:00 AM + up to 5 min jitter so jobs don't all pile up at once.
+    if (vnHour >= 2 && vnHour < 4) {
+      const msUntil4am = ((4 - vnHour) * 60 - vnMin) * 60_000;
+      const delayMs    = msUntil4am + Math.floor(Math.random() * 5 * 60_000);
+      logger.info('[SyncWorker] Off-hours delay (VN time)', { vnHour, vnMin, delayMs });
       await new Promise(r => setTimeout(r, delayMs));
     }
   }
