@@ -326,12 +326,12 @@ router.post('/declarations', requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'), async 
   const engine = new HkdDeclarationEngine();
   // Allow only household/HKD companies
   const compTypeRes = await pool.query<{ company_type: string; business_type: string }>(
-    `SELECT COALESCE(company_type, 'private') AS company_type,
-            COALESCE(business_type, 'DN')     AS business_type
+    `SELECT COALESCE(company_type, 'enterprise') AS company_type,
+            COALESCE(business_type, 'DN')         AS business_type
      FROM companies WHERE id = $1`,
     [companyId]
   );
-  const companyType  = compTypeRes.rows[0]?.company_type  ?? 'private';
+  const companyType  = compTypeRes.rows[0]?.company_type  ?? 'enterprise';
   const businessType = compTypeRes.rows[0]?.business_type ?? 'DN';
   const isHousehold  = companyType === 'household' || ['HKD', 'HND', 'CA_NHAN'].includes(String(businessType));
   if (!isHousehold) {

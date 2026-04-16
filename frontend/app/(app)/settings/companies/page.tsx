@@ -13,7 +13,7 @@ interface Company {
   address: string;
   phone: string;
   email: string;
-  company_type: 'private' | 'jsc' | 'partnership' | 'household' | 'other';
+  company_type: 'household' | 'enterprise' | 'branch';
   fiscal_year_start: number;
   onboarded: boolean;
   role: string;
@@ -21,11 +21,9 @@ interface Company {
 }
 
 const COMPANY_TYPE_LABELS: Record<string, string> = {
-  private: 'TNHH / Tư nhân',
-  jsc: 'Cổ phần',
-  partnership: 'Hợp danh',
   household: 'Hộ kinh doanh',
-  other: 'Khác',
+  enterprise: 'Doanh nghiệp',
+  branch: 'Chi nhánh doanh nghiệp',
 };
 
 const MONTHS = [
@@ -40,7 +38,7 @@ type CompanyFormData = {
   address: string;
   phone: string;
   email: string;
-  company_type: 'private' | 'jsc' | 'partnership' | 'household' | 'other';
+  company_type: 'household' | 'enterprise' | 'branch';
   fiscal_year_start: number;
 };
 
@@ -50,9 +48,23 @@ const EMPTY_FORM: CompanyFormData = {
   address: '',
   phone: '',
   email: '',
-  company_type: 'private',
+  company_type: 'enterprise',
   fiscal_year_start: 1,
 };
+
+function validateTaxCode(tax_code: string, company_type: CompanyFormData['company_type']): string {
+  if (!tax_code) return '';
+  if (company_type === 'household') {
+    if (!/^\d{9}$|^\d{10}$|^\d{11}$|^\d{12}$/.test(tax_code)) {
+      return 'Hộ kinh doanh: MST/Giấy tờ tùy thân phải là 9, 10, 11 hoặc 12 chữ số';
+    }
+  } else {
+    if (!/^\d{10}(-\d{3})?$/.test(tax_code)) {
+      return 'MST phải là 10 chữ số (hoặc 13 ký tự cho chi nhánh: 0123456789-001)';
+    }
+  }
+  return '';
+}
 
 export default function CompaniesSettingsPage() {
   const [companies, setCompanies] = useState<Company[]>([]);
@@ -60,6 +72,7 @@ export default function CompaniesSettingsPage() {
   const [showModal, setShowModal] = useState(false);
   const [editTarget, setEditTarget] = useState<Company | null>(null);
   const [form, setForm] = useState<CompanyFormData>(EMPTY_FORM);
+  const [taxCodeError, setTaxCodeError] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [deleteTarget, setDeleteTarget] = useState<Company | null>(null);
@@ -97,6 +110,7 @@ export default function CompaniesSettingsPage() {
     setEditTarget(null);
     setForm(EMPTY_FORM);
     setError('');
+    setTaxCodeError('');
     setShowModal(true);
   };
 
@@ -112,11 +126,17 @@ export default function CompaniesSettingsPage() {
       fiscal_year_start: c.fiscal_year_start,
     });
     setError('');
+    setTaxCodeError('');
     setShowModal(true);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    const tcErr = validateTaxCode(form.tax_code, form.company_type);
+    if (tcErr) {
+      setTaxCodeError(tcErr);
+      return;
+    }
     setError('');
     setSubmitting(true);
     try {
@@ -313,23 +333,37 @@ export default function CompaniesSettingsPage() {
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">Mã số thuế *</label>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">
+                    {form.company_type === 'household' ? 'MST / Giấy tờ tùy thân *' : 'Mã số thuế *'}
+                  </label>
                   <input
                     required
                     value={form.tax_code}
-                    onChange={(e) => setForm({ ...form, tax_code: e.target.value })}
-                    className="w-full border border-amber-400 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-amber-400"
-                    placeholder="0123456789"
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setForm({ ...form, tax_code: val });
+                      setTaxCodeError(validateTaxCode(val, form.company_type));
+                    }}
+                    className={`w-full border rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 ${
+                      taxCodeError
+                        ? 'border-red-400 focus:ring-red-300'
+                        : 'border-amber-400 focus:ring-amber-400'
+                    }`}
+                    placeholder={form.company_type === 'household' ? '0123456789 / CMND / CCCD' : '0123456789'}
                   />
-                  {!editTarget && (
+                  {taxCodeError ? (
+                    <p className="mt-1.5 text-xs text-red-600 font-medium">{taxCodeError}</p>
+                  ) : !editTarget ? (
                     <div className="mt-1.5 flex items-start gap-1.5 bg-amber-50 border border-amber-300 rounded-lg px-3 py-2 text-xs text-amber-800">
                       <span className="text-base leading-none mt-0.5">&#9888;&#xFE0F;</span>
                       <span>
-                        <strong>Mã số thuế phải chính xác.</strong> Hệ thống dùng MST này để đăng nhập cổng thuế GDT
-                        tự động đồng bộ hóa đơn. Sai MST sẽ không kết nối được.
+                        <strong>Mã số thuế phải chính xác.</strong>{' '}
+                        {form.company_type === 'household'
+                          ? 'Hộ kinh doanh có thể nhập MST (10 số), CMND (9 số), CCCD (12 số) hoặc giấy tờ tùy thân khác (11 số).'
+                          : 'Hệ thống dùng MST này để đăng nhập cổng thuế GDT tự động đồng bộ hóa đơn. Sai MST sẽ không kết nối được.'}
                       </span>
                     </div>
-                  )}
+                  ) : null}
                 </div>
 
                 <div className="grid grid-cols-2 gap-3">
@@ -337,7 +371,11 @@ export default function CompaniesSettingsPage() {
                     <label className="block text-xs font-medium text-gray-600 mb-1">Loại hình DN</label>
                     <select
                       value={form.company_type}
-                      onChange={(e) => setForm({ ...form, company_type: e.target.value as typeof form.company_type })}
+                      onChange={(e) => {
+                        const newType = e.target.value as typeof form.company_type;
+                        setForm({ ...form, company_type: newType });
+                        setTaxCodeError(validateTaxCode(form.tax_code, newType));
+                      }}
                       className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-300"
                     >
                       {Object.entries(COMPANY_TYPE_LABELS).map(([k, v]) => (

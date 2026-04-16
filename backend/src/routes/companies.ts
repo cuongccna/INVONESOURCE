@@ -12,17 +12,37 @@ router.use(authenticate);
 
 const companySchema = z.object({
   name: z.string().min(1).max(255),
-  tax_code: z.string().regex(/^\d{10}(-\d{3})?$/, 'MST phải là 10 chữ số (hoặc 13 ký tự cho chi nhánh)'),
+  tax_code: z.string().min(1).max(20),
   address: z.string().optional().default(''),
   phone: z.string().optional().default(''),
   email: z.string().email().optional().or(z.literal('')).default(''),
-  company_type: z.enum(['private', 'jsc', 'partnership', 'household', 'other']).default('private'),
+  company_type: z.enum(['household', 'enterprise', 'branch']).default('enterprise'),
   fiscal_year_start: z.coerce.number().int().min(1).max(12).default(1),
   organization_id: z.string().uuid().optional().nullable(),
   parent_id: z.string().uuid().optional().nullable(),
   level: z.coerce.number().int().min(1).max(20).optional(),
   entity_type: z.enum(['company', 'branch', 'representative_office', 'project']).optional(),
   is_consolidated: z.boolean().optional(),
+}).superRefine((data, ctx) => {
+  if (data.company_type === 'household') {
+    // HKD: CMND (9 số), MST thường (10 số), GTTT khác (11 số), CCCD (12 số)
+    if (!/^\d{9}$|^\d{10}$|^\d{11}$|^\d{12}$/.test(data.tax_code)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Hộ kinh doanh: MST/Giấy tờ tùy thân phải là 9, 10, 11 hoặc 12 chữ số',
+        path: ['tax_code'],
+      });
+    }
+  } else {
+    // Doanh nghiệp: 10 chữ số (hoặc 13 ký tự cho mã chi nhánh)
+    if (!/^\d{10}(-\d{3})?$/.test(data.tax_code)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'MST phải là 10 chữ số (hoặc 13 ký tự cho chi nhánh: 0123456789-001)',
+        path: ['tax_code'],
+      });
+    }
+  }
 });
 
 type CompanyTreeNode = {

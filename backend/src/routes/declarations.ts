@@ -82,12 +82,12 @@ router.post(
 
 // Block HKD/household companies — use /api/hkd endpoints instead
       const compRes = await pool.query<{ company_type: string; business_type: string }>(
-        `SELECT COALESCE(company_type, 'private') AS company_type,
-                COALESCE(business_type, 'DN')     AS business_type
+        `SELECT COALESCE(company_type, 'enterprise') AS company_type,
+                COALESCE(business_type, 'DN')         AS business_type
          FROM companies WHERE id = $1`,
         [req.user!.companyId]
       );
-      const companyType  = compRes.rows[0]?.company_type  ?? 'private';
+      const companyType  = compRes.rows[0]?.company_type  ?? 'enterprise';
       const businessType = compRes.rows[0]?.business_type ?? 'DN';
       const isHousehold  = companyType === 'household' || ['HKD', 'HND', 'CA_NHAN'].includes(String(businessType));
       if (isHousehold) {
