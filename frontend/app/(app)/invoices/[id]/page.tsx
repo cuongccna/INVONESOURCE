@@ -49,6 +49,7 @@ interface Invoice {
   line_items: LineItem[];
   invoice_group: number | null;
   has_line_items: boolean | null;
+  raw_data: Record<string, unknown> | null;
 }
 
 const STATUS_LABELS: Record<string, { label: string; color: string }> = {
@@ -77,6 +78,18 @@ function fmt(val: string | null | undefined) {
 function fmtDate(val: string | null | undefined) {
   if (!val) return '—';
   try { return format(new Date(val), 'dd/MM/yyyy', { locale: vi }); } catch { return val; }
+}
+
+/** Extract payment status text from GDT raw_data.ttkhac array. */
+function getGdtPaymentStatus(rawData: Record<string, unknown> | null): string | null {
+  if (!rawData) return null;
+  const ttkhac = rawData['ttkhac'];
+  if (!Array.isArray(ttkhac)) return null;
+  const entry = (ttkhac as Array<Record<string, unknown>>).find(
+    (e) => e['ttruong'] === 'Trạng thái thanh toán',
+  );
+  const val = entry?.['dlieu'];
+  return typeof val === 'string' && val.trim() ? val.trim() : null;
 }
 
 export default function InvoiceDetailPage() {
@@ -370,17 +383,28 @@ export default function InvoiceDetailPage() {
             <span className="text-gray-600">Phương thức TT</span>
             <span>{invoice.payment_method || '—'}</span>
           </div>
-          <div className="flex justify-between">
-            <span className="text-gray-600">Ngày TT</span>
-            <span>{fmtDate(invoice.payment_date)}</span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-gray-600">Hạn TT</span>
-            <span>{fmtDate(invoice.payment_due_date)}</span>
-          </div>
+          {invoice.payment_date && (
+            <div className="flex justify-between">
+              <span className="text-gray-600">Ngày TT</span>
+              <span>{fmtDate(invoice.payment_date)}</span>
+            </div>
+          )}
+          {invoice.payment_due_date && (
+            <div className="flex justify-between">
+              <span className="text-gray-600">Hạn TT</span>
+              <span>{fmtDate(invoice.payment_due_date)}</span>
+            </div>
+          )}
           <div className="flex justify-between">
             <span className="text-gray-600">Đã thanh toán</span>
-            <span className={invoice.is_paid ? 'text-green-600 font-medium' : 'text-gray-400'}>{invoice.is_paid ? 'Có' : 'Chưa'}</span>
+            {(() => {
+              const gdtStatus = getGdtPaymentStatus(invoice.raw_data);
+              if (gdtStatus) {
+                const isPaid = !gdtStatus.toLowerCase().includes('chưa');
+                return <span className={isPaid ? 'text-green-600 font-medium' : 'text-gray-400'}>{gdtStatus}</span>;
+              }
+              return <span className={invoice.is_paid ? 'text-green-600 font-medium' : 'text-gray-400'}>{invoice.is_paid ? 'Có' : 'Chưa'}</span>;
+            })()}
           </div>
           <div className="flex justify-between">
             <span className="text-gray-600">GDT xác nhận</span>

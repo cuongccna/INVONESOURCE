@@ -563,6 +563,8 @@ async function batchUpsertInvoices(
     const rawDatas: string[]    = [];
     const sources: string[]     = [];
     const gdtIds: string[]      = [];
+    const currencies: string[]          = [];
+    const paymentMethods: (string|null)[] = [];
 
     for (const inv of batch) {
       ids.push(uuidv4());
@@ -583,6 +585,8 @@ async function batchUpsertInvoices(
       rawDatas.push(JSON.stringify(inv.rawData));
       sources.push('gdt_bot');
       gdtIds.push(inv.id);
+      currencies.push(inv.currency || 'VND');
+      paymentMethods.push(inv.paymentMethod ?? null);
     }
 
     const result = await pool.query(
@@ -590,15 +594,22 @@ async function batchUpsertInvoices(
         id, company_id, direction, serial_number, invoice_number,
         invoice_date, status, seller_tax_code, seller_name,
         buyer_tax_code, buyer_name, total_before_tax, vat_amount,
-        total_amount, vat_rate, raw_data, source, gdt_invoice_id, gdt_validated
+        total_amount, vat_rate, raw_data, source, gdt_invoice_id, gdt_validated,
+        currency, payment_method, payment_method_source
       )
-      SELECT * FROM unnest(
+      SELECT *, CASE WHEN pm IS NOT NULL THEN 'gdt_data' ELSE NULL END
+      FROM unnest(
         $1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::text[],
         $6::date[], $7::text[], $8::text[], $9::text[],
         $10::text[], $11::text[], $12::numeric[], $13::numeric[],
         $14::numeric[], $15::text[], $16::jsonb[], $17::text[], $18::text[],
-        ARRAY_FILL(true, ARRAY[$19])::boolean[]
-      )
+        ARRAY_FILL(true, ARRAY[$19])::boolean[],
+        $20::text[], $21::text[]
+      ) AS t(id, company_id, direction, serial_number, invoice_number,
+             invoice_date, status, seller_tax_code, seller_name,
+             buyer_tax_code, buyer_name, total_before_tax, vat_amount,
+             total_amount, vat_rate, raw_data, source, gdt_invoice_id, gdt_validated,
+             currency, pm)
       ON CONFLICT (company_id, serial_number, invoice_number, seller_tax_code, direction)
       DO UPDATE SET
         status = EXCLUDED.status,
@@ -607,6 +618,13 @@ async function batchUpsertInvoices(
         total_amount = EXCLUDED.total_amount,
         raw_data = EXCLUDED.raw_data,
         gdt_validated = true,
+        currency = EXCLUDED.currency,
+        payment_method = COALESCE(EXCLUDED.payment_method, invoices.payment_method),
+        payment_method_source = CASE
+          WHEN EXCLUDED.payment_method IS NOT NULL AND invoices.payment_method_source IS DISTINCT FROM 'manual'
+          THEN 'gdt_data'
+          ELSE invoices.payment_method_source
+        END,
         updated_at = NOW()`,
       [
         ids, companyIds, directions, serials, invoiceNums,
@@ -614,6 +632,7 @@ async function batchUpsertInvoices(
         buyerTaxes, buyerNames, subtotals, vatAmounts,
         totals, vatRates, rawDatas, sources, gdtIds,
         batch.length,
+        currencies, paymentMethods,
       ],
     );
 

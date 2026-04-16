@@ -82,6 +82,10 @@ export interface ClassifiedInvoice {
   currency: string;
   vatRates: VatRateEntry[];
 
+  // Payment
+  /** Extracted from thtttoan (string) or htttoan (number: 9 = "TM/CK", others = null) */
+  paymentMethod: string | null;
+
   // Line items
   hasLineItems: boolean;
   lineItems: LineItem[];
@@ -265,6 +269,14 @@ export function classifyInvoice(
     total:     resolveNumber(raw, f.total as string[]),
     currency:  String(raw['dvtte'] ?? 'VND'),
     vatRates:  parseVatRates(raw, config),
+
+    paymentMethod: (() => {
+      const thtttoan = raw['thtttoan'];
+      if (typeof thtttoan === 'string' && thtttoan.trim()) return thtttoan.trim();
+      const htttoan = raw['htttoan'];
+      if (htttoan === 9) return 'TM/CK';
+      return null;
+    })(),
 
     hasLineItems: lineItems.length > 0,
     lineItems,
