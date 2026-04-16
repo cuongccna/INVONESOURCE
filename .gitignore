@@ -68,3 +68,12 @@ frontend/__tests__/apiClient.company-switch.test.ts
 backend/tests/tax/htkk-excluded-invoices.test.ts
 backend/src/scripts/test-gemini.ts
 .gitignore
+bot/test-output/load-test/0318613199-input-sample.json
+bot/test-output/load-test/0318613199-output-sample.json
+bot/test-output/load-test/0319303270-input-sample.json
+bot/test-output/load-test/0319303270-output-sample.json
+bot/test-output/load-test/5801543857-input-sample.json
+bot/test-output/load-test/5801543857-output-sample.json
+bot/test-output/load-test/load-test-1776354786856.json
+bot/test-output/load-test/load-test-1776355247051.json
+bot/src/test-load-concurrent.ts
