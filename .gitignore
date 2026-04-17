@@ -77,3 +77,6 @@ bot/test-output/load-test/5801543857-output-sample.json
 bot/test-output/load-test/load-test-1776354786856.json
 bot/test-output/load-test/load-test-1776355247051.json
 bot/src/test-load-concurrent.ts
+frontend/app/(app)/declarations/\[id]/page.tsx
+scripts/check_3801185171b.js
+scripts/check_3801185171.js

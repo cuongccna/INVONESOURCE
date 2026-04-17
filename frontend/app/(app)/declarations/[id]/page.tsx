@@ -490,8 +490,8 @@ export default function DeclarationDetailPage() {
               </>)}
               {/* 10% group (gộp 8%+10% per NQ142) */}
               {(() => {
-                const rev10 = decl.ct36_revenue_10pct + decl.ct34_revenue_8pct;
-                const vat10 = decl.ct37_vat_10pct + decl.ct35_vat_8pct;
+                const rev10 = Number(decl.ct36_revenue_10pct) + Number(decl.ct34_revenue_8pct);
+                const vat10 = Number(decl.ct37_vat_10pct) + Number(decl.ct35_vat_8pct);
                 if (rev10 === 0 && vat10 === 0) return null;
                 return (<>
                   <tr className="border-b border-gray-50 hover:bg-gray-50/50">
@@ -561,28 +561,75 @@ export default function DeclarationDetailPage() {
               <tr><td colSpan={3} className="px-4 pt-5 pb-1">
                 <p className="text-xs font-semibold text-primary-700 uppercase tracking-wider">III. Kết quả</p>
               </td></tr>
-              <tr className={`border-b border-gray-100 ${decl.ct41_payable_vat > 0 ? 'bg-red-50/50' : ''}`}>
-                <td className="py-3 pr-3 w-12 pl-4">
-                  <span className="text-xs bg-red-100 text-red-700 px-1.5 py-0.5 rounded font-mono font-bold">[41]</span>
-                </td>
-                <td className="py-3 pr-3 text-sm font-semibold text-gray-700">
-                  Thuế GTGT còn phải nộp = [40a] − [25]
-                </td>
-                <td className={`py-3 pr-4 text-right text-base tabular-nums font-bold ${decl.ct41_payable_vat > 0 ? 'text-red-600' : 'text-gray-400'}`}>
-                  {vnd(decl.ct41_payable_vat)}
-                </td>
-              </tr>
-              <tr className={`${decl.ct43_carry_forward_vat > 0 ? 'bg-green-50/50' : ''}`}>
-                <td className="py-3 pr-3 w-12 pl-4">
-                  <span className="text-xs bg-green-100 text-green-700 px-1.5 py-0.5 rounded font-mono font-bold">[43]</span>
-                </td>
-                <td className="py-3 pr-3 text-sm font-semibold text-gray-700">
-                  Thuế GTGT kết chuyển sang kỳ sau = [25] − [40a]
-                </td>
-                <td className={`py-3 pr-4 text-right text-base tabular-nums font-bold ${decl.ct43_carry_forward_vat > 0 ? 'text-green-600' : 'text-gray-400'}`}>
-                  {vnd(decl.ct43_carry_forward_vat)}
-                </td>
-              </tr>
+              {(() => {
+                const ct40  = Number(decl.ct41_payable_vat);    // MAX(0, [40a]−[25])
+                const ct41  = Number(decl.ct43_carry_forward_vat); // MAX(0, [25]−[40a])
+                const ct40b = 0; // Thuế GTGT mua vào dự án đầu tư — chưa có module
+                const ct42  = 0; // Thuế GTGT đề nghị hoàn — chưa có module
+                const ct43  = ct41 - ct42;
+                const mustPay = ct40 > 0;
+
+                if (mustPay) {
+                  // Bán ra > Mua vào → phải nộp [40b] + [40]
+                  return (<>
+                    <tr className="border-b border-gray-50 hover:bg-gray-50/50">
+                      <td className="py-2 pr-3 w-12 pl-4">
+                        <span className="text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-mono">[40b]</span>
+                      </td>
+                      <td className="py-2 pr-3 text-sm text-gray-500">
+                        Thuế GTGT mua vào dự án đầu tư được bù trừ <span className="text-xs text-gray-400">(≤ [40])</span>
+                      </td>
+                      <td className="py-2 pr-4 text-right text-sm tabular-nums text-gray-400">{vnd(ct40b)}</td>
+                    </tr>
+                    <tr className="border-b border-gray-100 bg-red-50/50">
+                      <td className="py-3 pr-3 w-12 pl-4">
+                        <span className="text-xs bg-red-100 text-red-700 px-1.5 py-0.5 rounded font-mono font-bold">[40]</span>
+                      </td>
+                      <td className="py-3 pr-3 text-sm font-semibold text-gray-700">
+                        Thuế GTGT còn phải nộp = [40a] − [25] − [40b]
+                      </td>
+                      <td className="py-3 pr-4 text-right text-base tabular-nums font-bold text-red-600">
+                        {vnd(ct40 - ct40b)}
+                      </td>
+                    </tr>
+                  </>);
+                }
+
+                // Mua vào ≥ Bán ra → kết chuyển [41] + [42] + [43]
+                return (<>
+                  <tr className="border-b border-gray-100 bg-green-50/50">
+                    <td className="py-3 pr-3 w-12 pl-4">
+                      <span className="text-xs bg-green-100 text-green-700 px-1.5 py-0.5 rounded font-mono font-bold">[41]</span>
+                    </td>
+                    <td className="py-3 pr-3 text-sm font-semibold text-gray-700">
+                      Thuế GTGT còn được khấu trừ chưa hết = [25] − [40a]
+                    </td>
+                    <td className={`py-3 pr-4 text-right text-base tabular-nums font-bold ${ct41 > 0 ? 'text-green-600' : 'text-gray-400'}`}>
+                      {vnd(ct41)}
+                    </td>
+                  </tr>
+                  <tr className="border-b border-gray-50 hover:bg-gray-50/50">
+                    <td className="py-2 pr-3 w-12 pl-4">
+                      <span className="text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-mono">[42]</span>
+                    </td>
+                    <td className="py-2 pr-3 text-sm text-gray-500">
+                      Thuế GTGT đề nghị hoàn <span className="text-xs text-gray-400">(≤ [41])</span>
+                    </td>
+                    <td className="py-2 pr-4 text-right text-sm tabular-nums text-gray-400">{vnd(ct42)}</td>
+                  </tr>
+                  <tr className={ct43 > 0 ? 'bg-green-50/30' : ''}>
+                    <td className="py-3 pr-3 w-12 pl-4">
+                      <span className="text-xs bg-green-100 text-green-700 px-1.5 py-0.5 rounded font-mono font-bold">[43]</span>
+                    </td>
+                    <td className="py-3 pr-3 text-sm font-semibold text-gray-700">
+                      Thuế GTGT còn được khấu trừ chuyển kỳ sau = [41] − [42]
+                    </td>
+                    <td className={`py-3 pr-4 text-right text-base tabular-nums font-bold ${ct43 > 0 ? 'text-green-600' : 'text-gray-400'}`}>
+                      {vnd(ct43)}
+                    </td>
+                  </tr>
+                </>);
+              })()}
             </tbody>
           </table>
         </div>

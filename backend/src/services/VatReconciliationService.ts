@@ -125,6 +125,7 @@ export class VatReconciliationService {
          )
          AND (
            total_amount <= 20000000
+           OR payment_method IS NULL
            OR (payment_method IS NOT NULL AND LOWER(payment_method) <> 'cash')
          )
          ${_notReplacedClause('invoices')}
@@ -319,6 +320,7 @@ export class VatReconciliationService {
          AND EXTRACT(MONTH FROM invoice_date) = ANY($3::int[])
          AND (
            total_amount <= 20000000
+           OR payment_method IS NULL
            OR (payment_method IS NOT NULL AND LOWER(payment_method) <> 'cash')
          )
          AND (
