@@ -47,9 +47,10 @@ interface PlucOutputRow {
  *   ct36_revenue_10pct + ct34  → HHDVBRaChiuTSuat10/ct32, ct33  (8% gộp vào nhóm 10%)
  *   ct40_total_output_revenue  → TongDThuVaThueGTGTHHDVBRa/ct34
  *   ct40a_total_output_vat     → ct35  (trước NQ142)
- *   plucOutputSumReduction     → ct36  (giảm theo NQ142/NQ204 = 2% × DT đầu ra 8%)
- *   MAX(0, ct35-ct36-ct25)     → ct40a, ct40  (phải nộp — 0 khi đầu vào > đầu ra)
- *   MAX(0, ct25-(ct35-ct36))   → ct41, ct43   (kết chuyển — 0 khi đầu ra > đầu vào)
+ *   ct35 - ct25                → ct36  (Thuế GTGT phát sinh trong kỳ = net VAT)
+ *   plucOutputSumReduction     → ct38  (Điều chỉnh giảm — giảm NQ142/NQ204 2% × DT 8%)
+ *   MAX(0, ct36+ct22-ct38)     → ct40a, ct40  (phải nộp — 0 khi đầu vào > đầu ra)
+ *   MAX(0, -(ct36+ct22-ct38))  → ct41, ct43   (kết chuyển — 0 khi đầu ra > đầu vào)
  *   ct41_payable_vat           → ct41
  *   ct43_carry_forward_vat     → ct43
  */
@@ -100,17 +101,18 @@ export class HtkkXmlGenerator {
     const plucOutputSumSubtotal  = plucOutputItems.reduce((s, r) => s + r.subtotal,    0);
     const plucOutputSumReduction = plucOutputItems.reduce((s, r) => s + r.vatReduction, 0);
 
-    // ct36 = giảm thuế GTGT theo NQ142 = 2% × doanh thu bán ra 8% (từ PLuc)
-    const xml_ct36_nq142 = plucOutputSumReduction;
-    // Tổng thuế đầu ra sau giảm NQ142 (giá trị trung gian)
-    const outputVatAfterNQ142 = n(d.ct40a_total_output_vat) - xml_ct36_nq142;
-    // Số thuế phải nộp NET = đầu ra sau NQ142 - tổng được khấu trừ [25]
-    // (ct25_total_deductible đã bao gồm kết chuyển kỳ trước [22])
-    const netPayable = outputVatAfterNQ142 - n(d.ct25_total_deductible);
+    // [36] = [35] - [25] = Thuế GTGT phát sinh trong kỳ (net VAT for period)
+    const xml_ct36 = xml_ct35_total - n(d.ct25_total_deductible);
+    // [38] Điều chỉnh giảm = NQ142 reduction (2% × doanh thu bán ra 8%)
+    const xml_ct38 = plucOutputSumReduction;
+    // ct40a_raw = [36] + [22] + [37] - [38] - [39a]
+    // Note: [36]+[22] = (ct35-ct25)+ct22 = ct35-ct24, so ct22 self-cancels
+    const xml_ct40a_raw = xml_ct36 + n(d.ct24_carried_over_vat) - xml_ct38;
     // ct40a/ct40: phải nộp — chỉ > 0 khi đầu ra > đầu vào
-    const xml_ct40a = Math.max(0, netPayable);
+    const xml_ct40a = Math.max(0, xml_ct40a_raw);
+    const xml_ct40  = xml_ct40a; // ct40 = ct40a - ct40b (ct40b = 0)
     // ct41: còn được khấu trừ chưa hết — chỉ > 0 khi đầu vào > đầu ra
-    const xml_ct41  = Math.max(0, -netPayable);
+    const xml_ct41  = Math.max(0, -xml_ct40a_raw);
     // ct43: kết chuyển sang kỳ sau = ct41 - ct42 (ct42 = 0)
     const xml_ct43  = xml_ct41;
 
@@ -216,13 +218,13 @@ export class HtkkXmlGenerator {
                 <ct34>${n(d.ct40_total_output_revenue)}</ct34>
                 <ct35>${xml_ct35_total}</ct35>
             </TongDThuVaThueGTGTHHDVBRa>
-            <ct36>${xml_ct36_nq142}</ct36>
+            <ct36>${xml_ct36}</ct36>
             <ct37>0</ct37>
-            <ct38>0</ct38>
+            <ct38>${xml_ct38}</ct38>
             <ct39a>0</ct39a>
             <ct40a>${xml_ct40a}</ct40a>
             <ct40b>0</ct40b>
-            <ct40>${xml_ct40a}</ct40>
+            <ct40>${xml_ct40}</ct40>
             <ct41>${xml_ct41}</ct41>
             <ct42>0</ct42>
             <ct43>${xml_ct43}</ct43>
