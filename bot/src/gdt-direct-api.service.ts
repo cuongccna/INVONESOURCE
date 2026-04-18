@@ -1368,7 +1368,12 @@ export class GdtDirectApiService {
               proxySwaps < MAX_PROXY_SWAPS
             ) {
               const oldUrl = this._currentProxyUrl;
-              if (oldUrl) this._proxyManager.markFailed(oldUrl);
+              // FIX: Do NOT call markFailed() here for session-level TCP drops.
+              // A TCP drop mid-session is often GDT-side (rate-limit, server reset)
+              // rather than an infra proxy failure. Calling markFailed() globally nulls
+              // the slot for ALL companies and triggers a 4-6 min rotation cooldown.
+              // markFailed() is still called by sync.worker.ts on login/probe failures
+              // (more reliable infra-failure signal). Just swap locally here.
               const newProxyUrl = this._proxyManager.nextForCompany(this._proxySessionSuffix);
               if (newProxyUrl && newProxyUrl !== oldUrl) {
                 proxySwaps++;

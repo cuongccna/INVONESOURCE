@@ -345,9 +345,12 @@ export class ProxyManager extends EventEmitter {
       const slot = this.slots.find(s => s.currentUrl === url);
       if (slot) {
         slot.failedUrls.add(url);
-        // Nullify ngay lập tức để nextForCompany không trả về URL lỗi trong thời gian xoay IP
-        slot.currentUrl       = null;
-        slot.currentSocks5Url = null;
+        // FIX: Do NOT null currentUrl immediately — keep the old URL available during rotation.
+        // Nulling immediately causes cascade pool exhaustion: with 2 slots, two markFailed()
+        // calls within 2s (e.g. proxy swap in GdtDirect) leave pool = null for up to 6min
+        // (TMProxy cooldown). Jobs during that window all abort with "No proxy available".
+        // Instead, keep the old URL so other sessions can still attempt it (pre-sync TCP probe
+        // will catch genuinely dead IPs). currentUrl is updated/nulled by _rotateSlot().
         logger.warn('[ProxyManager] Slot bị đánh dấu lỗi — đang xoay IP mới', {
           apiKey:    slot.apiKey.slice(0, 8) + '…',
           failedUrl: url.replace(/:([^@:]+)@/, ':****@'),

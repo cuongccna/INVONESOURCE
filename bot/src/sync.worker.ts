@@ -59,7 +59,9 @@ export const manualQueue = new Queue('gdt-sync-manual', {
   connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
   defaultJobOptions: {
     attempts:          5,
-    backoff:           { type: 'exponential', delay: 60_000 },
+    // FIX: Increased initial delay 60s→300s so retries don't hit the proxy pool
+    // during the TMProxy cooldown window (240–360s). Exponential: 5min→10min→20min.
+    backoff:           { type: 'exponential', delay: 300_000 },
     removeOnComplete:  200,
     removeOnFail:      100,
   },
