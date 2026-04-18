@@ -134,22 +134,7 @@ export default function BottomNav() {
             );
           })}
 
-          {/* "AI & Báo Cáo" drawer trigger */}
-          <button
-            onClick={() => setDrawerOpen((o) => !o)}
-            className="flex flex-col items-center gap-1 flex-1 py-2"
-          >
-            <svg
-              className={`w-6 h-6 ${isDrawerActive || drawerOpen ? 'text-primary-600' : 'text-gray-400'}`}
-              fill="none" viewBox="0 0 24 24" stroke="currentColor"
-            >
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                d="M4 6h16M4 12h16M4 18h7" />
-            </svg>
-            <span className={`text-xs font-medium ${isDrawerActive || drawerOpen ? 'text-primary-600' : 'text-gray-400'}`}>
-              Thêm
-            </span>
-          </button>
+          {/* Thêm drawer trigger — hidden */}
 
           {/* Settings */}
           <Link href="/settings" className="flex flex-col items-center gap-1 flex-1 py-2">

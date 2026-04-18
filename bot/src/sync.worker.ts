@@ -1800,10 +1800,10 @@ export const worker = new Worker<SyncJobData>(
 );
 
 // ── Manual worker (concurrency 10 — user-triggered syncs) ────────────────────
-// Wraps processGdtSync with a 350-second hard timeout (5m50s — 10s headroom under 6 min).
-// If a manual job stalls (e.g. GDT rate-limit, slow proxy), it fails fast and
-// retries with backoff rather than blocking the queue indefinitely.
-const MANUAL_SYNC_TIMEOUT_MS = 350_000; // 5m50s — leaves 10s headroom under 6 min
+// Wraps processGdtSync with a 25-minute hard timeout (leaves 5 min headroom under 30 min job limit).
+// Previous 6-minute limit caused MANUAL_SYNC_TIMEOUT for companies with >60 invoices
+// (each invoice takes ~4-9s for detail API + jitter → 285 invoices = ~20 min).
+const MANUAL_SYNC_TIMEOUT_MS = 25 * 60_000; // 25 min
 
 export const manualWorker = new Worker<SyncJobData>(
   'gdt-sync-manual',
@@ -1827,8 +1827,12 @@ export const manualWorker = new Worker<SyncJobData>(
                 // Fallback: no token recorded yet (lock wasn't acquired before timeout)
                 _lockRedis.del(`${BOT_LOCK_PREFIX}${companyId}`).catch(() => {});
               }
+              // Invalidate cached GDT session token: the JWT used during the timed-out
+              // run may be partially consumed / rate-limited by GDT, so next retry
+              // must re-login fresh rather than reusing the stale token.
+              _sessionCache.invalidateAllForCompany(companyId).catch(() => {});
             }
-            reject(new Error('MANUAL_SYNC_TIMEOUT: Sync exceeded 6-minute limit — will retry'));
+            reject(new Error('MANUAL_SYNC_TIMEOUT: Sync exceeded 25-minute limit — will retry'));
           },
           MANUAL_SYNC_TIMEOUT_MS,
         ),

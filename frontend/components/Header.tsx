@@ -249,53 +249,7 @@ export default function Header() {
             );
           })}
 
-          {/* Thêm dropdown — mirrors mobile drawer */}
-          <div ref={moreRef} className="relative">
-            <button
-              onClick={() => setShowMore((v) => !v)}
-              className={`flex items-center gap-1 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
-                (!!pathname && DRAWER_HREFS.some((h) => pathname.startsWith(h))) || showMore
-                  ? 'bg-primary-50 text-primary-700'
-                  : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
-              }`}
-            >
-              Thêm
-              <svg className={`w-3.5 h-3.5 transition-transform ${showMore ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-              </svg>
-            </button>
-
-            {showMore && (
-              <div className="absolute top-full right-0 mt-1 w-[640px] max-w-[calc(100vw-1rem)] bg-white rounded-2xl shadow-xl border border-gray-100 z-50 max-h-[80vh] overflow-y-auto">
-                <div className="p-4 grid grid-cols-2 gap-x-6 gap-y-4">
-                  {DRAWER_SECTIONS.map((section) => (
-                    <div key={section.title}>
-                      <p className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">
-                        {section.title}
-                      </p>
-                      <div className="space-y-0.5">
-                        {section.items.map((item) => {
-                          const active = !!pathname && pathname.startsWith(item.href);
-                          return (
-                            <Link
-                              key={item.href}
-                              href={item.href}
-                              onClick={() => setShowMore(false)}
-                              className={`block px-3 py-1.5 rounded-lg text-sm transition-colors ${
-                                active ? 'bg-primary-50 text-primary-700 font-medium' : 'text-gray-700 hover:bg-gray-50'
-                              }`}
-                            >
-                              {item.label}
-                            </Link>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
+          {/* Thêm dropdown — hidden */}
         </nav>
 
         {/* Right: Settings + Notification bell */}

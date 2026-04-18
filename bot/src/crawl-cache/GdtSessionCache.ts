@@ -37,4 +37,19 @@ export class GdtSessionCache {
   async invalidate(companyId: string, proxySessionId: string): Promise<void> {
     await this.redis.del(this.key(companyId, proxySessionId));
   }
+
+  /**
+   * Invalidate ALL cached tokens for a company (any proxySessionId).
+   * Used when a job times out — the cached JWT from the timed-out run may be
+   * partially consumed / rate-limited by GDT, so the next retry must re-login.
+   */
+  async invalidateAllForCompany(companyId: string): Promise<void> {
+    const pattern = `gdt:session:${companyId}:*`;
+    let cursor = '0';
+    do {
+      const [next, keys] = await this.redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+      cursor = next;
+      if (keys.length > 0) await this.redis.del(...keys);
+    } while (cursor !== '0');
+  }
 }
