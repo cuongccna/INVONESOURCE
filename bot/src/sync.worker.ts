@@ -806,6 +806,15 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       `INSERT INTO gdt_bot_runs (id, company_id, started_at, status) VALUES ($1, $2, NOW(), 'running')`,
       [runId, companyId]
     );
+    // Mark config as running + clear previous error so the UI immediately reflects the new attempt.
+    // Without this, gdt_bot_configs.last_run_status stays 'error' (from previous run) until
+    // the new run completes — causing the UI to show stale error banners during active jobs.
+    await pool.query(
+      `UPDATE gdt_bot_configs
+       SET last_run_status = 'running', last_error = NULL, updated_at = NOW()
+       WHERE company_id = $1`,
+      [companyId]
+    );
 
     // Human-like warmup: 3–15s random pause before opening session.
     // Simulates an accountant opening a browser and navigating to the portal.

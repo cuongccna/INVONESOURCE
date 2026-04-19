@@ -25,20 +25,20 @@ const companySchema = z.object({
   is_consolidated: z.boolean().optional(),
 }).superRefine((data, ctx) => {
   if (data.company_type === 'household') {
-    // HKD: CMND (9 số), MST thường (10 số), GTTT khác (11 số), CCCD (12 số)
-    if (!/^\d{9}$|^\d{10}$|^\d{11}$|^\d{12}$/.test(data.tax_code)) {
+    // HKD: CMND 9 số / MST 10 số / CCCD 12 số / một số HKD địa phương 13 số
+    if (!/^\d{9,13}$/.test(data.tax_code)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: 'Hộ kinh doanh: MST/Giấy tờ tùy thân phải là 9, 10, 11 hoặc 12 chữ số',
+        message: 'Hộ kinh doanh: MST/Giấy tờ tùy thân phải là từ 9 đến 13 chữ số',
         path: ['tax_code'],
       });
     }
   } else {
-    // Doanh nghiệp: 10 chữ số (hoặc 13 ký tự cho mã chi nhánh)
+    // Doanh nghiệp / Chi nhánh: 10 chữ số, hoặc 10+"-"+3 cho chi nhánh (vd: 0123456789-001)
     if (!/^\d{10}(-\d{3})?$/.test(data.tax_code)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: 'MST phải là 10 chữ số (hoặc 13 ký tự cho chi nhánh: 0123456789-001)',
+        message: 'MST phải là 10 chữ số (hoặc 14 ký tự cho chi nhánh: 0123456789-001)',
         path: ['tax_code'],
       });
     }

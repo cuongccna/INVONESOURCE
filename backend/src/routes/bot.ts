@@ -80,14 +80,24 @@ router.post(
       const { password, has_otp, otp_method, sync_frequency_hours } = parsed.data;
       const companyId = req.user!.companyId;
 
-      // Fetch company tax code
-      const compRes = await pool.query(`SELECT tax_code FROM companies WHERE id = $1`, [companyId]);
+      // Fetch company tax code and type
+      const compRes = await pool.query(`SELECT tax_code, company_type FROM companies WHERE id = $1`, [companyId]);
       if (compRes.rows.length === 0) throw new NotFoundError('Company not found');
-      const taxCode: string = compRes.rows[0].tax_code;
+      const taxCode: string    = compRes.rows[0].tax_code;
+      const companyType: string = compRes.rows[0].company_type ?? 'enterprise';
 
-      // Check if tax_code looks valid: /^\d{10}(-\d{3})?$/
-      if (!/^\d{10}(-\d{3})?$/.test(taxCode)) {
-        throw new ValidationError('Mã số thuế công ty không hợp lệ. Vui lòng cập nhật hồ sơ công ty trước.');
+      // Validate tax code based on company type:
+      //   HKD (household): 9–13 chữ số thuần (CMND 9 số / MST 10 số / CCCD 12 số / HKD 13 số)
+      //   DN / Chi nhánh:  10 chữ số, hoặc 10+"-"+3 cho chi nhánh (vd: 0123456789-001)
+      const isHousehold = companyType === 'household';
+      const validTaxCode = isHousehold
+        ? /^\d{9,13}$/.test(taxCode)
+        : /^\d{10}(-\d{3})?$/.test(taxCode);
+      if (!validTaxCode) {
+        const hint = isHousehold
+          ? 'Hộ kinh doanh: MST phải là 9–13 chữ số.'
+          : 'Doanh nghiệp: MST phải là 10 chữ số (hoặc 10+"-"+3 cho chi nhánh).';
+        throw new ValidationError(`Mã số thuế không hợp lệ — ${hint} Vui lòng cập nhật hồ sơ công ty trước.`);
       }
 
       // Encrypt password — store as JSON blob with username = tax_code (GDT portal)

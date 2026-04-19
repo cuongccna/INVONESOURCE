@@ -384,7 +384,10 @@ export default function BotSettingsPage() {
   };
 
   const cfg = status?.config;
-  const lastStatus = cfg?.last_run_status ?? null;
+  // Prefer the live status from gdt_bot_runs (lastRuns[0]) over gdt_bot_configs.last_run_status.
+  // gdt_bot_configs.last_run_status is only updated at run completion, so a job that is currently
+  // running would still show the previous run's status (e.g. 'error') from cfg alone.
+  const lastStatus = status?.lastRuns?.[0]?.status ?? cfg?.last_run_status ?? null;
   // Block all interactions when bot job is actively running
   const isJobRunning = lastStatus === 'running' || running;
 
@@ -513,7 +516,7 @@ export default function BotSettingsPage() {
             )}
           </div>
 
-          {cfg.last_error && (
+          {cfg.last_error && !isJobRunning && (
             <div className="bg-red-50 rounded-lg px-3 py-2 text-xs text-red-700 break-all">
               ⚠️ {cfg.last_error}
             </div>
