@@ -9,10 +9,10 @@ import { ParsedSerial } from 'shared';
  *   Position 4:   Type: T=Thường, M=Máy tính tiền, D=Điện, N=Nước, V=Viễn thông, X=Xăng dầu
  *   Position 5+:  Company identifier code (DN tự đặt)
  *
- * Group classification:
- *   Group 5: C-prefix → có mã CQT → full detail (line items) available
- *   Group 6: K-prefix, T-type → không mã CQT, hóa đơn thường → header only
- *   Group 8: K-prefix, M-type → không mã CQT, máy tính tiền → header only
+ * Group classification (invoiceType checked FIRST — overrides C/K prefix):
+ *   Group 8: Type=M (máy tính tiền) — both C26MED and K26MED → group 8 regardless of prefix
+ *   Group 5: C-prefix + non-M type → đã cấp mã CQT, full detail (line items) available
+ *   Group 6: K-prefix + non-M type → không mã CQT, header only
  */
 
 const TYPE_LABELS: Record<string, string> = {
@@ -47,14 +47,17 @@ export function parseInvoiceSerial(serial: string): ParsedSerial {
   const companyCode = s.substring(4);
 
   // Group classification per TT78/2021
+  // invoiceType (position 4) takes priority — 'M' always means MTT (group 8),
+  // regardless of whether the invoice has a CQT code (C prefix) or not (K prefix).
+  // C26MED = CQT-coded MTT invoice → group 8 (not 5!)
   let invoiceGroup: 5 | 6 | 8 | null = null;
   if (firstChar === 'C' || firstChar === 'K') {
-    if (hasCqtCode) {
-      invoiceGroup = 5;
-    } else if (invoiceType === 'M') {
-      invoiceGroup = 8;
+    if (invoiceType === 'M') {
+      invoiceGroup = 8;                     // Máy tính tiền (both C and K prefix)
+    } else if (hasCqtCode) {
+      invoiceGroup = 5;                     // Có mã CQT, hóa đơn thường/điện/nước/...
     } else {
-      invoiceGroup = 6;
+      invoiceGroup = 6;                     // Không mã CQT, hóa đơn thường
     }
   }
 

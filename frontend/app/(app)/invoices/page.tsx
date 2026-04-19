@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import apiClient from '../../../lib/apiClient';
 import { useCompany } from '../../../contexts/CompanyContext';
@@ -65,6 +65,33 @@ export default function InvoicesPage() {
   const [deleting, setDeleting] = useState(false);
   const [ignoreTarget, setIgnoreTarget] = useState<string | null>(null);
   const [ignoring, setIgnoring] = useState(false);
+
+  // ── Smart filter logic (GDT rules) ────────────────────────────────────────
+  // For Bán ra: no type 5/6/8 filter (GDT "Kết quả kiểm tra" = Tất cả).
+  // For Mua vào: Row 2 (type 5/6/8) and Row 4 (nguồn) are INDEPENDENT filters.
+  // Row 2 always shows all 3 types; Row 4 always shows both options.
+  // Hierarchy: Row 2 → Row 4, not the other way around.
+  const visibleGroupOpts = useMemo(() => {
+    if (direction === 'output') return []; // Bán ra — no type filter
+    return GROUP_OPTS; // Mua vào / Tất cả hướng: always show all types
+  }, [direction]);
+
+  const handleDirectionSelect = (v: '' | 'output' | 'input') => {
+    setDirection(v);
+    setInvoiceGroup('');  // clear type when switching direction
+    setIsSco(null);       // reset source
+    setSelectedIds([]);
+  };
+
+  const handleGroupSelect = (v: number | '') => {
+    setInvoiceGroup(invoiceGroup === v ? '' : v as number | '');
+    setSelectedIds([]);
+  };
+
+  const handleIsScoSelect = (v: boolean | null) => {
+    setIsSco(isSco === v ? null : v);
+    setSelectedIds([]);
+  };
 
   // Debounce search input
   useEffect(() => {
@@ -358,7 +385,7 @@ export default function InvoicesPage() {
       <div className="flex gap-1.5 mb-2 flex-wrap">
         {DIR_OPTS.map(opt => (
           <button key={opt.v}
-            onClick={() => { setDirection(opt.v); setSelectedIds([]); }}
+            onClick={() => handleDirectionSelect(opt.v)}
             className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
               direction === opt.v ? 'bg-gray-900 text-white border-gray-900' : 'bg-white text-gray-600 border-gray-300 hover:border-gray-500'
             }`}>
@@ -367,18 +394,25 @@ export default function InvoicesPage() {
         ))}
       </div>
 
-      {/* ── Filter Row 2: Invoice Group ── */}
-      <div className="flex gap-1.5 mb-2 flex-wrap">
-        {GROUP_OPTS.map(opt => (
-          <button key={String(opt.v)}
-            onClick={() => { setInvoiceGroup(invoiceGroup === opt.v ? '' : (opt.v as number | '')); setSelectedIds([]); }}
-            className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
-              invoiceGroup === opt.v ? opt.activeCls : `bg-white ${opt.cls}`
-            }`}>
-            {opt.label}
-          </button>
-        ))}
-      </div>
+      {/* ── Filter Row 2: Invoice Group (Kết quả kiểm tra) ── */}
+      {/* Bán ra has no type filter (GDT shows Tất cả for Kết quả kiểm tra). */}
+      {/* Mua vào: types 5/6 → HĐ điện tử; type 8 → HĐ máy tính tiền. */}
+      {visibleGroupOpts.length > 0 && (
+        <div className="flex items-center gap-1.5 mb-2 flex-wrap">
+          {direction === 'input' && (
+            <span className="text-xs text-gray-400 font-medium mr-1">Kết quả KT:</span>
+          )}
+          {visibleGroupOpts.map(opt => (
+            <button key={String(opt.v)}
+              onClick={() => handleGroupSelect(opt.v as number | '')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                invoiceGroup === opt.v ? opt.activeCls : `bg-white ${opt.cls}`
+              }`}>
+              {opt.label}
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* ── Filter Row 2b: Status ── */}
       <div className="flex gap-1.5 mb-2 flex-wrap">
@@ -400,11 +434,11 @@ export default function InvoicesPage() {
         ))}
       </div>
 
-      {/* ── Filter Row 3: Source type (HĐ điện tử vs MTTTT) ── */}
+      {/* ── Filter Row 3: Source type (HĐ điện tử vs HĐ máy tính tiền) ── */}
       <div className="flex gap-1.5 mb-3 flex-wrap">
         {SCO_OPTS.map(opt => (
           <button key={String(opt.v)}
-            onClick={() => { setIsSco(isSco === opt.v ? null : opt.v); setSelectedIds([]); }}
+            onClick={() => handleIsScoSelect(opt.v)}
             className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
               isSco === opt.v
                 ? opt.v === true

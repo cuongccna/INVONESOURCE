@@ -174,6 +174,8 @@ export class InvoiceNormalizer {
   /**
    * GROUP 47: Enrich a normalized invoice with serial number classification.
    * Parses serial_number to determine invoice_group (5/6/8), serial_has_cqt, has_line_items.
+   * Also corrects is_sco: any MTT invoice (group 8) must have is_sco=true regardless of
+   * which endpoint it was fetched from (C26MED fetched via /query still = SCO/MTT).
    */
   static enrichWithSerialInfo(inv: NormalizedInvoice): NormalizedInvoice {
     const parsed = parseInvoiceSerial(inv.serialNumber);

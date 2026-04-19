@@ -1223,7 +1223,14 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
 // ── FIX-5 Helpers ─────────────────────────────────────────────────────────────
 
-/** Compute GROUP 47 serial classification — extracted from _upsertInvoice for reuse. */
+/** Compute GROUP 47 serial classification — extracted from _upsertInvoice for reuse.
+ *
+ * TT78/2021 rule: invoiceType at position 4 (index 3) takes priority over C/K prefix.
+ *   'M' → group 8 (máy tính tiền) — regardless of C or K prefix.
+ *   'C' + non-M → group 5 (có mã CQT, hóa đơn thường)
+ *   'K' + non-M → group 6 (không mã CQT)
+ * C26MED = CQT-coded MTT → group 8, NOT group 5.
+ */
 function _classifySerial(serialNumber: string | null | undefined): {
   invoiceGroup: number | null;
   serialHasCqt: boolean | null;
@@ -1232,13 +1239,12 @@ function _classifySerial(serialNumber: string | null | undefined): {
   const serial = (serialNumber ?? '').toUpperCase().trim();
   if (serial.length < 4) return { invoiceGroup: null, serialHasCqt: null, hasLineItems: false };
   const firstChar = serial[0];
-  if (firstChar === 'C') return { invoiceGroup: 5, serialHasCqt: true,  hasLineItems: true  };
-  if (firstChar === 'K') return {
-    invoiceGroup: serial[3] === 'M' ? 8 : 6,
-    serialHasCqt: false,
-    hasLineItems:  false,
-  };
-  return { invoiceGroup: null, serialHasCqt: null, hasLineItems: false };
+  if (firstChar !== 'C' && firstChar !== 'K') return { invoiceGroup: null, serialHasCqt: null, hasLineItems: false };
+  const hasCqt = firstChar === 'C';
+  // Position 4 (index 3) = invoice type. 'M' = máy tính tiền → always group 8.
+  if (serial[3] === 'M') return { invoiceGroup: 8, serialHasCqt: hasCqt, hasLineItems: hasCqt };
+  if (hasCqt)            return { invoiceGroup: 5, serialHasCqt: true,   hasLineItems: true  };
+  return                        { invoiceGroup: 6, serialHasCqt: false,  hasLineItems: false };
 }
 
 /** Stable lookup key for the batch upsert return map. */
@@ -1297,7 +1303,9 @@ async function _batchUpsertInvoices(
     invoiceGroups.push(invoiceGroup);
     serialHasCqts.push(serialHasCqt);
     hasLineItemsArr.push(hasLineItems);
-    isScos.push(inv.is_sco ?? false);
+    // Derive is_sco from serial classification if group is 8 (MTT), even when fetched
+    // via /query endpoint (e.g. C26MED has C-prefix but is an SCO/MTT invoice).
+    isScos.push((inv.is_sco ?? false) || invoiceGroup === 8);
     tcHdons.push(inv.tc_hdon ?? null);
     khhdClQuans.push(inv.khhd_cl_quan ?? null);
     soHdClQuans.push(inv.so_hd_cl_quan ?? null);
