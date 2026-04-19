@@ -160,3 +160,16 @@ PRD.md  prompts.md
 [ ] ViewContext checked before API calls?
 [ ] Inter-company invoices excluded from consolidated view?
 [ ] Tax calc follows exact 01/GTGT formula from PRD Section 7?
+
+
+# Timezone Convention
+
+- **Vietnam timezone**: UTC+7 / `Asia/Ho_Chi_Minh`
+- **DB stores**: All timestamps as `TIMESTAMPTZ` in **UTC** (PostgreSQL standard)
+- **Display**: Always use `timeZone: 'Asia/Ho_Chi_Minh'` in `toLocaleString` — never rely on browser default
+- **datetime-local input**: HTML `datetime-local` gives/expects LOCAL time strings (no timezone suffix).
+  - Reading UTC from DB → input: use `toLocalDatetimeInput(utcIso)` helper (converts via Date object using local offset)
+  - Writing input → DB: `new Date(localString).toISOString()` correctly converts local→UTC if the helper was used correctly
+- **Backend**: Never add +7 offset manually to DB inserts — PostgreSQL TIMESTAMPTZ handles UTC storage/retrieval correctly
+- **Bot/worker**: Use `new Date().toISOString()` for timestamps → stored as UTC, displayed as UTC+7 on frontend
+

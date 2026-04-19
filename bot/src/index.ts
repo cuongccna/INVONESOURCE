@@ -5,6 +5,7 @@ import 'dotenv/config';
 import { proxyManager } from './proxy-manager';
 import { logger } from './logger';
 import { runGdtHealthCheck } from './cron/gdt-health-check';
+import { runAutoSyncCycle } from './cron/auto-sync';
 
 logger.info('[Bot] GDT Crawler Bot starting', {
   concurrency: process.env['WORKER_CONCURRENCY'] ?? '2',
@@ -52,6 +53,12 @@ void (async () => {
 
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
   process.on('SIGINT',  () => void shutdown('SIGINT'));
+
+  // Auto-sync scheduler — checks every 5 minutes for companies due for sync
+  const AUTO_SYNC_INTERVAL_MS = 5 * 60 * 1000; // 5 min
+  void runAutoSyncCycle(); // Run immediately on startup
+  setInterval(() => void runAutoSyncCycle(), AUTO_SYNC_INTERVAL_MS);
+  logger.info('[Bot] Auto-sync scheduler started — polling every 5 min');
 })();
 
 // Phase 7: GDT canary health check every 15 minutes

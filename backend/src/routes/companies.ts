@@ -166,6 +166,33 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
       entity_type,
       is_consolidated,
     } = parsed.data;
+
+    // ── Enforce max_companies from user's license plan ──────────────────────
+    const userId = req.user!.userId;
+    const companyCountRes = await pool.query<{ cnt: string }>(
+      `SELECT COUNT(*)::text AS cnt FROM user_companies WHERE user_id = $1`,
+      [userId],
+    );
+    const currentCount = parseInt(companyCountRes.rows[0]?.cnt ?? '0', 10);
+
+    // Look up the user's plan limit (default to 1 if no subscription)
+    const planLimitRes = await pool.query<{ max_companies: number }>(
+      `SELECT lp.max_companies
+       FROM user_subscriptions us
+       JOIN license_plans lp ON lp.id = us.plan_id
+       WHERE us.user_id = $1 AND us.status IN ('active', 'trial')
+       LIMIT 1`,
+      [userId],
+    );
+    const maxCompanies = planLimitRes.rows[0]?.max_companies ?? 1;
+
+    if (currentCount >= maxCompanies) {
+      throw new ForbiddenError(
+        `Gói dịch vụ của bạn cho phép tối đa ${maxCompanies} công ty. ` +
+        `Bạn đã có ${currentCount} công ty. Vui lòng nâng cấp gói để thêm công ty mới.`
+      );
+    }
+
     const client = await pool.connect();
     try {
       await client.query('BEGIN');

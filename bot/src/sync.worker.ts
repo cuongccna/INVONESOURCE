@@ -292,6 +292,19 @@ function jitteredDelay(): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
 }
 
+/**
+ * Returns a log-safe proxy address: strips credentials, shows only host:port.
+ * e.g. "http://user:pass@1.2.3.4:8080" → "1.2.3.4:8080"
+ */
+function _maskProxyUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    return `${u.hostname}:${u.port}`;
+  } catch {
+    return url.replace(/\/\/.*@/, '//').slice(0, 40);
+  }
+}
+
 /** Occasional longer pause to simulate reading/examining an invoice */
 let _nextReadPause = READ_PAUSE_EVERY_MIN + Math.floor(Math.random() * (READ_PAUSE_EVERY_MAX - READ_PAUSE_EVERY_MIN));
 function shouldReadPause(index: number): boolean {
@@ -334,6 +347,11 @@ interface SyncJobData {
   jobTotal?:  number; // total jobs in the group
   allJobs?:   SyncJobGroupItem[]; // all jobs, so each job can enqueue the next
   isChained?: boolean; // true = this job was enqueued by the previous month in a quarter sync
+  // BUG2 FIX: userId of the person who triggered manual sync (not necessarily OWNER)
+  // Must be set for all manual jobs so proxy is acquired for the correct user.
+  triggeredByUserId?: string;
+  // Origin of the trigger — 'user_manual' | 'user_quick_sync' | 'auto_scheduler' | 'quarter_group'
+  triggeredBy?: string;
 }
 
 const xmlParser = new GdtXmlParser();
@@ -529,9 +547,15 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     }
   }
 
+  const queueType = job.queueName === 'gdt-sync-manual' ? 'MANUAL' : 'AUTO';
   logger.info('[SyncWorker] Starting job', {
     jobId: job.id,
     companyId,
+    queueType,
+    triggeredBy:       job.data.triggeredBy       ?? 'auto',
+    triggeredByUserId: job.data.triggeredByUserId
+      ? job.data.triggeredByUserId.slice(0, 8) + '…'
+      : '—',
     timeoutMin: Math.round((jobDeadlineMs - startedAt) / 60_000),
   });
 
@@ -671,8 +695,9 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     }
 
     // ── 3. Sticky proxy per company ────────────────────────────────────────────
-    // Each company gets its own session ID → TMProxy gateway assigns a dedicated IP.
-    // GDT will see a different residential IP for each company (no cross-account pattern).
+    // Dual-mode proxy selection:
+    //   Manual sync → static residential proxy (per-user sticky from DB pool)
+    //   Auto sync   → TMProxy rotating pool (existing Mode A/C/B)
     let proxySessionId = cfg.proxy_session_id;
     if (!proxySessionId) {
       proxySessionId = randomBytes(8).toString('hex'); // 16-char hex, e.g. 'a3f9b2c1d4e5f678'
@@ -682,8 +707,44 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       );
       logger.info('[SyncWorker] New proxy session assigned', { companyId, proxySessionId });
     }
-    const proxyUrl       = proxyManager.nextForCompany(proxySessionId);
-    const socks5ProxyUrl = proxyManager.nextSocks5ForCompany(proxySessionId);
+
+    let proxyUrl: string | null;
+    let socks5ProxyUrl: string | null;
+
+    if (isManual) {
+      // Manual sync: ONLY static residential proxy pool, keyed to the triggering user.
+      // triggeredByUserId must be set at enqueue time (backend/routes/bot.ts).
+      // Fall back to OWNER only if job was enqueued by legacy code without userId.
+      const triggerUserId = job.data.triggeredByUserId ?? await _getCompanyOwner(companyId);
+      if (triggerUserId) {
+        proxyUrl = await proxyManager.nextForManualSync(triggerUserId);
+        const maskedIp = proxyUrl ? _maskProxyUrl(proxyUrl) : 'none';
+        logger.info('[SyncWorker] Proxy selected — MANUAL (static IP)', {
+          companyId,
+          taxCode:      cfg.tax_code,
+          proxyIp:      maskedIp,
+          userId:       triggerUserId.slice(0, 8) + '…',
+          isManual:     true,
+        });
+      } else {
+        logger.warn('[SyncWorker] Manual sync: no triggerUserId and no OWNER found', { companyId });
+        proxyUrl = null;
+      }
+      // SOCKS5 not available for static proxies (HTTP CONNECT only) — set null explicitly
+      socks5ProxyUrl = null;
+    } else {
+      // Auto sync: TMProxy rotating pool
+      proxyUrl       = proxyManager.nextForAutoSync(proxySessionId);
+      socks5ProxyUrl = proxyManager.nextSocks5ForCompany(proxySessionId);
+      const maskedIp = proxyUrl ? _maskProxyUrl(proxyUrl) : 'none';
+      logger.info('[SyncWorker] Proxy selected — AUTO (TMProxy)', {
+        companyId,
+        taxCode:      cfg.tax_code,
+        proxyIp:      maskedIp,
+        sessionId:    proxySessionId?.slice(0, 8) ?? '—',
+        isManual:     false,
+      });
+    }
 
     // Safety guard: never login to GDT without proxy protection.
     // Running without a proxy exposes the real server IP — GDT can correlate multiple
@@ -719,7 +780,12 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       const proxyOk = await proxyManager.probe(proxyUrl, probeTimeoutMs);
       if (!proxyOk) {
         proxyManager.markFailed(proxyUrl);
-        logger.warn('[SyncWorker] Proxy health check failed — rotating proxy', { companyId, proxyUrl });
+        logger.warn('[SyncWorker] Proxy health check FAILED', {
+          companyId,
+          taxCode:  cfg.tax_code,
+          proxyIp:  _maskProxyUrl(proxyUrl),
+          mode:     isManual ? 'MANUAL/static' : 'AUTO/TMProxy',
+        });
         // Clear the DB proxy_session_id so next run gets a fresh session ID → fresh IP.
         await pool.query(
           `UPDATE gdt_bot_configs SET proxy_session_id = NULL, updated_at = NOW() WHERE company_id = $1`,
@@ -727,7 +793,12 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
         );
         throw new Error(`PROXY_DEAD: Proxy TCP probe failed (${proxyUrl.slice(0, 32)}…) — will retry`);
       }
-      logger.info('[SyncWorker] Proxy TCP probe OK', { companyId });
+      logger.info('[SyncWorker] Proxy TCP probe OK', {
+        companyId,
+        taxCode:  cfg.tax_code,
+        proxyIp:  _maskProxyUrl(proxyUrl),
+        mode:     isManual ? 'MANUAL/static' : 'AUTO/TMProxy',
+      });
     }
 
     // ── 4. Login via GDT Direct API ──────────────────────────────────────────────
@@ -749,11 +820,16 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     }
 
     // FIX-PERF-01: Check session cache — skip captcha+login if we have a valid token.
+    // BUG3 FIX: Manual sync MUST NOT reuse a cached token from auto-sync.
+    // Auto-sync uses TMProxy IP; manual uses a different static IP.
+    // GDT binds sessions to IP — reusing an auto-sync token on a static IP causes 401/session errors.
     let cachedToken: string | null = null;
-    try {
-      cachedToken = await _sessionCache.get(companyId, proxySessionId ?? '');
-    } catch (cacheErr) {
-      logger.warn('[SyncWorker] Session cache read failed (non-fatal)', { companyId });
+    if (!isManual) {
+      try {
+        cachedToken = await _sessionCache.get(companyId, proxySessionId ?? '');
+      } catch (cacheErr) {
+        logger.warn('[SyncWorker] Session cache read failed (non-fatal)', { companyId });
+      }
     }
     if (cachedToken) {
       gdtApi.setToken(cachedToken);

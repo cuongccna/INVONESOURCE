@@ -1,0 +1,434 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<HSoThueDTu xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://kekhaithue.gdt.gov.vn/TKhaiThue">
+  <HSoKhaiThue id="NODETOSIGN">
+    <TTinChung>
+      <TTinDVu>
+        <maDVu>TTGQ TTHC</maDVu>
+        <tenDVu>TTGQ TTHC</tenDVu>
+        <pbanDVu>1.0.0</pbanDVu>
+        <ttinNhaCCapDVu>TTGQ TTHC</ttinNhaCCapDVu>
+      </TTinDVu>
+      <TTinTKhaiThue>
+        <TKhaiThue>
+          <maTKhai>473</maTKhai>
+          <tenTKhai>Tờ khai thuế đối với hộ kinh doanh, cá nhân kinh doanh</tenTKhai>
+          <moTaBMau>(Ban hành kèm theo Thông tư số 40/2021/TT-BTC ngày 01/6/2021 của Bộ trưởng Bộ Tài Chính)</moTaBMau>
+          <pbanTKhaiXML>2.8.3</pbanTKhaiXML>
+          <loaiTKhai>C</loaiTKhai>
+          <soLan>0</soLan>
+          <KyKKhaiThue>
+            <kieuKy>Q</kieuKy>
+            <kyKKhai>1/2026</kyKKhai>
+            <kyKKhaiTuNgay>01/01/2026</kyKKhaiTuNgay>
+            <kyKKhaiDenNgay>31/03/2026</kyKKhaiDenNgay>
+            <kyKKhaiTuThang>01/2026</kyKKhaiTuThang>
+            <kyKKhaiDenThang>03/2026</kyKKhaiDenThang>
+          </KyKKhaiThue>
+          <maCQTNoiNop/>
+          <tenCQTNoiNop/>
+          <ngayLapTKhai>2026-04-06</ngayLapTKhai>
+          <GiaHan>
+            <maLyDoGiaHan/>
+            <lyDoGiaHan/>
+          </GiaHan>
+          <nguoiKy/>
+          <ngayKy>2026-04-06</ngayKy>
+          <nganhNgheKD/>
+        </TKhaiThue>
+        <NNT>
+          <mst>0319303270</mst>
+          <tenNNT>Công Ty Ân test</tenNNT>
+          <dchiNNT></dchiNNT>
+          <phuongXa/>
+          <maHuyenNNT/>
+          <tenHuyenNNT/>
+          <maTinhNNT/>
+          <tenTinhNNT/>
+          <dthoaiNNT></dthoaiNNT>
+          <faxNNT/>
+          <emailNNT></emailNNT>
+        </NNT>
+      </TTinTKhaiThue>
+    </TTinChung>
+    <CTieuTKhaiChinh>
+      <mst_cu/>
+      <Header>
+        <hkdcnkdnopthuekhoan>0</hkdcnkdnopthuekhoan>
+        <cnkdnopps>0</cnkdnopps>
+        <tccnkhainopthay>0</tccnkhainopthay>
+        <hkdcnkdnopkekhai>1</hkdcnkdnopkekhai>
+        <hkdcnkdnnxddoanhthu>0</hkdcnkdnnxddoanhthu>
+        <hkdchuyendoipptinhthue>0</hkdchuyendoipptinhthue>
+        <ct05>Công Ty Ân test</ct05>
+        <ct06/>
+        <CT08>
+          <NNgheKDoanh id="ID_1">
+            <maNNgheKDoanh/>
+            <tenNNgheKDoanh/>
+          </NNgheKDoanh>
+        </CT08>
+        <ct08a>0</ct08a>
+        <ct09>0</ct09>
+        <ct09a>0</ct09a>
+        <ct10>0</ct10>
+        <CT11>
+          <tuGio>8</tuGio>
+          <tuPhut>0</tuPhut>
+          <denGio>17</denGio>
+          <denPhut>0</denPhut>
+        </CT11>
+        <CT12>
+          <ct12a_tdtt>0</ct12a_tdtt>
+          <ct12b_soNha></ct12b_soNha>
+          <ct12c_maPhuong/>
+          <ct12c_tenPhuong/>
+          <ct12d_maQuan/>
+          <ct12d_tenQuan/>
+          <ct12d_maTinh/>
+          <ct12d_tenTinh/>
+          <ct12e_kdbiengioi>0</ct12e_kdbiengioi>
+        </CT12>
+        <CT13>
+          <ct13a_soNha/>
+          <ct13b_maPhuong/>
+          <ct13b_tenPhuong/>
+          <ct13c_maQuan/>
+          <ct13c_tenQuan/>
+          <ct13d_maTinh/>
+          <ct13d_tenTinh/>
+        </CT13>
+        <ct17/>
+        <ct17_ngay xsi:nil="true"/>
+        <CNKDChuaDangKyThue>
+          <ct18a_ngaySinh xsi:nil="true"/>
+          <ct18b_maQuocTich/>
+          <ct18b_tenQuocTich/>
+          <ct18c_ma/>
+          <ct18c_ten/>
+          <ct18c_soCMND_CCCD/>
+          <ct18c_1_ngayCap xsi:nil="true"/>
+          <ct18c_2_noiCap_loai>01</ct18c_2_noiCap_loai>
+          <ct18c_2_noiCap_ten/>
+          <ct18c_2_noiCap_ma/>
+        </CNKDChuaDangKyThue>
+        <ct18k>0</ct18k>
+        <ToChucKThay>
+          <ct22/>
+          <ct23 xsi:nil="true"/>
+          <ct24/>
+          <ct25/>
+          <ct26/>
+          <ct27/>
+        </ToChucKThay>
+      </Header>
+      <KKThueGTGT_TNCN>
+        <DoanhThuThueGTGT>
+          <ct28>41815164</ct28>
+          <ct29>5403518</ct29>
+          <ct30>9322222</ct30>
+          <ct31>0</ct31>
+          <ct32>56540904</ct32>
+        </DoanhThuThueGTGT>
+        <SoThueGTGT>
+          <ct28>418152</ct28>
+          <ct29>54035</ct29>
+          <ct30>93222</ct30>
+          <ct31>0</ct31>
+          <ct32>565409</ct32>
+        </SoThueGTGT>
+        <DoanhThuThueTNCN>
+          <ct28>41815164</ct28>
+          <ct29>5403518</ct29>
+          <ct30>9322222</ct30>
+          <ct31>0</ct31>
+          <ct32>56540904</ct32>
+        </DoanhThuThueTNCN>
+        <SoThueTNCN>
+          <ct28>209076</ct28>
+          <ct29>27018</ct29>
+          <ct30>46611</ct30>
+          <ct31>0</ct31>
+          <ct32>282705</ct32>
+        </SoThueTNCN>
+      </KKThueGTGT_TNCN>
+      <KKhaiThueTTDB>
+        <CTietKKhaiThueTTDB id="ID_1">
+          <ct2_ma/>
+          <ct2_ten/>
+          <ct3/>
+          <ct4/>
+          <ct5>0</ct5>
+          <ct6>0</ct6>
+          <ct7>0</ct7>
+        </CTietKKhaiThueTTDB>
+        <tong_ct5>0</tong_ct5>
+        <tong_ct7>0</tong_ct7>
+      </KKhaiThueTTDB>
+      <KKhaiTBVMT_TN>
+        <ThueTaiNguyen>
+          <CTietThueTaiNguyen id="ID_1">
+            <ct2_ma/>
+            <ct2_ten/>
+            <ct3/>
+            <ct4/>
+            <ct5>0</ct5>
+            <ct6>0</ct6>
+            <ct7>0</ct7>
+            <ct8>0</ct8>
+          </CTietThueTaiNguyen>
+          <tongCong>0</tongCong>
+        </ThueTaiNguyen>
+        <ThueBVMT>
+          <CTietThueBVMT id="ID_1">
+            <ct2_ma/>
+            <ct2_ten/>
+            <ct3/>
+            <ct4/>
+            <ct5>0</ct5>
+            <ct6>0</ct6>
+            <ct8>0</ct8>
+          </CTietThueBVMT>
+          <tongCong>0</tongCong>
+        </ThueBVMT>
+        <PhiBVMT>
+          <CTietPhiBVMT id="ID_1">
+            <ct2_ma/>
+            <ct2_ten/>
+            <ct3/>
+            <ct4/>
+            <ct5>0</ct5>
+            <ct6>0</ct6>
+            <ct8>0</ct8>
+          </CTietPhiBVMT>
+          <tongCong>0</tongCong>
+        </PhiBVMT>
+      </KKhaiTBVMT_TN>
+    </CTieuTKhaiChinh>
+    <PLuc>
+      <PLuc_01_2_BK_HDKD>
+        <VlieuDcuSPHH>
+          <BKeVLDCSPHH>
+            <CTietHKDCNKD id="ID_1">
+              <ct06>Hóa đơn thay thế cho hóa đơn điện tử mẫu 1 ký hiệu C26TAS số 3 lập ngày 07/01/2026</ct06>
+              <ct07>Cái</ct07>
+              <ct08>0</ct08>
+              <ct09>0</ct09>
+              <ct10>0</ct10>
+              <ct11>0</ct11>
+              <ct12>0</ct12>
+              <ct13>0</ct13>
+              <ct14>0</ct14>
+              <ct15>0</ct15>
+            </CTietHKDCNKD>
+            <CTietHKDCNKD id="ID_2">
+              <ct06>Hóa đơn thay thế cho hóa đơn điện tử mẫu 1 ký hiệu C26TAS số 6 lập ngày 07/01/2026</ct06>
+              <ct07>Cái</ct07>
+              <ct08>0</ct08>
+              <ct09>0</ct09>
+              <ct10>0</ct10>
+              <ct11>0</ct11>
+              <ct12>0</ct12>
+              <ct13>0</ct13>
+              <ct14>0</ct14>
+              <ct15>0</ct15>
+            </CTietHKDCNKD>
+            <CTietHKDCNKD id="ID_3">
+              <ct06>Hóa đơn thay thế cho hóa đơn điện tử mẫu 1 ký hiệu C26TAS số 4 lập ngày 07/01/2026</ct06>
+              <ct07>Cái</ct07>
+              <ct08>0</ct08>
+              <ct09>0</ct09>
+              <ct10>0</ct10>
+              <ct11>0</ct11>
+              <ct12>0</ct12>
+              <ct13>0</ct13>
+              <ct14>0</ct14>
+              <ct15>0</ct15>
+            </CTietHKDCNKD>
+            <CTietHKDCNKD id="ID_4">
+              <ct06>Dịch vụ đăng ký chữ ký số (Gói 3 năm)</ct06>
+              <ct07>Gói</ct07>
+              <ct08>0</ct08>
+              <ct09>0</ct09>
+              <ct10>0</ct10>
+              <ct11>0</ct11>
+              <ct12>11</ct12>
+              <ct13>24390185</ct13>
+              <ct14>11</ct14>
+              <ct15>24390185</ct15>
+            </CTietHKDCNKD>
+            <CTietHKDCNKD id="ID_5">
+              <ct06>Dịch vụ đăng ký chữ ký số (Gói 1 năm)</ct06>
+              <ct07>Gói</ct07>
+              <ct08>0</ct08>
+              <ct09>0</ct09>
+              <ct10>0</ct10>
+              <ct11>0</ct11>
+              <ct12>8</ct12>
+              <ct13>12777407</ct13>
+              <ct14>8</ct14>
+              <ct15>12777407</ct15>
+            </CTietHKDCNKD>
+            <CTietHKDCNKD id="ID_6">
+              <ct06>Phần Mềm Hoá Đơn Điện Tử 300 số</ct06>
+              <ct07>Gói</ct07>
+              <ct08>0</ct08>
+              <ct09>0</ct09>
+              <ct10>0</ct10>
+              <ct11>0</ct11>
+              <ct12>4</ct12>
+              <ct13>3780000</ct13>
+              <ct14>4</ct14>
+              <ct15>3780000</ct15>
+            </CTietHKDCNKD>
+            <CTietHKDCNKD id="ID_7">
+              <ct06>Phần mềm hoá đơn điện tử 300 số</ct06>
+              <ct07>Gói</ct07>
+              <ct08>0</ct08>
+              <ct09>0</ct09>
+              <ct10>0</ct10>
+              <ct11>0</ct11>
+              <ct12>3</ct12>
+              <ct13>2880000</ct13>
+              <ct14>3</ct14>
+              <ct15>2880000</ct15>
+            </CTietHKDCNKD>
+            <CTietHKDCNKD id="ID_8">
+              <ct06>Dịch vụ đăng ký chữ ký số 3 năm</ct06>
+              <ct07>Gói</ct07>
+              <ct08>0</ct08>
+              <ct09>0</ct09>
+              <ct10>0</ct10>
+              <ct11>0</ct11>
+              <ct12>1</ct12>
+              <ct13>2800000</ct13>
+              <ct14>1</ct14>
+              <ct15>2800000</ct15>
+            </CTietHKDCNKD>
+            <CTietHKDCNKD id="ID_9">
+              <ct06>Dịch vụ đăng ký chữ ký số (Gói 30 tháng)</ct06>
+              <ct07>Gói</ct07>
+              <ct08>0</ct08>
+              <ct09>0</ct09>
+              <ct10>0</ct10>
+              <ct11>0</ct11>
+              <ct12>1</ct12>
+              <ct13>1800000</ct13>
+              <ct14>1</ct14>
+              <ct15>1800000</ct15>
+            </CTietHKDCNKD>
+            <CTietHKDCNKD id="ID_10">
+              <ct06>Dịch vụ gia hạn chữ ký số (Gói 1 năm)</ct06>
+              <ct07>Gói</ct07>
+              <ct08>0</ct08>
+              <ct09>0</ct09>
+              <ct10>0</ct10>
+              <ct11>0</ct11>
+              <ct12>2</ct12>
+              <ct13>1538666</ct13>
+              <ct14>2</ct14>
+              <ct15>1538666</ct15>
+            </CTietHKDCNKD>
+            <CTietHKDCNKD id="ID_11">
+              <ct06>Dịch vụ đăng ký chứng thư số 1 năm</ct06>
+              <ct07>Gói</ct07>
+              <ct08>0</ct08>
+              <ct09>0</ct09>
+              <ct10>0</ct10>
+              <ct11>0</ct11>
+              <ct12>1</ct12>
+              <ct13>1260000</ct13>
+              <ct14>1</ct14>
+              <ct15>1260000</ct15>
+            </CTietHKDCNKD>
+            <CTietHKDCNKD id="ID_12">
+              <ct06>Dịch vụ gia hạn chứng thư số 1 năm</ct06>
+              <ct07>Gói</ct07>
+              <ct08>0</ct08>
+              <ct09>0</ct09>
+              <ct10>0</ct10>
+              <ct11>0</ct11>
+              <ct12>1</ct12>
+              <ct13>1159091</ct13>
+              <ct14>1</ct14>
+              <ct15>1159091</ct15>
+            </CTietHKDCNKD>
+            <CTietHKDCNKD id="ID_13">
+              <ct06>Dịch vụ gia hạn chữ ký số (Gói 2 năm)</ct06>
+              <ct07>Gói</ct07>
+              <ct08>0</ct08>
+              <ct09>0</ct09>
+              <ct10>0</ct10>
+              <ct11>0</ct11>
+              <ct12>1</ct12>
+              <ct13>1100000</ct13>
+              <ct14>1</ct14>
+              <ct15>1100000</ct15>
+            </CTietHKDCNKD>
+            <CTietHKDCNKD id="ID_14">
+              <ct06>Dịch vụ gia hạn chứng thư số 2 năm</ct06>
+              <ct07>Gói</ct07>
+              <ct08>0</ct08>
+              <ct09>0</ct09>
+              <ct10>0</ct10>
+              <ct11>0</ct11>
+              <ct12>1</ct12>
+              <ct13>1100000</ct13>
+              <ct14>1</ct14>
+              <ct15>1100000</ct15>
+            </CTietHKDCNKD>
+            <CTietHKDCNKD id="ID_15">
+              <ct06>Phần mềm hoá đơn điện tử 1000 số</ct06>
+              <ct07>Gói</ct07>
+              <ct08>0</ct08>
+              <ct09>0</ct09>
+              <ct10>0</ct10>
+              <ct11>0</ct11>
+              <ct12>1</ct12>
+              <ct13>1100000</ct13>
+              <ct14>1</ct14>
+              <ct15>1100000</ct15>
+            </CTietHKDCNKD>
+            <CTietHKDCNKD id="ID_16">
+              <ct06>Hoa hồng môi giới tháng 1/2026</ct06>
+              <ct07>Tháng</ct07>
+              <ct08>0</ct08>
+              <ct09>0</ct09>
+              <ct10>0</ct10>
+              <ct11>0</ct11>
+              <ct12>1</ct12>
+              <ct13>633333</ct13>
+              <ct14>1</ct14>
+              <ct15>633333</ct15>
+            </CTietHKDCNKD>
+            <CTietHKDCNKD id="ID_17">
+              <ct06>Hoa hồng môi giới tháng 2/2026</ct06>
+              <ct07>Tháng</ct07>
+              <ct08>0</ct08>
+              <ct09>0</ct09>
+              <ct10>0</ct10>
+              <ct11>0</ct11>
+              <ct12>1</ct12>
+              <ct13>222222</ct13>
+              <ct14>1</ct14>
+              <ct15>222222</ct15>
+            </CTietHKDCNKD>
+            <ct17>0</ct17>
+            <ct19>0</ct19>
+            <ct21>56540904</ct21>
+            <ct23>56540904</ct23>
+          </BKeVLDCSPHH>
+        </VlieuDcuSPHH>
+        <ChiPhiQL>
+          <ct24>0</ct24>
+          <ct25>0</ct25>
+          <ct26>0</ct26>
+          <ct27>0</ct27>
+          <ct28>0</ct28>
+          <ct29>0</ct29>
+          <ct30>0</ct30>
+          <ct31>0</ct31>
+        </ChiPhiQL>
+      </PLuc_01_2_BK_HDKD>
+    </PLuc>
+  </HSoKhaiThue>
+</HSoThueDTu>

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import apiClient, { setAccessToken } from '../../lib/apiClient';
@@ -11,6 +11,15 @@ export default function LoginPage() {
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+
+  // Show message when redirected here due to session revocation
+  useEffect(() => {
+    const msg = sessionStorage.getItem('session_revoked_msg');
+    if (msg) {
+      setError(msg);
+      sessionStorage.removeItem('session_revoked_msg');
+    }
+  }, []);
 
   const login = async (e: React.FormEvent) => {
     e.preventDefault();

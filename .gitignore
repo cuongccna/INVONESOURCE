@@ -80,3 +80,7 @@ bot/src/test-load-concurrent.ts
 frontend/app/(app)/declarations/\[id]/page.tsx
 scripts/check_3801185171b.js
 scripts/check_3801185171.js
+bot/scripts/test-proxy-gdt.js
+scripts/check-bot-runs.js
+scripts/check-test-state.js
+scripts/setup-and-test-queue.js

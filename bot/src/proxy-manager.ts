@@ -29,6 +29,7 @@
 import * as net from 'net';
 import { EventEmitter } from 'events';
 import { TmproxyRefresher, TmproxyNoSessionError } from './tmproxy-refresher';
+import { staticProxyPool } from './static-proxy-pool';
 import { logger } from './logger';
 
 export interface AxiosProxyConfig {
@@ -520,6 +521,54 @@ export class ProxyManager extends EventEmitter {
     return this.slots.length > 0 ? this.slots.length : this.proxies.length;
   }
   get failedCount(): number { return this.failed.size; }
+
+  // ── Dual-mode proxy selection (manual vs auto sync) ──────────────────────
+
+  /**
+   * For MANUAL sync: ONLY use static residential proxy pool (DB-backed, per-user sticky).
+   * Returns null if user has no assigned active proxy — caller must abort, NOT fall back to TMProxy.
+   * This ensures manual and auto sync are on fully separate IP paths.
+   */
+  async nextForManualSync(userId: string): Promise<string | null> {
+    try {
+      const result = await staticProxyPool.acquireForUser(userId);
+      if (result) return result.url;
+      logger.warn('[ProxyManager] Manual sync: no static proxy assigned for user — aborting (no TMProxy fallback)', {
+        userId: userId.slice(0, 8),
+      });
+      return null;
+    } catch (err) {
+      logger.error('[ProxyManager] Manual sync: static pool error — aborting (no TMProxy fallback)', {
+        userId: userId.slice(0, 8),
+        error: (err as Error).message,
+      });
+      return null;
+    }
+  }
+
+  /**
+   * For AUTO sync: use TMProxy rotating pool (existing Mode A/C/B).
+   * Static proxies are reserved for manual (user-triggered) syncs.
+   */
+  nextForAutoSync(sessionSuffix: string): string | null {
+    return this.nextForCompany(sessionSuffix);
+  }
+
+  /**
+   * Mark a static proxy as blocked and auto-rotate the user to next available.
+   */
+  async markStaticBlocked(proxyId: string, userId: string, reason: string): Promise<string | null> {
+    try {
+      const result = await staticProxyPool.markBlocked(proxyId, userId, reason);
+      return result?.url ?? null;
+    } catch (err) {
+      logger.error('[ProxyManager] Failed to mark static proxy blocked', {
+        proxyId: proxyId.slice(0, 8),
+        error: (err as Error).message,
+      });
+      return null;
+    }
+  }
 
   // ── Private helpers ───────────────────────────────────────────────────────
 

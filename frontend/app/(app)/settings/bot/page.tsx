@@ -28,6 +28,8 @@ interface BotStatus {
   lastRuns:             BotRun[];
   manualCooldownSec:    number;
   quickSyncCooldownSec: number;
+  quotaInfo:            { quota_used: number; quota_total: number; quota_reset_at: string | null } | null;
+  proxyAssigned:        boolean;
 }
 
 interface BotRun {
@@ -260,13 +262,38 @@ export default function BotSettingsPage() {
 
   const runNow = async (fromDate?: string, toDate?: string) => {
     if (running || cooldownEndsAt) return;
+
+    // ── Quota warning: warn if >= 80% used ───────────────────────────────────
+    const qi = status?.quotaInfo;
+    if (qi && qi.quota_total > 0) {
+      const pct = qi.quota_used / qi.quota_total;
+      if (pct >= 0.8) {
+        const remaining = qi.quota_total - qi.quota_used;
+        const ok = confirm(
+          `⚠️ Hạn mức gần hết!\n\nBạn đã dùng ${qi.quota_used.toLocaleString('vi-VN')}/${qi.quota_total.toLocaleString('vi-VN')} hóa đơn (${Math.round(pct * 100)}%).\n` +
+          `Còn lại: ${remaining.toLocaleString('vi-VN')} hóa đơn.\n\nTiếp tục đồng bộ?`
+        );
+        if (!ok) return;
+      }
+    }
+
     setRunning(true);
     try {
       const body: Record<string, string> = {};
       if (fromDate) body['from_date'] = fromDate;
       if (toDate)   body['to_date']   = toDate;
-      await apiClient.post('/bot/run-now', body);
-      toast.success(fromDate ? `Đã xếp hàng lấy dữ liệu từ ${fromDate}` : 'Đã thêm vào hàng đợi đồng bộ');
+      const res = await apiClient.post<{ data: { queued: boolean; delayed_sec?: number; estimated_start?: string } }>('/bot/run-now', body);
+      const delaySec = res.data.data?.delayed_sec ?? 0;
+      if (delaySec > 30) {
+        const delayMin = Math.round(delaySec / 60);
+        toast.success(
+          fromDate
+            ? `⏱ Xếp hàng lấy dữ liệu từ ${fromDate} — sẽ bắt đầu sau ~${delayMin} phút (xếp lịch tránh đăng nhập đồng thời)`
+            : `⏱ Đã xếp hàng — sẽ bắt đầu sau ~${delayMin} phút (xếp lịch tránh đăng nhập đồng thời)`
+        );
+      } else {
+        toast.success(fromDate ? `Đã xếp hàng lấy dữ liệu từ ${fromDate}` : 'Đã thêm vào hàng đợi đồng bộ');
+      }
       // Random cooldown 1–3 phút sau mỗi lần click (không tăng lũy tiến).
       const cooldownSec = Math.floor(Math.random() * 120) + 60; // 60–180 giây
       const endsAt = Date.now() + cooldownSec * 1000;
@@ -282,6 +309,8 @@ export default function BotSettingsPage() {
       } else if (apiErr?.code === 'ALREADY_RUNNING') {
         toast.error('⏳ Bot đang chạy job đồng bộ. Chờ hoàn tất rồi thử lại.');
         void load(); // refresh status display
+      } else if (apiErr?.code === 'NO_PROXY_ASSIGNED') {
+        toast.error('⛔ ' + (apiErr.message ?? 'Tài khoản chưa được cấp IP tĩnh. Vui lòng liên hệ Admin.'));
       } else {
         toast.error(apiErr?.message ?? 'Lỗi kích hoạt đồng bộ');
       }
@@ -333,6 +362,8 @@ export default function BotSettingsPage() {
       } else if (apiErr?.code === 'ALREADY_RUNNING') {
         toast.error('⏳ Bot đang chạy. Chờ hoàn tất rồi thử lại.');
         void load();
+      } else if (apiErr?.code === 'NO_PROXY_ASSIGNED') {
+        toast.error('⛔ ' + (apiErr.message ?? 'Tài khoản chưa được cấp IP tĩnh. Vui lòng liên hệ Admin.'));
       } else {
         toast.error(apiErr?.message ?? 'Lỗi kích hoạt đồng bộ nhanh');
       }
@@ -388,6 +419,54 @@ export default function BotSettingsPage() {
         Bot tự đăng nhập cổng thuế, tải file XML theo lịch và cập nhật vào hệ thống.</p>
         <p className="text-blue-700">🔒 Thông tin đăng nhập được mã hóa AES-256-GCM và chỉ dùng để kết nối cổng thuế.</p>
       </div>
+
+      {/* ── No proxy warning banner ── */}
+      {status && !status.proxyAssigned && (
+        <div className="bg-red-50 border border-red-300 rounded-xl p-4 flex items-start gap-3">
+          <span className="text-red-500 text-xl flex-shrink-0">⛔</span>
+          <div className="text-sm">
+            <p className="font-semibold text-red-800">Chưa được cấp IP tĩnh</p>
+            <p className="text-red-700 mt-0.5">
+              Tài khoản của bạn chưa được Admin gán IP tĩnh (Static Proxy).
+              Chức năng đồng bộ thủ công sẽ bị chặn cho đến khi được cấp.
+            </p>
+            <p className="text-red-600 mt-1 font-medium">
+              📞 Vui lòng liên hệ Admin để được gán quyền đồng bộ.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* ── Quota warning banner ── */}
+      {(() => {
+        const qi = status?.quotaInfo;
+        if (!qi || qi.quota_total === 0) return null;
+        const pct = qi.quota_used / qi.quota_total;
+        if (pct < 0.8) return null;
+        const remaining = qi.quota_total - qi.quota_used;
+        const isNearEmpty = pct >= 0.95;
+        return (
+          <div className={`border rounded-xl p-4 flex items-start gap-3 ${isNearEmpty ? 'bg-red-50 border-red-300' : 'bg-amber-50 border-amber-300'}`}>
+            <span className={`text-xl flex-shrink-0 ${isNearEmpty ? 'text-red-500' : 'text-amber-500'}`}>
+              {isNearEmpty ? '🔴' : '⚠️'}
+            </span>
+            <div className="text-sm">
+              <p className={`font-semibold ${isNearEmpty ? 'text-red-800' : 'text-amber-800'}`}>
+                {isNearEmpty ? 'Hạn mức gần cạn!' : 'Hạn mức sắp hết'}
+              </p>
+              <p className={`mt-0.5 ${isNearEmpty ? 'text-red-700' : 'text-amber-700'}`}>
+                Đã dùng <strong>{qi.quota_used.toLocaleString('vi-VN')}</strong>/{qi.quota_total.toLocaleString('vi-VN')} hóa đơn
+                ({Math.round(pct * 100)}%) — còn lại <strong>{remaining.toLocaleString('vi-VN')}</strong> hóa đơn
+                {qi.quota_reset_at && (
+                  <span className="ml-1">
+                    (reset {new Date(qi.quota_reset_at).toLocaleDateString('vi-VN')})
+                  </span>
+                )}.
+              </p>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* ── Status card — Not configured ── */}
       {!cfg && (

@@ -79,6 +79,22 @@ apiClient.interceptors.response.use(
   (res: AxiosResponse) => res,
   async (error) => {
     const original = error.config;
+
+    // SESSION_REVOKED = logged in from another device → immediate redirect, no refresh
+    const errorCode = error.response?.data?.error?.code;
+    if (error.response?.status === 401 && errorCode === 'SESSION_REVOKED') {
+      setAccessToken(null);
+      // Store message to show on login page
+      if (typeof window !== 'undefined') {
+        sessionStorage.setItem(
+          'session_revoked_msg',
+          'Phiên đăng nhập đã hết hạn do đăng nhập từ thiết bị khác'
+        );
+        window.location.href = '/login';
+      }
+      return Promise.reject(error);
+    }
+
     if (error.response?.status === 401 && !original._retry && !refreshing) {
       original._retry = true;
       refreshing = true;

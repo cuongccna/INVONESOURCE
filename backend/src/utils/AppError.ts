@@ -45,8 +45,8 @@ export class ConnectorError extends AppError {
  * Authentication error (401)
  */
 export class AuthError extends AppError {
-  constructor(message = 'Unauthorized') {
-    super(message, 401, 'UNAUTHORIZED');
+  constructor(message = 'Unauthorized', code = 'UNAUTHORIZED') {
+    super(message, 401, code);
     this.name = 'AuthError';
     Object.setPrototypeOf(this, AuthError.prototype);
   }

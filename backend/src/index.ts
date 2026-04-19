@@ -50,12 +50,14 @@ import { scheduleSyncCron } from './jobs/SyncWorker';
 import { gdtValidateWorker } from './jobs/GdtValidatorWorker';
 import { scheduleTaxDeadlineReminder } from './jobs/TaxDeadlineReminderJob';
 import { scheduleRepurchaseAlertJob } from './jobs/RepurchaseAlertJob';
-import { scheduleGdtBotSync, gdtBotSchedulerWorker } from './jobs/GdtBotSchedulerJob';
+// DISABLED: auto-sync scheduling moved to bot process (bot/src/cron/auto-sync.ts)
+// import { scheduleGdtBotSync, gdtBotSchedulerWorker } from './jobs/GdtBotSchedulerJob';
 import { scheduleQuotaReset } from './jobs/QuotaResetJob';
 import { syncNotificationWorker } from './jobs/SyncNotificationWorker';
 import { gdtRawCacheSyncWorker } from './jobs/GdtRawCacheSyncWorker';
 import { gdtRawCacheSchedulerWorker, scheduleGdtRawCacheSync } from './jobs/GdtRawCacheScheduler';
 import adminRouter from './routes/admin';
+import adminProxyRouter from './routes/admin-proxy';
 import toolsRouter from './routes/tools';
 import syncStatusRouter from './routes/syncStatus';
 
@@ -146,6 +148,7 @@ app.use('/api/journals', journalsRouter);
 app.use('/api/reports/profit-loss', profitLossRouter);
 app.use('/api/hkd', hkdRouter);
 app.use('/api/admin', adminRouter);
+app.use('/api/admin/proxies', adminProxyRouter);
 app.use('/api/tools', toolsRouter);
 app.use('/api/sync-status', syncStatusRouter);
 
@@ -179,11 +182,11 @@ async function start(): Promise<void> {
   await scheduleSyncCron();
   // gdtValidateWorker is auto-started on import
   void gdtValidateWorker;
-  // GDT Bot per-company periodic scheduler (checks every 30min, enqueues due companies)
-  void gdtBotSchedulerWorker;   // auto-started on import
+  // DISABLED: auto-sync scheduling moved to bot process (bot/src/cron/auto-sync.ts)
+  // void gdtBotSchedulerWorker;
+  // await scheduleGdtBotSync();
   // Notification bridge: processes push notifications enqueued by bot worker
   void syncNotificationWorker;  // auto-started on import
-  await scheduleGdtBotSync();
   await scheduleTaxDeadlineReminder();
   await scheduleRepurchaseAlertJob();
   await scheduleQuotaReset();

@@ -7,6 +7,7 @@ import { requireCompany } from '../middleware/company';
 import { encrypt, decrypt } from '../utils/encryption';
 import { ValidationError, NotFoundError } from '../utils/AppError';
 import { sendSuccess, sendPaginated } from '../utils/response';
+import { quotaService } from '../services/QuotaService';
 import { Queue } from 'bullmq';
 import IORedis from 'ioredis';
 import { env } from '../config/env';
@@ -149,11 +150,43 @@ router.get(
         ? await Promise.all([_redis.ttl(cooldownKey), _redis.ttl(quickCooldownKey)])
         : [-1, -1];
 
+      // ── Quota info for warning banner ─────────────────────────────────────
+      const userId = req.user!.userId;
+      const quotaRes = await pool.query(
+        `SELECT us.quota_used, us.quota_total, us.quota_reset_at
+         FROM user_subscriptions us
+         WHERE us.user_id = $1 AND us.status IN ('active', 'trial')
+         ORDER BY us.created_at DESC LIMIT 1`,
+        [userId]
+      );
+      const quotaInfo = quotaRes.rows.length > 0 ? {
+        quota_used:      Number(quotaRes.rows[0].quota_used),
+        quota_total:     Number(quotaRes.rows[0].quota_total),
+        quota_reset_at:  quotaRes.rows[0].quota_reset_at,
+      } : null;
+
+      // ── Proxy assignment check ────────────────────────────────────────────
+      // Only enforce when at least one active static proxy exists in the pool.
+      const poolCountRes = await pool.query(
+        `SELECT COUNT(*) AS cnt FROM static_proxies WHERE status = 'active'`
+      );
+      const poolHasProxies = Number(poolCountRes.rows[0].cnt) > 0;
+      let proxyAssigned = true; // default: no enforcement when pool is empty
+      if (poolHasProxies) {
+        const assignedRes = await pool.query(
+          `SELECT id FROM static_proxies WHERE assigned_user_id = $1 AND status = 'active' LIMIT 1`,
+          [userId]
+        );
+        proxyAssigned = assignedRes.rowCount !== null && assignedRes.rowCount > 0;
+      }
+
       sendSuccess(res, {
         config:                cfgRes.rows[0] ?? null,
         lastRuns:              runsRes.rows,
         manualCooldownSec:     cooldownTtl      > 0 ? cooldownTtl      : 0,
         quickSyncCooldownSec:  quickCooldownTtl > 0 ? quickCooldownTtl : 0,
+        quotaInfo,
+        proxyAssigned,
       });
     } catch (err) {
       next(err);
@@ -179,6 +212,39 @@ router.post(
       );
       if (cfgRes.rows.length === 0) throw new NotFoundError('GDT Bot chưa được cấu hình');
       if (!cfgRes.rows[0].is_active) throw new ValidationError('GDT Bot hiện đang tắt');
+
+      // ── Quota pre-check: fail fast before enqueuing ────────────────────────
+      // The bot worker also checks quota, but pre-checking here gives the user
+      // immediate feedback instead of a delayed job failure.
+      try {
+        await quotaService.checkCanSync(req.user!.userId);
+      } catch (quotaErr) {
+        // Re-throw as-is — QuotaExceededError (429) or SubscriptionRequiredError (403)
+        throw quotaErr;
+      }
+
+      // ── Static proxy enforcement ──────────────────────────────────────────
+      // Only enforce when the pool has at least one active proxy. This avoids
+      // blocking all users during initial setup before any proxies are added.
+      const poolCountRes = await pool.query(
+        `SELECT COUNT(*) AS cnt FROM static_proxies WHERE status = 'active'`
+      );
+      if (Number(poolCountRes.rows[0].cnt) > 0) {
+        const proxyRow = await pool.query(
+          `SELECT id FROM static_proxies WHERE assigned_user_id = $1 AND status = 'active' LIMIT 1`,
+          [req.user!.userId]
+        );
+        if (proxyRow.rowCount === 0) {
+          res.status(403).json({
+            success: false,
+            error: {
+              code:    'NO_PROXY_ASSIGNED',
+              message: 'Tài khoản chưa được cấp IP tĩnh. Vui lòng liên hệ Admin để được gán quyền đồng bộ.',
+            },
+          });
+          return;
+        }
+      }
 
       // ── Quick-sync (Đồng bộ hôm nay) uses a separate, shorter cooldown ────────
       // Cooldown riêng 5 phút so với full-sync 6 phút, cho phép người dùng
@@ -228,16 +294,57 @@ router.post(
         );
       }
 
+      // ── Per-user sequential gate (human-like stagger) ───────────────────────
+      // An accountant managing 2-20 companies uses ONE static IP.
+      // If they trigger 3 companies at once, GDT would see 3 simultaneous logins
+      // from the same IP — a clear bot pattern.
+      // Solution: gate each user's manual jobs so they start 1–6 min apart,
+      // mimicking a human who finishes one company then moves to the next.
+      //
+      // Quick-sync (Đồng bộ hôm nay) is exempt: it's a lightweight poll with its
+      // own short cooldown and different GDT endpoint behaviour.
+      const USER_SLOT_KEY = `bot:user:next_manual_slot:${req.user!.userId}`;
+      const USER_SLOT_TTL = 60 * 60; // 1h — auto-expire stale slot keys
+      const MIN_STAGGER_MS = 60_000;   // 1 min minimum gap
+      const MAX_STAGGER_MS = 360_000;  // 6 min maximum gap
+
+      let jobDelayMs = 0;
+      let estimatedStartAt: Date | null = null;
+
+      if (!quick) {
+        const now = Date.now();
+        const nextSlotRaw = await _redis.get(USER_SLOT_KEY);
+        const nextSlotMs  = nextSlotRaw ? parseInt(nextSlotRaw, 10) : 0;
+
+        if (nextSlotMs > now) {
+          // Another job for this user is already queued/starting — delay this one
+          jobDelayMs = nextSlotMs - now;
+          estimatedStartAt = new Date(nextSlotMs);
+        } else {
+          // No pending slot: this job starts immediately
+          jobDelayMs = 0;
+          estimatedStartAt = new Date(now);
+        }
+
+        // Advance the slot: reserve from (job start time) + random 1–6 min
+        const thisJobStartMs  = now + jobDelayMs;
+        const nextGapMs       = Math.floor(Math.random() * (MAX_STAGGER_MS - MIN_STAGGER_MS)) + MIN_STAGGER_MS;
+        const nextSlotNewMs   = thisJobStartMs + nextGapMs;
+        await _redis.set(USER_SLOT_KEY, String(nextSlotNewMs), 'EX', USER_SLOT_TTL);
+      }
+
       const jobId = `gdt-bot-manual-${companyId}-${Date.now()}`;
       // BOT-ENT-01: Push to dedicated manual queue (high priority, concurrency=10)
       await getManualBotQueue().add('sync', {
         companyId,
+        triggeredByUserId: req.user!.userId,  // BUG2 FIX: proxy acquired for triggering user
         ...(from_date ? { fromDate: from_date } : {}),
         ...(to_date   ? { toDate:   to_date   } : {}),
         triggeredBy: quick ? 'user_quick_sync' : 'user_manual',
       }, {
         jobId,
-        priority: 1,           // highest priority in manual queue
+        delay:    jobDelayMs,   // 0 = immediate; >0 = human-like stagger
+        priority: 1,            // highest priority in manual queue
         attempts: 3,
         backoff:  { type: 'exponential', delay: 30_000 },
       });
@@ -245,7 +352,13 @@ router.post(
       // Set cooldown key
       await _redis.set(cooldownKey, '1', 'EX', cooldownTtlSec);
 
-      sendSuccess(res, { queued: true, jobId, quick: quick ?? false });
+      sendSuccess(res, {
+        queued:            true,
+        jobId,
+        quick:             quick ?? false,
+        delayed_sec:       Math.round(jobDelayMs / 1000),
+        estimated_start:   estimatedStartAt?.toISOString() ?? null,
+      });
     } catch (err) {
       next(err);
     }

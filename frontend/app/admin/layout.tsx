@@ -13,6 +13,7 @@ const NAV_ITEMS = [
   { href: '/admin/users',              label: 'Người dùng',       icon: '👥' },
   { href: '/admin/plans',              label: 'Gói dịch vụ',      icon: '💼' },
   { href: '/admin/analytics',          label: 'Phân tích',        icon: '📈' },
+  { href: '/admin/proxies',            label: 'Proxy Pool',       icon: '🌐' },
   { href: '/admin/crawler-recipes',    label: 'Crawler Recipes',  icon: '🔧' },
 ];
 

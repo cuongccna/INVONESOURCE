@@ -8,7 +8,21 @@ import { pool } from '../db/pool';
 import { env } from '../config/env';
 import { AuthError, ValidationError, NotFoundError } from '../utils/AppError';
 import { sendSuccess, sendError } from '../utils/response';
-import { authenticate } from '../middleware/auth';
+import { authenticate, setActiveSession } from '../middleware/auth';
+
+/** Lazy-loaded Redis for session reads (reuses auth middleware's export pattern) */
+let _sessionRedis: import('ioredis').default | null = null;
+async function getSessionId(userId: string): Promise<string | undefined> {
+  try {
+    if (!_sessionRedis) {
+      const Redis = (await import('ioredis')).default;
+      _sessionRedis = new Redis(env.REDIS_URL, { maxRetriesPerRequest: 1 });
+    }
+    return (await _sessionRedis.get(`user:session:${userId}`)) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 const hashToken = (token: string): string =>
   createHash('sha256').update(token).digest('hex');
@@ -46,12 +60,26 @@ router.post('/login', async (req: Request, res: Response, next: NextFunction) =>
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) throw new AuthError('Invalid email or password');
 
+    // ── Single-session enforcement ─────────────────────────────────────────
+    // Generate a unique session id. Store in Redis so that when this user logs
+    // in again, the old session's JWT is immediately rejected.
+    const sessionId = uuidv4();
+    await setActiveSession(user.id, sessionId);
+
+    // Revoke all previous refresh tokens — old sessions can't renew after expiry
+    await pool.query(
+      `UPDATE refresh_tokens SET revoked_at = NOW()
+       WHERE user_id = $1 AND revoked_at IS NULL`,
+      [user.id],
+    );
+
     const accessToken = jwt.sign(
       {
         userId: user.id,
         email: user.email,
         role: user.role ?? 'VIEWER',
         companyId: user.company_id,
+        sessionId,
         ...(user.is_platform_admin ? { is_platform_admin: true } : {}),
       },
       env.JWT_SECRET,
@@ -112,12 +140,17 @@ router.post('/refresh', async (req: Request, res: Response, next: NextFunction) 
     const row = tokenResult.rows[0];
     if (!row) throw new AuthError('Invalid or expired refresh token');
 
+    // Read current session id from Redis so the refreshed JWT carries it forward.
+    let sessionId: string | undefined;
+    sessionId = await getSessionId(row.user_id);
+
     const accessToken = jwt.sign(
       {
         userId: row.user_id,
         email: row.email,
         role: row.role ?? 'VIEWER',
         companyId: row.company_id,
+        ...(sessionId ? { sessionId } : {}),
         ...(row.is_platform_admin ? { is_platform_admin: true } : {}),
       },
       env.JWT_SECRET,
