@@ -885,7 +885,8 @@ export class GdtDirectApiService {
     const scoPath = this.recipe?.api.endpoints.scoSold ?? GDT_SCO_SOLD;
     const queryResult = await this._fetchRangeByMonth('sold', fromDate, toDate);
     await humanDelay(1_500, 3_000);
-    const scoResult = await this._fetchRangeByMonth('sold', fromDate, toDate, undefined, scoPath);
+    // SCO sold — always use weekly chunks to avoid the 50-item page limit bug on /sco-query.
+    const scoResult = await this._fetchScoByWeeks('sold', fromDate, toDate, scoPath);
 
     // Dedup by invoice_number + serial_number + invoice_date
     const seen   = new Set<string>();
@@ -933,10 +934,11 @@ export class GdtDirectApiService {
     const q6 = await this._fetchRangeByMonth('purchase', fromDate, toDate, 'ttxly==6');
     await humanDelay(1_500, 3_000);
 
-    // HĐ MTTTT via /sco-query — single call with NO ttxly filter.
+    // HĐ MTTTT via /sco-query — weekly chunks with NO ttxly filter.
     // The SCO endpoint returns all types (5/6/8) in one paginated response.
     // xml_available is derived from each row's ttxly value in mapInvoice.
-    const scoAll = await this._fetchRangeByMonth('purchase', fromDate, toDate, undefined, scoPurchasePath);
+    // Weekly chunking prevents the X-Total-Count = pageSize bug from truncating results.
+    const scoAll = await this._fetchScoByWeeks('purchase', fromDate, toDate, scoPurchasePath);
 
     // Merge & deduplicate across all three streams.
     // Dedup key: invoice_number + seller_tax_code + invoice_date
@@ -956,6 +958,52 @@ export class GdtDirectApiService {
       merged: merged.length,
     });
     return merged;
+  }
+
+  /**
+   * Fetch SCO invoices by splitting the date range into WEEKLY chunks.
+   *
+   * Root cause of the SCO 50-item limit (GDT bug):
+   *   /sco-query endpoints return X-Total-Count equal to the page size (50) instead of
+   *   the true total, OR return HTTP 500 on page > 0 for companies with > 50 MTT invoices
+   *   per month. Both cases cause _fetchAllPagesBuffered / _streamPages to stop after
+   *   exactly one page — silently truncating results.
+   *
+   * Fix: split the range into 7-day windows. Each chunk has ~10-25 invoices (far below
+   * page size = 50), so only one page is ever needed per chunk — the GDT limit is never hit.
+   * Errors per chunk are caught non-fatally so one bad week doesn't abort the full sync.
+   */
+  private async _fetchScoByWeeks(
+    endpoint:     'sold' | 'purchase',
+    fromDate:     Date,
+    toDate:       Date,
+    scoPath:      string,
+  ): Promise<RawInvoice[]> {
+    const chunks = splitIntoWeeks(fromDate, toDate);
+    logger.info('[GdtDirect] SCO weekly fetch', {
+      endpoint, totalChunks: chunks.length,
+      from: formatGdtDate(fromDate), to: formatGdtDate(toDate),
+    });
+    const all: RawInvoice[] = [];
+    for (let i = 0; i < chunks.length; i++) {
+      if (i > 0) await humanDelay(2_000, 5_000);
+      const { from, to } = chunks[i]!;
+      try {
+        const chunk = await this._fetchAllPagesBuffered(endpoint, from, to, undefined, scoPath);
+        all.push(...chunk);
+        logger.debug('[GdtDirect] SCO weekly chunk done', {
+          chunk: i + 1, total: chunks.length,
+          from: formatGdtDate(from), to: formatGdtDate(to), count: chunk.length,
+        });
+      } catch (err) {
+        logger.warn('[GdtDirect] SCO weekly chunk failed (non-fatal)', {
+          chunk: i + 1, total: chunks.length,
+          from: formatGdtDate(from), to: formatGdtDate(to),
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    return all;
   }
 
   /**
@@ -1359,14 +1407,42 @@ export class GdtDirectApiService {
     toDate:   Date,
   ): AsyncGenerator<RawInvoice[]> {
     const scoPath = this.recipe?.api.endpoints.scoSold ?? GDT_SCO_SOLD;
-    // Main endpoint
+    // Main endpoint — paginated over full date range
     for await (const batch of this._streamPages('sold', fromDate, toDate)) {
       yield batch;
     }
     await humanDelay(1_500, 3_000);
-    // SCO endpoint
-    for await (const batch of this._streamPages('sold', fromDate, toDate, undefined, scoPath)) {
-      yield batch;
+
+    // SCO endpoint — split into WEEKLY chunks.
+    // Root cause: GDT's /sco-query/invoices/sold returns X-Total-Count equal to the
+    // current page size (50) instead of the true total, OR returns HTTP 500 on page > 0
+    // for companies with many MTT invoices (> 50/month). This causes _streamPages to
+    // stop after exactly one page (50 items) even when hundreds exist.
+    // Fix: fetch one week at a time — each chunk has ~10-25 invoices, fits in 1 page,
+    // so pagination is never needed and the GDT limit is never hit.
+    // Each chunk is also isolated in its own try-catch so a transient 500 on one week
+    // does not abort the entire sync.
+    const scoSoldChunks = splitIntoWeeks(fromDate, toDate);
+    logger.info('[GdtDirect] SCO sold — fetching by weekly chunks', {
+      totalChunks: scoSoldChunks.length,
+      from: formatGdtDate(fromDate),
+      to:   formatGdtDate(toDate),
+    });
+    for (let i = 0; i < scoSoldChunks.length; i++) {
+      if (i > 0) await humanDelay(2_000, 5_000);
+      const { from, to } = scoSoldChunks[i]!;
+      try {
+        for await (const batch of this._streamPages('sold', from, to, undefined, scoPath)) {
+          yield batch;
+        }
+      } catch (err) {
+        logger.warn('[GdtDirect] SCO sold chunk failed (non-fatal, skipping chunk)', {
+          chunk: i + 1,
+          from:  formatGdtDate(from),
+          to:    formatGdtDate(to),
+          err:   err instanceof Error ? err.message : String(err),
+        });
+      }
     }
   }
 
@@ -1388,9 +1464,30 @@ export class GdtDirectApiService {
       yield batch;
     }
     await humanDelay(1_500, 3_000);
-    // SCO (no ttxly filter — all types)
-    for await (const batch of this._streamPages('purchase', fromDate, toDate, undefined, scoPurchasePath)) {
-      yield batch;
+
+    // SCO purchase endpoint — weekly chunks for the same reason as SCO sold.
+    // /sco-query/invoices/purchase also suffers from X-Total-Count = pageSize bug.
+    const scoPurchaseChunks = splitIntoWeeks(fromDate, toDate);
+    logger.info('[GdtDirect] SCO purchase — fetching by weekly chunks', {
+      totalChunks: scoPurchaseChunks.length,
+      from: formatGdtDate(fromDate),
+      to:   formatGdtDate(toDate),
+    });
+    for (let i = 0; i < scoPurchaseChunks.length; i++) {
+      if (i > 0) await humanDelay(2_000, 5_000);
+      const { from, to } = scoPurchaseChunks[i]!;
+      try {
+        for await (const batch of this._streamPages('purchase', from, to, undefined, scoPurchasePath)) {
+          yield batch;
+        }
+      } catch (err) {
+        logger.warn('[GdtDirect] SCO purchase chunk failed (non-fatal, skipping chunk)', {
+          chunk: i + 1,
+          from:  formatGdtDate(from),
+          to:    formatGdtDate(to),
+          err:   err instanceof Error ? err.message : String(err),
+        });
+      }
     }
   }
 
