@@ -101,20 +101,44 @@ export class HtkkXmlGenerator {
     const plucOutputSumSubtotal  = plucOutputItems.reduce((s, r) => s + r.subtotal,    0);
     const plucOutputSumReduction = plucOutputItems.reduce((s, r) => s + r.vatReduction, 0);
 
-    // [36] = [35] - [25] = Thuế GTGT phát sinh trong kỳ (net VAT for period)
-    const xml_ct36 = xml_ct35_total - n(d.ct25_total_deductible);
-    // [38] Điều chỉnh giảm = NQ142 reduction (2% × doanh thu bán ra 8%)
-    const xml_ct38 = plucOutputSumReduction;
-    // ct40a_raw = [36] + [22] + [37] - [38] - [39a]
-    // Note: [36]+[22] = (ct35-ct25)+ct22 = ct35-ct24, so ct22 self-cancels
-    const xml_ct40a_raw = xml_ct36 + n(d.ct24_carried_over_vat) - xml_ct38;
+    // ── FIX: [25] trong XML = CHỈ thuế đầu vào kỳ này (ct23_deductible_input_vat = form [24])
+    // KHÔNG bao gồm [22] kết chuyển kỳ trước. ct25_total_deductible=[24]+[22] chỉ dùng nội bộ.
+    const xml_ct25 = n(d.ct23_deductible_input_vat);
+    // [22] = kết chuyển từ kỳ trước
+    const xml_ct22 = n(d.ct24_carried_over_vat);
+
+    // [36] = [35] - [25] = Thuế GTGT phát sinh trong kỳ (chưa tính kết chuyển và điều chỉnh)
+    const xml_ct36 = xml_ct35_total - xml_ct25;
+
+    // [37] Điều chỉnh giảm = tự nhập (giảm số được khấu trừ kỳ trước)
+    // KHÔNG bao gồm giảm NQ142 (NQ142 giảm thuế phải nộp → thuộc ct38)
+    const xml_ct37 = n(d.ct37_adjustment_decrease ?? 0);
+
+    // [38] Điều chỉnh tăng = giảm thuế NQ142 + tăng khấu trừ kỳ trước (tự nhập)
+    // NQ142 GIẢM thuế phải nộp → đưa vào [38] "tăng" để trừ khỏi [40a]
+    const xml_ct38 = plucOutputSumReduction + n(d.ct38_adjustment_increase ?? 0);
+
+    // [40a] = MAX(0, [36] - [22] + [37] - [38])
+    // FIX: dấu [22] phải là trừ (kết chuyển làm giảm số phải nộp)
+    const xml_ct40a_raw = xml_ct36 - xml_ct22 + xml_ct37 - xml_ct38;
     // ct40a/ct40: phải nộp — chỉ > 0 khi đầu ra > đầu vào
     const xml_ct40a = Math.max(0, xml_ct40a_raw);
-    const xml_ct40  = xml_ct40a; // ct40 = ct40a - ct40b (ct40b = 0)
+    // ct40b = bù trừ dự án đầu tư (nhập tay)
+    const xml_ct40b = n(d.ct40b_investment_vat ?? 0);
+    const xml_ct40  = Math.max(0, xml_ct40a - xml_ct40b);
     // ct41: còn được khấu trừ chưa hết — chỉ > 0 khi đầu vào > đầu ra
-    const xml_ct41  = Math.max(0, -xml_ct40a_raw);
+    const xml_ct41  = Math.max(0, -xml_ct40a_raw) + Math.max(0, xml_ct40b - xml_ct40a);
     // ct43: kết chuyển sang kỳ sau = ct41 - ct42 (ct42 = 0)
     const xml_ct43  = xml_ct41;
+
+    // [26] = doanh thu không chịu thuế (KCT). Dùng ct26_kct_revenue nếu có, fallback ct30.
+    const xml_ct26  = n(d.ct26_kct_revenue ?? d.ct30_exempt_revenue);
+    // [29] = doanh thu thuế suất 0% (xuất khẩu)
+    const xml_ct29  = n(d.ct29_0pct_revenue ?? 0);
+    // [32a] = doanh thu KKKNT
+    const xml_ct32a = n(d.ct32a_kkknt_revenue ?? 0);
+    // [21] = không phát sinh (checkbox)
+    const xml_ct21  = d.ct21_no_activity ? 'true' : 'false';
 
     // ── 4. Ngày kỳ khai ──────────────────────────────────────────────────────
     const period = buildPeriod(declaration.period_month, declaration.period_year, isQuarterly);
@@ -188,23 +212,23 @@ export class HtkkXmlGenerator {
                     <ct11c_tinhTP_ten/>
                 </DiaChiHDSXKDKhacTinhNDTSC>
             </Header>
-            <ct21>false</ct21>
-            <ct22>${n(d.ct24_carried_over_vat)}</ct22>
+            <ct21>${xml_ct21}</ct21>
+            <ct22>${xml_ct22}</ct22>
             <GiaTriVaThueGTGTHHDVMuaVao>
                 <ct23>${n(inputSubtotal)}</ct23>
-                <ct24>${n(d.ct23_deductible_input_vat)}</ct24>
+                <ct24>${xml_ct25}</ct24>
             </GiaTriVaThueGTGTHHDVMuaVao>
             <HangHoaDichVuNhapKhau>
                 <ct23a>0</ct23a>
                 <ct24a>0</ct24a>
             </HangHoaDichVuNhapKhau>
-            <ct25>${n(d.ct25_total_deductible)}</ct25>
-            <ct26>${n(d.ct30_exempt_revenue)}</ct26>
+            <ct25>${xml_ct25 + xml_ct22}</ct25>
+            <ct26>${xml_ct26}</ct26>
             <HHDVBRaChiuThueGTGT>
                 <ct27>${xml_ct27_taxable}</ct27>
                 <ct28>${xml_ct28_vat}</ct28>
             </HHDVBRaChiuThueGTGT>
-            <ct29>0</ct29>
+            <ct29>${xml_ct29}</ct29>
             <HHDVBRaChiuTSuat5>
                 <ct30>${n(d.ct32_revenue_5pct)}</ct30>
                 <ct31>${n(d.ct33_vat_5pct)}</ct31>
@@ -213,17 +237,17 @@ export class HtkkXmlGenerator {
                 <ct32>${xml_ct32_revenue}</ct32>
                 <ct33>${xml_ct33_vat}</ct33>
             </HHDVBRaChiuTSuat10>
-            <ct32a>0</ct32a>
+            <ct32a>${xml_ct32a}</ct32a>
             <TongDThuVaThueGTGTHHDVBRa>
                 <ct34>${n(d.ct40_total_output_revenue)}</ct34>
                 <ct35>${xml_ct35_total}</ct35>
             </TongDThuVaThueGTGTHHDVBRa>
             <ct36>${xml_ct36}</ct36>
-            <ct37>0</ct37>
+            <ct37>${xml_ct37}</ct37>
             <ct38>${xml_ct38}</ct38>
             <ct39a>0</ct39a>
             <ct40a>${xml_ct40a}</ct40a>
-            <ct40b>0</ct40b>
+            <ct40b>${xml_ct40b}</ct40b>
             <ct40>${xml_ct40}</ct40>
             <ct41>${xml_ct41}</ct41>
             <ct42>0</ct42>

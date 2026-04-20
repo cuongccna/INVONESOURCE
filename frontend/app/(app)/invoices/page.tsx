@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import apiClient from '../../../lib/apiClient';
 import { useCompany } from '../../../contexts/CompanyContext';
@@ -163,49 +163,11 @@ export default function InvoicesPage() {
     if (!companyLoading) void load(1);
   }, [load, companyLoading]);
 
-  // ── Sync processboard state ───────────────────────────────────────────────
-  type SyncPhase = 'idle' | 'connecting' | 'fetching' | 'done' | 'error';
-  interface SyncResult { outputCount: number; inputCount: number; durationSec: number; finishedAt: Date }
-  const [syncPhase, setSyncPhase]   = useState<SyncPhase>('idle');
-  const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
-  const [syncError, setSyncError]   = useState('');
-  const syncStartRef = useRef<number>(0);
-  const syncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const clearSyncTimer = () => { if (syncTimerRef.current) { clearTimeout(syncTimerRef.current); syncTimerRef.current = null; } };
-  useEffect(() => () => clearSyncTimer(), []);
-
-  const handleSync = async () => {
-    if (!activeCompany?.tax_code || syncPhase !== 'idle') return;
-    setSyncPhase('connecting');
-    setSyncResult(null);
-    setSyncError('');
-    syncStartRef.current = Date.now();
-
-    // Fake "connecting" phase 1-2s — gives user tactile feedback
-    await new Promise(r => { syncTimerRef.current = setTimeout(r, 1000 + Math.random() * 1000); });
-
-    try {
-      const now = new Date();
-      const invoiceType = direction === 'input' ? 'purchase' : 'sale';
-      await apiClient.post('/sync-status/trigger', {
-        mst:         activeCompany.tax_code,
-        invoiceType,
-        periodYear:  now.getFullYear(),
-        periodMonth: now.getMonth() + 1,
-      });
-    } catch (err: unknown) {
-      const status = (err as { response?: { status?: number } })?.response?.status;
-      setSyncError(status === 409 ? 'Đang có đồng bộ khác đang chạy, vui lòng chờ.' : 'Lỗi kết nối. Vui lòng thử lại.');
-      setSyncPhase('error');
-      return;
-    }
-
-    // Fake "fetching" phase 1-2s while we wait for data reload
-    setSyncPhase('fetching');
-    await new Promise(r => { syncTimerRef.current = setTimeout(r, 1000 + Math.random() * 1000); });
-
-    // Reload invoice list and capture result
+  // ── Refresh handler — just re-fetch data, no GDT sync trigger ──────────
+  const [refreshing, setRefreshing] = useState(false);
+  const handleRefresh = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
     try {
       const params: Record<string, unknown> = { page: 1, pageSize };
       if (direction)    params.direction    = direction;
@@ -218,21 +180,11 @@ export default function InvoicesPage() {
       setInvoices(res.data.data);
       setMeta(res.data.meta);
       setSelectedIds([]);
-
-      const durationSec = Math.round((Date.now() - syncStartRef.current) / 1000);
-      // Estimate output/input split from current visible data (direction filter)
-      const shownData = res.data.data;
-      const outCount  = direction === 'output' ? res.data.meta.total
-                      : direction === 'input'  ? 0
-                      : shownData.filter(i => i.direction === 'output').length;
-      const inCount   = direction === 'input'  ? res.data.meta.total
-                      : direction === 'output' ? 0
-                      : shownData.filter(i => i.direction === 'input').length;
-      setSyncResult({ outputCount: outCount, inputCount: inCount, durationSec, finishedAt: new Date() });
-      setSyncPhase('done');
+      toast.success('Đã làm mới dữ liệu');
     } catch {
-      setSyncError('Tải dữ liệu sau đồng bộ thất bại.');
-      setSyncPhase('error');
+      toast.error('Làm mới thất bại. Vui lòng thử lại.');
+    } finally {
+      setRefreshing(false);
     }
   };
 
@@ -257,6 +209,16 @@ export default function InvoicesPage() {
     }
   };
 
+  const handleToggleNonDeductible = async (id: string, value: boolean) => {
+    try {
+      await apiClient.patch(`/invoices/${id}/non-deductible`, { non_deductible: value });
+      setInvoices(prev => prev.map(inv => inv.id === id ? { ...inv, non_deductible: value } : inv));
+      toast.success(value ? 'Đã loại khỏi khấu trừ thuế' : 'Đã đưa lại vào khấu trừ');
+    } catch {
+      toast.error('Cập nhật thất bại. Vui lòng thử lại.');
+    }
+  };
+
   return (
     <div className="p-4 max-w-[1400px] mx-auto">
       {/* ── Header ── */}
@@ -273,105 +235,19 @@ export default function InvoicesPage() {
           </div>
         </div>
         <div className="flex items-center gap-2">
-          {/* Single "Đồng Bộ" button — refresh icon removed (same function) */}
+          {/* Refresh button — re-fetches data from DB, no GDT sync */}
           <button
-            onClick={() => void handleSync()}
-            disabled={syncPhase !== 'idle' && syncPhase !== 'done' && syncPhase !== 'error'}
+            onClick={() => void handleRefresh()}
+            disabled={refreshing}
             className="flex items-center gap-2 bg-primary-600 text-white px-4 py-2 rounded-lg text-sm font-medium disabled:opacity-60 hover:bg-primary-700 transition-colors"
           >
-            <svg className={`w-4 h-4 ${syncPhase === 'connecting' || syncPhase === 'fetching' ? 'animate-spin' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
             </svg>
-            {syncPhase === 'connecting' ? 'Đang kết nối...'
-              : syncPhase === 'fetching' ? 'Đang tải...'
-              : 'Đồng Bộ'}
+            {refreshing ? 'Đang tải...' : 'Làm mới'}
           </button>
         </div>
       </div>
-
-      {/* ── Sync Processboard ── */}
-      {syncPhase !== 'idle' && (
-        <div className={`rounded-xl border mb-4 overflow-hidden transition-all ${
-          syncPhase === 'done'  ? 'border-emerald-200 bg-emerald-50'
-          : syncPhase === 'error' ? 'border-red-200 bg-red-50'
-          : 'border-blue-200 bg-blue-50'
-        }`}>
-          <div className="px-4 py-3 flex items-center gap-3">
-            {/* Phase icon */}
-            {(syncPhase === 'connecting' || syncPhase === 'fetching') && (
-              <div className="flex-shrink-0 w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center">
-                <svg className="w-4 h-4 text-blue-600 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                </svg>
-              </div>
-            )}
-            {syncPhase === 'done' && (
-              <div className="flex-shrink-0 w-8 h-8 rounded-full bg-emerald-100 flex items-center justify-center">
-                <svg className="w-4 h-4 text-emerald-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                </svg>
-              </div>
-            )}
-            {syncPhase === 'error' && (
-              <div className="flex-shrink-0 w-8 h-8 rounded-full bg-red-100 flex items-center justify-center">
-                <svg className="w-4 h-4 text-red-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </div>
-            )}
-
-            {/* Phase text */}
-            <div className="flex-1 min-w-0">
-              {syncPhase === 'connecting' && (
-                <p className="text-sm font-medium text-blue-800">Đang kết nối hệ thống cache...</p>
-              )}
-              {syncPhase === 'fetching' && (
-                <div>
-                  <p className="text-sm font-medium text-blue-800">Đang tải dữ liệu hóa đơn...</p>
-                  <div className="mt-1.5 h-1.5 bg-blue-200 rounded-full overflow-hidden w-48">
-                    <div className="h-full bg-blue-500 rounded-full animate-[loading_1.5s_ease-in-out_infinite]" style={{width:'60%'}} />
-                  </div>
-                </div>
-              )}
-              {syncPhase === 'done' && syncResult && (
-                <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-                  <p className="text-sm font-semibold text-emerald-800">✓ Đồng bộ hoàn tất</p>
-                  <div className="flex flex-wrap gap-3 text-xs text-emerald-700">
-                    <span className="bg-emerald-100 px-2 py-0.5 rounded-full font-medium">
-                      ↑ Bán ra: {syncResult.outputCount.toLocaleString('vi-VN')}
-                    </span>
-                    <span className="bg-emerald-100 px-2 py-0.5 rounded-full font-medium">
-                      ↓ Mua vào: {syncResult.inputCount.toLocaleString('vi-VN')}
-                    </span>
-                    <span className="bg-emerald-100 px-2 py-0.5 rounded-full font-medium">
-                      ⏱ {syncResult.durationSec}s
-                    </span>
-                    <span className="text-emerald-600">
-                      Lần cuối: {syncResult.finishedAt.toLocaleTimeString('vi-VN')}
-                    </span>
-                  </div>
-                </div>
-              )}
-              {syncPhase === 'error' && (
-                <p className="text-sm font-medium text-red-800">{syncError}</p>
-              )}
-            </div>
-
-            {/* Dismiss after done/error */}
-            {(syncPhase === 'done' || syncPhase === 'error') && (
-              <button
-                onClick={() => { setSyncPhase('idle'); setSyncResult(null); setSyncError(''); }}
-                className="flex-shrink-0 text-gray-400 hover:text-gray-700 ml-2"
-                title="Đóng"
-              >
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            )}
-          </div>
-        </div>
-      )}
 
       {/* ── Import session banner ── */}
       {importSessionId && (
@@ -503,6 +379,7 @@ export default function InvoicesPage() {
         onSelectionChange={setSelectedIds}
         onDelete={(id) => setDeleteTarget(id)}
         onPermanentIgnore={(id) => setIgnoreTarget(id)}
+        onToggleNonDeductible={(id, value) => void handleToggleNonDeductible(id, value)}
         onPageChange={(p) => void load(p)}
         onPageSizeChange={(size) => setPageSize(size)}
         onExcelExport={handleExcelExport}

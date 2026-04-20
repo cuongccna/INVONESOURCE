@@ -123,16 +123,23 @@ async function storeVolumeEstimate(
  * Returns between 3 minutes (minimum) and 30 minutes (cap).
  */
 function calculateJobTimeout(estimate: { outCount: number; inCount: number }): number {
+  const { getPeakTimeoutMultiplier } = require('./gdt-direct-api.service');
+  const m: number = getPeakTimeoutMultiplier();
   const total      = Math.max(0, estimate.outCount) + Math.max(0, estimate.inCount);
   const LOGIN_TIME = 16_000;
   const LIST_TIME  = Math.ceil(total / 50) * 1_000;
-  const DETAIL_TIME = total * 12_000;   // worst case: sco-query
+  // Peak: detail time per invoice increases from 12s to 30s (GDT responses much slower)
+  const detailPerInvoice = m > 1 ? 30_000 : 12_000;
+  const DETAIL_TIME = total * detailPerInvoice;
   const BUFFER      = 60_000;
   const ms = LOGIN_TIME + LIST_TIME + DETAIL_TIME + BUFFER;
-  const result = Math.min(Math.max(ms, 3 * 60_000), 30 * 60_000);
+  // Peak: cap increases from 30min to 90min
+  const maxCap = m > 1 ? 90 * 60_000 : 30 * 60_000;
+  const result = Math.min(Math.max(ms, 3 * 60_000), maxCap);
   logger.info('[SyncWorker] Dynamic timeout calculated', {
     total,
     timeoutMin: Math.round(result / 60_000),
+    peakMultiplier: m,
   });
   return result;
 }
@@ -230,7 +237,12 @@ const _sessionCache = new GdtSessionCache(_lockRedis);
 // FIX-2: Pagination checkpoint singleton — resumes on crash, no restart from page 0
 const _checkpoint   = new SyncCheckpoint(_lockRedis);
 const BOT_LOCK_PREFIX   = 'bot:sync:lock:';
-const BOT_LOCK_TTL      = 45 * 60; // 45 min — upper bound for any single sync run
+// Peak period: increase lock TTL from 45min to 120min to prevent lock expiry during long syncs
+function getBotLockTtl(): number {
+  const { getPeakTimeoutMultiplier } = require('./gdt-direct-api.service');
+  const m: number = getPeakTimeoutMultiplier();
+  return m > 1 ? 120 * 60 : 45 * 60; // seconds
+}
 const BOT_CANCEL_PREFIX = 'bot:sync:cancel:';
 
 // Fenced-lock Lua script: only DELETE if value matches our token.
@@ -255,7 +267,7 @@ const _activeLockTokens = new Map<string, string>();
  */
 async function acquireCompanyLock(companyId: string): Promise<string | null> {
   const token  = uuidv4();
-  const result = await _lockRedis.set(`${BOT_LOCK_PREFIX}${companyId}`, token, 'EX', BOT_LOCK_TTL, 'NX');
+  const result = await _lockRedis.set(`${BOT_LOCK_PREFIX}${companyId}`, token, 'EX', getBotLockTtl(), 'NX');
   return result === 'OK' ? token : null;
 }
 
@@ -355,12 +367,6 @@ interface SyncJobData {
 }
 
 const xmlParser = new GdtXmlParser();
-
-// Max XML (line items) fetches per sync run — keeps runs bounded in time
-const MAX_XML_FETCHES_PER_RUN = 50;
-// Delay between consecutive XML fetches to respect GDT rate limit (~1 req/3s)
-const XML_FETCH_DELAY_MIN = 2500;
-const XML_FETCH_DELAY_MAX = 4500;
 
 // ── Phase 5: Smart enqueue with mutual exclusion ──────────────────────────────
 
@@ -603,7 +609,7 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
   // a second job to acquire the lock and cause concurrent DB writes.
   const lockHeartbeat = setInterval(async () => {
     try {
-      await _lockRedis.expire(`${BOT_LOCK_PREFIX}${companyId}`, BOT_LOCK_TTL);
+      await _lockRedis.expire(`${BOT_LOCK_PREFIX}${companyId}`, getBotLockTtl());
     } catch (e) {
       logger.warn('[SyncWorker] Lock heartbeat thất bại (non-fatal)', { companyId, err: (e as Error).message });
     }
@@ -953,8 +959,6 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
         source: jobFromDate ? 'job' : 'default',
       });
 
-      let xmlFetchCount = 0;
-
       const yyyymm = `${fromDate.getFullYear()}${String(fromDate.getMonth() + 1).padStart(2, '0')}`;
 
       // ── Pre-sync proxy freshness check ───────────────────────────────────────
@@ -1055,13 +1059,11 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
               .expire(outDedupSetKey, 7200)
               .exec().catch(() => {});
 
-            // Line items (XML fetch) per invoice in slice
+            // Line items (detail API) per invoice in slice
             for (const { inv } of slice) {
               const invoiceId = idMap.get(_invMapKey(inv)) ?? null;
-              if (invoiceId && xmlFetchCount < MAX_XML_FETCHES_PER_RUN) {
-                const xmlFetched = await _maybeInsertLineItems(runner, inv, invoiceId, companyId);
-                xmlFetchCount += xmlFetched;
-                if (xmlFetched > 0) await jitteredDelay();
+              if (invoiceId) {
+                await _maybeInsertLineItems(runner, inv, invoiceId, companyId);
               }
             }
           }
@@ -1129,10 +1131,8 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
             for (const { inv } of slice) {
               const invoiceId = idMap.get(_invMapKey(inv)) ?? null;
-              if (invoiceId && xmlFetchCount < MAX_XML_FETCHES_PER_RUN) {
-                const xmlFetched = await _maybeInsertLineItems(runner, inv, invoiceId, companyId);
-                xmlFetchCount += xmlFetched;
-                if (xmlFetched > 0) await jitteredDelay();
+              if (invoiceId) {
+                await _maybeInsertLineItems(runner, inv, invoiceId, companyId);
               }
             }
           }
@@ -1362,6 +1362,7 @@ async function _batchUpsertInvoices(
   const totals:         (number | null)[]  = [];
   const vatAmounts:     (number | null)[]  = [];
   const vatRates:       (string | null)[]  = [];
+  const taxCategories:  (string | null)[]  = [];
   const invoiceGroups:  (number | null)[]  = [];
   const serialHasCqts:  (boolean | null)[] = [];
   const hasLineItemsArr: boolean[]         = [];
@@ -1385,6 +1386,7 @@ async function _batchUpsertInvoices(
     totals.push(inv.total_amount ?? null);
     vatAmounts.push(inv.vat_amount ?? null);
     vatRates.push(inv.vat_rate ?? null);
+    taxCategories.push(inv.tax_category ?? null);
     invoiceGroups.push(invoiceGroup);
     serialHasCqts.push(serialHasCqt);
     hasLineItemsArr.push(hasLineItems);
@@ -1403,27 +1405,27 @@ async function _batchUpsertInvoices(
     `INSERT INTO invoices
      (id, company_id, invoice_number, serial_number, invoice_date, direction, status,
       seller_name, seller_tax_code, buyer_name, buyer_tax_code,
-      subtotal, total_amount, vat_amount, vat_rate, gdt_validated, source, provider,
+      subtotal, total_amount, vat_amount, vat_rate, tax_category, gdt_validated, source, provider,
       invoice_group, serial_has_cqt, has_line_items, is_sco,
       tc_hdon, khhd_cl_quan, so_hd_cl_quan, created_at)
      SELECT
        t.id, t.company_id, t.invoice_number, t.serial_number,
        COALESCE(t.invoice_date::date, CURRENT_DATE), t.direction, t.status,
        t.seller_name, COALESCE(t.seller_tax_code, ''), t.buyer_name, t.buyer_tax_code,
-       t.subtotal, t.total_amount, t.vat_amount, t.vat_rate,
+       t.subtotal, t.total_amount, t.vat_amount, t.vat_rate, t.tax_category,
        true, 'gdt_bot', 'gdt_bot',
        t.invoice_group, t.serial_has_cqt, t.has_line_items, t.is_sco,
        t.tc_hdon, t.khhd_cl_quan, t.so_hd_cl_quan, NOW()
      FROM UNNEST(
        $1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::text[], $6::invoice_direction[], $7::invoice_status[],
        $8::text[], $9::text[], $10::text[], $11::text[],
-       $12::numeric[], $13::numeric[], $14::numeric[], $15::numeric[],
-       $16::int[], $17::boolean[], $18::boolean[], $19::boolean[],
-       $20::smallint[], $21::text[], $22::text[]
+       $12::numeric[], $13::numeric[], $14::numeric[], $15::numeric[], $16::text[],
+       $17::int[], $18::boolean[], $19::boolean[], $20::boolean[],
+       $21::smallint[], $22::text[], $23::text[]
      ) AS t(
        id, company_id, invoice_number, serial_number, invoice_date, direction, status,
        seller_name, seller_tax_code, buyer_name, buyer_tax_code,
-       subtotal, total_amount, vat_amount, vat_rate,
+       subtotal, total_amount, vat_amount, vat_rate, tax_category,
        invoice_group, serial_has_cqt, has_line_items, is_sco,
        tc_hdon, khhd_cl_quan, so_hd_cl_quan
      )
@@ -1440,6 +1442,7 @@ async function _batchUpsertInvoices(
        total_amount   = EXCLUDED.total_amount,
        vat_amount     = EXCLUDED.vat_amount,
        vat_rate       = EXCLUDED.vat_rate,
+       tax_category   = COALESCE(EXCLUDED.tax_category, invoices.tax_category),
        gdt_validated  = true,
        invoice_group  = COALESCE(EXCLUDED.invoice_group,  invoices.invoice_group),
        serial_has_cqt = COALESCE(EXCLUDED.serial_has_cqt, invoices.serial_has_cqt),
@@ -1457,7 +1460,7 @@ async function _batchUpsertInvoices(
     [
       ids, compArr, invNums, serials, dates, dirArr, statuses,
       sellerNames, sellerTaxes, buyerNames, buyerTaxes,
-      subtotals, totals, vatAmounts, vatRates,
+      subtotals, totals, vatAmounts, vatRates, taxCategories,
       invoiceGroups, serialHasCqts, hasLineItemsArr, isScos,
       tcHdons, khhdClQuans, soHdClQuans,
     ],
@@ -1602,13 +1605,9 @@ async function _maybeInsertLineItems(
   invoiceId: string,
   companyId: string,
 ): Promise<number> {
-  // NOTE: xml_available=false (ttxly==6, ttxly==8) means export-xml returns HTTP 500.
-  // However, /query/invoices/detail DOES return hdhhdvu line items for all invoice types.
-  // We always attempt the detail API first; xml_available only gates the XML ZIP fallback below.
-
   // Need invoice_number + serial_number + seller_tax_code to call detail API
   if (!inv.invoice_number || !inv.serial_number || !inv.seller_tax_code) {
-    logger.info('[SyncWorker] XML skip — missing params', {
+    logger.info('[SyncWorker] Detail skip — missing params', {
       invoiceId,
       invoice_number:  inv.invoice_number,
       serial_number:   inv.serial_number,
@@ -1624,12 +1623,10 @@ async function _maybeInsertLineItems(
   );
   if (existing.rows.length > 0) return 0;
 
-  // Rate-limit: small delay before every detail/XML fetch
-  await thinkTime(XML_FETCH_DELAY_MIN, XML_FETCH_DELAY_MAX);
+  // Rate-limit: small delay before detail fetch
+  await thinkTime(2500, 4500);
 
-  // ── Strategy 1: Detail API (JSON, ~6KB) ─────────────────────────────────
-  // Uses the normal HTTP CONNECT proxy — small JSON response, always reliable.
-  // Avoids downloading 400KB+ binary ZIP which TMProxy 4G sessions cannot complete.
+  // Detail API (JSON) — only strategy (XML fallback removed to reduce GDT load)
   try {
     const detail = await gdtApi.fetchInvoiceDetail({
       nbmst:    inv.seller_tax_code,
@@ -1651,48 +1648,7 @@ async function _maybeInsertLineItems(
     const msg = detailErr instanceof Error ? detailErr.message : String(detailErr);
     // 401 = token expired, propagate
     if (msg.includes('token expired')) throw detailErr;
-    logger.warn('[SyncWorker] Detail API failed — falling back to XML', { invoiceId, isSco: inv.is_sco, msg });
-  }
-
-  // ── Strategy 2: XML ZIP fallback ────────────────────────────────────────
-  // Only reached if detail API fails (network error, unexpected 500, etc.)
-  // xml_available=false: ttxly==6 (không mã) and ttxly==8 (ủy nhiệm) have no XML on GDT server.
-  // For SCO (is_sco=true) types 6/8: detail API should succeed above; reaching here means GDT API error.
-  // For non-SCO ttxly==6: /query/invoices/detail returns 500; no XML either — GDT limitation.
-  if (!inv.xml_available) {
-    logger.info('[SyncWorker] XML skip — no XML available for this invoice', { invoiceId, isSco: inv.is_sco });
-    return 1;
-  }
-  try {
-    let xmlBuf: Buffer;
-    try {
-      xmlBuf = await gdtApi.exportInvoiceXml({
-        nbmst:    inv.seller_tax_code,
-        khhdon:   inv.serial_number,
-        shdon:    inv.invoice_number,
-        khmshdon: 1,
-      });
-    } catch (firstErr: unknown) {
-      const is429 = firstErr instanceof Error && firstErr.message.includes('429');
-      if (!is429) throw firstErr;
-      logger.warn('[SyncWorker] XML fetch 429 — waiting 12s then retrying once', { invoiceId });
-      await thinkTime(12_000, 15_000);
-      xmlBuf = await gdtApi.exportInvoiceXml({
-        nbmst:    inv.seller_tax_code,
-        khhdon:   inv.serial_number,
-        shdon:    inv.invoice_number,
-        khmshdon: 1,
-      });
-    }
-
-    const lineItems: LineItem[] = xmlParser.parseLineItems(xmlBuf);
-    if (lineItems.length > 0) {
-      await _bulkInsertLineItems(lineItems, invoiceId, companyId);
-      logger.info('[SyncWorker] Line items inserted (XML)', { invoiceId, count: lineItems.length });
-    }
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    logger.warn('[SyncWorker] Line items fetch failed (non-fatal)', { invoiceId, msg });
+    logger.warn('[SyncWorker] Detail API failed (non-fatal, skipping line items)', { invoiceId, isSco: inv.is_sco, msg });
   }
   return 1;
 }
@@ -1723,6 +1679,11 @@ async function _bulkInsertLineItems(
       unit, quantity, unit_price, subtotal, vat_rate, vat_amount, total)
      VALUES ${values13}`,
     params,
+  );
+  // Fix: update has_line_items after successfully inserting line items
+  await pool.query(
+    `UPDATE invoices SET has_line_items = true WHERE id = $1 AND has_line_items = false`,
+    [invoiceId],
   );
 }
 

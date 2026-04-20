@@ -169,6 +169,78 @@ router.patch(
   }
 );
 
+// PATCH /api/declarations/:id/manual-fields — nhập tay các chỉ tiêu [37],[38],[40b],[21]
+router.patch(
+  '/:id/manual-fields',
+  requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const body = z.object({
+        ct37: z.number().int().min(0).nullable().optional(),
+        ct38: z.number().int().min(0).nullable().optional(),
+        ct40b: z.number().int().min(0).nullable().optional(),
+        ct21: z.boolean().nullable().optional(),
+      }).parse(req.body);
+
+      // Fetch current row to recalculate payable/carry-forward
+      const { rows } = await pool.query<{
+        ct23_deductible_input_vat: string;
+        ct24_carried_over_vat: string;
+        ct40a_total_output_vat: string;
+        ct36_nq_vat_reduction: string;
+      }>(
+        `SELECT ct23_deductible_input_vat, ct24_carried_over_vat, ct40a_total_output_vat, ct36_nq_vat_reduction
+         FROM tax_declarations WHERE id = $1 AND company_id = $2`,
+        [req.params.id, req.user!.companyId]
+      );
+      if (!rows[0]) throw new NotFoundError('Declaration not found');
+
+      const ct23  = Number(rows[0].ct23_deductible_input_vat ?? 0);
+      const ct24  = Number(rows[0].ct24_carried_over_vat ?? 0);
+      const ct25  = ct23 + ct24;
+      const ct40a = Number(rows[0].ct40a_total_output_vat ?? 0);
+      const nqRed = Number(rows[0].ct36_nq_vat_reduction ?? 0);
+
+      const ct37_manual  = body.ct37  ?? 0;
+      const ct38_manual  = body.ct38  ?? 0;
+      const ct40b_manual = body.ct40b ?? 0;
+
+      const net      = ct40a - nqRed - ct25 + ct37_manual - ct38_manual;
+      const ct40_pay = Math.max(0, Math.max(0, net) - ct40b_manual);
+      const ct41     = Math.max(0, -net) + Math.max(0, ct40b_manual - Math.max(0, net));
+      const ct43     = ct41;
+
+      const result = await pool.query(
+        `UPDATE tax_declarations
+         SET ct37_adjustment_decrease = $1,
+             ct38_adjustment_increase = $2,
+             ct40b_investment_vat     = $3,
+             ct21_no_activity         = $4,
+             ct41_payable_vat         = $5,
+             ct43_carry_forward_vat   = $6,
+             xml_content              = NULL,
+             xml_generated_at         = NULL,
+             updated_at               = NOW()
+         WHERE id = $7 AND company_id = $8
+           AND submission_status NOT IN ('submitted','accepted')
+         RETURNING *`,
+        [
+          body.ct37  ?? null,
+          body.ct38  ?? null,
+          body.ct40b ?? null,
+          body.ct21  ?? null,
+          ct40_pay, ct43,
+          req.params.id, req.user!.companyId,
+        ]
+      );
+      if (!result.rows[0]) throw new NotFoundError('Declaration not found or already submitted');
+      sendSuccess(res, result.rows[0], 'Đã cập nhật chỉ tiêu nhập tay');
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
 // PATCH /api/declarations/:id/status
 router.patch(
   '/:id/status',

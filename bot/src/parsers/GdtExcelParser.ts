@@ -128,6 +128,7 @@ export class GdtExcelParser {
       tc_hdon:         0,
       khhd_cl_quan:    null,
       so_hd_cl_quan:   null,
+      tax_category:    this._extractTaxCategory(get('vat_rate')),
     };
   }
 
@@ -175,6 +176,18 @@ export class GdtExcelParser {
     if (s === '5' || s === '5%') return '5%';
     if (s === '8' || s === '8%') return '8%';
     if (s === '10' || s === '10%') return '10%';
+    return null;
+  }
+
+  private _extractTaxCategory(raw: unknown): string | null {
+    if (raw == null) return null;
+    const s = String(raw).trim().toUpperCase().replace('%', '');
+    if (s === 'KCT') return 'KCT';
+    if (s === 'KKKNT' || s === 'KKKTT') return 'KKKNT';
+    if (s === '0') return '0';
+    if (s === '5') return '5';
+    if (s === '8') return '8';
+    if (s === '10') return '10';
     return null;
   }
 }

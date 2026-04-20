@@ -7,6 +7,7 @@ import { setAccessToken } from '../lib/apiClient';
 import { CompanyProvider } from '../contexts/CompanyContext';
 import { ViewProvider, useView } from '../contexts/ViewContext';
 import { SyncProvider, useSyncContext } from '../contexts/SyncContext';
+import { AuthProvider } from '../contexts/AuthContext';
 import Header from './Header';
 import BottomNav from './BottomNav';
 import SyncProgressPanel from './SyncProgressPanel';
@@ -142,6 +143,7 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
   }
 
   return (
+    <AuthProvider>
     <SyncProvider>
       <CompanyProvider>
         <ViewProvider>
@@ -159,5 +161,7 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
         </ViewProvider>
       </CompanyProvider>
     </SyncProvider>
+    </AuthProvider>
+
   );
 }

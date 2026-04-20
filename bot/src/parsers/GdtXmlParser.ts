@@ -55,6 +55,15 @@ export interface RawInvoice {
   khhd_cl_quan:    string | null;
   /** Số hóa đơn bị thay thế/điều chỉnh (shdon của hóa đơn gốc). */
   so_hd_cl_quan:   string | null;
+  /**
+   * Phân loại thuế suất — dùng để phân bucket chỉ tiêu tờ khai 01/GTGT:
+   *   'KCT'   = Không chịu thuế GTGT ([26])
+   *   'KKKNT' = Không phải kê khai, tính nộp GTGT ([32a])
+   *   '0'     = Thuế suất 0% / xuất khẩu ([29])
+   *   '5'|'8'|'10' = thuế suất thông thường ([30]/[32])
+   * null = chưa xác định
+   */
+  tax_category:    string | null;
 }
 
 export interface LineItem {
@@ -171,6 +180,7 @@ export class GdtXmlParser {
       tc_hdon:         this._num(ttchung, 'TCHDon', 'tcHDon', 'LHDCLQuan') ?? 0,
       khhd_cl_quan:    this._str(ttchung, 'KHHDCLQuan', 'KHHDon_goc', 'kHHDCLQuan'),
       so_hd_cl_quan:   this._str(ttchung, 'SHDCLQuan',  'SHDon_goc',  'sHDCLQuan'),
+      tax_category:    this._extractTaxCategory(this._val(ndhdon, 'TSuat', 'tSuat')),
     };
   }
 
@@ -248,6 +258,18 @@ export class GdtXmlParser {
     if (s === '8' || s === '8%') return '8%';
     if (s === '10' || s === '10%') return '10%';
     return s.toLowerCase() || null;
+  }
+
+  private _extractTaxCategory(raw: unknown): string | null {
+    if (raw == null) return null;
+    const s = String(raw).trim().toUpperCase().replace('%', '');
+    if (s === 'KCT') return 'KCT';
+    if (s === 'KKKNT' || s === 'KKKTT') return 'KKKNT';
+    if (s === '0') return '0';
+    if (s === '5') return '5';
+    if (s === '8') return '8';
+    if (s === '10') return '10';
+    return null;
   }
 
   /**

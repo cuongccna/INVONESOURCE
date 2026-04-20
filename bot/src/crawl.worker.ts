@@ -194,11 +194,13 @@ function createGdtClient(
 
   const client = axios.create(axiosConfig);
 
-  // Request interceptor: per-endpoint timeout
+  // Request interceptor: per-endpoint timeout (with peak period multiplier)
   client.interceptors.request.use((reqConfig) => {
     const url = reqConfig.url ?? '';
     const path = url.startsWith('/') ? url.split('?')[0] : new URL(url, config.api.baseUrl).pathname;
-    reqConfig.timeout = config.api.endpointTimeouts[path] ?? config.timing.requestTimeoutMs;
+    const baseTimeout = config.api.endpointTimeouts[path] ?? config.timing.requestTimeoutMs;
+    const { getPeakTimeoutMultiplier } = require('./gdt-direct-api.service');
+    reqConfig.timeout = Math.round(baseTimeout * getPeakTimeoutMultiplier());
     return reqConfig;
   });
 

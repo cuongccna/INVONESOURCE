@@ -32,13 +32,15 @@ function CodeSearch({
 }: { label: string; placeholder: string; onSearch: (q: string) => Promise<Suggestion[]>; value: string; onChange: (v: string) => void }) {
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [open, setOpen] = useState(false);
+  const [searched, setSearched] = useState(false);
 
   useEffect(() => {
-    if (value.length < 2) { setSuggestions([]); setOpen(false); return; }
+    if (value.length < 2) { setSuggestions([]); setOpen(false); setSearched(false); return; }
     const t = setTimeout(async () => {
       const res = await onSearch(value);
       setSuggestions(res);
-      setOpen(res.length > 0);
+      setSearched(true);
+      setOpen(true);
     }, 350);
     return () => clearTimeout(t);
   }, [value, onSearch]);
@@ -49,15 +51,15 @@ function CodeSearch({
       <input
         type="text"
         value={value}
-        onChange={e => onChange(e.target.value)}
+        onChange={e => { onChange(e.target.value); setSearched(false); }}
         onFocus={() => value.length >= 2 && suggestions.length > 0 && setOpen(true)}
         onBlur={() => setTimeout(() => setOpen(false), 200)}
         placeholder={placeholder}
         className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
       />
       {open && (
-        <div className="absolute z-50 top-full left-0 right-0 bg-white border border-gray-200 rounded-lg shadow-lg mt-1 max-h-36 overflow-y-auto">
-          {suggestions.map(s => (
+        <div className="absolute z-50 top-full left-0 right-0 bg-white border border-gray-200 rounded-lg shadow-lg mt-1 max-h-40 overflow-y-auto">
+          {suggestions.length > 0 ? suggestions.map(s => (
             <button
               key={s.code}
               type="button"
@@ -67,7 +69,12 @@ function CodeSearch({
               <span className="font-mono text-primary-700">{s.code}</span>
               {s.name && <span className="text-gray-500 ml-2 text-xs">— {s.name}</span>}
             </button>
-          ))}
+          )) : searched && (
+            <div className="px-3 py-3 text-xs text-gray-500">
+              <p className="font-medium text-gray-700 mb-1">Chưa có dữ liệu catalog</p>
+              <p>Vào <span className="font-mono text-primary-600">Cài đặt → Danh mục</span> và nhấn <strong>Xây dựng lại danh mục</strong> để tự động tạo từ hóa đơn đã nhập.</p>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -85,7 +92,7 @@ export function BulkItemCodeModal({ ids, onClose }: BulkModalProps) {
   const search = useCallback(async (q: string): Promise<Suggestion[]> => {
     try {
       const r = await apiClient.get<{ data: Array<{ item_code: string; display_name: string }> }>(
-        `/products?search=${encodeURIComponent(q)}&pageSize=10`
+        `/catalogs/products?q=${encodeURIComponent(q)}&pageSize=10`
       );
       return (r.data.data ?? []).map(d => ({ code: d.item_code, name: d.display_name }));
     } catch { return []; }
@@ -147,10 +154,10 @@ export function BulkCustomerCodeModal({ ids, onClose }: BulkModalProps) {
     try {
       const [cr, sr] = await Promise.all([
         apiClient.get<{ data: Array<{ customer_code: string; name: string }> }>(
-          `/catalogs/customers?search=${encodeURIComponent(q)}&pageSize=5`
+          `/catalogs/customers?q=${encodeURIComponent(q)}&pageSize=5`
         ).catch(() => ({ data: { data: [] } })),
         apiClient.get<{ data: Array<{ supplier_code: string; name: string }> }>(
-          `/catalogs/suppliers?search=${encodeURIComponent(q)}&pageSize=5`
+          `/catalogs/suppliers?q=${encodeURIComponent(q)}&pageSize=5`
         ).catch(() => ({ data: { data: [] } })),
       ]);
       return [

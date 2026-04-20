@@ -94,6 +94,9 @@ export class TaxDeclarationEngine {
     // Step 2: Get carry-forward from previous period [24]
     const ct24 = await this.getCarryForward(companyId, month, year);
 
+    // Step 2b: Preserve manual fields from existing row (if any) — do NOT overwrite on recalculate
+    const existingManuals = await this.getManualFields(companyId, month, year, 'monthly');
+
     // [25] = [23] + [24]
     const ct25 = vat.ct23_deductible_input_vat + ct24;
 
@@ -103,11 +106,22 @@ export class TaxDeclarationEngine {
     // [40a] sau NQ142 = tổng thuế đầu ra - giảm NQ
     const ct40a_adjusted = Math.round(vat.ct40a_total_output_vat) - ct36_nq;
 
-    // [41] = MAX(0, [40a_adj] - [25]) → phải nộp
-    const ct41 = Math.max(0, ct40a_adjusted - ct25);
+    // net = [40a_adj] - [25] + [37_adj_decrease] - [38_adj_increase]
+    // [37] điều chỉnh giảm: giảm số được khấu trừ → tăng số phải nộp (cộng vào net)
+    // [38] điều chỉnh tăng: tăng số được khấu trừ → giảm số phải nộp (trừ khỏi net)
+    const ct37_manual = existingManuals.ct37_adjustment_decrease ?? 0;
+    const ct38_manual = existingManuals.ct38_adjustment_increase ?? 0;
+    const ct40b_manual = existingManuals.ct40b_investment_vat ?? 0;
+    const net = ct40a_adjusted - ct25 + ct37_manual - ct38_manual;
 
-    // [43] = MAX(0, [25] - [40a_adj]) → kết chuyển
-    const ct43 = Math.max(0, ct25 - ct40a_adjusted);
+    // [40] = MAX(0, net) - ct40b (bù trừ dự án đầu tư)
+    const ct40_pay = Math.max(0, Math.max(0, net) - ct40b_manual);
+
+    // [41] = MAX(0, [25] - [40a_adj] - [38] + [37]) = MAX(0, -net) + MAX(0, ct40b - MAX(0,net))
+    const ct41 = Math.max(0, -net) + Math.max(0, ct40b_manual - Math.max(0, net));
+
+    // [43] = [41] (carry forward = all undeducted)
+    const ct43 = ct41;
 
     // Upsert tax_declarations
     const id = uuidv4();
@@ -117,15 +131,20 @@ export class TaxDeclarationEngine {
         ct22_total_input_vat, ct23_deductible_input_vat, ct23_input_subtotal,
         ct24_carried_over_vat, ct25_total_deductible,
         ct29_total_revenue, ct30_exempt_revenue,
+        ct26_kct_revenue, ct29_0pct_revenue, ct32a_kkknt_revenue,
         ct32_revenue_5pct, ct33_vat_5pct,
         ct34_revenue_8pct, ct35_vat_8pct,
         ct36_revenue_10pct, ct37_vat_10pct,
         ct36_nq_vat_reduction,
         ct40_total_output_revenue, ct40a_total_output_vat,
         ct41_payable_vat, ct43_carry_forward_vat,
+        ct37_adjustment_decrease, ct38_adjustment_increase, ct40b_investment_vat,
+        ct21_no_activity,
         submission_status, updated_at
       ) VALUES (
-        $1,$2,$3,$4,'01/GTGT','monthly',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,NOW()
+        $1,$2,$3,$4,'01/GTGT','monthly',
+        $5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,
+        $26,$27,$28,$29,$30,NOW()
       )
       ON CONFLICT (company_id, period_month, period_year, form_type, period_type)
       DO UPDATE SET
@@ -136,6 +155,9 @@ export class TaxDeclarationEngine {
         ct25_total_deductible = EXCLUDED.ct25_total_deductible,
         ct29_total_revenue = EXCLUDED.ct29_total_revenue,
         ct30_exempt_revenue = EXCLUDED.ct30_exempt_revenue,
+        ct26_kct_revenue = EXCLUDED.ct26_kct_revenue,
+        ct29_0pct_revenue = EXCLUDED.ct29_0pct_revenue,
+        ct32a_kkknt_revenue = EXCLUDED.ct32a_kkknt_revenue,
         ct32_revenue_5pct = EXCLUDED.ct32_revenue_5pct,
         ct33_vat_5pct = EXCLUDED.ct33_vat_5pct,
         ct34_revenue_8pct = EXCLUDED.ct34_revenue_8pct,
@@ -147,6 +169,12 @@ export class TaxDeclarationEngine {
         ct40a_total_output_vat = EXCLUDED.ct40a_total_output_vat,
         ct41_payable_vat = EXCLUDED.ct41_payable_vat,
         ct43_carry_forward_vat = EXCLUDED.ct43_carry_forward_vat,
+        -- Manual fields: only update if the existing row has NOT been manually set
+        -- (preserve user-entered adjustments across recalculations)
+        ct37_adjustment_decrease = COALESCE(tax_declarations.ct37_adjustment_decrease, EXCLUDED.ct37_adjustment_decrease),
+        ct38_adjustment_increase = COALESCE(tax_declarations.ct38_adjustment_increase, EXCLUDED.ct38_adjustment_increase),
+        ct40b_investment_vat     = COALESCE(tax_declarations.ct40b_investment_vat,     EXCLUDED.ct40b_investment_vat),
+        ct21_no_activity         = COALESCE(tax_declarations.ct21_no_activity,         EXCLUDED.ct21_no_activity),
         submission_status = CASE WHEN tax_declarations.submission_status IN ('submitted','accepted')
                                  THEN tax_declarations.submission_status
                                  ELSE 'draft' END,
@@ -160,6 +188,9 @@ export class TaxDeclarationEngine {
         Math.round(ct25),
         Math.round(vat.ct29_total_revenue),
         Math.round(vat.ct30_exempt_revenue),
+        Math.round(vat.ct26_kct_revenue),
+        Math.round(vat.ct29_0pct_revenue),
+        Math.round(vat.ct32a_kkknt_revenue),
         Math.round(vat.ct32_revenue_5pct),
         Math.round(vat.ct33_vat_5pct),
         Math.round(vat.ct34_revenue_8pct),
@@ -169,8 +200,12 @@ export class TaxDeclarationEngine {
         ct36_nq,
         Math.round(vat.ct40_total_output_revenue),
         Math.round(vat.ct40a_total_output_vat),
-        Math.round(ct41),
+        Math.round(ct40_pay),
         Math.round(ct43),
+        ct37_manual,
+        ct38_manual,
+        ct40b_manual,
+        existingManuals.ct21_no_activity ?? false,
         'draft',
       ]
     );
@@ -223,14 +258,20 @@ export class TaxDeclarationEngine {
       validInvoiceIds.length > 0 ? { inputIds: validInputIds, outputIds: validOutputIds } : undefined
     );
     const ct24 = await this.getCarryForwardQuarterly(companyId, quarter, year);
+    const existingManuals = await this.getManualFields(companyId, quarter, year, 'quarterly');
     const ct25 = vat.ct23_deductible_input_vat + ct24;
 
     // NQ142/NQ204: giảm thuế = 2% × doanh thu đầu ra 8%
     const ct36_nq = Math.round(vat.ct34_revenue_8pct * 0.02);
     const ct40a_adjusted = Math.round(vat.ct40a_total_output_vat) - ct36_nq;
 
-    const ct41 = Math.max(0, ct40a_adjusted - ct25);
-    const ct43 = Math.max(0, ct25 - ct40a_adjusted);
+    const ct37_manual  = existingManuals.ct37_adjustment_decrease ?? 0;
+    const ct38_manual  = existingManuals.ct38_adjustment_increase ?? 0;
+    const ct40b_manual = existingManuals.ct40b_investment_vat ?? 0;
+    const net = ct40a_adjusted - ct25 + ct37_manual - ct38_manual;
+    const ct40_pay = Math.max(0, Math.max(0, net) - ct40b_manual);
+    const ct41 = Math.max(0, -net) + Math.max(0, ct40b_manual - Math.max(0, net));
+    const ct43 = ct41;
 
     const id = uuidv4();
     await pool.query(
@@ -239,15 +280,20 @@ export class TaxDeclarationEngine {
         ct22_total_input_vat, ct23_deductible_input_vat, ct23_input_subtotal,
         ct24_carried_over_vat, ct25_total_deductible,
         ct29_total_revenue, ct30_exempt_revenue,
+        ct26_kct_revenue, ct29_0pct_revenue, ct32a_kkknt_revenue,
         ct32_revenue_5pct, ct33_vat_5pct,
         ct34_revenue_8pct, ct35_vat_8pct,
         ct36_revenue_10pct, ct37_vat_10pct,
         ct36_nq_vat_reduction,
         ct40_total_output_revenue, ct40a_total_output_vat,
         ct41_payable_vat, ct43_carry_forward_vat,
+        ct37_adjustment_decrease, ct38_adjustment_increase, ct40b_investment_vat,
+        ct21_no_activity,
         submission_status, updated_at
       ) VALUES (
-        $1,$2,$3,$4,'01/GTGT','quarterly',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,NOW()
+        $1,$2,$3,$4,'01/GTGT','quarterly',
+        $5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,
+        $26,$27,$28,$29,$30,NOW()
       )
       ON CONFLICT (company_id, period_month, period_year, form_type, period_type)
       DO UPDATE SET
@@ -258,6 +304,9 @@ export class TaxDeclarationEngine {
         ct25_total_deductible = EXCLUDED.ct25_total_deductible,
         ct29_total_revenue = EXCLUDED.ct29_total_revenue,
         ct30_exempt_revenue = EXCLUDED.ct30_exempt_revenue,
+        ct26_kct_revenue = EXCLUDED.ct26_kct_revenue,
+        ct29_0pct_revenue = EXCLUDED.ct29_0pct_revenue,
+        ct32a_kkknt_revenue = EXCLUDED.ct32a_kkknt_revenue,
         ct32_revenue_5pct = EXCLUDED.ct32_revenue_5pct,
         ct33_vat_5pct = EXCLUDED.ct33_vat_5pct,
         ct34_revenue_8pct = EXCLUDED.ct34_revenue_8pct,
@@ -269,6 +318,10 @@ export class TaxDeclarationEngine {
         ct40a_total_output_vat = EXCLUDED.ct40a_total_output_vat,
         ct41_payable_vat = EXCLUDED.ct41_payable_vat,
         ct43_carry_forward_vat = EXCLUDED.ct43_carry_forward_vat,
+        ct37_adjustment_decrease = COALESCE(tax_declarations.ct37_adjustment_decrease, EXCLUDED.ct37_adjustment_decrease),
+        ct38_adjustment_increase = COALESCE(tax_declarations.ct38_adjustment_increase, EXCLUDED.ct38_adjustment_increase),
+        ct40b_investment_vat     = COALESCE(tax_declarations.ct40b_investment_vat,     EXCLUDED.ct40b_investment_vat),
+        ct21_no_activity         = COALESCE(tax_declarations.ct21_no_activity,         EXCLUDED.ct21_no_activity),
         submission_status = CASE WHEN tax_declarations.submission_status IN ('submitted','accepted')
                                  THEN tax_declarations.submission_status
                                  ELSE 'draft' END,
@@ -280,13 +333,18 @@ export class TaxDeclarationEngine {
         Math.round(vat.ct23_input_subtotal),
         Math.round(ct24), Math.round(ct25),
         Math.round(vat.ct29_total_revenue), Math.round(vat.ct30_exempt_revenue),
+        Math.round(vat.ct26_kct_revenue),
+        Math.round(vat.ct29_0pct_revenue),
+        Math.round(vat.ct32a_kkknt_revenue),
         Math.round(vat.ct32_revenue_5pct),  Math.round(vat.ct33_vat_5pct),
         Math.round(vat.ct34_revenue_8pct),  Math.round(vat.ct35_vat_8pct),
         Math.round(vat.ct36_revenue_10pct), Math.round(vat.ct37_vat_10pct),
         ct36_nq,
         Math.round(vat.ct40_total_output_revenue),
         Math.round(vat.ct40a_total_output_vat),
-        Math.round(ct41), Math.round(ct43),
+        Math.round(ct40_pay), Math.round(ct43),
+        ct37_manual, ct38_manual, ct40b_manual,
+        existingManuals.ct21_no_activity ?? false,
         'draft',
       ]
     );
@@ -298,6 +356,43 @@ export class TaxDeclarationEngine {
       [companyId, quarter, year]
     );
     return { ...rows[0]!, _validation: validationOutput };
+  }
+
+  /**
+   * Get carry-forward from previous period [24].
+   * For monthly: previous month's ct43.
+   * For quarterly: previous quarter's ct43 (or last monthly ct43 if Q1).
+   */
+  private async getManualFields(
+    companyId: string,
+    period: number,
+    year: number,
+    periodType: 'monthly' | 'quarterly',
+  ): Promise<{
+    ct37_adjustment_decrease: number | null;
+    ct38_adjustment_increase: number | null;
+    ct40b_investment_vat: number | null;
+    ct21_no_activity: boolean | null;
+  }> {
+    const { rows } = await pool.query<{
+      ct37_adjustment_decrease: string | null;
+      ct38_adjustment_increase: string | null;
+      ct40b_investment_vat: string | null;
+      ct21_no_activity: boolean | null;
+    }>(
+      `SELECT ct37_adjustment_decrease, ct38_adjustment_increase, ct40b_investment_vat, ct21_no_activity
+       FROM tax_declarations
+       WHERE company_id = $1 AND period_month = $2 AND period_year = $3
+         AND form_type = '01/GTGT' AND period_type = $4`,
+      [companyId, period, year, periodType]
+    );
+    if (!rows.length) return { ct37_adjustment_decrease: null, ct38_adjustment_increase: null, ct40b_investment_vat: null, ct21_no_activity: null };
+    return {
+      ct37_adjustment_decrease: rows[0].ct37_adjustment_decrease != null ? parseFloat(rows[0].ct37_adjustment_decrease) : null,
+      ct38_adjustment_increase: rows[0].ct38_adjustment_increase != null ? parseFloat(rows[0].ct38_adjustment_increase) : null,
+      ct40b_investment_vat:     rows[0].ct40b_investment_vat     != null ? parseFloat(rows[0].ct40b_investment_vat)     : null,
+      ct21_no_activity:         rows[0].ct21_no_activity ?? null,
+    };
   }
 
   /**

@@ -131,6 +131,14 @@ async function main() {
       });
       fetched++;
 
+      // Save raw XML to the invoices table so download-xml works for gdt_bot invoices
+      const rawXmlStr = xmlBuf.toString('utf8');
+      await pool.query(
+        `UPDATE invoices SET raw_xml = $1, updated_at = NOW() WHERE id = $2`,
+        [rawXmlStr, inv.id],
+      );
+      logger.info('[Backfill] raw_xml saved', { invoiceId: inv.id, bytes: xmlBuf.byteLength });
+
       const lineItems = xmlParser.parseLineItems(xmlBuf);
       if (lineItems.length === 0) {
         logger.warn('[Backfill] XML fetched but 0 line items parsed', { invoiceId: inv.id });

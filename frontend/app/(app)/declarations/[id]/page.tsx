@@ -34,6 +34,13 @@ interface Declaration {
   ct40a_total_output_vat: number;
   ct41_payable_vat: number;
   ct43_carry_forward_vat: number;
+  ct26_kct_revenue?: number;
+  ct29_0pct_revenue?: number;
+  ct32a_kkknt_revenue?: number;
+  ct37_adjustment_decrease?: number | null;
+  ct38_adjustment_increase?: number | null;
+  ct40b_investment_vat?: number | null;
+  ct21_no_activity?: boolean | null;
   notes: string | null;
   submission_at: string | null;
   gdt_reference_number: string | null;
@@ -111,6 +118,12 @@ export default function DeclarationDetailPage() {
   const [editingOB, setEditingOB] = useState(false);
   const [obInput, setObInput] = useState('');
   const [savingOB, setSavingOB] = useState(false);
+  const [editingMF, setEditingMF] = useState(false);
+  const [mfCt37, setMfCt37] = useState('');
+  const [mfCt38, setMfCt38] = useState('');
+  const [mfCt40b, setMfCt40b] = useState('');
+  const [mfCt21, setMfCt21] = useState(false);
+  const [savingMF, setSavingMF] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -206,6 +219,38 @@ export default function DeclarationDetailPage() {
       toast.error('Lỗi lưu số đầu kỳ. Vui lòng thử lại.');
     } finally {
       setSavingOB(false);
+    }
+  };
+
+  const openManualFields = () => {
+    if (!decl) return;
+    setMfCt37(String(decl.ct37_adjustment_decrease ?? ''));
+    setMfCt38(String(decl.ct38_adjustment_increase ?? ''));
+    setMfCt40b(String(decl.ct40b_investment_vat ?? ''));
+    setMfCt21(decl.ct21_no_activity ?? false);
+    setEditingMF(true);
+  };
+
+  const saveManualFields = async () => {
+    if (!decl) return;
+    setSavingMF(true);
+    try {
+      const res = await apiClient.patch<{ data: Declaration }>(
+        `/declarations/${decl.id}/manual-fields`,
+        {
+          ct37:  mfCt37  ? parseInt(mfCt37,  10) : null,
+          ct38:  mfCt38  ? parseInt(mfCt38,  10) : null,
+          ct40b: mfCt40b ? parseInt(mfCt40b, 10) : null,
+          ct21:  mfCt21,
+        }
+      );
+      setDecl(res.data.data);
+      setEditingMF(false);
+      toast.success('Đã lưu chỉ tiêu nhập tay');
+    } catch {
+      toast.error('Lỗi lưu chỉ tiêu. Vui lòng thử lại.');
+    } finally {
+      setSavingMF(false);
     }
   };
 
@@ -468,8 +513,26 @@ export default function DeclarationDetailPage() {
                   <td className="py-2 pr-3 w-12 pl-4">
                     <span className="text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-mono">[26]</span>
                   </td>
-                  <td className="py-2 pr-3 text-sm text-gray-600">HHDV không chịu thuế GTGT</td>
-                  <td className="py-2 pr-4 text-right text-sm tabular-nums text-gray-900">{vnd(decl.ct30_exempt_revenue)}</td>
+                  <td className="py-2 pr-3 text-sm text-gray-600">HHDV không chịu thuế GTGT (KCT)</td>
+                  <td className="py-2 pr-4 text-right text-sm tabular-nums text-gray-900">{vnd(decl.ct26_kct_revenue ?? decl.ct30_exempt_revenue)}</td>
+                </tr>
+              )}
+              {(decl.ct29_0pct_revenue ?? 0) > 0 && (
+                <tr className="border-b border-gray-50 hover:bg-gray-50/50">
+                  <td className="py-2 pr-3 w-12 pl-4">
+                    <span className="text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-mono">[29]</span>
+                  </td>
+                  <td className="py-2 pr-3 text-sm text-gray-600">Doanh thu HHDV xuất khẩu (thuế suất 0%)</td>
+                  <td className="py-2 pr-4 text-right text-sm tabular-nums text-gray-900">{vnd(decl.ct29_0pct_revenue ?? 0)}</td>
+                </tr>
+              )}
+              {(decl.ct32a_kkknt_revenue ?? 0) > 0 && (
+                <tr className="border-b border-gray-50 hover:bg-gray-50/50">
+                  <td className="py-2 pr-3 w-12 pl-4">
+                    <span className="text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-mono">[32a]</span>
+                  </td>
+                  <td className="py-2 pr-3 text-sm text-gray-600">Doanh thu KKKNT (không kê khai, nộp thay)</td>
+                  <td className="py-2 pr-4 text-right text-sm tabular-nums text-gray-900">{vnd(decl.ct32a_kkknt_revenue ?? 0)}</td>
                 </tr>
               )}
               {(decl.ct32_revenue_5pct > 0 || decl.ct33_vat_5pct > 0) && (<>
@@ -556,6 +619,78 @@ export default function DeclarationDetailPage() {
                   </tr>
                 );
               })()}
+
+              {/* ─ Section IIb: Chỉ tiêu nhập tay ─ */}
+              <tr><td colSpan={3} className="px-4 pt-4 pb-1">
+                <div className="flex items-center justify-between">
+                  <p className="text-xs font-semibold text-primary-700 uppercase tracking-wider">Điều chỉnh &amp; Đặc biệt</p>
+                  {!editingMF && !['submitted','accepted'].includes(decl.submission_status) && (
+                    <button onClick={openManualFields} className="text-xs text-primary-600 hover:text-primary-700 underline underline-offset-2">
+                      Nhập tay
+                    </button>
+                  )}
+                </div>
+              </td></tr>
+              {(decl.ct21_no_activity) && (
+                <tr className="border-b border-gray-50 bg-yellow-50/30">
+                  <td className="py-2 pr-3 w-12 pl-4">
+                    <span className="text-xs bg-yellow-100 text-yellow-700 px-1.5 py-0.5 rounded font-mono">[21]</span>
+                  </td>
+                  <td colSpan={2} className="py-2 pr-4 text-sm text-yellow-700 font-medium">✓ Không phát sinh hoạt động trong kỳ</td>
+                </tr>
+              )}
+              {(decl.ct37_adjustment_decrease ?? 0) !== 0 && (
+                <tr className="border-b border-gray-50 hover:bg-gray-50/50">
+                  <td className="py-2 pr-3 w-12 pl-4"><span className="text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-mono">[37]</span></td>
+                  <td className="py-2 pr-3 text-sm text-gray-600">Điều chỉnh giảm thuế khấu trừ kỳ trước</td>
+                  <td className="py-2 pr-4 text-right text-sm tabular-nums text-orange-700">− {vnd(decl.ct37_adjustment_decrease ?? 0)}</td>
+                </tr>
+              )}
+              {(decl.ct38_adjustment_increase ?? 0) !== 0 && (
+                <tr className="border-b border-gray-50 hover:bg-gray-50/50">
+                  <td className="py-2 pr-3 w-12 pl-4"><span className="text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-mono">[38]</span></td>
+                  <td className="py-2 pr-3 text-sm text-gray-600">Điều chỉnh tăng (khấu trừ kỳ trước thiếu)</td>
+                  <td className="py-2 pr-4 text-right text-sm tabular-nums text-green-700">+ {vnd(decl.ct38_adjustment_increase ?? 0)}</td>
+                </tr>
+              )}
+              {editingMF && (
+                <tr>
+                  <td colSpan={3} className="px-4 pb-4 pt-2">
+                    <div className="bg-white border border-primary-200 rounded-xl p-3 space-y-2.5 shadow-sm">
+                      <label className="flex items-center gap-2 text-sm text-gray-700">
+                        <input type="checkbox" checked={mfCt21} onChange={e => setMfCt21(e.target.checked)} className="rounded" />
+                        <span>[21] Không phát sinh trong kỳ</span>
+                      </label>
+                      {[
+                        { label: '[37] Điều chỉnh giảm (VND)', val: mfCt37, set: setMfCt37 },
+                        { label: '[38] Điều chỉnh tăng (VND)', val: mfCt38, set: setMfCt38 },
+                        { label: '[40b] Thuế đầu vào dự án đầu tư (VND)', val: mfCt40b, set: setMfCt40b },
+                      ].map(({ label, val, set }) => (
+                        <div key={label} className="flex items-center gap-2">
+                          <label className="text-xs text-gray-600 w-56 flex-shrink-0">{label}</label>
+                          <input
+                            type="text" inputMode="numeric"
+                            className="flex-1 border border-gray-200 rounded-lg px-2.5 py-1.5 text-right text-sm tabular-nums focus:outline-none focus:ring-2 focus:ring-primary-300"
+                            value={val}
+                            onChange={e => set(e.target.value.replace(/[^0-9]/g, ''))}
+                            placeholder="0"
+                          />
+                        </div>
+                      ))}
+                      <div className="flex gap-2 pt-1">
+                        <button onClick={() => void saveManualFields()} disabled={savingMF}
+                          className="flex-1 bg-primary-600 text-white rounded-lg py-1.5 text-xs font-semibold hover:bg-primary-700 disabled:opacity-50">
+                          {savingMF ? '…' : 'Lưu'}
+                        </button>
+                        <button onClick={() => setEditingMF(false)}
+                          className="flex-1 bg-gray-100 text-gray-600 rounded-lg py-1.5 text-xs hover:bg-gray-200">
+                          Huỷ
+                        </button>
+                      </div>
+                    </div>
+                  </td>
+                </tr>
+              )}
 
               {/* ─ Section III: Kết quả ─ */}
               <tr><td colSpan={3} className="px-4 pt-5 pb-1">

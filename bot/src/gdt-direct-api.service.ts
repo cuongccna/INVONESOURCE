@@ -101,8 +101,40 @@ const REQUEST_TIMEOUT = 30_000;
 // TMProxy and residential proxies have short idle timeouts — give generous room.
 const BINARY_TIMEOUT = 120_000; // 2 min — override with recipe.timing.binaryTimeoutMs
 
+// ── Peak period detection ─────────────────────────────────────────────────────
+// GDT traffic peaks during tax filing deadline (20th of each month).
+// Ngày 18-25: response times balloon from ~2s to 5-6 min. Static 30-60s timeouts
+// cause mass failures. Dynamic multiplier adjusts all timeouts + retries.
+
+/**
+ * Returns a timeout multiplier based on the current day of the month (Vietnam timezone).
+ *   Day  1-17, 26-31: 1.0  (normal traffic)
+ *   Day 18-20:        4.0  (early peak, approaching deadline)
+ *   Day 21-25:        6.0  (post-deadline peak, heaviest load)
+ */
+export function getPeakTimeoutMultiplier(): number {
+  const vnNow = new Date(Date.now() + 7 * 3_600_000); // UTC+7
+  const day = vnNow.getUTCDate();
+  if (day >= 21 && day <= 25) return 6.0;
+  if (day >= 18 && day <= 20) return 4.0;
+  return 1.0;
+}
+
+/** Returns retry count adjusted for peak periods */
+export function getPeakMaxRetries(): number {
+  const m = getPeakTimeoutMultiplier();
+  return m > 1 ? 5 : MAX_RETRIES; // 3 → 5 during peak
+}
+
+/** Returns retry delay base (ms) adjusted for peak periods */
+export function getPeakRetryDelay(): number {
+  const m = getPeakTimeoutMultiplier();
+  return m > 1 ? 8_000 : RETRY_DELAY; // 3s → 8s during peak
+}
+
 // VĐ2: Per-endpoint timeouts — /sco-query/ endpoints are significantly slower than /query/
-const ENDPOINT_TIMEOUTS: Record<string, number> = {
+// Base values (normal period). Multiply by getPeakTimeoutMultiplier() at runtime.
+const BASE_ENDPOINT_TIMEOUTS: Record<string, number> = {
   '/query/invoices/sold':                   30_000,
   '/query/invoices/purchase':               30_000,
   '/query/invoices/detail':                 45_000,
@@ -306,6 +338,31 @@ function parseVatRate(raw: unknown): string | null {
   return isNaN(n) ? null : String(n);
 }
 
+/**
+ * Derive tax_category from raw VAT rate string.
+ * Keeps the semantic distinction that parseVatRate() loses by normalising to '0'.
+ * Returns:
+ *   'KCT'   — không chịu thuế GTGT → chỉ tiêu [26]
+ *   'KKKNT' — không phải kê khai, tính nộp GTGT → chỉ tiêu [32a]
+ *   '0'     — thuế suất 0% (xuất khẩu) → chỉ tiêu [29]
+ *   '5'|'8'|'10' — thuế suất thông thường
+ *   null    — không xác định
+ */
+function extractTaxCategory(raw: unknown): string | null {
+  if (raw == null) return null;
+  const s = String(raw).replace('%', '').trim().toLowerCase();
+  if (s === '') return null;
+  if (s === 'kct') return 'KCT';
+  if (s === 'kkknt' || s === 'kkktt') return 'KKKNT';
+  const n = parseFloat(s);
+  if (isNaN(n)) return null;
+  if (n === 0) return '0';
+  if (n === 5) return '5';
+  if (n === 8) return '8';
+  if (n === 10) return '10';
+  return String(n);
+}
+
 /** Coerce to number or null */
 function num(v: unknown): number | null {
   if (v == null || v === '') return null;
@@ -426,12 +483,19 @@ function mapInvoice(
   // VAT rate is nested in thttltsuat[0].tsuat (path configurable via recipe)
   const vatNestedPath = fields?.vatRateNestedPath ?? 'thttltsuat';
   let vatRate: string | null = null;
+  let taxCategory: string | null = null;
   const nestedArr = r[vatNestedPath];
   if (Array.isArray(nestedArr) && nestedArr.length > 0) {
-    vatRate = parseVatRate((nestedArr[0] as Record<string, unknown>)['tsuat']);
+    const rawTsuat = (nestedArr[0] as Record<string, unknown>)['tsuat'];
+    vatRate     = parseVatRate(rawTsuat);
+    taxCategory = extractTaxCategory(rawTsuat);
   }
   // fallback to top-level tsuat
-  if (!vatRate) vatRate = parseVatRate(pick(r, ...(fields?.vatRate ?? ['tsuat', 'thueSuat', 'thue_suat'])));
+  if (!vatRate) {
+    const rawFallback = pick(r, ...(fields?.vatRate ?? ['tsuat', 'thueSuat', 'thue_suat']));
+    vatRate     = parseVatRate(rawFallback);
+    taxCategory = extractTaxCategory(rawFallback);
+  }
 
   const xmlSet = recipeXmlSet ?? XML_AVAILABLE_TTXLY;
 
@@ -474,6 +538,7 @@ function mapInvoice(
                   })(),
     khhd_cl_quan: String(pick(r, 'khhdgoc', 'khhdon_goc', 'kyHieuGoc', 'KHHDCLQuan') ?? '').trim() || null,
     so_hd_cl_quan: String(pick(r, 'shdgoc',  'shdon_goc',  'soHdonGoc', 'SHDCLQuan')  ?? '').trim() || null,
+    tax_category: taxCategory,
   };
 }
 
@@ -598,11 +663,16 @@ export class GdtDirectApiService {
   private _addTimeoutInterceptor(instance: AxiosInstance): void {
     instance.interceptors.request.use(config => {
       const url = config.url ?? '';
-      for (const [path, ms] of Object.entries(ENDPOINT_TIMEOUTS)) {
+      const m = getPeakTimeoutMultiplier();
+      for (const [path, baseMs] of Object.entries(BASE_ENDPOINT_TIMEOUTS)) {
         if (url.includes(path)) {
-          config.timeout = ms;
+          config.timeout = Math.round(baseMs * m);
           break;
         }
+      }
+      // Apply peak multiplier to default timeout too (for unmatched endpoints)
+      if (m > 1 && config.timeout === REQUEST_TIMEOUT) {
+        config.timeout = Math.round(REQUEST_TIMEOUT * m);
       }
       return config;
     });
@@ -702,8 +772,8 @@ export class GdtDirectApiService {
     this._reloginAttempted  = false;
     let attempts = 0;
     let lastCaptchaId: string | null = null;
-    const maxRetries   = this.recipe?.timing.maxRetries    ?? MAX_RETRIES;
-    const retryDelayMs = this.recipe?.timing.retryDelayMs  ?? RETRY_DELAY;
+    const maxRetries   = this.recipe?.timing.maxRetries    ?? getPeakMaxRetries();
+    const retryDelayMs = this.recipe?.timing.retryDelayMs  ?? getPeakRetryDelay();
     const captchaPath  = this.recipe?.api.endpoints.captcha ?? '/captcha';
     const authPath     = this.recipe?.api.endpoints.auth    ?? '/security-taxpayer/authenticate';
 
@@ -1326,8 +1396,8 @@ export class GdtDirectApiService {
 
   /** GET JSON with auto-retry on transient errors (5xx, timeout) */
   private async _getWithRetry<T>(url: string, params: Record<string, unknown>) {
-    const maxRetries   = this.recipe?.timing.maxRetries   ?? MAX_RETRIES;
-    const retryDelayMs = this.recipe?.timing.retryDelayMs ?? RETRY_DELAY;
+    const maxRetries   = this.recipe?.timing.maxRetries   ?? getPeakMaxRetries();
+    const retryDelayMs = this.recipe?.timing.retryDelayMs ?? getPeakRetryDelay();
     let lastErr: Error | null = null;
     // VĐ1: Track proxy swaps separately — they don't consume the GDT retry budget
     let proxySwaps = 0;

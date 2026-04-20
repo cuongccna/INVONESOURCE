@@ -5,6 +5,7 @@ import { format } from 'date-fns';
 import { vi } from 'date-fns/locale';
 import { useRouter } from 'next/navigation';
 import InvoiceEditPanel from './InvoiceEditPanel';
+import { useToast } from '../ToastProvider';
 
 export interface GridInvoice {
   id: string;
@@ -30,6 +31,10 @@ export interface GridInvoice {
   customer_code: string | null;
   item_code: string | null;
   notes: string | null;
+  tc_hdon: number | null;
+  khhd_cl_quan: string | null;
+  so_hd_cl_quan: string | null;
+  non_deductible: boolean | null;
 }
 
 export interface GridMeta {
@@ -54,6 +59,7 @@ interface Props {
   onSelectionChange: (ids: string[]) => void;
   onDelete: (id: string) => void;
   onPermanentIgnore: (id: string) => void;
+  onToggleNonDeductible?: (id: string, value: boolean) => void;
   onPageChange: (page: number) => void;
   onPageSizeChange: (size: number) => void;
   onExcelExport?: () => void;
@@ -63,7 +69,7 @@ interface Props {
 const STATUS_LABELS: Record<string, { label: string; color: string }> = {
   valid:     { label: 'Hợp lệ',    color: 'bg-green-100 text-green-700' },
   cancelled: { label: 'Đã hủy',    color: 'bg-red-100 text-red-700' },
-  replaced:  { label: 'Thay thế',  color: 'bg-yellow-100 text-yellow-700' },
+  replaced:  { label: 'Bị thay thế',  color: 'bg-red-100 text-red-700' },
   adjusted:  { label: 'Điều chỉnh', color: 'bg-blue-100 text-blue-700' },
 };
 
@@ -71,7 +77,7 @@ const PAGE_SIZES = [15, 30, 50, 100];
 
 function rowBg(inv: GridInvoice): string {
   if (inv.status === 'cancelled' || inv.status === 'invalid') return 'bg-red-50/60';
-  if (inv.status === 'replaced')  return 'bg-yellow-50/60';
+  if (inv.status === 'replaced')  return 'bg-red-50/60';
   if (inv.status === 'adjusted')  return 'bg-blue-50/50';
   if (!inv.payment_method && Number(inv.total_amount) >= 5_000_000 && inv.direction === 'input') return 'bg-amber-50/40';
   return '';
@@ -80,7 +86,7 @@ function rowBg(inv: GridInvoice): string {
 const STATUS_LEFT_BORDER: Record<string, string> = {
   cancelled: 'border-l-2 border-l-red-400',
   invalid:   'border-l-2 border-l-red-400',
-  replaced:  'border-l-2 border-l-yellow-400',
+  replaced:  'border-l-2 border-l-red-400',
   adjusted:  'border-l-2 border-l-blue-400',
 };
 
@@ -94,7 +100,7 @@ function fmtVND(n: string | number | null | undefined): string {
 export default function InvoiceGrid({
   invoices, meta, loading, direction,
   selectedIds, onSelectionChange,
-  onDelete, onPermanentIgnore,
+  onDelete, onPermanentIgnore, onToggleNonDeductible,
   onPageChange, onPageSizeChange,
   onExcelExport, onRefresh,
 }: Props) {
@@ -179,7 +185,7 @@ export default function InvoiceGrid({
                 )}
                 {replaced.count > 0 && (
                   <span className="flex items-center gap-1 text-yellow-700 bg-yellow-50 px-2 py-0.5 rounded-full">
-                    ↺ Thay thế: <strong>{replaced.count}</strong> HĐ &middot; {fmtVND(replaced.subtotal)}đ
+                    ⊘ Bị thay thế: <strong>{replaced.count}</strong> HĐ &middot; {fmtVND(replaced.subtotal)}đ
                   </span>
                 )}
                 {adjusted.count > 0 && (
@@ -291,10 +297,18 @@ export default function InvoiceGrid({
                             <span className="ml-1 text-xs bg-red-100 text-red-600 px-1 rounded" title="Hóa đơn đã bị hủy">⛔ Hủy</span>
                           )}
                           {inv.status === 'replaced' && (
-                            <span className="ml-1 text-xs bg-yellow-100 text-yellow-700 px-1 rounded" title="Hóa đơn đã bị thay thế bởi hóa đơn khác">↺ Thay thế</span>
+                            <span className="ml-1 text-xs bg-red-100 text-red-700 px-1 rounded" title="Hóa đơn đã bị thay thế bởi hóa đơn khác">⊘ Bị thay thế</span>
                           )}
                           {inv.status === 'adjusted' && (
                             <span className="ml-1 text-xs bg-blue-100 text-blue-700 px-1 rounded" title="Hóa đơn điều chỉnh cho hóa đơn khác">✏ Điều chỉnh</span>
+                          )}
+                          {(inv.tc_hdon === 1 || inv.tc_hdon === 2) && inv.so_hd_cl_quan && (
+                            <span className="ml-1 text-xs bg-amber-100 text-amber-700 px-1 rounded" title={`${inv.tc_hdon === 1 ? 'Thay thế' : 'Điều chỉnh'} cho HĐ ${inv.khhd_cl_quan ?? ''}${inv.so_hd_cl_quan}`}>
+                              {inv.tc_hdon === 1 ? '↺' : '✏'} HĐ gốc: {inv.so_hd_cl_quan}
+                            </span>
+                          )}
+                          {inv.non_deductible && (
+                            <span className="ml-1 text-xs bg-orange-100 text-orange-700 px-1 rounded" title="Không đủ điều kiện khấu trừ thuế GTGT">⊘ Không KT</span>
                           )}
                         </div>
                       </td>
@@ -327,6 +341,14 @@ export default function InvoiceGrid({
                         {openMenuId === inv.id && (
                           <div className="absolute right-0 top-8 bg-white rounded-xl shadow-lg border border-gray-100 z-30 py-1 min-w-[160px]">
                             <button onClick={e => { e.stopPropagation(); router.push(`/invoices/${inv.id}`); }} className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50">Xem chi tiết</button>
+                            {inv.direction === 'input' && onToggleNonDeductible && (
+                              <button
+                                onClick={e => { e.stopPropagation(); setOpenMenuId(null); onToggleNonDeductible(inv.id, !inv.non_deductible); }}
+                                className="w-full text-left px-4 py-2 text-sm text-orange-600 hover:bg-orange-50"
+                              >
+                                {inv.non_deductible ? '✓ Đưa lại vào khấu trừ' : '⊘ Loại khỏi khấu trừ [25]'}
+                              </button>
+                            )}
                             <button onClick={e => { e.stopPropagation(); setOpenMenuId(null); onDelete(inv.id); }} className="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50">Ẩn hóa đơn</button>
                             <button onClick={e => { e.stopPropagation(); setOpenMenuId(null); onPermanentIgnore(inv.id); }} className="w-full text-left px-4 py-2 text-sm text-red-700 hover:bg-red-50">Bỏ qua vĩnh viễn</button>
                           </div>
@@ -409,6 +431,7 @@ function BulkActionBar({
 }) {
   const [modal, setModal] = useState<'item' | 'customer' | 'payment' | null>(null);
   const n = selectedIds.length;
+  const toast = useToast();
 
   return (
     <>
@@ -417,6 +440,39 @@ function BulkActionBar({
         <button onClick={() => setModal('item')}     className="text-xs border border-primary-300 bg-white rounded-lg px-3 py-1.5 text-primary-700 hover:bg-primary-50">Gán mã hàng</button>
         <button onClick={() => setModal('customer')} className="text-xs border border-primary-300 bg-white rounded-lg px-3 py-1.5 text-primary-700 hover:bg-primary-50">Gán mã KH/NCC</button>
         <button onClick={() => setModal('payment')}  className="text-xs border border-primary-300 bg-white rounded-lg px-3 py-1.5 text-primary-700 hover:bg-primary-50">Khai báo TT</button>
+        <button
+          onClick={async () => {
+            try {
+              const { default: apiClient } = await import('../../lib/apiClient');
+              const res = await apiClient.get(`/invoices/download-xml?ids=${selectedIds.join(',')}`, { responseType: 'blob' });
+              const url = URL.createObjectURL(new Blob([res.data as BlobPart]));
+              const a = document.createElement('a'); a.href = url;
+              a.download = `HoaDon_XML_${new Date().toISOString().slice(0, 10)}.zip`;
+              a.click(); URL.revokeObjectURL(url);
+            } catch (err: unknown) {
+              // Try to read error message from blob response
+              const axiosErr = err as { response?: { data?: Blob; status?: number } };
+              if (axiosErr.response?.data instanceof Blob) {
+                try {
+                  const text = await axiosErr.response.data.text();
+                  const json = JSON.parse(text) as { error?: { code?: string; message?: string } };
+                  const code = json?.error?.code ?? '';
+                  const msg  = json?.error?.message ?? '';
+                  if (code === 'NO_XML_BOT_SOURCE') {
+                    toast.info('Hóa đơn từ GDT Bot không có file XML gốc lưu trữ. Vào Cài đặt → Kết nối Hóa Đơn và chạy "Backfill XML" để tải về từ GDT.');
+                    return;
+                  }
+                  if (code === 'NO_XML' || msg.includes('No invoices with XML') || msg.includes('chưa có file XML')) {
+                    toast.info('Các hóa đơn đã chọn chưa có dữ liệu XML. Chỉ HĐ đồng bộ từ GDT/Viettel mới có XML.');
+                    return;
+                  }
+                } catch { /* ignore parse errors */ }
+              }
+              toast.error('Tải XML thất bại. Vui lòng thử lại sau.');
+            }
+          }}
+          className="text-xs border border-primary-300 bg-white rounded-lg px-3 py-1.5 text-primary-700 hover:bg-primary-50"
+        >📥 Tải XML</button>
         <button onClick={onClear} className="ml-auto text-xs text-gray-400 hover:text-gray-700">Hủy chọn</button>
       </div>
 

@@ -7,7 +7,8 @@ import { useCompany } from '../contexts/CompanyContext';
 import { useView } from '../contexts/ViewContext';
 import NotificationPanel from './NotificationPanel';
 import apiClient from '../lib/apiClient';
-import { DRAWER_SECTIONS, DRAWER_HREFS } from '../lib/navSections';
+import { DRAWER_HREFS, VISIBLE_DRAWER_SECTIONS, VISIBLE_DRAWER_HREFS } from '../lib/navSections';
+import { useAuth } from '../contexts/AuthContext';
 
 interface UnreadCount {
   count: number;
@@ -16,6 +17,7 @@ interface UnreadCount {
 export default function Header() {
   const { companies, activeCompany, setActiveCompanyId, loading } = useCompany();
   const { mode, orgId, setSingleCompany, setPortfolio, setGroup } = useView();
+  const { user } = useAuth();
   const router = useRouter();
   const pathname = usePathname();
   const [showSwitcher, setShowSwitcher] = useState(false);
@@ -249,7 +251,46 @@ export default function Header() {
             );
           })}
 
-          {/* Thêm dropdown — hidden */}
+          {/* Thêm dropdown */}
+          <div ref={moreRef} className="relative">
+            <button
+              onClick={() => setShowMore((v) => !v)}
+              className={`flex items-center gap-1 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                !!pathname && VISIBLE_DRAWER_HREFS.some((h) => pathname.startsWith(h))
+                  ? 'bg-primary-50 text-primary-700'
+                  : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
+              }`}
+            >
+              Thêm
+              <svg className={`w-3.5 h-3.5 transition-transform ${showMore ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </button>
+            {showMore && (
+              <div className="absolute top-full left-0 mt-1 w-60 bg-white rounded-xl shadow-lg border border-gray-100 py-2 z-50">
+                {VISIBLE_DRAWER_SECTIONS.map((section) => (
+                  <div key={section.title}>
+                    <p className="px-3 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-400">{section.title}</p>
+                    {section.items.map((item) => {
+                      const active = !!pathname && pathname.startsWith(item.href);
+                      return (
+                        <Link
+                          key={item.href}
+                          href={item.href}
+                          onClick={() => setShowMore(false)}
+                          className={`flex items-center px-3 py-2 text-sm transition-colors ${
+                            active ? 'text-primary-700 font-medium bg-primary-50' : 'text-gray-700 hover:bg-gray-50'
+                          }`}
+                        >
+                          {item.label}
+                        </Link>
+                      );
+                    })}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </nav>
 
         {/* Right: Settings + Notification bell */}
@@ -258,15 +299,27 @@ export default function Header() {
           <div ref={settingsRef} className="relative">
             <button
               onClick={() => setShowSettings((v) => !v)}
-              className="w-9 h-9 flex items-center justify-center rounded-full hover:bg-gray-100 transition-colors"
-              aria-label="Cài đặt"
+              className="flex items-center gap-1.5 px-2 py-1 rounded-full hover:bg-gray-100 transition-colors"
+              aria-label="Tài khoản"
             >
-              <svg className="w-5 h-5 text-gray-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
-              </svg>
+              <div className="w-7 h-7 rounded-full bg-primary-600 flex items-center justify-center text-white text-xs font-bold flex-shrink-0">
+                {user?.full_name?.[0]?.toUpperCase() ?? user?.email?.[0]?.toUpperCase() ?? '?'}
+              </div>
+              {user && (
+                <span className="hidden lg:block text-sm font-medium text-gray-700 max-w-[120px] truncate">
+                  {user.full_name || user.email}
+                </span>
+              )}
             </button>
             {showSettings && (
-              <div className="absolute top-full right-0 mt-1 w-52 bg-white rounded-xl shadow-lg border border-gray-100 py-1.5 z-50">
+              <div className="absolute top-full right-0 mt-1 w-56 bg-white rounded-xl shadow-lg border border-gray-100 py-1.5 z-50">
+                {/* User info header */}
+                {user && (
+                  <div className="px-4 py-2.5 border-b border-gray-100 mb-1">
+                    <p className="text-sm font-semibold text-gray-900 truncate">{user.full_name}</p>
+                    <p className="text-xs text-gray-400 truncate">{user.email}</p>
+                  </div>
+                )}
                 <Link href="/settings/profile" onClick={() => setShowSettings(false)}
                   className="flex items-center gap-2.5 px-4 py-2 text-sm text-gray-700 hover:bg-gray-50">
                   <svg className="w-4 h-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">

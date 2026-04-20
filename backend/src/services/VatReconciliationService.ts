@@ -16,7 +16,15 @@ export interface VatSummary {
   ct22_total_input_vat: number;
   ct23_deductible_input_vat: number;
   ct23_input_subtotal: number;
+  /** Tổng doanh thu đầu ra tất cả loại */
   ct29_total_revenue: number;
+  /** [26] Doanh thu không chịu thuế GTGT (tax_category=KCT) */
+  ct26_kct_revenue: number;
+  /** [29] Doanh thu thuế suất 0% / xuất khẩu (tax_category=0) */
+  ct29_0pct_revenue: number;
+  /** [32a] Doanh thu không phải kê khai, tính nộp thuế (tax_category=KKKNT) */
+  ct32a_kkknt_revenue: number;
+  /** Backward-compat alias of ct26_kct_revenue */
   ct30_exempt_revenue: number;
   ct32_revenue_5pct: number;
   ct33_vat_5pct: number;
@@ -113,6 +121,7 @@ export class VatReconciliationService {
          AND deleted_at IS NULL
          AND EXTRACT(MONTH FROM invoice_date) = $2
          AND EXTRACT(YEAR FROM invoice_date) = $3
+         AND (non_deductible = false OR non_deductible IS NULL)
          AND (
            -- Group 5: có mã CQT → phải gdt_validated; NULL group không tự động coi là group 5
            (invoice_group = 5 AND gdt_validated = true)
@@ -139,13 +148,25 @@ export class VatReconciliationService {
 
     // ============================================================
     // Output invoices — valid only, excluding logically-replaced invoices
+    // GROUP BY tax_category for proper [26]/[29]/[32a]/[30]/[32]/[34] bucket routing
     // ============================================================
     const { rows: outputByRate } = await pool.query<{
-      vat_rate: string;
+      tax_cat: string;
       vat_sum: string;
       subtotal_sum: string;
     }>(
-      `SELECT vat_rate, SUM(vat_amount) as vat_sum, SUM(subtotal) as subtotal_sum
+      `SELECT
+         COALESCE(tax_category,
+           CASE
+             WHEN ROUND(vat_rate::numeric, 2) = 5.00  THEN '5'
+             WHEN ROUND(vat_rate::numeric, 2) = 8.00  THEN '8'
+             WHEN ROUND(vat_rate::numeric, 2) = 10.00 THEN '10'
+             WHEN ROUND(vat_rate::numeric, 2) = 0.00  THEN 'KCT'
+             ELSE NULL
+           END
+         ) AS tax_cat,
+         SUM(vat_amount) as vat_sum,
+         SUM(subtotal) as subtotal_sum
        FROM invoices
        WHERE company_id = $1
          AND direction = 'output'
@@ -155,33 +176,37 @@ export class VatReconciliationService {
          AND EXTRACT(YEAR FROM invoice_date) = $3
          ${_notReplacedClause('invoices')}
          ${outputIdFilter}
-       GROUP BY vat_rate`,
+       GROUP BY 1`,
       outputBaseParams()
     );
 
-    // Build output breakdown by rate.
-    // NaN keys occur when vat_rate is NULL or non-numeric in DB (e.g. KCT stored before
-    // the parseVatRate fix).  Merge them into '0' (tax-exempt bucket → ct30) so they
-    // show up in [26] instead of silently inflating ct40 with no matching breakdown row.
+    // Build output breakdown by tax_category key.
+    // NULL tax_cat → merge into 'KCT' (safest fallback for unknown 0-rate output).
     const outputMap: Record<string, { subtotal: number; vat: number }> = {};
     for (const row of outputByRate) {
-      const rateParsed = parseFloat(row.vat_rate);
-      const rate = isNaN(rateParsed) ? '0' : String(rateParsed);
-      const existing = outputMap[rate] ?? { subtotal: 0, vat: 0 };
-      outputMap[rate] = {
+      const key = row.tax_cat ?? 'KCT';
+      const existing = outputMap[key] ?? { subtotal: 0, vat: 0 };
+      outputMap[key] = {
         subtotal: existing.subtotal + parseFloat(row.subtotal_sum || '0'),
         vat:      existing.vat     + parseFloat(row.vat_sum     || '0'),
       };
     }
 
-    const ct29 = Object.values(outputMap).reduce((sum, v) => sum + v.subtotal, 0);
-    const ct30 = outputMap['0']?.subtotal ?? 0;
+    const ct26_kct   = outputMap['KCT']?.subtotal   ?? 0;  // [26] không chịu thuế
+    const ct29_0pct  = outputMap['0']?.subtotal     ?? 0;  // [29] thuế suất 0%
+    const ct32a_kkknt = outputMap['KKKNT']?.subtotal ?? 0; // [32a] KKKNT
     const ct32 = outputMap['5']?.subtotal ?? 0;
     const ct33 = outputMap['5']?.vat ?? 0;
     const ct34 = outputMap['8']?.subtotal ?? 0;
     const ct35 = outputMap['8']?.vat ?? 0;
     const ct36 = outputMap['10']?.subtotal ?? 0;
     const ct37 = outputMap['10']?.vat ?? 0;
+    // [27] tổng doanh thu chịu thuế = 0% + 5% + 8% + 10%
+    const ct27_taxable = ct29_0pct + ct32 + ct34 + ct36;
+    // [34] tổng doanh thu = [26] + [27] + [32a]
+    const ct29 = ct26_kct + ct27_taxable + ct32a_kkknt;
+    // Backward compat: ct30_exempt_revenue = ct26_kct
+    const ct30 = ct26_kct;
     const ct40 = ct29;
     const ct40a = ct33 + ct35 + ct37;
     const outputVat = ct40a;
@@ -203,8 +228,8 @@ export class VatReconciliationService {
     const breakdown: VatBreakdown = {
       by_rate: {
         0: {
-          output_subtotal: outputMap['0']?.subtotal ?? 0,
-          output_vat: outputMap['0']?.vat ?? 0,
+          output_subtotal: ct26_kct + ct29_0pct,
+          output_vat: (outputMap['KCT']?.vat ?? 0) + (outputMap['0']?.vat ?? 0),
           input_subtotal: inputMap['0']?.subtotal ?? 0,
           input_vat: inputMap['0']?.vat ?? 0,
         },
@@ -255,6 +280,9 @@ export class VatReconciliationService {
       ct23_deductible_input_vat: ct23,
       ct23_input_subtotal,
       ct29_total_revenue: ct29,
+      ct26_kct_revenue: ct26_kct,
+      ct29_0pct_revenue: ct29_0pct,
+      ct32a_kkknt_revenue: ct32a_kkknt,
       ct30_exempt_revenue: ct30,
       ct32_revenue_5pct: ct32,
       ct33_vat_5pct: ct33,
@@ -318,6 +346,7 @@ export class VatReconciliationService {
          AND deleted_at IS NULL
          AND EXTRACT(YEAR FROM invoice_date) = $2
          AND EXTRACT(MONTH FROM invoice_date) = ANY($3::int[])
+         AND (non_deductible = false OR non_deductible IS NULL)
          AND (
            total_amount <= 20000000
            OR payment_method IS NULL
@@ -340,8 +369,18 @@ export class VatReconciliationService {
     const ct23 = inputDeductible.reduce((s, r) => s + parseFloat(r.vat_sum || '0'), 0);
     const ct23_input_subtotal = inputDeductible.reduce((s, r) => s + parseFloat(r.subtotal_sum || '0'), 0);
 
-    const { rows: outputByRate } = await pool.query<{ vat_rate: string; vat_sum: string; subtotal_sum: string }>(
-      `SELECT vat_rate, SUM(vat_amount) AS vat_sum, SUM(subtotal) AS subtotal_sum
+    const { rows: outputByRate } = await pool.query<{ tax_cat: string; vat_sum: string; subtotal_sum: string }>(
+      `SELECT
+         COALESCE(tax_category,
+           CASE
+             WHEN ROUND(vat_rate::numeric, 2) = 5.00  THEN '5'
+             WHEN ROUND(vat_rate::numeric, 2) = 8.00  THEN '8'
+             WHEN ROUND(vat_rate::numeric, 2) = 10.00 THEN '10'
+             WHEN ROUND(vat_rate::numeric, 2) = 0.00  THEN 'KCT'
+             ELSE NULL
+           END
+         ) AS tax_cat,
+         SUM(vat_amount) AS vat_sum, SUM(subtotal) AS subtotal_sum
        FROM invoices
        WHERE company_id = $1
          AND direction = 'output'
@@ -351,17 +390,17 @@ export class VatReconciliationService {
          AND EXTRACT(MONTH FROM invoice_date) = ANY($3::int[])
          ${_notReplacedClause('invoices')}
          ${outputIdFilter}
-       GROUP BY vat_rate`,
+       GROUP BY 1`,
       outputBaseParams(),
     );
 
-    // Build output breakdown — merge NaN/NULL vat_rate into '0' (exempt bucket = ct30).
+    // Build output breakdown by tax_category key.
+    // NULL tax_cat → merge into 'KCT' (safest fallback for unknown 0-rate output).
     const outputMap: Record<string, { subtotal: number; vat: number }> = {};
     for (const row of outputByRate) {
-      const rateParsed = parseFloat(row.vat_rate);
-      const rate = isNaN(rateParsed) ? '0' : String(rateParsed);
-      const existing = outputMap[rate] ?? { subtotal: 0, vat: 0 };
-      outputMap[rate] = {
+      const key = row.tax_cat ?? 'KCT';
+      const existing = outputMap[key] ?? { subtotal: 0, vat: 0 };
+      outputMap[key] = {
         subtotal: existing.subtotal + parseFloat(row.subtotal_sum || '0'),
         vat:      existing.vat     + parseFloat(row.vat_sum     || '0'),
       };
@@ -378,17 +417,21 @@ export class VatReconciliationService {
       };
     }
 
-    const ct29 = Object.values(outputMap).reduce((s, v) => s + v.subtotal, 0);
-    const ct30 = outputMap['0']?.subtotal ?? 0;
+    const ct26_kct    = outputMap['KCT']?.subtotal   ?? 0;
+    const ct29_0pct   = outputMap['0']?.subtotal     ?? 0;
+    const ct32a_kkknt = outputMap['KKKNT']?.subtotal ?? 0;
     const ct32 = outputMap['5']?.subtotal ?? 0;  const ct33 = outputMap['5']?.vat ?? 0;
     const ct34 = outputMap['8']?.subtotal ?? 0;  const ct35 = outputMap['8']?.vat ?? 0;
     const ct36 = outputMap['10']?.subtotal ?? 0; const ct37 = outputMap['10']?.vat ?? 0;
+    const ct27_taxable = ct29_0pct + ct32 + ct34 + ct36;
+    const ct29 = ct26_kct + ct27_taxable + ct32a_kkknt;
+    const ct30 = ct26_kct;
     const ct40 = ct29;
     const ct40a = ct33 + ct35 + ct37;
 
     const breakdown: VatBreakdown = {
       by_rate: {
-        0:  { output_subtotal: ct30,  output_vat: outputMap['0']?.vat  ?? 0, input_subtotal: inputMap['0']?.subtotal  ?? 0, input_vat: inputMap['0']?.vat  ?? 0 },
+        0:  { output_subtotal: ct26_kct + ct29_0pct,  output_vat: (outputMap['KCT']?.vat ?? 0) + (outputMap['0']?.vat ?? 0), input_subtotal: inputMap['0']?.subtotal  ?? 0, input_vat: inputMap['0']?.vat  ?? 0 },
         5:  { output_subtotal: ct32,  output_vat: ct33, input_subtotal: inputMap['5']?.subtotal  ?? 0, input_vat: inputMap['5']?.vat  ?? 0 },
         8:  { output_subtotal: ct34,  output_vat: ct35, input_subtotal: inputMap['8']?.subtotal  ?? 0, input_vat: inputMap['8']?.vat  ?? 0 },
         10: { output_subtotal: ct36,  output_vat: ct37, input_subtotal: inputMap['10']?.subtotal ?? 0, input_vat: inputMap['10']?.vat ?? 0 },
@@ -421,6 +464,9 @@ export class VatReconciliationService {
       ct23_deductible_input_vat: ct23,
       ct23_input_subtotal,
       ct29_total_revenue: ct29, ct30_exempt_revenue: ct30,
+      ct26_kct_revenue: ct26_kct,
+      ct29_0pct_revenue: ct29_0pct,
+      ct32a_kkknt_revenue: ct32a_kkknt,
       ct32_revenue_5pct: ct32,  ct33_vat_5pct: ct33,
       ct34_revenue_8pct: ct34,  ct35_vat_8pct: ct35,
       ct36_revenue_10pct: ct36, ct37_vat_10pct: ct37,

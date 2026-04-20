@@ -183,6 +183,13 @@ export interface TaxDeclaration {
   ct40a_total_output_vat: number;
   ct41_payable_vat: number;
   ct43_carry_forward_vat: number;
+  ct26_kct_revenue?: number;
+  ct29_0pct_revenue?: number;
+  ct32a_kkknt_revenue?: number;
+  ct37_adjustment_decrease?: number | null;
+  ct38_adjustment_increase?: number | null;
+  ct40b_investment_vat?: number | null;
+  ct21_no_activity?: boolean | null;
   xml_content: string | null;
   xml_generated_at: Date | null;
   submission_method: SubmissionMethod;

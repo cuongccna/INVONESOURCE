@@ -384,21 +384,29 @@ export function calculateJobTimeout(estimate: {
   outEst: number;
   inEst: number;
 }): number {
+  // Dynamic import to avoid circular dependency
+  const { getPeakTimeoutMultiplier } = require('./gdt-direct-api.service');
+  const m: number = getPeakTimeoutMultiplier();
   const total = estimate.outEst + estimate.inEst;
 
+  // Peak: detail time per invoice increases from 12s to 30s
+  const detailPerInvoice = m > 1 ? 30_000 : 12_000;
   const estimated =
     16_000 +                           // login + captcha
     Math.ceil(total / 50) * 1_000 +    // list pages
-    total * 12_000 +                   // detail fetch (worst case sco)
+    total * detailPerInvoice +         // detail fetch
     60_000;                            // retry buffer
 
-  const clamped = Math.min(Math.max(estimated, 3 * 60_000), 30 * 60_000);
+  // Peak: cap increases from 30min to 90min
+  const maxCap = m > 1 ? 90 * 60_000 : 30 * 60_000;
+  const clamped = Math.min(Math.max(estimated, 3 * 60_000), maxCap);
 
   const minutes = Math.round(clamped / 60_000 * 10) / 10;
-  logger.info(`Dynamic timeout set: ${minutes}m for ${total} invoices`, {
+  logger.info(`Dynamic timeout set: ${minutes}m for ${total} invoices (peak x${m})`, {
     outEst: estimate.outEst,
     inEst: estimate.inEst,
     timeoutMs: clamped,
+    peakMultiplier: m,
   });
 
   return clamped;

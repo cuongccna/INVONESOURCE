@@ -9,12 +9,13 @@ import apiClient, { setAccessToken } from '../../lib/apiClient';
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 
 const NAV_ITEMS = [
-  { href: '/admin',                    label: 'Tổng quan',        icon: '📊' },
-  { href: '/admin/users',              label: 'Người dùng',       icon: '👥' },
-  { href: '/admin/plans',              label: 'Gói dịch vụ',      icon: '💼' },
-  { href: '/admin/analytics',          label: 'Phân tích',        icon: '📈' },
-  { href: '/admin/proxies',            label: 'Proxy Pool',       icon: '🌐' },
-  { href: '/admin/crawler-recipes',    label: 'Crawler Recipes',  icon: '🔧' },
+  { href: '/admin',                      label: 'Tổng quan',        icon: '📊' },
+  { href: '/admin/users',                label: 'Người dùng',       icon: '👥' },
+  { href: '/admin/plans',                label: 'Gói dịch vụ',      icon: '💼' },
+  { href: '/admin/analytics',            label: 'Phân tích',        icon: '📈' },
+  { href: '/admin/proxies',              label: 'Proxy Pool',       icon: '🌐' },
+  { href: '/admin/crawler-recipes',      label: 'Crawler Recipes',  icon: '🔧' },
+  { href: '/admin/indicator-configs',    label: 'Chỉ tiêu 01/GTGT', icon: '⚙️' },
 ];
 
 function SidebarContent({ pathname, onClose }: { pathname: string; onClose?: () => void }) {

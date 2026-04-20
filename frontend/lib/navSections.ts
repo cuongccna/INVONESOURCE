@@ -93,3 +93,24 @@ export const DRAWER_SECTIONS = [
 ];
 
 export const DRAWER_HREFS = DRAWER_SECTIONS.flatMap((s) => s.items.map((i) => i.href));
+
+// Only these sections are currently visible in the "Thêm" menu.
+// Remaining sections are preserved above for future re-enabling.
+export const VISIBLE_DRAWER_SECTIONS = [
+  {
+    title: '🗂️ Danh Mục',
+    items: [
+      { href: '/catalogs/products',  label: 'Hàng hóa & dịch vụ' },
+      { href: '/catalogs/customers', label: 'Khách hàng' },
+      { href: '/catalogs/suppliers', label: 'Nhà cung cấp' },
+    ],
+  },
+  {
+    title: '📒 Kế Toán',
+    items: [
+      { href: '/reports/sales-journal', label: 'Bảng kê bán ra / mua vào' },
+    ],
+  },
+];
+
+export const VISIBLE_DRAWER_HREFS = VISIBLE_DRAWER_SECTIONS.flatMap((s) => s.items.map((i) => i.href));

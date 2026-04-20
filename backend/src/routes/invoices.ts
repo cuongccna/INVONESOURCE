@@ -88,7 +88,9 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
                 payment_method,
                 COALESCE(customer_code, NULL)::TEXT AS customer_code,
                 COALESCE(item_code, NULL)::TEXT     AS item_code,
-                COALESCE(notes, NULL)::TEXT          AS notes
+                COALESCE(notes, NULL)::TEXT          AS notes,
+                tc_hdon, khhd_cl_quan, so_hd_cl_quan,
+                non_deductible
          FROM invoices WHERE ${where}
          ORDER BY invoice_date DESC
          LIMIT $${idx} OFFSET $${idx + 1}`,
@@ -240,6 +242,61 @@ router.get('/export', async (req: Request, res: Response, next: NextFunction) =>
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="HoaDon_${new Date().toISOString().slice(0, 10)}.xlsx"`);
     res.send(buf);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/invoices/download-xml — tải ZIP chứa XML của các hóa đơn được chọn
+router.get('/download-xml', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const idsParam = req.query.ids as string;
+    if (!idsParam) return res.status(400).json({ success: false, error: { code: 'MISSING_IDS', message: 'ids query parameter is required' } });
+
+    const ids = idsParam.split(',').slice(0, 100);
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const validIds = ids.filter(id => uuidRegex.test(id));
+    if (validIds.length === 0) return res.status(400).json({ success: false, error: { code: 'INVALID_IDS', message: 'No valid UUIDs provided' } });
+
+    const placeholders = validIds.map((_, i) => `$${i + 2}`).join(',');
+    const { rows } = await pool.query(
+      `SELECT invoice_number, seller_tax_code, buyer_tax_code, direction, raw_xml FROM invoices WHERE company_id = $1 AND id IN (${placeholders}) AND raw_xml IS NOT NULL AND deleted_at IS NULL`,
+      [companyId, ...validIds]
+    );
+
+    if (rows.length === 0) {
+      // Check if invoices actually exist but just have no raw_xml stored
+      const { rows: existRows } = await pool.query<{ source: string }>(
+        `SELECT source FROM invoices WHERE company_id = $1 AND id IN (${placeholders}) AND deleted_at IS NULL LIMIT 5`,
+        [companyId, ...validIds],
+      );
+      if (existRows.length > 0) {
+        const hasBotSource = existRows.some((r) => r.source === 'gdt_bot');
+        const code = hasBotSource ? 'NO_XML_BOT_SOURCE' : 'NO_XML';
+        const message = hasBotSource
+          ? 'Hóa đơn từ GDT Bot không có file XML gốc — bot chỉ lưu dữ liệu JSON. Chạy lại Backfill XML để lấy về.'
+          : 'Các hóa đơn chưa có file XML đính kèm.';
+        return res.status(404).json({ success: false, error: { code, message } });
+      }
+      return res.status(404).json({ success: false, error: { code: 'NO_XML', message: 'No invoices with XML found' } });
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const createArchive = require('archiver') as (format: string, options: Record<string, unknown>) => { pipe: (dest: NodeJS.WritableStream) => void; append: (source: string, data: { name: string }) => void; finalize: () => Promise<void> };
+    const archive = createArchive('zip', { zlib: { level: 5 } });
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="HoaDon_XML_${new Date().toISOString().slice(0, 10)}.zip"`);
+    archive.pipe(res);
+
+    for (const row of rows) {
+      const prefix = row.direction === 'output' ? 'BR' : 'MV';
+      const taxCode = row.direction === 'output' ? row.seller_tax_code : row.buyer_tax_code;
+      const filename = `${prefix}_${taxCode}_${row.invoice_number || 'unknown'}.xml`.replace(/[/\\?%*:|"<>]/g, '_');
+      archive.append(row.raw_xml, { name: filename });
+    }
+
+    await archive.finalize();
   } catch (err) {
     next(err);
   }
@@ -458,18 +515,19 @@ router.patch('/bulk-update', requireRole('OWNER', 'ADMIN'), async (req: Request,
 
     const { ids, updates, only_missing } = body.data;
     const setClauses: string[] = [];
+    const whereMissing: string[] = [];
     const params: unknown[] = [];
     let idx = 1;
 
     if (updates.item_code !== undefined) {
-      const cond = only_missing ? ` AND (item_code IS NULL OR item_code = '')` : '';
-      setClauses.push(`item_code = $${idx++}${cond}`);
+      setClauses.push(`item_code = $${idx++}`);
       params.push(updates.item_code);
+      if (only_missing) whereMissing.push(`(item_code IS NULL OR item_code = '')`);
     }
     if (updates.customer_code !== undefined) {
-      const cond = only_missing ? ` AND (customer_code IS NULL OR customer_code = '')` : '';
-      setClauses.push(`customer_code = $${idx++}${cond}`);
+      setClauses.push(`customer_code = $${idx++}`);
       params.push(updates.customer_code);
+      if (only_missing) whereMissing.push(`(customer_code IS NULL OR customer_code = '')`);
     }
     if (updates.payment_method !== undefined) {
       setClauses.push(`payment_method = $${idx++}, payment_method_source = 'manual'`);
@@ -481,9 +539,10 @@ router.patch('/bulk-update', requireRole('OWNER', 'ADMIN'), async (req: Request,
     params.push(ids);
     params.push(companyId);
 
+    const missingCond = whereMissing.length > 0 ? ` AND (${whereMissing.join(' OR ')})` : '';
     await pool.query(
       `UPDATE invoices SET ${setClauses.join(', ')}, updated_at = NOW()
-       WHERE id = ANY($${idx}::uuid[]) AND company_id = $${idx + 1} AND deleted_at IS NULL`,
+       WHERE id = ANY($${idx}::uuid[]) AND company_id = $${idx + 1} AND deleted_at IS NULL${missingCond}`,
       params
     );
     await writeAuditLog(companyId, userId, 'bulk_update_category', null, { ids, updates });
@@ -999,6 +1058,22 @@ router.patch('/:id/cash-risk-acknowledge', async (req: Request, res: Response, n
     const { note } = req.body as { note?: string };
     await cashPaymentDetector.acknowledge(req.params.id!, userId, companyId, note);
     sendSuccess(res, { ok: true });
+  } catch (err) { next(err); }
+});
+
+// PATCH /api/invoices/:id/non-deductible — đánh dấu hoá đơn không đủ điều kiện khấu trừ
+router.patch('/:id/non-deductible', requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const { non_deductible } = z.object({ non_deductible: z.boolean() }).parse(req.body);
+    const { rows } = await pool.query(
+      `UPDATE invoices SET non_deductible = $1, updated_at = NOW()
+       WHERE id = $2 AND company_id = $3 AND deleted_at IS NULL
+       RETURNING id, non_deductible`,
+      [non_deductible, req.params.id, companyId]
+    );
+    if (!rows[0]) throw new NotFoundError('Invoice not found');
+    sendSuccess(res, rows[0]);
   } catch (err) { next(err); }
 });
 

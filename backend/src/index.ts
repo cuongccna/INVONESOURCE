@@ -60,6 +60,7 @@ import adminRouter from './routes/admin';
 import adminProxyRouter from './routes/admin-proxy';
 import toolsRouter from './routes/tools';
 import syncStatusRouter from './routes/syncStatus';
+import indicatorConfigsRouter from './routes/indicatorConfigs';
 
 const app = express();
 
@@ -151,6 +152,7 @@ app.use('/api/admin', adminRouter);
 app.use('/api/admin/proxies', adminProxyRouter);
 app.use('/api/tools', toolsRouter);
 app.use('/api/sync-status', syncStatusRouter);
+app.use('/api/indicator-configs', indicatorConfigsRouter);
 
 // Health check (unauthenticated)
 app.get('/health', (_req, res) => {
