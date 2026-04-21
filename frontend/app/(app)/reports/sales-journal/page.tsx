@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import apiClient from '../../../../lib/apiClient';
 import { useCompany } from '../../../../contexts/CompanyContext';
 import { formatVND } from '../../../../utils/formatCurrency';
@@ -61,6 +61,8 @@ export default function JournalsPage() {
   const [data, setData] = useState<JournalData | null>(null);
   const [loading, setLoading] = useState(true);
   const [period, setPeriod] = useState<PeriodValue>(defaultPeriod);
+  const [exportLoading, setExportLoading] = useState(false);
+  const anchorRef = useRef<HTMLAnchorElement>(null);
 
   useEffect(() => {
     if (!activeCompanyId) return;
@@ -80,8 +82,36 @@ export default function JournalsPage() {
   };
   const totals = data?.totals ?? emptyTotals;
 
+  async function handleExport() {
+    if (!activeCompanyId) return;
+    setExportLoading(true);
+    try {
+      const endpoint = tab === 'sales' ? 'sales/export' : 'purchase/export';
+      const response = await apiClient.get(`/journals/${endpoint}?${periodToParams(period)}`, {
+        responseType: 'blob',
+      });
+      const blob = new Blob([response.data as BlobPart], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = anchorRef.current!;
+      a.href = url;
+      a.download = tab === 'sales'
+        ? `BaoCaoChiTiet_BanRa.xlsx`
+        : `BaoCaoChiTiet_MuaVao.xlsx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } finally {
+      setExportLoading(false);
+    }
+  }
+
   return (
     <div className="p-4 max-w-6xl mx-auto space-y-4">
+      {/* Hidden anchor for blob download */}
+      {/* eslint-disable-next-line jsx-a11y/anchor-has-content */}
+      <a ref={anchorRef} className="hidden" />
+
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">
@@ -101,6 +131,23 @@ export default function JournalsPage() {
             </button>
           </div>
           <PeriodSelector value={period} onChange={setPeriod} />
+          <button
+            onClick={handleExport}
+            disabled={exportLoading}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium bg-green-600 text-white hover:bg-green-700 disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            {exportLoading ? (
+              <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+              </svg>
+            ) : (
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                <path fillRule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm3.293-7.707a1 1 0 011.414 0L9 10.586V3a1 1 0 112 0v7.586l1.293-1.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z" clipRule="evenodd" />
+              </svg>
+            )}
+            Xuất Excel
+          </button>
         </div>
       </div>
 

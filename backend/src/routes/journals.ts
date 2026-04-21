@@ -8,10 +8,49 @@ import { requireCompany } from '../middleware/company';
 import { pool } from '../db/pool';
 import { sendSuccess } from '../utils/response';
 import { resolvePeriod } from '../utils/period';
+import { JournalExcelGenerator } from '../reports/JournalExcelGenerator';
 
 const router = Router();
 router.use(authenticate);
 router.use(requireCompany);
+
+const journalExcelGenerator = new JournalExcelGenerator();
+
+// GET /api/journals/sales/export — Excel export (must be before /sales route)
+router.get('/sales/export', async (req: Request, res: Response) => {
+  const companyId = req.user!.companyId!;
+  const period = resolvePeriod(req.query);
+
+  const buffer = await journalExcelGenerator.generateSalesExport(companyId, period);
+
+  const periodSuffix = period.periodType === 'quarterly'
+    ? `Q${period.quarter}_${period.year}`
+    : period.periodType === 'yearly'
+    ? `${period.year}`
+    : `T${String(period.month).padStart(2, '0')}_${period.year}`;
+
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="BaoCaoChiTiet_BanRa_${periodSuffix}.xlsx"`);
+  res.send(buffer);
+});
+
+// GET /api/journals/purchase/export — Excel export (must be before /purchase route)
+router.get('/purchase/export', async (req: Request, res: Response) => {
+  const companyId = req.user!.companyId!;
+  const period = resolvePeriod(req.query);
+
+  const buffer = await journalExcelGenerator.generatePurchaseExport(companyId, period);
+
+  const periodSuffix = period.periodType === 'quarterly'
+    ? `Q${period.quarter}_${period.year}`
+    : period.periodType === 'yearly'
+    ? `${period.year}`
+    : `T${String(period.month).padStart(2, '0')}_${period.year}`;
+
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="BaoCaoChiTiet_MuaVao_${periodSuffix}.xlsx"`);
+  res.send(buffer);
+});
 
 // GET /api/journals/sales?month=&year=&periodType=monthly|quarterly|yearly&quarter=
 router.get('/sales', async (req: Request, res: Response) => {

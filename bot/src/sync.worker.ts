@@ -1616,12 +1616,18 @@ async function _maybeInsertLineItems(
     return 0;
   }
 
-  // Skip if line items already exist in DB
+  // Check if line items already exist AND whether payment_method still needs to be fetched
   const existing = await pool.query(
-    'SELECT 1 FROM invoice_line_items WHERE invoice_id = $1 LIMIT 1',
-    [invoiceId]
+    `SELECT
+       (SELECT 1 FROM invoice_line_items WHERE invoice_id = $1 LIMIT 1) AS has_items,
+       (SELECT payment_method FROM invoices WHERE id = $1)              AS payment_method`,
+    [invoiceId],
   );
-  if (existing.rows.length > 0) return 0;
+  const hasLineItems     = existing.rows[0]?.has_items === 1;
+  const needsPaymentMethod = !existing.rows[0]?.payment_method;
+
+  // Skip entirely if line items exist AND payment_method is already set
+  if (hasLineItems && !needsPaymentMethod) return 0;
 
   // Rate-limit: small delay before detail fetch
   await thinkTime(2500, 4500);
@@ -1636,13 +1642,30 @@ async function _maybeInsertLineItems(
       isSco:    inv.is_sco,
     });
     const lineItems = GdtDirectApiService.parseLineItemsFromDetail(detail);
-    if (lineItems.length > 0) {
+    if (lineItems.length > 0 && !hasLineItems) {
+      // Only insert line items if they don't already exist
       await _bulkInsertLineItems(lineItems, invoiceId, companyId);
       logger.info('[SyncWorker] Line items inserted (detail API)', { invoiceId, count: lineItems.length });
-      return 1;
+    } else if (lineItems.length === 0 && !hasLineItems) {
+      // Detail returned 200 but hdhhdvu empty — invoice may have no line items (e.g. summary invoice)
+      logger.info('[SyncWorker] Detail API: no line items in hdhhdvu', { invoiceId });
     }
-    // Detail returned 200 but hdhhdvu empty — invoice may have no line items (e.g. summary invoice)
-    logger.info('[SyncWorker] Detail API: no line items in hdhhdvu', { invoiceId });
+
+    // Save payment_method from detail if not yet set (source = gdt_detail)
+    const paymentMethodFromDetail = typeof detail.thtttoan === 'string' && detail.thtttoan.trim()
+      ? detail.thtttoan.trim()
+      : null;
+    if (paymentMethodFromDetail) {
+      await pool.query(
+        `UPDATE invoices
+         SET payment_method = $1,
+             payment_method_source = 'gdt_detail'
+         WHERE id = $2
+           AND (payment_method IS NULL OR payment_method_source NOT IN ('manual', 'gdt_data'))`,
+        [paymentMethodFromDetail, invoiceId],
+      );
+    }
+
     return 1;
   } catch (detailErr: unknown) {
     const msg = detailErr instanceof Error ? detailErr.message : String(detailErr);

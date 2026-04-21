@@ -218,6 +218,7 @@ interface GdtInvoiceDetail {
   tgtthue?:  number;   // total VAT
   tgtttbso?: number;   // total with VAT
   ttxly?:    number;   // processing status
+  thtttoan?: string;   // hình thức thanh toán: "TM/CK", "CK", "TM"...
   hdhhdvu?:  GdtHdhhdvuItem[];  // line items array
   [key: string]: unknown;
 }
