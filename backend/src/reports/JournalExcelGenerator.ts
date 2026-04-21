@@ -373,7 +373,10 @@ export class JournalExcelGenerator {
       cell.border    = allBorders();
     }
 
-    const buffer = await wb.xlsx.writeBuffer();
-    return buffer as Buffer;
+    const buf = await wb.xlsx.writeBuffer();
+    // ExcelJS may return ArrayBuffer | Buffer | Uint8Array depending on environment.
+    // Ensure we return a Node.js Buffer for downstream code and typing compatibility.
+    const nodeBuffer = Buffer.isBuffer(buf) ? buf : Buffer.from(buf as any);
+    return nodeBuffer;
   }
 }
