@@ -23,7 +23,7 @@ export interface RawInvoice {
   invoice_number:  string | null;
   invoice_date:    string | null;
   direction:       'output' | 'input';
-  status:          'valid' | 'cancelled' | 'replaced' | 'adjusted';
+  status:          'valid' | 'cancelled' | 'replaced' | 'adjusted' | 'replaced_original';
   seller_name:     string | null;
   seller_tax_code: string | null;
   buyer_name:      string | null;
@@ -56,6 +56,12 @@ export interface RawInvoice {
   /** Số hóa đơn bị thay thế/điều chỉnh (shdon của hóa đơn gốc). */
   so_hd_cl_quan:   string | null;
   /**
+   * Ngày lập hóa đơn gốc (tdlhdgoc từ GDT).
+   * Dùng phát hiện điều chỉnh cross-period cho [37]/[38].
+   * null = không phải hóa đơn điều chỉnh.
+   */
+  original_invoice_date: string | null;
+  /**
    * Phân loại thuế suất — dùng để phân bucket chỉ tiêu tờ khai 01/GTGT:
    *   'KCT'   = Không chịu thuế GTGT ([26])
    *   'KKKNT' = Không phải kê khai, tính nộp GTGT ([32a])
@@ -67,16 +73,22 @@ export interface RawInvoice {
 }
 
 export interface LineItem {
-  line_number: number | null;
-  item_code:   string | null;
-  item_name:   string | null;
-  unit:        string | null;
-  quantity:    number | null;
-  unit_price:  number | null;
-  subtotal:    number | null;
-  vat_rate:    number | null;
-  vat_amount:  number | null;
-  total:       number | null;
+  line_number:     number | null;
+  item_code:       string | null;
+  item_name:       string | null;
+  unit:            string | null;
+  quantity:        number | null;
+  unit_price:      number | null;
+  subtotal:        number | null;
+  vat_rate:        number | null;   // integer % (e.g. 8)
+  vat_rate_label:  string | null;   // raw string from GDT (e.g. "KCT", "8%")
+  vat_amount:      number | null;
+  total:           number | null;
+  discount_amount: number | null;   // stckhau — chiết khấu dòng
+  discount_rate:   number | null;   // tlckhau — tỷ lệ chiết khấu (e.g. 0.05 = 5%)
+  line_type:       number | null;   // tchat (1=hàng hóa, 2=dịch vụ)
+  gdt_line_id:     string | null;   // id — UUID dòng từ GDT
+  gdt_invoice_id:  string | null;   // idhdon — UUID hóa đơn từ GDT
 }
 
 // GDT invoice status codes (TTHThue field)
@@ -181,6 +193,7 @@ export class GdtXmlParser {
       khhd_cl_quan:    this._str(ttchung, 'KHHDCLQuan', 'KHHDon_goc', 'kHHDCLQuan'),
       so_hd_cl_quan:   this._str(ttchung, 'SHDCLQuan',  'SHDon_goc',  'sHDCLQuan'),
       tax_category:    this._extractTaxCategory(this._val(ndhdon, 'TSuat', 'tSuat')),
+      original_invoice_date: null,
     };
   }
 
@@ -333,17 +346,23 @@ export class GdtXmlParser {
       })();
 
       return {
-        line_number: this._num(r, 'STT', 'stt') ?? idx + 1,
-        item_code:   this._str(r, 'MHHDVu', 'mHHDVu', 'MHH', 'ma_hh'),
-        item_name:   this._str(r, 'THHDVu', 'tHHDVu', 'Ten', 'ten_hh'),
-        unit:        this._str(r, 'DVTinh', 'dVTinh', 'dvt'),
-        quantity:    this._num(r, 'SLuong', 'sLuong', 'so_luong'),
-        unit_price:  this._num(r, 'DGia', 'dGia', 'don_gia'),
-        subtotal:    this._num(r, 'ThTien', 'thTien', 'thanh_tien'),
-        vat_rate:    vatRateNum,
-        vat_amount:  this._num(r, 'TienThue', 'tienThue', 'tien_thue') ?? this._ttkhacVal(r, 'VATAmount'),
+        line_number:    this._num(r, 'STT', 'stt') ?? idx + 1,
+        item_code:      this._str(r, 'MHHDVu', 'mHHDVu', 'MHH', 'ma_hh'),
+        item_name:      this._str(r, 'THHDVu', 'tHHDVu', 'Ten', 'ten_hh'),
+        unit:           this._str(r, 'DVTinh', 'dVTinh', 'dvt'),
+        quantity:       this._num(r, 'SLuong', 'sLuong', 'so_luong'),
+        unit_price:     this._num(r, 'DGia', 'dGia', 'don_gia'),
+        subtotal:       this._num(r, 'ThTien', 'thTien', 'thanh_tien'),
+        vat_rate:       vatRateNum,
+        vat_rate_label: vatRateRaw != null ? String(vatRateRaw) : null,
+        vat_amount:     this._num(r, 'TienThue', 'tienThue', 'tien_thue') ?? this._ttkhacVal(r, 'VATAmount'),
         // 'Amount' (TTKhac) = tổng tiền thanh toán per-line (subtotal + VAT)
-        total:       this._ttkhacVal(r, 'Amount') ?? this._num(r, 'TgTTTBSo', 'tgTTTBSo', 'TToan', 'tToan'),
+        total:          this._ttkhacVal(r, 'Amount') ?? this._num(r, 'TgTTTBSo', 'tgTTTBSo', 'TToan', 'tToan'),
+        discount_amount: null,
+        discount_rate:   null,
+        line_type:       null,
+        gdt_line_id:     null,
+        gdt_invoice_id:  null,
       };
     }).filter(item => item.item_name != null);
   }

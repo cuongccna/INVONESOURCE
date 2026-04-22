@@ -290,26 +290,6 @@ export default function InvoicesPage() {
         </div>
       )}
 
-      {/* ── Filter Row 2b: Status ── */}
-      <div className="flex gap-1.5 mb-2 flex-wrap">
-        {([
-          { v: '',         label: 'Tất cả trạng thái', cls: 'border-gray-300 text-gray-600',            activeCls: 'bg-gray-900 text-white border-gray-900' },
-          { v: 'valid',    label: '✅ Hợp lệ',          cls: 'bg-green-50 text-green-700 border-green-200',  activeCls: 'bg-green-600 text-white border-green-600' },
-          { v: 'cancelled',label: '⛔ Đã hủy',          cls: 'bg-red-50 text-red-700 border-red-200',         activeCls: 'bg-red-600 text-white border-red-600' },
-          { v: 'replaced', label: '↺ Thay thế',        cls: 'bg-yellow-50 text-yellow-700 border-yellow-200', activeCls: 'bg-yellow-500 text-white border-yellow-500' },
-          { v: 'adjusted', label: '✏ Điều chỉnh',      cls: 'bg-blue-50 text-blue-700 border-blue-200',      activeCls: 'bg-blue-600 text-white border-blue-600' },
-          { v: 'invalid',  label: '⚠ Không hợp lệ',   cls: 'bg-orange-50 text-orange-700 border-orange-200', activeCls: 'bg-orange-600 text-white border-orange-600' },
-        ] as const).map(opt => (
-          <button key={opt.v}
-            onClick={() => { setStatusFilter(statusFilter === opt.v ? '' : opt.v); setSelectedIds([]); }}
-            className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
-              statusFilter === opt.v ? opt.activeCls : `bg-white ${opt.cls} hover:border-gray-400`
-            }`}>
-            {opt.label}
-          </button>
-        ))}
-      </div>
-
       {/* ── Filter Row 3: Source type (HĐ điện tử vs HĐ máy tính tiền) ── */}
       <div className="flex gap-1.5 mb-3 flex-wrap">
         {SCO_OPTS.map(opt => (
@@ -327,6 +307,27 @@ export default function InvoicesPage() {
                   : opt.v === false
                     ? 'bg-white text-sky-700 border-sky-200 hover:border-sky-400'
                     : 'bg-white text-gray-600 border-gray-300 hover:border-gray-500'
+            }`}>
+            {opt.label}
+          </button>
+        ))}
+      </div>
+
+      {/* ── Filter Row 3b: Status (trạng thái — trên ngày tháng để dễ lọc nhanh) ── */}
+      <div className="flex gap-1.5 mb-3 flex-wrap">
+        {([
+          { v: '',                  label: 'Tất cả trạng thái', cls: 'border-gray-300 text-gray-600',                activeCls: 'bg-gray-900 text-white border-gray-900' },
+          { v: 'valid',             label: '✅ Hợp lệ',          cls: 'bg-green-50 text-green-700 border-green-200',   activeCls: 'bg-green-600 text-white border-green-600' },
+          { v: 'cancelled',         label: '⛔ Đã hủy',          cls: 'bg-red-50 text-red-700 border-red-200',         activeCls: 'bg-red-600 text-white border-red-600' },
+          { v: 'replaced',          label: '↺ HĐ thay thế',      cls: 'bg-yellow-50 text-yellow-700 border-yellow-200', activeCls: 'bg-yellow-500 text-white border-yellow-500' },
+          { v: 'replaced_original', label: '🔄 Bị thay thế',     cls: 'bg-orange-50 text-orange-700 border-orange-200', activeCls: 'bg-orange-600 text-white border-orange-600' },
+          { v: 'adjusted',          label: '✏ HĐ điều chỉnh',    cls: 'bg-blue-50 text-blue-700 border-blue-200',      activeCls: 'bg-blue-600 text-white border-blue-600' },
+          { v: 'invalid',           label: '⚠ Không hợp lệ',    cls: 'bg-orange-50 text-orange-700 border-orange-200', activeCls: 'bg-orange-600 text-white border-orange-600' },
+        ] as const).map(opt => (
+          <button key={opt.v}
+            onClick={() => { setStatusFilter(statusFilter === opt.v ? '' : opt.v); setSelectedIds([]); }}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+              statusFilter === opt.v ? opt.activeCls : `bg-white ${opt.cls} hover:border-gray-400`
             }`}>
             {opt.label}
           </button>

@@ -21,6 +21,9 @@ import type { LineItem } from './parsers/GdtXmlParser';
 import { InvoiceDeduplicator } from './crawl-cache/InvoiceDeduplicator';
 import { GdtSessionCache }     from './crawl-cache/GdtSessionCache';
 import { SyncCheckpoint }      from './crawl-cache/SyncCheckpoint';
+import { GdtDetailCache }      from './crawl-cache/GdtDetailCache';
+import { MstLookupCache }      from './crawl-cache/MstLookupCache';
+import { gdtRawCacheService }  from './crawl-cache/GdtRawCacheService';
 
 const REDIS_URL    = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
 const CONCURRENCY  = parseInt(process.env['WORKER_CONCURRENCY'] ?? '2', 10);
@@ -236,6 +239,10 @@ const _dedup        = new InvoiceDeduplicator(_lockRedis);
 const _sessionCache = new GdtSessionCache(_lockRedis);
 // FIX-2: Pagination checkpoint singleton — resumes on crash, no restart from page 0
 const _checkpoint   = new SyncCheckpoint(_lockRedis);
+// BOT-CACHE-01: Detail API response cache — prevents redundant GDT calls on re-sync
+const _detailCache  = new GdtDetailCache(_lockRedis);
+// BOT-CACHE-03B: MST lookup cache — prevents N+1 GDT tax-code lookups
+export const _mstCache = new MstLookupCache(_lockRedis);
 const BOT_LOCK_PREFIX   = 'bot:sync:lock:';
 // Peak period: increase lock TTL from 45min to 120min to prevent lock expiry during long syncs
 function getBotLockTtl(): number {
@@ -362,6 +369,8 @@ interface SyncJobData {
   // BUG2 FIX: userId of the person who triggered manual sync (not necessarily OWNER)
   // Must be set for all manual jobs so proxy is acquired for the correct user.
   triggeredByUserId?: string;
+  // BOT-LICENSE-01: resolved plan id from LicenseService (passed by backend/routes/bot.ts)
+  userPlan?: string;
   // Origin of the trigger — 'user_manual' | 'user_quick_sync' | 'auto_scheduler' | 'quarter_group'
   triggeredBy?: string;
 }
@@ -571,6 +580,25 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
   // Chained jobs are sequential months in a quarter sync (enqueued by the previous month).
   // They reuse the cached GDT token (no new login), so the 15-min login cooldown does not apply.
   const isChained = job.data.isChained ?? false;
+
+  // BOT-LICENSE-01: Enforce rate limit for manual jobs using the plan resolved at enqueue time.
+  // This check runs BEFORE acquiring the company lock so the lock is not wasted.
+  if (isManual && job.data.triggeredByUserId) {
+    const rl = await checkManualRateLimit(
+      job.data.triggeredByUserId,
+      job.data.userPlan ?? RATE_LIMIT_DEFAULT_PLAN,
+    );
+    if (!rl.allowed) {
+      logger.warn('[SyncWorker] Manual rate limit exceeded — dropping job', {
+        jobId:    job.id,
+        userId:   job.data.triggeredByUserId.slice(0, 8) + '…',
+        userPlan: job.data.userPlan,
+        message:  rl.message,
+      });
+      // UnrecoverableError: do not retry — limit will reset on its own
+      throw new UnrecoverableError(`RATE_LIMIT: ${rl.message ?? 'Rate limit exceeded'}`);
+    }
+  }
 
   // ── 0. Time-of-day awareness (BEFORE lock — don't hold lock while sleeping) ──
   // Prefer running during Vietnam business hours (8am-8pm GMT+7).
@@ -828,7 +856,7 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     await job.updateProgress({ percent: 5, statusMessage: 'Đang đăng nhập GDT...' } as Record<string, unknown>);
     await thinkTime(isManual ? 500 : 3_000, isManual ? 2_000 : 15_000);
 
-    const gdtApi = new GdtDirectApiService(proxyUrl, socks5ProxyUrl, undefined, companyId, _checkpoint);
+    const gdtApi = new GdtDirectApiService(proxyUrl, socks5ProxyUrl, undefined, companyId, _checkpoint, gdtRawCacheService);
     // VĐ1: Wire proxy manager for mid-request proxy swap on TCP drops
     if (proxyUrl && proxySessionId) {
       gdtApi.setProxyManager(proxyManager, proxySessionId);
@@ -973,7 +1001,7 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
           const freshSocks5Url = proxyManager.nextSocks5ForCompany(proxySessionId!);
           if (freshUrl && freshUrl !== proxyUrl) {
             // Rebuild GdtDirectApiService with fresh proxy; re-login with the new IP.
-            const freshApi = new GdtDirectApiService(freshUrl, freshSocks5Url, undefined, companyId, _checkpoint);
+            const freshApi = new GdtDirectApiService(freshUrl, freshSocks5Url, undefined, companyId, _checkpoint, gdtRawCacheService);
             await freshApi.login(creds.username, creds.password, isManual);
             // Swap in-scope references
             Object.assign(gdtApi, freshApi);
@@ -1370,6 +1398,7 @@ async function _batchUpsertInvoices(
   const tcHdons:        (number | null)[]  = [];
   const khhdClQuans:    (string | null)[]  = [];
   const soHdClQuans:    (string | null)[]  = [];
+  const originalInvDates: (string | null)[] = [];
 
   for (const inv of invoices) {
     const { invoiceGroup, serialHasCqt, hasLineItems } = _classifySerial(inv.serial_number);
@@ -1396,6 +1425,7 @@ async function _batchUpsertInvoices(
     tcHdons.push(inv.tc_hdon ?? null);
     khhdClQuans.push(inv.khhd_cl_quan ?? null);
     soHdClQuans.push(inv.so_hd_cl_quan ?? null);
+    originalInvDates.push(inv.original_invoice_date ?? null);
   }
 
   const dirArr  = Array(invoices.length).fill(direction) as string[];
@@ -1407,7 +1437,7 @@ async function _batchUpsertInvoices(
       seller_name, seller_tax_code, buyer_name, buyer_tax_code,
       subtotal, total_amount, vat_amount, vat_rate, tax_category, gdt_validated, source, provider,
       invoice_group, serial_has_cqt, has_line_items, is_sco,
-      tc_hdon, khhd_cl_quan, so_hd_cl_quan, created_at)
+      tc_hdon, khhd_cl_quan, so_hd_cl_quan, original_invoice_date, created_at)
      SELECT
        t.id, t.company_id, t.invoice_number, t.serial_number,
        COALESCE(t.invoice_date::date, CURRENT_DATE), t.direction, t.status,
@@ -1415,43 +1445,44 @@ async function _batchUpsertInvoices(
        t.subtotal, t.total_amount, t.vat_amount, t.vat_rate, t.tax_category,
        true, 'gdt_bot', 'gdt_bot',
        t.invoice_group, t.serial_has_cqt, t.has_line_items, t.is_sco,
-       t.tc_hdon, t.khhd_cl_quan, t.so_hd_cl_quan, NOW()
+       t.tc_hdon, t.khhd_cl_quan, t.so_hd_cl_quan, t.original_invoice_date, NOW()
      FROM UNNEST(
        $1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::text[], $6::invoice_direction[], $7::invoice_status[],
        $8::text[], $9::text[], $10::text[], $11::text[],
        $12::numeric[], $13::numeric[], $14::numeric[], $15::numeric[], $16::text[],
        $17::int[], $18::boolean[], $19::boolean[], $20::boolean[],
-       $21::smallint[], $22::text[], $23::text[]
+       $21::smallint[], $22::text[], $23::text[], $24::date[]
      ) AS t(
        id, company_id, invoice_number, serial_number, invoice_date, direction, status,
        seller_name, seller_tax_code, buyer_name, buyer_tax_code,
        subtotal, total_amount, vat_amount, vat_rate, tax_category,
        invoice_group, serial_has_cqt, has_line_items, is_sco,
-       tc_hdon, khhd_cl_quan, so_hd_cl_quan
+       tc_hdon, khhd_cl_quan, so_hd_cl_quan, original_invoice_date
      )
      ON CONFLICT (company_id, provider, invoice_number,
        COALESCE(seller_tax_code, ''), COALESCE(serial_number, '')) DO UPDATE SET
-       direction      = EXCLUDED.direction,
-       status         = EXCLUDED.status,
-       invoice_date   = EXCLUDED.invoice_date,
-       serial_number  = COALESCE(EXCLUDED.serial_number, invoices.serial_number),
-       seller_name    = EXCLUDED.seller_name,
-       buyer_name     = EXCLUDED.buyer_name,
-       buyer_tax_code = EXCLUDED.buyer_tax_code,
-       subtotal       = EXCLUDED.subtotal,
-       total_amount   = EXCLUDED.total_amount,
-       vat_amount     = EXCLUDED.vat_amount,
-       vat_rate       = EXCLUDED.vat_rate,
-       tax_category   = COALESCE(EXCLUDED.tax_category, invoices.tax_category),
-       gdt_validated  = true,
-       invoice_group  = COALESCE(EXCLUDED.invoice_group,  invoices.invoice_group),
-       serial_has_cqt = COALESCE(EXCLUDED.serial_has_cqt, invoices.serial_has_cqt),
-       has_line_items = COALESCE(EXCLUDED.has_line_items, invoices.has_line_items),
-       is_sco         = EXCLUDED.is_sco,
-       tc_hdon        = COALESCE(EXCLUDED.tc_hdon,        invoices.tc_hdon),
-       khhd_cl_quan   = COALESCE(EXCLUDED.khhd_cl_quan,   invoices.khhd_cl_quan),
-       so_hd_cl_quan  = COALESCE(EXCLUDED.so_hd_cl_quan,  invoices.so_hd_cl_quan),
-       updated_at     = NOW()
+       direction             = EXCLUDED.direction,
+       status                = EXCLUDED.status,
+       invoice_date          = EXCLUDED.invoice_date,
+       serial_number         = COALESCE(EXCLUDED.serial_number, invoices.serial_number),
+       seller_name           = EXCLUDED.seller_name,
+       buyer_name            = EXCLUDED.buyer_name,
+       buyer_tax_code        = EXCLUDED.buyer_tax_code,
+       subtotal              = EXCLUDED.subtotal,
+       total_amount          = EXCLUDED.total_amount,
+       vat_amount            = EXCLUDED.vat_amount,
+       vat_rate              = EXCLUDED.vat_rate,
+       tax_category          = COALESCE(EXCLUDED.tax_category, invoices.tax_category),
+       gdt_validated         = true,
+       invoice_group         = COALESCE(EXCLUDED.invoice_group,  invoices.invoice_group),
+       serial_has_cqt        = COALESCE(EXCLUDED.serial_has_cqt, invoices.serial_has_cqt),
+       has_line_items        = COALESCE(EXCLUDED.has_line_items, invoices.has_line_items),
+       is_sco                = EXCLUDED.is_sco,
+       tc_hdon               = COALESCE(EXCLUDED.tc_hdon,        invoices.tc_hdon),
+       khhd_cl_quan          = COALESCE(EXCLUDED.khhd_cl_quan,   invoices.khhd_cl_quan),
+       so_hd_cl_quan         = COALESCE(EXCLUDED.so_hd_cl_quan,  invoices.so_hd_cl_quan),
+       original_invoice_date = COALESCE(EXCLUDED.original_invoice_date, invoices.original_invoice_date),
+       updated_at            = NOW()
      RETURNING id,
        invoice_number,
        COALESCE(serial_number,    '') AS serial_number,
@@ -1462,7 +1493,7 @@ async function _batchUpsertInvoices(
       sellerNames, sellerTaxes, buyerNames, buyerTaxes,
       subtotals, totals, vatAmounts, vatRates, taxCategories,
       invoiceGroups, serialHasCqts, hasLineItemsArr, isScos,
-      tcHdons, khhdClQuans, soHdClQuans,
+      tcHdons, khhdClQuans, soHdClQuans, originalInvDates,
     ],
   );
 
@@ -1634,13 +1665,28 @@ async function _maybeInsertLineItems(
 
   // Detail API (JSON) — only strategy (XML fallback removed to reduce GDT load)
   try {
-    const detail = await gdtApi.fetchInvoiceDetail({
-      nbmst:    inv.seller_tax_code,
-      khhdon:   inv.serial_number,
-      shdon:    inv.invoice_number,
-      khmshdon: 1,
-      isSco:    inv.is_sco,
-    });
+    // BOT-CACHE-01: Check Redis detail cache before hitting GDT API
+    let detail: Awaited<ReturnType<typeof gdtApi.fetchInvoiceDetail>>;
+    const cachedDetail = await _detailCache.get(
+      inv.seller_tax_code, inv.serial_number, inv.invoice_number,
+    );
+    if (cachedDetail) {
+      detail = cachedDetail as Awaited<ReturnType<typeof gdtApi.fetchInvoiceDetail>>;
+      logger.info('[SyncWorker] Detail cache HIT — skipping GDT call', { invoiceId });
+    } else {
+      detail = await gdtApi.fetchInvoiceDetail({
+        nbmst:    inv.seller_tax_code,
+        khhdon:   inv.serial_number,
+        shdon:    inv.invoice_number,
+        khmshdon: 1,
+        isSco:    inv.is_sco,
+      });
+      // Populate cache for future hits (non-fatal internally)
+      await _detailCache.set(
+        inv.seller_tax_code, inv.serial_number, inv.invoice_number,
+        detail as Record<string, unknown>,
+      );
+    }
     const lineItems = GdtDirectApiService.parseLineItemsFromDetail(detail);
     if (lineItems.length > 0 && !hasLineItems) {
       // Only insert line items if they don't already exist
@@ -1651,19 +1697,97 @@ async function _maybeInsertLineItems(
       logger.info('[SyncWorker] Detail API: no line items in hdhhdvu', { invoiceId });
     }
 
-    // Save payment_method from detail if not yet set (source = gdt_detail)
-    const paymentMethodFromDetail = typeof detail.thtttoan === 'string' && detail.thtttoan.trim()
-      ? detail.thtttoan.trim()
-      : null;
-    if (paymentMethodFromDetail) {
+    // ── Save raw detail + all extended header fields ──────────────────────────
+    // Non-fatal: if new columns don't exist yet (migration pending), log and continue.
+    try {
+      const d = detail as Record<string, unknown>;
+      const paymentMethod = typeof detail.thtttoan === 'string' && detail.thtttoan.trim()
+        ? detail.thtttoan.trim() : null;
       await pool.query(
-        `UPDATE invoices
-         SET payment_method = $1,
-             payment_method_source = 'gdt_detail'
-         WHERE id = $2
-           AND (payment_method IS NULL OR payment_method_source NOT IN ('manual', 'gdt_data'))`,
-        [paymentMethodFromDetail, invoiceId],
+        `UPDATE invoices SET
+           raw_detail          = $1::jsonb,
+           raw_detail_at       = NOW(),
+           gdt_invoice_id      = $2,
+           gdt_mhdon           = $3,
+           gdt_mtdtchieu       = $4,
+           gdt_khmshdon        = $5,
+           gdt_hdon            = $6,
+           gdt_hthdon          = $7,
+           gdt_htttoan         = $8,
+           gdt_dvtte           = $9,
+           gdt_tgia            = $10,
+           gdt_nky             = $11,
+           gdt_ttxly           = $12,
+           gdt_cqt             = $13,
+           gdt_tvandnkntt      = $14,
+           gdt_pban            = $15,
+           gdt_thlap           = $16,
+           gdt_thdon           = $17,
+           seller_address      = $18,
+           seller_bank_account = $19,
+           seller_bank_name    = $20,
+           seller_email        = $21,
+           seller_phone        = $22,
+           buyer_address       = $23,
+           buyer_bank_account  = $24,
+           gdt_ttcktmai        = $25,
+           gdt_tgtphi          = $26,
+           gdt_qrcode          = $27,
+           gdt_gchu            = $28,
+           gdt_nbcks           = $29,
+           gdt_cqtcks          = $30,
+           payment_method      = CASE
+             WHEN (payment_method IS NULL OR payment_method_source NOT IN ('manual','gdt_data'))
+             THEN $31 ELSE payment_method END,
+           payment_method_source = CASE
+             WHEN (payment_method IS NULL OR payment_method_source NOT IN ('manual','gdt_data'))
+               AND $31 IS NOT NULL
+             THEN 'gdt_detail' ELSE payment_method_source END
+         WHERE id = $32`,
+        [
+          JSON.stringify(detail),                           // $1  raw_detail
+          d['id']          as string ?? null,               // $2  gdt_invoice_id
+          d['mhdon']       as string ?? null,               // $3  gdt_mhdon
+          d['mtdtchieu']   as string ?? null,               // $4  gdt_mtdtchieu
+          d['khmshdon']    as number ?? null,               // $5  gdt_khmshdon
+          d['hdon']        as string ?? null,               // $6  gdt_hdon
+          d['hthdon']      as number ?? null,               // $7  gdt_hthdon
+          d['htttoan']     as number ?? null,               // $8  gdt_htttoan
+          d['dvtte']       as string ?? null,               // $9  gdt_dvtte
+          d['tgia']        as number ?? null,               // $10 gdt_tgia
+          d['nky']         as string ?? null,               // $11 gdt_nky
+          d['ttxly']       as number ?? null,               // $12 gdt_ttxly
+          d['cqt']         as string ?? null,               // $13 gdt_cqt
+          d['tvandnkntt']  as string ?? null,               // $14 gdt_tvandnkntt
+          d['pban']        as string ?? null,               // $15 gdt_pban
+          d['thlap']       as number ?? null,               // $16 gdt_thlap
+          d['thdon']       as string ?? null,               // $17 gdt_thdon
+          d['nbdchi']      as string ?? null,               // $18 seller_address
+          d['nbstkhoan']   as string ?? null,               // $19 seller_bank_account
+          d['nbtnhang']    as string ?? null,               // $20 seller_bank_name
+          d['nbdctdtu']    as string ?? null,               // $21 seller_email
+          d['nbsdthoai']   as string ?? null,               // $22 seller_phone
+          d['nmdchi']      as string ?? null,               // $23 buyer_address
+          d['nmstkhoan']   as string ?? null,               // $24 buyer_bank_account
+          d['ttcktmai']    as number ?? null,               // $25 gdt_ttcktmai
+          d['tgtphi']      as number ?? null,               // $26 gdt_tgtphi
+          d['qrcode']      as string ?? null,               // $27 gdt_qrcode
+          d['gchu']        as string ?? null,               // $28 gdt_gchu
+          typeof d['nbcks']  === 'object'
+            ? JSON.stringify(d['nbcks'])  : d['nbcks']  as string ?? null, // $29 gdt_nbcks
+          typeof d['cqtcks'] === 'object'
+            ? JSON.stringify(d['cqtcks']) : d['cqtcks'] as string ?? null, // $30 gdt_cqtcks
+          paymentMethod,                                    // $31 payment_method
+          invoiceId,                                        // $32 WHERE id
+        ],
       );
+      logger.info('[SyncWorker] Raw detail + header fields saved', { invoiceId });
+    } catch (saveErr: unknown) {
+      // Column may not exist yet if migration is pending — non-fatal, sync continues.
+      logger.warn('[SyncWorker] raw_detail save failed (non-fatal — run migration 038)', {
+        invoiceId,
+        err: saveErr instanceof Error ? saveErr.message : String(saveErr),
+      });
     }
 
     return 1;
@@ -1683,9 +1807,9 @@ async function _bulkInsertLineItems(
   companyId: string,
 ): Promise<void> {
   await pool.query('DELETE FROM invoice_line_items WHERE invoice_id = $1', [invoiceId]);
-  const values13 = lineItems.map((_, i) => {
-    const b = i * 13;
-    return `($${b+1},$${b+2},$${b+3},$${b+4},$${b+5},$${b+6},$${b+7},$${b+8},$${b+9},$${b+10},$${b+11},$${b+12},$${b+13})`;
+  const values19 = lineItems.map((_, i) => {
+    const b = i * 19;
+    return `($${b+1},$${b+2},$${b+3},$${b+4},$${b+5},$${b+6},$${b+7},$${b+8},$${b+9},$${b+10},$${b+11},$${b+12},$${b+13},$${b+14},$${b+15},$${b+16},$${b+17},$${b+18},$${b+19})`;
   }).join(',');
   const params: unknown[] = [];
   for (const item of lineItems) {
@@ -1694,13 +1818,21 @@ async function _bulkInsertLineItems(
       item.line_number, item.item_code, item.item_name,
       item.unit, item.quantity, item.unit_price,
       item.subtotal, item.vat_rate, item.vat_amount, item.total,
+      // New fields (migration 039)
+      item.discount_amount  ?? null,
+      item.discount_rate    ?? null,
+      item.line_type        ?? null,
+      item.vat_rate_label   ?? null,
+      item.gdt_line_id      ?? null,
+      item.gdt_invoice_id   ?? null,
     );
   }
   await pool.query(
     `INSERT INTO invoice_line_items
      (id, invoice_id, company_id, line_number, item_code, item_name,
-      unit, quantity, unit_price, subtotal, vat_rate, vat_amount, total)
-     VALUES ${values13}`,
+      unit, quantity, unit_price, subtotal, vat_rate, vat_amount, total,
+      discount_amount, discount_rate, line_type, vat_rate_label, gdt_line_id, gdt_invoice_id)
+     VALUES ${values19}`,
     params,
   );
   // Fix: update has_line_items after successfully inserting line items

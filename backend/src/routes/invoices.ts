@@ -40,7 +40,7 @@ const listSchema = z.object({
   page: z.coerce.number().int().positive().default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(50),
   direction: z.enum(['output', 'input']).optional(),
-  status: z.enum(['valid', 'cancelled', 'replaced', 'adjusted', 'invalid']).optional(),
+  status: z.enum(['valid', 'cancelled', 'replaced', 'replaced_original', 'adjusted', 'invalid']).optional(),
   fromDate: z.string().optional(),
   toDate: z.string().optional(),
   search: z.string().optional(),
@@ -71,7 +71,7 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
     if (invoiceGroup != null) { conditions.push(`invoice_group = $${idx++}`); params.push(invoiceGroup); }
     if (isSco != null) { conditions.push(`is_sco = $${idx++}`); params.push(isSco === 'true'); }
     if (search) {
-      conditions.push(`(invoice_number ILIKE $${idx} OR seller_name ILIKE $${idx} OR buyer_name ILIKE $${idx})`);
+      conditions.push(`(invoice_number ILIKE $${idx} OR seller_name ILIKE $${idx} OR buyer_name ILIKE $${idx} OR seller_tax_code ILIKE $${idx} OR buyer_tax_code ILIKE $${idx})`);
       params.push(`%${search}%`);
       idx++;
     }
@@ -165,19 +165,21 @@ router.get('/export', async (req: Request, res: Response, next: NextFunction) =>
     if (invoiceGroup) { conditions.push(`invoice_group = $${idx++}`); params.push(Number(invoiceGroup)); }
     if (isSco === 'true' || isSco === 'false') { conditions.push(`is_sco = $${idx++}`); params.push(isSco === 'true'); }
     if (search) {
-      conditions.push(`(invoice_number ILIKE $${idx} OR seller_name ILIKE $${idx} OR buyer_name ILIKE $${idx})`);
+      conditions.push(`(invoice_number ILIKE $${idx} OR seller_name ILIKE $${idx} OR buyer_name ILIKE $${idx} OR seller_tax_code ILIKE $${idx} OR buyer_tax_code ILIKE $${idx})`);
       params.push(`%${search}%`);
       idx++;
     }
 
     const where = conditions.join(' AND ');
     const { rows } = await pool.query(
-      `SELECT invoice_number, serial_number, invoice_date, direction, status,
-              seller_name, seller_tax_code, buyer_name, buyer_tax_code,
-              subtotal, total_amount, vat_amount, vat_rate,
-              payment_method, customer_code, item_code, notes
-       FROM invoices WHERE ${where}
-       ORDER BY invoice_date DESC
+      `SELECT i.invoice_number, i.serial_number, i.invoice_date, i.direction, i.status,
+              i.seller_name, i.seller_tax_code, i.buyer_name, i.buyer_tax_code,
+              i.subtotal, i.total_amount, i.vat_amount, i.vat_rate,
+              i.payment_method, i.customer_code, i.item_code, i.notes,
+              CASE WHEN i.direction='output' THEN i.buyer_name ELSE i.seller_name END AS party_name,
+              (SELECT STRING_AGG(li.item_name, '; ') FROM invoice_line_items li WHERE li.invoice_id = i.id LIMIT 3) AS item_name
+       FROM invoices i WHERE ${where}
+       ORDER BY i.invoice_date DESC
        LIMIT 5000`,
       params
     );
@@ -201,11 +203,12 @@ router.get('/export', async (req: Request, res: Response, next: NextFunction) =>
       { header: 'Thuế VAT',      key: 'vat',     width: 14 },
       { header: 'Tổng tiền',     key: 'total',   width: 16 },
       { header: 'TS%',           key: 'rate',    width: 6  },
-      { header: 'TT thanh toán', key: 'pay',     width: 14 },
-      { header: 'Mã KH/NCC',    key: 'cust',    width: 14 },
-      { header: 'Mã hàng',      key: 'item',    width: 14 },
-      { header: 'Trạng thái',   key: 'status',  width: 12 },
-      { header: 'Ghi chú',      key: 'notes',   width: 24 },
+      { header: 'TT thanh toán', key: 'pay',      width: 14 },
+      { header: 'Mã KH/NCC',    key: 'cust',     width: 14 },
+      { header: 'Tên KH/NCC',   key: 'party_name', width: 28 },
+      { header: 'Mã hàng',      key: 'item',     width: 14 },
+      { header: 'Tên mặt hàng', key: 'item_name', width: 28 },
+      { header: 'Ghi chú',      key: 'notes',    width: 24 },
     ];
 
     const hdr = sh.getRow(1);
@@ -229,8 +232,9 @@ router.get('/export', async (req: Request, res: Response, next: NextFunction) =>
         rate:      inv.vat_rate,
         pay:       inv.payment_method ?? '',
         cust:      inv.customer_code  ?? '',
+        party_name: inv.party_name    ?? '',
         item:      inv.item_code      ?? '',
-        status:    inv.status,
+        item_name: inv.item_name      ?? '',
         notes:     inv.notes         ?? '',
       });
       for (const c of ['sub', 'vat', 'total']) r.getCell(c).numFmt = '#,##0';

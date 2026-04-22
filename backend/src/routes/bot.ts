@@ -8,6 +8,7 @@ import { encrypt, decrypt } from '../utils/encryption';
 import { ValidationError, NotFoundError } from '../utils/AppError';
 import { sendSuccess, sendPaginated } from '../utils/response';
 import { quotaService } from '../services/QuotaService';
+import { licenseService } from '../services/LicenseService';
 import { Queue } from 'bullmq';
 import IORedis from 'ioredis';
 import { env } from '../config/env';
@@ -344,10 +345,13 @@ router.post(
       }
 
       const jobId = `gdt-bot-manual-${companyId}-${Date.now()}`;
+      // BOT-LICENSE-01: resolve user plan for proper rate limiting in the worker
+      const userPlan = await licenseService.getPlanId(req.user!.userId);
       // BOT-ENT-01: Push to dedicated manual queue (high priority, concurrency=10)
       await getManualBotQueue().add('sync', {
         companyId,
         triggeredByUserId: req.user!.userId,  // BUG2 FIX: proxy acquired for triggering user
+        userPlan,
         ...(from_date ? { fromDate: from_date } : {}),
         ...(to_date   ? { toDate:   to_date   } : {}),
         triggeredBy: quick ? 'user_quick_sync' : 'user_manual',

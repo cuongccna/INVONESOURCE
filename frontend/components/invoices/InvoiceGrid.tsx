@@ -67,27 +67,30 @@ interface Props {
 }
 
 const STATUS_LABELS: Record<string, { label: string; color: string }> = {
-  valid:     { label: 'Hợp lệ',    color: 'bg-green-100 text-green-700' },
-  cancelled: { label: 'Đã hủy',    color: 'bg-red-100 text-red-700' },
-  replaced:  { label: 'Bị thay thế',  color: 'bg-red-100 text-red-700' },
-  adjusted:  { label: 'Điều chỉnh', color: 'bg-blue-100 text-blue-700' },
+  valid:            { label: 'Hợp lệ',      color: 'bg-green-100 text-green-700' },
+  cancelled:        { label: 'Đã hủy',      color: 'bg-red-100 text-red-700' },
+  replaced:         { label: 'Thay thế',    color: 'bg-yellow-100 text-yellow-700' },
+  replaced_original:{ label: 'Bị thay thế', color: 'bg-orange-100 text-orange-700' },
+  adjusted:         { label: 'Điều chỉnh',  color: 'bg-blue-100 text-blue-700' },
 };
 
 const PAGE_SIZES = [15, 30, 50, 100];
 
 function rowBg(inv: GridInvoice): string {
   if (inv.status === 'cancelled' || inv.status === 'invalid') return 'bg-red-50/60';
-  if (inv.status === 'replaced')  return 'bg-red-50/60';
+  if (inv.status === 'replaced_original') return 'bg-red-50/60';
+  if (inv.status === 'replaced')  return 'bg-yellow-50/50';
   if (inv.status === 'adjusted')  return 'bg-blue-50/50';
   if (!inv.payment_method && Number(inv.total_amount) >= 5_000_000 && inv.direction === 'input') return 'bg-amber-50/40';
   return '';
 }
 
 const STATUS_LEFT_BORDER: Record<string, string> = {
-  cancelled: 'border-l-2 border-l-red-400',
-  invalid:   'border-l-2 border-l-red-400',
-  replaced:  'border-l-2 border-l-red-400',
-  adjusted:  'border-l-2 border-l-blue-400',
+  cancelled:         'border-l-2 border-l-red-400',
+  invalid:           'border-l-2 border-l-red-400',
+  replaced_original: 'border-l-2 border-l-red-400',
+  replaced:          'border-l-2 border-l-yellow-400',
+  adjusted:          'border-l-2 border-l-blue-400',
 };
 
 function fmtVND(n: string | number | null | undefined): string {
@@ -149,22 +152,38 @@ export default function InvoiceGrid({
       {/* ── Summary Bar ── */}
       {sum && (() => {
         const bs = sum.by_status ?? {};
-        const valid      = bs['valid']     ?? { count: 0, subtotal: 0, vat: 0 };
-        const cancelled  = bs['cancelled'] ?? { count: 0, subtotal: 0, vat: 0 };
-        const replaced   = bs['replaced']  ?? { count: 0, subtotal: 0, vat: 0 };
-        const adjusted   = bs['adjusted']  ?? { count: 0, subtotal: 0, vat: 0 };
-        const invalid    = bs['invalid']   ?? { count: 0, subtotal: 0, vat: 0 };
-        const nonValidCount = cancelled.count + replaced.count + adjusted.count + invalid.count;
+        // tthai=1 → valid (normal invoice)
+        const valid        = bs['valid']             ?? { count: 0, subtotal: 0, vat: 0 };
+        // tthai=3 → cancelled (true cancellation)
+        const cancelled    = bs['cancelled']         ?? { count: 0, subtotal: 0, vat: 0 };
+        // tthai=5 → replaced = the NEW replacement invoice (valid for VAT)
+        const replaced     = bs['replaced']          ?? { count: 0, subtotal: 0, vat: 0 };
+        // tthai=4 → replaced_original = the OLD original that was superseded (excluded from VAT)
+        const replacedOrig = bs['replaced_original'] ?? { count: 0, subtotal: 0, vat: 0 };
+        // tthai=6 → adjusted = adjustment invoice (valid for VAT, creates a delta)
+        const adjusted     = bs['adjusted']          ?? { count: 0, subtotal: 0, vat: 0 };
+        const invalid      = bs['invalid']           ?? { count: 0, subtotal: 0, vat: 0 };
+
+        // Excluded from VAT: cancelled + replaced_original (old superseded) + invalid
+        // NOTE: replaced (new replacement, tthai=5) and adjusted (tthai=6) ARE valid for VAT
+        const notValidCount = cancelled.count + replacedOrig.count + invalid.count;
+        const hasExtraInfo  = replaced.count > 0 || adjusted.count > 0;
+
+        // VAT-valid total: valid + replaced (new replacement) + adjusted
+        const vatValidSubtotal = valid.subtotal + replaced.subtotal + adjusted.subtotal;
+        const vatValidVat      = valid.vat      + replaced.vat      + adjusted.vat;
+        const vatValidCount    = valid.count    + replaced.count    + adjusted.count;
+
         return (
           <div className="bg-white border border-gray-200 rounded-xl px-4 py-3 text-sm shadow-sm space-y-2">
-            {/* Dòng 1: Tổng + Hợp lệ */}
+            {/* Dòng 1: Tổng + Hợp lệ (= valid + replaced + adjusted đều tính VAT) */}
             <div className="flex items-center justify-between flex-wrap gap-2">
               <div className="flex items-center gap-3 flex-wrap gap-y-1">
                 <span className="text-gray-500">Tổng: <strong className="text-gray-900">{sum.count.toLocaleString('vi-VN')}</strong> HĐ</span>
                 <span className="text-green-700 font-semibold">
-                  Hợp lệ: <strong>{valid.count.toLocaleString('vi-VN')}</strong> HĐ
-                  {valid.subtotal > 0 && (
-                    <> &mdash; <span className="font-normal">{fmtVND(valid.subtotal)}đ</span> | VAT: <span className="font-normal">{fmtVND(valid.vat)}đ</span></>
+                  Hợp lệ: <strong>{vatValidCount.toLocaleString('vi-VN')}</strong> HĐ
+                  {vatValidSubtotal > 0 && (
+                    <> &mdash; <span className="font-normal">{fmtVND(vatValidSubtotal)}đ</span> | VAT: <span className="font-normal">{fmtVND(vatValidVat)}đ</span></>
                   )}
                 </span>
               </div>
@@ -175,27 +194,34 @@ export default function InvoiceGrid({
                 </button>
               )}
             </div>
-            {/* Dòng 2: Breakdown cho trạng thái không hợp lệ — chỉ hiện khi có */}
-            {nonValidCount > 0 && (
+            {/* Dòng 2: Breakdown — hiển thị khi có hóa đơn đặc biệt hoặc không hợp lệ */}
+            {(notValidCount > 0 || hasExtraInfo) && (
               <div className="flex items-center gap-x-4 gap-y-1 flex-wrap text-xs border-t border-gray-100 pt-2">
+                {/* Không hợp lệ — loại khỏi khấu trừ VAT */}
                 {cancelled.count > 0 && (
                   <span className="flex items-center gap-1 text-red-600 bg-red-50 px-2 py-0.5 rounded-full">
                     ⛔ Hủy: <strong>{cancelled.count}</strong> HĐ &middot; {fmtVND(cancelled.subtotal)}đ
                   </span>
                 )}
+                {replacedOrig.count > 0 && (
+                  <span className="flex items-center gap-1 text-orange-700 bg-orange-50 px-2 py-0.5 rounded-full">
+                    🔄 Bị thay thế: <strong>{replacedOrig.count}</strong> HĐ &middot; {fmtVND(replacedOrig.subtotal)}đ
+                  </span>
+                )}
+                {invalid.count > 0 && (
+                  <span className="flex items-center gap-1 text-red-700 bg-red-50 px-2 py-0.5 rounded-full">
+                    ⚠ Không hợp lệ: <strong>{invalid.count}</strong> HĐ
+                  </span>
+                )}
+                {/* Hợp lệ nhưng là loại đặc biệt — vẫn tính VAT */}
                 {replaced.count > 0 && (
                   <span className="flex items-center gap-1 text-yellow-700 bg-yellow-50 px-2 py-0.5 rounded-full">
-                    ⊘ Bị thay thế: <strong>{replaced.count}</strong> HĐ &middot; {fmtVND(replaced.subtotal)}đ
+                    ↺ Thay thế: <strong>{replaced.count}</strong> HĐ &middot; {fmtVND(replaced.subtotal)}đ
                   </span>
                 )}
                 {adjusted.count > 0 && (
                   <span className="flex items-center gap-1 text-blue-700 bg-blue-50 px-2 py-0.5 rounded-full">
                     ✏ Điều chỉnh: <strong>{adjusted.count}</strong> HĐ &middot; {fmtVND(adjusted.subtotal)}đ
-                  </span>
-                )}
-                {invalid.count > 0 && (
-                  <span className="flex items-center gap-1 text-orange-700 bg-orange-50 px-2 py-0.5 rounded-full">
-                    ⚠ Không hợp lệ: <strong>{invalid.count}</strong> HĐ
                   </span>
                 )}
               </div>
@@ -244,7 +270,7 @@ export default function InvoiceGrid({
                 <th className="px-3 py-3 text-left text-xs font-semibold text-gray-500">Tên {partyLabel}</th>
                 <th className="px-3 py-3 text-right text-xs font-semibold text-gray-500 hidden xl:table-cell">Tiền hàng</th>
                 <th className="px-3 py-3 text-right text-xs font-semibold text-gray-500">Thuế VAT</th>
-                <th className="px-3 py-3 text-left text-xs font-semibold text-gray-500">Trạng thái</th>
+                {/* Status column hidden — status is conveyed by row color + left border */}
                 <th className="w-10 px-2 py-3" />
               </tr>
             </thead>
@@ -324,11 +350,7 @@ export default function InvoiceGrid({
                       <td className="px-3 py-3 text-right text-gray-700 tabular-nums text-xs" onClick={() => handleRowClick(inv)}>
                         {fmtVND(inv.vat_amount)}
                       </td>
-                      <td className="px-3 py-3" onClick={() => handleRowClick(inv)}>
-                        <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${statusInfo.color}`}>
-                          {statusInfo.label}
-                        </span>
-                      </td>
+                      {/* Status badge cell hidden — status conveyed by row color + left border */}
                       <td className="px-2 py-3 relative" ref={openMenuId === inv.id ? menuRef : undefined}>
                         <button
                           onClick={e => { e.stopPropagation(); setOpenMenuId(openMenuId === inv.id ? null : inv.id); }}

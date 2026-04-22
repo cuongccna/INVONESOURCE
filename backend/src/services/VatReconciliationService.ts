@@ -38,6 +38,10 @@ export interface VatSummary {
   inputVat: number;
   payableVat: number;
   breakdown: VatBreakdown;
+  /** [37] Auto-computed: VAT giảm từ HĐ điều chỉnh cross-period (HĐ gốc ở kỳ trước) */
+  ct37_cross_period_decrease?: number;
+  /** [38] Auto-computed: VAT tăng từ HĐ điều chỉnh cross-period (HĐ gốc ở kỳ trước) */
+  ct38_cross_period_increase?: number;
 }
 
 /**
@@ -81,7 +85,7 @@ export class VatReconciliationService {
     const inputBaseParams  = () => hasValidInput  ? [companyId, month, year, validIds!.inputIds]  : [companyId, month, year];
     const outputBaseParams = () => hasValidOutput ? [companyId, month, year, validIds!.outputIds] : [companyId, month, year];
     // ============================================================
-    // [22] Total input VAT — all non-cancelled input invoices
+    // [22] Total input VAT — all received input invoices (excl. replaced_original)
     // ============================================================
     const { rows: inputAll } = await pool.query<{
       vat_rate: string;
@@ -92,7 +96,7 @@ export class VatReconciliationService {
        FROM invoices
        WHERE company_id = $1
          AND direction = 'input'
-         AND status NOT IN ('cancelled', 'replaced', 'adjusted')
+         AND status NOT IN ('cancelled', 'replaced_original')
          AND deleted_at IS NULL
          AND EXTRACT(MONTH FROM invoice_date) = $2
          AND EXTRACT(YEAR FROM invoice_date) = $3
@@ -117,7 +121,7 @@ export class VatReconciliationService {
        FROM invoices
        WHERE company_id = $1
          AND direction = 'input'
-         AND status = 'valid'
+         AND status IN ('valid', 'replaced', 'adjusted')
          AND deleted_at IS NULL
          AND EXTRACT(MONTH FROM invoice_date) = $2
          AND EXTRACT(YEAR FROM invoice_date) = $3
@@ -170,10 +174,14 @@ export class VatReconciliationService {
        FROM invoices
        WHERE company_id = $1
          AND direction = 'output'
-         AND status = 'valid'
+         AND status IN ('valid', 'replaced', 'adjusted')
          AND deleted_at IS NULL
          AND EXTRACT(MONTH FROM invoice_date) = $2
          AND EXTRACT(YEAR FROM invoice_date) = $3
+         AND (
+           original_invoice_date IS NULL
+           OR DATE_TRUNC('month', original_invoice_date) = DATE_TRUNC('month', invoice_date)
+         )
          ${_notReplacedClause('invoices')}
          ${outputIdFilter}
        GROUP BY 1`,
@@ -191,6 +199,30 @@ export class VatReconciliationService {
         vat:      existing.vat     + parseFloat(row.vat_sum     || '0'),
       };
     }
+
+    // ============================================================
+    // [37]/[38] Cross-period adjustment invoices (điều chỉnh liên kỳ)
+    // Adjustment invoices issued this month for invoices from a PRIOR month are
+    // reported separately in [37] (VAT decrease) and [38] (VAT increase).
+    // They are EXCLUDED from normal output totals above (original_invoice_date filter).
+    // ============================================================
+    const { rows: crossPeriodRows } = await pool.query<{ ct37_auto: string; ct38_auto: string }>(
+      `SELECT
+         COALESCE(SUM(CASE WHEN vat_amount < 0 THEN ABS(vat_amount) ELSE 0 END), 0)::text AS ct37_auto,
+         COALESCE(SUM(CASE WHEN vat_amount > 0 THEN vat_amount        ELSE 0 END), 0)::text AS ct38_auto
+       FROM invoices
+       WHERE company_id = $1
+         AND direction = 'output'
+         AND status IN ('replaced', 'adjusted')
+         AND deleted_at IS NULL
+         AND EXTRACT(MONTH FROM invoice_date) = $2
+         AND EXTRACT(YEAR FROM invoice_date) = $3
+         AND original_invoice_date IS NOT NULL
+         AND DATE_TRUNC('month', original_invoice_date) < DATE_TRUNC('month', invoice_date)`,
+      [companyId, month, year],
+    );
+    const ct37_cross_period_decrease = parseFloat(crossPeriodRows[0]?.ct37_auto ?? '0');
+    const ct38_cross_period_increase = parseFloat(crossPeriodRows[0]?.ct38_auto ?? '0');
 
     const ct26_kct   = outputMap['KCT']?.subtotal   ?? 0;  // [26] không chịu thuế
     const ct29_0pct  = outputMap['0']?.subtotal     ?? 0;  // [29] thuế suất 0%
@@ -294,6 +326,8 @@ export class VatReconciliationService {
       ct40a_total_output_vat: ct40a,
       outputVat, inputVat, payableVat,
       breakdown,
+      ct37_cross_period_decrease,
+      ct38_cross_period_increase,
     };
   }
 
@@ -326,7 +360,7 @@ export class VatReconciliationService {
        FROM invoices
        WHERE company_id = $1
          AND direction = 'input'
-         AND status NOT IN ('cancelled', 'replaced', 'adjusted')
+         AND status NOT IN ('cancelled', 'replaced_original')
          AND deleted_at IS NULL
          AND EXTRACT(YEAR FROM invoice_date) = $2
          AND EXTRACT(MONTH FROM invoice_date) = ANY($3::int[])
@@ -342,7 +376,7 @@ export class VatReconciliationService {
        FROM invoices
        WHERE company_id = $1
          AND direction = 'input'
-         AND status = 'valid'
+         AND status IN ('valid', 'replaced', 'adjusted')
          AND deleted_at IS NULL
          AND EXTRACT(YEAR FROM invoice_date) = $2
          AND EXTRACT(MONTH FROM invoice_date) = ANY($3::int[])
@@ -384,10 +418,14 @@ export class VatReconciliationService {
        FROM invoices
        WHERE company_id = $1
          AND direction = 'output'
-         AND status = 'valid'
+         AND status IN ('valid', 'replaced', 'adjusted')
          AND deleted_at IS NULL
          AND EXTRACT(YEAR FROM invoice_date) = $2
          AND EXTRACT(MONTH FROM invoice_date) = ANY($3::int[])
+         AND (
+           original_invoice_date IS NULL
+           OR DATE_TRUNC('quarter', original_invoice_date) = DATE_TRUNC('quarter', invoice_date)
+         )
          ${_notReplacedClause('invoices')}
          ${outputIdFilter}
        GROUP BY 1`,
@@ -416,6 +454,25 @@ export class VatReconciliationService {
         vat:      existing.vat     + parseFloat(row.vat_sum     || '0'),
       };
     }
+
+    // [37]/[38] Cross-period adjustment invoices for the quarter
+    const { rows: crossPeriodRowsQ } = await pool.query<{ ct37_auto: string; ct38_auto: string }>(
+      `SELECT
+         COALESCE(SUM(CASE WHEN vat_amount < 0 THEN ABS(vat_amount) ELSE 0 END), 0)::text AS ct37_auto,
+         COALESCE(SUM(CASE WHEN vat_amount > 0 THEN vat_amount        ELSE 0 END), 0)::text AS ct38_auto
+       FROM invoices
+       WHERE company_id = $1
+         AND direction = 'output'
+         AND status IN ('replaced', 'adjusted')
+         AND deleted_at IS NULL
+         AND EXTRACT(YEAR FROM invoice_date) = $2
+         AND EXTRACT(MONTH FROM invoice_date) = ANY($3::int[])
+         AND original_invoice_date IS NOT NULL
+         AND DATE_TRUNC('quarter', original_invoice_date) < DATE_TRUNC('quarter', invoice_date)`,
+      [companyId, year, months],
+    );
+    const ct37_cross_period_decrease = parseFloat(crossPeriodRowsQ[0]?.ct37_auto ?? '0');
+    const ct38_cross_period_increase = parseFloat(crossPeriodRowsQ[0]?.ct38_auto ?? '0');
 
     const ct26_kct    = outputMap['KCT']?.subtotal   ?? 0;
     const ct29_0pct   = outputMap['0']?.subtotal     ?? 0;
@@ -475,6 +532,8 @@ export class VatReconciliationService {
       outputVat: ct40a, inputVat: ct23,
       payableVat: Math.max(0, ct40a - ct23),
       breakdown,
+      ct37_cross_period_decrease,
+      ct38_cross_period_increase,
     };
   }
 }

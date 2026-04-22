@@ -25,6 +25,7 @@ import { logger } from './logger';
 import type { RawInvoice } from './parsers/GdtXmlParser';
 import type { CrawlerRecipe, RecipeFields } from './types/recipe.types';
 import { SyncCheckpoint } from './crawl-cache/SyncCheckpoint';
+import type { GdtRawCacheService } from './crawl-cache/GdtRawCacheService';
 import type { ProxyManager } from './proxy-manager';
 
 // ── Human-like browser simulation ───────────────────────────────────────────
@@ -275,6 +276,7 @@ interface GdtPagedResponse {
 const STATUS_MAP: Record<number, RawInvoice['status']> = {
   1: 'valid',
   3: 'cancelled',
+  4: 'replaced_original',   // HĐ gốc bị thay thế — tthai=4
   5: 'replaced',
   6: 'adjusted',
 };
@@ -539,6 +541,18 @@ function mapInvoice(
                   })(),
     khhd_cl_quan: String(pick(r, 'khhdgoc', 'khhdon_goc', 'kyHieuGoc', 'KHHDCLQuan') ?? '').trim() || null,
     so_hd_cl_quan: String(pick(r, 'shdgoc',  'shdon_goc',  'soHdonGoc', 'SHDCLQuan')  ?? '').trim() || null,
+    original_invoice_date: (() => {
+                    // tdlhdgoc = ngày lập HĐ gốc. Định dạng GDT thường là 'DD/MM/YYYY' hoặc ISO.
+                    const raw = String(pick(r, 'tdlhdgoc', 'ngayHdGoc', 'tdlhdon_goc') ?? '').trim();
+                    if (!raw) return null;
+                    // Try DD/MM/YYYY
+                    const dmyMatch = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+                    if (dmyMatch) return `${dmyMatch[3]}-${dmyMatch[2]!.padStart(2, '0')}-${dmyMatch[1]!.padStart(2, '0')}`;
+                    // Try ISO YYYY-MM-DD (possibly with time)
+                    const isoMatch = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+                    if (isoMatch) return isoMatch[1] ?? null;
+                    return null;
+                  })(),
     tax_category: taxCategory,
   };
 }
@@ -555,6 +569,7 @@ export class GdtDirectApiService {
   // FIX-2: Pagination checkpoint (resume after crash)
   private _companyId:    string | null = null;
   private _checkpoint:   SyncCheckpoint | null = null;
+  private _rawCache:     GdtRawCacheService | null = null;
   // Phase 4: UA rotation — never use the same UA twice in a row per company
   private static _lastUaMap = new Map<string, string>();
   private _lastUa:       string | null = null;
@@ -580,15 +595,17 @@ export class GdtDirectApiService {
   private _commonHeaders:        Record<string, string> = {};
 
   constructor(
-    proxyUrl?:     string | null,
+    proxyUrl?:       string | null,
     socks5ProxyUrl?: string | null,
-    recipe?:       CrawlerRecipe,
-    companyId?:    string | null,
-    checkpoint?:   SyncCheckpoint | null,
+    recipe?:         CrawlerRecipe,
+    companyId?:      string | null,
+    checkpoint?:     SyncCheckpoint | null,
+    rawCache?:       GdtRawCacheService | null,
   ) {
     this.recipe       = recipe ?? null;
     this._companyId   = companyId ?? null;
     this._checkpoint  = checkpoint ?? null;
+    this._rawCache    = rawCache ?? null;
     this.captchaService = new CaptchaService();
     const httpAgent = proxyUrl ? createTunnelAgent({ proxyUrl }) : undefined;
     // Phase 4: Pick a UA that differs from the previous one for this company.
@@ -1155,17 +1172,24 @@ export class GdtDirectApiService {
       const vatAmount  = item.tthue    ?? vatAmountFromExtra ?? (subtotal != null && vatRate != null ? Math.round(subtotal * vatRate) : null);
       const total      = totalFromExtra ?? (subtotal != null && vatAmount != null ? subtotal + vatAmount : subtotal);
 
+      const itemRec = item as Record<string, unknown>;
       return {
-        line_number: item.stt     ?? null,
-        item_code:   null,                        // GDT detail API does not expose item code
-        item_name:   item.ten     ?? null,
-        unit:        item.dvtinh  ?? null,
-        quantity:    item.sluong  ?? null,
-        unit_price:  item.dgia    ?? null,
+        line_number:     item.stt     ?? null,
+        item_code:       null,                        // GDT detail API does not expose item code
+        item_name:       item.ten     ?? null,
+        unit:            item.dvtinh  ?? null,
+        quantity:        item.sluong  ?? null,
+        unit_price:      item.dgia    ?? null,
         subtotal,
-        vat_rate:    vatRate != null ? Math.round(vatRate * 100) : null,  // store as integer % (e.g. 8)
-        vat_amount:  vatAmount,
+        vat_rate:        vatRate != null ? Math.round(vatRate * 100) : null,  // store as integer % (e.g. 8)
+        vat_rate_label:  item.ltsuat  ?? null,        // raw string: "8%", "KCT", "KKKNT"
+        vat_amount:      vatAmount,
         total,
+        discount_amount: item.stckhau ?? null,        // chiết khấu dòng (absolute)
+        discount_rate:   item.tlckhau ?? null,        // tỷ lệ chiết khấu (0.05 = 5%)
+        line_type:       item.tchat   ?? null,        // 1=hàng hóa, 2=dịch vụ
+        gdt_line_id:     itemRec['id']     as string ?? null,  // UUID dòng từ GDT
+        gdt_invoice_id:  itemRec['idhdon'] as string ?? null,  // UUID hóa đơn từ GDT
       };
     });
   }
@@ -1274,10 +1298,14 @@ export class GdtDirectApiService {
 
       const rows = res.data.datas ?? res.data.data ?? [];
 
-      // X-Total-Count header takes precedence over response body
+      // BUG-FIX: Same X-Total-Count trust fix as _streamPages.
+      // Only update total when the header reports more than one full page.
       const headerTotal = parseInt(res.headers['x-total-count'] ?? '', 10);
-      if (!isNaN(headerTotal)) total = headerTotal;
-      else if (res.data.total != null) total = Number(res.data.total);
+      if (!isNaN(headerTotal) && headerTotal > pageSize) {
+        total = headerTotal;
+      } else if (res.data.total != null && Number(res.data.total) > pageSize) {
+        total = Number(res.data.total);
+      }
 
       if (rows.length === 0) break;
 
@@ -1297,12 +1325,25 @@ export class GdtDirectApiService {
         endpoint, page, rows: rows.length, soFar: all.length, total,
       });
 
+      // BOT-CACHE-02: Store raw page response in gdt_raw_cache for replay/debugging (non-fatal)
+      if (this._rawCache && this._companyId) {
+        const period = `${fromDate.getFullYear()}-${String(fromDate.getMonth() + 1).padStart(2, '0')}`;
+        void this._rawCache.upsertPage({
+          companyId: this._companyId,
+          endpoint:  endpointPath,
+          page,
+          period,
+          rawJson:   res.data,
+        });
+      }
+
       // FIX-2: Save checkpoint after each successful page (non-fatal)
       if (this._checkpoint && this._companyId && yyyymm) {
         await this._checkpoint.save(this._companyId, yyyymm, direction, page).catch(() => {});
       }
 
       if (all.length >= total) break;
+      if (rows.length < pageSize) break; // Partial page = natural end of stream
       page++;
       // Random 0.8-2.5s between pages — mimics human scrolling through results.
       // Fixed delays are a bot fingerprint; randomised intervals are harder to detect.
@@ -1355,6 +1396,8 @@ export class GdtDirectApiService {
 
     const isSco  = overridePath?.includes('sco-query') ?? false;
     let fetched  = 0;
+    // Start with Infinity so the loop always runs at least once.
+    // total is only updated when X-Total-Count is trustworthy (> pageSize).
     let total    = Infinity;
 
     while (fetched < total) {
@@ -1364,9 +1407,25 @@ export class GdtDirectApiService {
       );
 
       const rows = res.data.datas ?? res.data.data ?? [];
+
+      // BUG-FIX: GDT's /sco-query endpoints (and occasionally /query) return
+      // X-Total-Count equal to the page size (50) regardless of the actual count.
+      // Trusting that value stops the loop after the first page even when
+      // hundreds of invoices remain.  We therefore only update `total` when the
+      // header signals MORE than one full page worth of data (> pageSize).
+      // When the header is unreliable we fall back to the empty-page sentinel
+      // (rows.length === 0) as the natural end-of-stream signal.
       const headerTotal = parseInt(res.headers['x-total-count'] ?? '', 10);
-      if (!isNaN(headerTotal)) total = headerTotal;
-      else if (res.data.total != null) total = Number(res.data.total);
+      if (!isNaN(headerTotal) && headerTotal > pageSize) {
+        total = headerTotal;
+      } else if (res.data.total != null && Number(res.data.total) > pageSize) {
+        total = Number(res.data.total);
+      } else if (!isNaN(headerTotal)) {
+        // Suspicious header (= pageSize or smaller) — log and keep total=Infinity
+        logger.debug('[GdtDirect] X-Total-Count <= pageSize — ignoring, continuing until empty page', {
+          endpoint: endpointPath, page, headerTotal, pageSize,
+        });
+      }
 
       if (rows.length === 0) break;
 
@@ -1388,7 +1447,10 @@ export class GdtDirectApiService {
 
       yield mapped;
 
+      // Stop if we've reached the declared total (only meaningful when total is finite)
+      // OR if this page was partial (fewer rows than pageSize) — natural last page.
       if (fetched >= total) break;
+      if (rows.length < pageSize) break;
       page++;
       await humanDelay(800, 2500);
     }
@@ -1449,20 +1511,29 @@ export class GdtDirectApiService {
 
   /**
    * Phase 8: Stream input invoices page-by-page (hóa đơn đầu vào).
+   *
+   * The main /query/invoices/purchase endpoint requires a ttxly filter.
+   * We drive the filter list from config.api.query.purchaseFilters so that
+   * future filter additions require no code change.
+   * Default filters: ['ttxly==5', 'ttxly==6'] (ttxly==8 is MTTTT-only, handled by SCO).
    */
   async *fetchInputInvoicesStream(
     fromDate: Date,
     toDate:   Date,
   ): AsyncGenerator<RawInvoice[]> {
     const scoPurchasePath = this.recipe?.api.endpoints.scoPurchase ?? GDT_SCO_PURCHASE;
-    // ttxly==5 stream
-    for await (const batch of this._streamPages('purchase', fromDate, toDate, 'ttxly==5')) {
-      yield batch;
-    }
-    await humanDelay(1_500, 3_000);
-    // ttxly==6 stream
-    for await (const batch of this._streamPages('purchase', fromDate, toDate, 'ttxly==6')) {
-      yield batch;
+
+    // Main /query endpoint: each ttxly type needs a separate paginated stream
+    // because the endpoint requires exactly one ttxly filter.
+    // Config-driven: defaults to ['ttxly==5', 'ttxly==6'] if not set.
+    const purchaseFilters = this.recipe?.api.query?.purchaseFilters ?? ['ttxly==5', 'ttxly==6'];
+    for (let fi = 0; fi < purchaseFilters.length; fi++) {
+      if (fi > 0) await humanDelay(1_500, 3_000);
+      const filter = purchaseFilters[fi]!;
+      logger.info('[GdtDirect] Fetching purchase invoices (main /query)', { filter, from: formatGdtDate(fromDate), to: formatGdtDate(toDate) });
+      for await (const batch of this._streamPages('purchase', fromDate, toDate, filter)) {
+        yield batch;
+      }
     }
     await humanDelay(1_500, 3_000);
 

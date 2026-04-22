@@ -53,6 +53,7 @@ import { scheduleRepurchaseAlertJob } from './jobs/RepurchaseAlertJob';
 // DISABLED: auto-sync scheduling moved to bot process (bot/src/cron/auto-sync.ts)
 // import { scheduleGdtBotSync, gdtBotSchedulerWorker } from './jobs/GdtBotSchedulerJob';
 import { scheduleQuotaReset } from './jobs/QuotaResetJob';
+import { registerCatalogRebuildJob } from './jobs/CatalogRebuildJob';
 import { syncNotificationWorker } from './jobs/SyncNotificationWorker';
 import { gdtRawCacheSyncWorker } from './jobs/GdtRawCacheSyncWorker';
 import { gdtRawCacheSchedulerWorker, scheduleGdtRawCacheSync } from './jobs/GdtRawCacheScheduler';
@@ -192,6 +193,7 @@ async function start(): Promise<void> {
   await scheduleTaxDeadlineReminder();
   await scheduleRepurchaseAlertJob();
   await scheduleQuotaReset();
+  await registerCatalogRebuildJob();
   // GDT Raw Cache layer — background pre-fetch + change detection
   void gdtRawCacheSyncWorker;         // auto-started on import
   void gdtRawCacheSchedulerWorker;    // auto-started on import

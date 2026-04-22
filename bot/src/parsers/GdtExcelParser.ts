@@ -129,6 +129,7 @@ export class GdtExcelParser {
       khhd_cl_quan:    null,
       so_hd_cl_quan:   null,
       tax_category:    this._extractTaxCategory(get('vat_rate')),
+      original_invoice_date: null,
     };
   }
 

@@ -12,6 +12,7 @@ import * as bcrypt from 'bcryptjs';
 import { pool } from '../db/pool';
 import { authenticate } from '../middleware/auth';
 import { requireAdmin } from '../middleware/adminAuth';
+import { licenseService } from '../services/LicenseService';
 import { quotaService } from '../services/QuotaService';
 import { sendSuccess, sendPaginated } from '../utils/response';
 import { ValidationError, NotFoundError } from '../utils/AppError';
@@ -693,6 +694,113 @@ router.post('/quota/reset-all', async (req: Request, res: Response, next: NextFu
     void confirm;
     const count = await quotaService.resetAllMonthlyQuotas();
     sendSuccess(res, { reset_count: count }, `Đã reset quota cho ${count} subscription`);
+  } catch (err) { next(err); }
+});
+
+// ── BOT-LICENSE-01: License tier CRUD ────────────────────────────────────────
+
+const tierBodySchema = z.object({
+  sync_per_hour:   z.number().int().min(1).max(100),
+  burst_max:       z.number().int().min(1).max(100),
+  max_companies:   z.number().int().min(0),   // 0 = unlimited
+  can_export_xml:  z.boolean(),
+  can_use_ai_audit: z.boolean(),
+});
+
+const newTierSchema = tierBodySchema.extend({
+  plan_id: z.string().min(1).max(50),
+});
+
+// GET /api/admin/license-tiers
+router.get('/license-tiers', async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT plan_id, sync_per_hour, burst_max, max_companies, can_export_xml, can_use_ai_audit
+       FROM license_tiers ORDER BY plan_id`
+    );
+    sendSuccess(res, rows);
+  } catch (err) { next(err); }
+});
+
+// POST /api/admin/license-tiers
+router.post('/license-tiers', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const body = newTierSchema.safeParse(req.body);
+    if (!body.success) throw new ValidationError('Invalid tier data');
+    const { plan_id, sync_per_hour, burst_max, max_companies, can_export_xml, can_use_ai_audit } = body.data;
+    const { rows } = await pool.query(
+      `INSERT INTO license_tiers (plan_id, sync_per_hour, burst_max, max_companies, can_export_xml, can_use_ai_audit)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       RETURNING *`,
+      [plan_id, sync_per_hour, burst_max, max_companies, can_export_xml, can_use_ai_audit]
+    );
+    sendSuccess(res, rows[0]);
+  } catch (err) { next(err); }
+});
+
+// PUT /api/admin/license-tiers/:planId
+router.put('/license-tiers/:planId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { planId } = req.params as { planId: string };
+    const body = tierBodySchema.safeParse(req.body);
+    if (!body.success) throw new ValidationError('Invalid tier data');
+    const { sync_per_hour, burst_max, max_companies, can_export_xml, can_use_ai_audit } = body.data;
+
+    const { rows } = await pool.query(
+      `UPDATE license_tiers
+       SET sync_per_hour=$2, burst_max=$3, max_companies=$4, can_export_xml=$5, can_use_ai_audit=$6
+       WHERE plan_id=$1
+       RETURNING *`,
+      [planId, sync_per_hour, burst_max, max_companies, can_export_xml, can_use_ai_audit]
+    );
+    if (rows.length === 0) throw new NotFoundError(`Tier '${planId}' không tồn tại`);
+
+    // Invalidate all users on this plan
+    const affected = await pool.query(
+      `SELECT user_id FROM user_subscriptions WHERE plan=$1 AND status IN ('trial','active')`,
+      [planId]
+    );
+    for (const row of affected.rows as { user_id: string }[]) {
+      void licenseService.invalidate(row.user_id);
+    }
+
+    sendSuccess(res, rows[0]);
+  } catch (err) { next(err); }
+});
+
+// POST /api/admin/users/:userId/rate-limit-override
+const overrideSchema = z.object({
+  plan: z.enum(['free', 'starter', 'pro', 'enterprise']),
+  ttl_seconds: z.number().int().min(60).max(86400).optional().default(3600),
+});
+
+router.post('/users/:userId/rate-limit-override', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { userId } = req.params as { userId: string };
+    const body = overrideSchema.safeParse(req.body);
+    if (!body.success) throw new ValidationError('Invalid override data');
+    const { plan, ttl_seconds } = body.data;
+
+    const IORedis = (await import('ioredis')).default;
+    const r = new IORedis(process.env['REDIS_URL'] ?? 'redis://localhost:6379', { maxRetriesPerRequest: 3 });
+    await r.set(`ratelimit:override:${userId}`, plan, 'EX', ttl_seconds);
+    await r.quit();
+
+    await licenseService.invalidate(userId);
+    sendSuccess(res, { userId, plan, ttl_seconds });
+  } catch (err) { next(err); }
+});
+
+// DELETE /api/admin/users/:userId/rate-limit-override
+router.delete('/users/:userId/rate-limit-override', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { userId } = req.params as { userId: string };
+    const IORedis = (await import('ioredis')).default;
+    const r = new IORedis(process.env['REDIS_URL'] ?? 'redis://localhost:6379', { maxRetriesPerRequest: 3 });
+    await r.del(`ratelimit:override:${userId}`);
+    await r.quit();
+    await licenseService.invalidate(userId);
+    sendSuccess(res, { userId, removed: true });
   } catch (err) { next(err); }
 });
 
