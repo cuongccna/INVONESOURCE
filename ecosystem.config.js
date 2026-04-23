@@ -65,5 +65,28 @@ module.exports = {
       out_file: '/opt/INVONESOURCE/logs/bot-out.log',
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
     },
+
+    // ─── GDT Detail Worker (Phase 2 — async detail fetch) ────────────────────
+    // Polls invoice_detail_queue, fetches /detail JSON, inserts line_items.
+    // Separate process from invone-bot (Phase 1 = list sync).
+    // One crash here NEVER affects list sync (invone-bot).
+    {
+      name: 'invone-detail-worker',
+      cwd: '/opt/INVONESOURCE/bot',
+      script: 'node',
+      args: '-r dotenv/config dist/detail.worker.js',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      watch: false,
+      max_memory_restart: '512M',
+      kill_timeout: 10000,
+      env: {
+        NODE_ENV: 'production',
+      },
+      error_file: '/opt/INVONESOURCE/logs/detail-worker-error.log',
+      out_file: '/opt/INVONESOURCE/logs/detail-worker-out.log',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+    },
   ],
 };

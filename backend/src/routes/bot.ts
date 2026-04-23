@@ -21,6 +21,149 @@ const QUICK_SYNC_COOLDOWN_TTL_SEC  = 5 * 60;  // 5 minutes cooldown for quick-sy
 
 const router = Router();
 router.use(authenticate);
+
+// ── BOT-REFACTOR-04: Phase 2 progress routes (user-scoped, no requireCompany) ─
+
+/** Max companies that can be actively processing detail simultaneously. */
+const MAX_CONCURRENT_COMPANIES = 20;
+
+/**
+ * GET /api/bot/users/me/sync-status
+ * Returns aggregate Phase 2 detail-fetch progress for ALL companies the user has access to.
+ *
+ * Response shape:
+ *   { total, pending, processing, done, failed, skipped, byCompany: [...] }
+ *
+ * Only considers rows enqueued in the last 48 hours so the response stays relevant.
+ */
+router.get('/users/me/sync-status', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const userId = (req as Request & { user?: { id: string } }).user?.id;
+    if (!userId) {
+      res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Not authenticated' } });
+      return;
+    }
+
+    // Aggregate over all companies the user has access to (last 48h of queue rows)
+    const aggRes = await pool.query<{
+      total:      string;
+      pending:    string;
+      processing: string;
+      done:       string;
+      failed:     string;
+      skipped:    string;
+    }>(
+      `SELECT
+         COUNT(*)                                       AS total,
+         COUNT(*) FILTER (WHERE q.status = 'pending')  AS pending,
+         COUNT(*) FILTER (WHERE q.status = 'processing') AS processing,
+         COUNT(*) FILTER (WHERE q.status = 'done')     AS done,
+         COUNT(*) FILTER (WHERE q.status = 'failed')   AS failed,
+         COUNT(*) FILTER (WHERE q.status = 'skipped')  AS skipped
+       FROM invoice_detail_queue q
+       JOIN user_companies uc ON uc.company_id = q.company_id
+       WHERE uc.user_id      = $1
+         AND q.enqueued_at  > NOW() - INTERVAL '48 hours'`,
+      [userId],
+    );
+    const agg = aggRes.rows[0] ?? { total: '0', pending: '0', processing: '0', done: '0', failed: '0', skipped: '0' };
+
+    // Per-company breakdown with real tax_code display
+    const byCompanyRes = await pool.query<{
+      company_id:   string;
+      tax_code:     string;
+      company_name: string;
+      total:        string;
+      pending:      string;
+      processing:   string;
+      done:         string;
+      failed:       string;
+      skipped:      string;
+    }>(
+      `SELECT
+         q.company_id,
+         co.tax_code,
+         co.name                                              AS company_name,
+         COUNT(*)                                             AS total,
+         COUNT(*) FILTER (WHERE q.status = 'pending')        AS pending,
+         COUNT(*) FILTER (WHERE q.status = 'processing')     AS processing,
+         COUNT(*) FILTER (WHERE q.status = 'done')           AS done,
+         COUNT(*) FILTER (WHERE q.status = 'failed')         AS failed,
+         COUNT(*) FILTER (WHERE q.status = 'skipped')        AS skipped
+       FROM invoice_detail_queue q
+       JOIN user_companies uc ON uc.company_id = q.company_id
+       JOIN companies co      ON co.id          = q.company_id
+       WHERE uc.user_id      = $1
+         AND q.enqueued_at  > NOW() - INTERVAL '48 hours'
+       GROUP BY q.company_id, co.tax_code, co.name
+       ORDER BY total DESC
+       LIMIT $2`,
+      [userId, MAX_CONCURRENT_COMPANIES],
+    );
+
+    sendSuccess(res, {
+      total:      parseInt(agg.total,      10),
+      pending:    parseInt(agg.pending,    10),
+      processing: parseInt(agg.processing, 10),
+      done:       parseInt(agg.done,       10),
+      failed:     parseInt(agg.failed,     10),
+      skipped:    parseInt(agg.skipped,    10),
+      byCompany:  byCompanyRes.rows.map(r => ({
+        companyId:   r.company_id,
+        taxCode:     r.tax_code,
+        companyName: r.company_name,
+        total:       parseInt(r.total,      10),
+        pending:     parseInt(r.pending,    10),
+        processing:  parseInt(r.processing, 10),
+        done:        parseInt(r.done,       10),
+        failed:      parseInt(r.failed,     10),
+        skipped:     parseInt(r.skipped,    10),
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/bot/users/me/sync-status/retry
+ * Resets all failed detail-queue rows (for user's companies) back to pending
+ * so detail.worker will retry them.
+ *
+ * Only resets rows where attempts < max_attempts.
+ * Returns { reset: number } — count of rows reset.
+ */
+router.post('/users/me/sync-status/retry', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const userId = (req as Request & { user?: { id: string } }).user?.id;
+    if (!userId) {
+      res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Not authenticated' } });
+      return;
+    }
+
+    const retryRes = await pool.query<{ count: string }>(
+      `WITH resetted AS (
+         UPDATE invoice_detail_queue q
+         SET status = 'pending', last_error = NULL
+         FROM user_companies uc
+         WHERE uc.company_id = q.company_id
+           AND uc.user_id    = $1
+           AND q.status      = 'failed'
+           AND q.attempts    < q.max_attempts
+         RETURNING q.id
+       )
+       SELECT COUNT(*) AS count FROM resetted`,
+      [userId],
+    );
+    const reset = parseInt(retryRes.rows[0]?.count ?? '0', 10);
+    sendSuccess(res, { reset });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── End Phase 2 progress routes ──────────────────────────────────────────────
+
 router.use(requireCompany);
 
 // ── BullMQ queues for bot sync jobs ─────────────────────────────────────────

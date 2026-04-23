@@ -1087,13 +1087,18 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
               .expire(outDedupSetKey, 7200)
               .exec().catch(() => {});
 
-            // Line items (detail API) per invoice in slice
-            for (const { inv } of slice) {
-              const invoiceId = idMap.get(_invMapKey(inv)) ?? null;
-              if (invoiceId) {
-                await _maybeInsertLineItems(runner, inv, invoiceId, companyId);
-              }
-            }
+            // Phase 2: enqueue detail fetch for all invoices in this slice.
+            // detail.worker (separate PM2 process) picks them up and fetches
+            // raw_detail + line_items asynchronously via the same GDT session.
+            // Promise.allSettled: one enqueue failure never blocks the others.
+            await Promise.allSettled(
+              slice.map(({ inv }) => {
+                const invoiceId = idMap.get(_invMapKey(inv)) ?? null;
+                if (!invoiceId) return Promise.resolve();
+                // Priority 1 = manual (user waiting), 5 = auto background
+                return _enqueueForDetail(inv, invoiceId, companyId, isManual ? 1 : 5);
+              })
+            );
           }
         }
 
@@ -1157,12 +1162,14 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
               .expire(inDedupSetKey, 7200)
               .exec().catch(() => {});
 
-            for (const { inv } of slice) {
-              const invoiceId = idMap.get(_invMapKey(inv)) ?? null;
-              if (invoiceId) {
-                await _maybeInsertLineItems(runner, inv, invoiceId, companyId);
-              }
-            }
+            // Phase 2: enqueue detail fetch (same as output loop)
+            await Promise.allSettled(
+              slice.map(({ inv }) => {
+                const invoiceId = idMap.get(_invMapKey(inv)) ?? null;
+                if (!invoiceId) return Promise.resolve();
+                return _enqueueForDetail(inv, invoiceId, companyId, isManual ? 1 : 5);
+              })
+            );
           }
         }
 
@@ -1195,11 +1202,20 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
       if (proxyUrl) proxyManager.markHealthy(proxyUrl);
 
-      // Final progress update
+      // Đếm số HĐ đã enqueue detail trong 2h gần nhất cho company này
+      const detailQueuedRes = await pool.query<{ count: string }>(
+        `SELECT COUNT(*) AS count FROM invoice_detail_queue
+         WHERE company_id = $1 AND enqueued_at > NOW() - INTERVAL '2 hours'`,
+        [companyId],
+      ).catch(() => ({ rows: [{ count: '0' }] }));
+      const detailQueued = parseInt(detailQueuedRes.rows[0]?.count ?? '0', 10);
+
+      // Final progress update — Phase 1 complete, Phase 2 starting in background
       await job.updateProgress({
         percent: 100,
         invoicesFetched: outputCount + inputCount,
-        statusMessage: `Hoàn thành — ${outputCount} HĐ đầu ra, ${inputCount} HĐ đầu vào`,
+        detailQueued,
+        statusMessage: `Đã tải ${outputCount + inputCount} hóa đơn. Đang xử lý chi tiết ${detailQueued} HĐ trong nền...`,
       } as Record<string, unknown>);
 
       const durationMs = Date.now() - startedAt;
@@ -1243,7 +1259,7 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
         [freqHours, companyId],
       );
 
-      logger.info('[SyncWorker] Done', { companyId, outputCount, inputCount, durationMs });
+      logger.info('[SyncWorker] Done', { companyId, outputCount, inputCount, durationMs, detailQueued, note: 'Phase 2 detail fetch running in background via detail worker' });
 
       // ── Push notification via backend queue ─────────────────────────────────────
       if (totalSynced > 0) {
@@ -1623,6 +1639,63 @@ async function _upsertInvoice(
   }
 
   return invoiceDbId;
+}
+
+/**
+ * BOT-REFACTOR-03: Enqueue an invoice into invoice_detail_queue for Phase 2 detail fetch.
+ *
+ * ALL serial types (C and K) are enqueued — both have /detail JSON API (HTTP 200).
+ *   C-series (ttxly=5): detail + XML available
+ *   K-series (ttxly=6/8): detail JSON only (no XML file)
+ *
+ * is_sco determines the endpoint used in Phase 2:
+ *   true  → /sco-query/invoices/detail (MTTTT/SCO invoices)
+ *   false → /query/invoices/detail     (HĐĐT + K-series)
+ *
+ * ON CONFLICT(invoice_id): idempotent — safe to call multiple times.
+ * Non-fatal: never throws, never blocks the list sync.
+ */
+async function _enqueueForDetail(
+  inv:       import('./parsers/GdtXmlParser').RawInvoice,
+  invoiceId: string,
+  companyId: string,
+  priority:  1 | 5 | 10 = 5,
+): Promise<void> {
+  // Need all 3 params to call GDT detail API
+  if (!inv.invoice_number || !inv.serial_number || !inv.seller_tax_code) return;
+
+  try {
+    await pool.query(
+      `INSERT INTO invoice_detail_queue
+         (invoice_id, company_id, nbmst, khhdon, shdon, is_sco, status, priority, enqueued_at)
+       VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, NOW())
+       ON CONFLICT (invoice_id) DO UPDATE
+         SET
+           -- Keep done/skipped as-is; reset others to pending so detail is retried
+           status   = CASE
+             WHEN invoice_detail_queue.status IN ('done','skipped')
+             THEN invoice_detail_queue.status
+             ELSE 'pending'
+           END,
+           -- Lower priority number (higher urgency) wins
+           priority = LEAST(invoice_detail_queue.priority, EXCLUDED.priority)`,
+      [
+        invoiceId,
+        companyId,
+        inv.seller_tax_code,   // nbmst
+        inv.serial_number,     // khhdon (C26TAS, K26TAX, C26MTK, ...)
+        inv.invoice_number,    // shdon
+        inv.is_sco ?? false,   // true = MTTTT/SCO, false = HĐĐT or K-series
+        priority,
+      ],
+    );
+  } catch (err) {
+    // Non-fatal: queue failure must not block list sync
+    logger.warn('[SyncWorker] _enqueueForDetail failed (non-fatal)', {
+      invoiceId, serial: inv.serial_number,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 /**

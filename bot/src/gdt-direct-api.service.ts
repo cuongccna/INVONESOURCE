@@ -430,6 +430,34 @@ function splitIntoWeeks(from: Date, to: Date): Array<{ from: Date; to: Date }> {
   return chunks;
 }
 
+/**
+ * Split a date range into single-day windows.
+ * Fallback for SCO chunks suspected of truncation
+ * (GDT HTTP 500 on page > 0 when chunk has > pageSize invoices).
+ *
+ * Example: a 7-day week → 7 chunks of 1 day each.
+ * At 22 HĐ/day for high-volume MTT companies: always < pageSize=50, no 500.
+ */
+function splitIntoDays(from: Date, to: Date): Array<{ from: Date; to: Date }> {
+  const chunks: Array<{ from: Date; to: Date }> = [];
+  let cur = new Date(from);
+  cur.setHours(0, 0, 0, 0);
+  const end = new Date(to);
+  end.setHours(23, 59, 59, 999);
+
+  while (cur <= end) {
+    const dayEnd = new Date(cur);
+    dayEnd.setHours(23, 59, 59, 999);
+    const chunkEnd = dayEnd < end ? new Date(dayEnd) : new Date(end);
+    chunks.push({ from: new Date(cur), to: chunkEnd });
+    const next = new Date(cur);
+    next.setDate(next.getDate() + 1);
+    next.setHours(0, 0, 0, 0);
+    cur = next;
+  }
+  return chunks;
+}
+
 // ── Map GDT JSON row → RawInvoice ─────────────────────────────────────────────
 
 interface MapInvoiceOpts {
@@ -991,36 +1019,134 @@ export class GdtDirectApiService {
    * page size = 50), so only one page is ever needed per chunk — the GDT limit is never hit.
    * Errors per chunk are caught non-fatally so one bad week doesn't abort the full sync.
    */
+  /**
+   * Fetch SCO invoices with auto-fallback: weekly → daily when truncation detected.
+   *
+   * Truncation detection:
+   *   result.length % pageSize === 0 AND result.length > 0
+   *   → GDT may have HTTP 500'd on page > 0 (chunk > pageSize invoices).
+   *   → Automatically retry that week with daily sub-splits.
+   *
+   * Applies to:
+   *   - /sco-query/invoices/sold    (HĐ máy tính tiền bán ra)
+   *   - /sco-query/invoices/purchase (HĐ máy tính tiền mua vào)
+   * Does NOT apply to /query (no HTTP-500-on-page-1 bug).
+   *
+   * Low-volume  (< 50 HĐ/week): weekly only — 4–5 API calls/month.
+   * High-volume (> 50 HĐ/week): auto daily sub-split — 28–31 API calls/month.
+   */
   private async _fetchScoByWeeks(
     endpoint:     'sold' | 'purchase',
     fromDate:     Date,
     toDate:       Date,
     scoPath:      string,
   ): Promise<RawInvoice[]> {
-    const chunks = splitIntoWeeks(fromDate, toDate);
-    logger.info('[GdtDirect] SCO weekly fetch', {
-      endpoint, totalChunks: chunks.length,
+    const pageSize   = this.recipe?.api.pagination.pageSize ?? PAGE_SIZE;
+    const weekChunks = splitIntoWeeks(fromDate, toDate);
+
+    // ── Fast probe: single no-retry call to check SCO availability ──────────
+    // prefetchCount() uses this.http.get() DIRECTLY — no _getWithRetry retries.
+    // Fails in <5s on HTTP 500 vs ~2 min if we let _getWithRetry exhaust all
+    // peak-period retries (5 × exponential 8s backoff) per chunk.
+    //
+    // GDT returns HTTP 500 (not 200+[]) for companies with NO MTT/SCO setup.
+    // Returning -1 here means: skip the entire weekly loop immediately.
+    const probeCount = await this.prefetchCount(endpoint, fromDate, toDate, undefined, scoPath);
+    if (probeCount < 0) {
+      logger.info('[GdtDirect] SCO probe: endpoint returned error — no MTT/SCO setup for this company, skipping weekly loop', {
+        endpoint, from: formatGdtDate(fromDate), to: formatGdtDate(toDate),
+        hint: 'GDT returns HTTP 500 (not 200+[]) for companies without SCO/MTT configuration.',
+      });
+      return [];
+    }
+    logger.info('[GdtDirect] SCO probe OK — proceeding with weekly fetch', {
+      endpoint, probeCount, totalWeekChunks: weekChunks.length,
       from: formatGdtDate(fromDate), to: formatGdtDate(toDate),
     });
+
     const all: RawInvoice[] = [];
-    for (let i = 0; i < chunks.length; i++) {
-      if (i > 0) await humanDelay(2_000, 5_000);
-      const { from, to } = chunks[i]!;
+
+    for (let i = 0; i < weekChunks.length; i++) {
+      if (i > 0) await humanDelay(2_000, 4_000);
+      const { from, to } = weekChunks[i]!;
+
       try {
-        const chunk = await this._fetchAllPagesBuffered(endpoint, from, to, undefined, scoPath);
-        all.push(...chunk);
-        logger.debug('[GdtDirect] SCO weekly chunk done', {
-          chunk: i + 1, total: chunks.length,
-          from: formatGdtDate(from), to: formatGdtDate(to), count: chunk.length,
-        });
+        const weekResult = await this._fetchAllPagesBuffered(endpoint, from, to, undefined, scoPath);
+
+        // Truncation detection: result is an exact multiple of pageSize (50, 100, 150...)
+        // → GDT likely HTTP 500'd on page 1+ (real count is higher).
+        if (weekResult.length > 0 && weekResult.length % pageSize === 0) {
+          logger.warn('[GdtDirect] SCO chunk suspected truncation — retrying with daily sub-splits', {
+            endpoint, weekChunk: i + 1,
+            weekResult: weekResult.length, pageSize,
+            from: formatGdtDate(from), to: formatGdtDate(to),
+          });
+
+          const dayChunks  = splitIntoDays(from, to);
+          const dayResults: RawInvoice[] = [];
+
+          for (let d = 0; d < dayChunks.length; d++) {
+            if (d > 0) await humanDelay(1_200, 2_500);
+            const { from: df, to: dt } = dayChunks[d]!;
+            try {
+              const dayResult = await this._fetchAllPagesBuffered(endpoint, df, dt, undefined, scoPath);
+              dayResults.push(...dayResult);
+              logger.debug('[GdtDirect] SCO day sub-chunk', {
+                day: d + 1, of: dayChunks.length, count: dayResult.length,
+                date: formatGdtDate(df).slice(0, 10),
+              });
+            } catch (dayErr) {
+              logger.warn('[GdtDirect] SCO day sub-chunk failed (non-fatal)', {
+                day: d + 1, date: formatGdtDate(df).slice(0, 10),
+                err: dayErr instanceof Error ? dayErr.message : String(dayErr),
+              });
+            }
+          }
+
+          // Use daily results if they recovered more than weekly
+          if (dayResults.length > weekResult.length) {
+            logger.info('[GdtDirect] SCO daily sub-split recovered more invoices', {
+              endpoint, weekChunk: i + 1,
+              weekly: weekResult.length, daily: dayResults.length,
+              gained: dayResults.length - weekResult.length,
+            });
+            all.push(...dayResults);
+          } else {
+            // Exact multiple was coincidence, or daily also failed — keep weekly result
+            all.push(...weekResult);
+          }
+        } else {
+          // Normal: no truncation suspected
+          all.push(...weekResult);
+          logger.debug('[GdtDirect] SCO weekly chunk OK', {
+            chunk: i + 1, of: weekChunks.length, count: weekResult.length,
+          });
+        }
       } catch (err) {
         logger.warn('[GdtDirect] SCO weekly chunk failed (non-fatal)', {
-          chunk: i + 1, total: chunks.length,
+          chunk: i + 1, of: weekChunks.length,
           from: formatGdtDate(from), to: formatGdtDate(to),
           err: err instanceof Error ? err.message : String(err),
         });
+
+        if (all.length === 0) {
+          // Fast-fail: first chunk failure with no results collected yet.
+          // GDT returns HTTP 500 (not 200+[]) for companies with no MTT/SCO setup.
+          // All subsequent chunks would also return 500 — skip them to avoid
+          // wasting getPeakMaxRetries() × exponential-backoff per chunk
+          // (during peak = 5 retries × 8s base = ~2 min per chunk × N chunks).
+          logger.info('[GdtDirect] SCO fast-fail: first chunk failed with no prior results — assuming no SCO invoices', {
+            endpoint,
+            skippingChunks: weekChunks.length - (i + 1),
+            hint: 'Company likely has no MTT/SCO setup. GDT returns 500 for non-SCO companies.',
+          });
+          break;
+        }
+        // Subsequent chunk failures (all.length > 0): log and continue (might be transient)
       }
     }
+
+    logger.info('[GdtDirect] SCO fetch complete', { endpoint, total: all.length });
     return all;
   }
 
@@ -1476,36 +1602,11 @@ export class GdtDirectApiService {
     }
     await humanDelay(1_500, 3_000);
 
-    // SCO endpoint — split into WEEKLY chunks.
-    // Root cause: GDT's /sco-query/invoices/sold returns X-Total-Count equal to the
-    // current page size (50) instead of the true total, OR returns HTTP 500 on page > 0
-    // for companies with many MTT invoices (> 50/month). This causes _streamPages to
-    // stop after exactly one page (50 items) even when hundreds exist.
-    // Fix: fetch one week at a time — each chunk has ~10-25 invoices, fits in 1 page,
-    // so pagination is never needed and the GDT limit is never hit.
-    // Each chunk is also isolated in its own try-catch so a transient 500 on one week
-    // does not abort the entire sync.
-    const scoSoldChunks = splitIntoWeeks(fromDate, toDate);
-    logger.info('[GdtDirect] SCO sold — fetching by weekly chunks', {
-      totalChunks: scoSoldChunks.length,
-      from: formatGdtDate(fromDate),
-      to:   formatGdtDate(toDate),
-    });
-    for (let i = 0; i < scoSoldChunks.length; i++) {
-      if (i > 0) await humanDelay(2_000, 5_000);
-      const { from, to } = scoSoldChunks[i]!;
-      try {
-        for await (const batch of this._streamPages('sold', from, to, undefined, scoPath)) {
-          yield batch;
-        }
-      } catch (err) {
-        logger.warn('[GdtDirect] SCO sold chunk failed (non-fatal, skipping chunk)', {
-          chunk: i + 1,
-          from:  formatGdtDate(from),
-          to:    formatGdtDate(to),
-          err:   err instanceof Error ? err.message : String(err),
-        });
-      }
+    // SCO sold: use _fetchScoByWeeks (weekly → daily fallback on truncation detection).
+    // Buffered then yielded in PAGE_SIZE batches so the caller sees the same interface.
+    const scoSoldAll = await this._fetchScoByWeeks('sold', fromDate, toDate, scoPath);
+    for (let i = 0; i < scoSoldAll.length; i += PAGE_SIZE) {
+      yield scoSoldAll.slice(i, i + PAGE_SIZE);
     }
   }
 
@@ -1537,29 +1638,10 @@ export class GdtDirectApiService {
     }
     await humanDelay(1_500, 3_000);
 
-    // SCO purchase endpoint — weekly chunks for the same reason as SCO sold.
-    // /sco-query/invoices/purchase also suffers from X-Total-Count = pageSize bug.
-    const scoPurchaseChunks = splitIntoWeeks(fromDate, toDate);
-    logger.info('[GdtDirect] SCO purchase — fetching by weekly chunks', {
-      totalChunks: scoPurchaseChunks.length,
-      from: formatGdtDate(fromDate),
-      to:   formatGdtDate(toDate),
-    });
-    for (let i = 0; i < scoPurchaseChunks.length; i++) {
-      if (i > 0) await humanDelay(2_000, 5_000);
-      const { from, to } = scoPurchaseChunks[i]!;
-      try {
-        for await (const batch of this._streamPages('purchase', from, to, undefined, scoPurchasePath)) {
-          yield batch;
-        }
-      } catch (err) {
-        logger.warn('[GdtDirect] SCO purchase chunk failed (non-fatal, skipping chunk)', {
-          chunk: i + 1,
-          from:  formatGdtDate(from),
-          to:    formatGdtDate(to),
-          err:   err instanceof Error ? err.message : String(err),
-        });
-      }
+    // SCO purchase: same buffered approach with truncation detection + daily fallback.
+    const scoPurchaseAll = await this._fetchScoByWeeks('purchase', fromDate, toDate, scoPurchasePath);
+    for (let i = 0; i < scoPurchaseAll.length; i += PAGE_SIZE) {
+      yield scoPurchaseAll.slice(i, i + PAGE_SIZE);
     }
   }
 

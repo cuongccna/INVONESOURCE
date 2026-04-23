@@ -6,6 +6,7 @@ import { proxyManager } from './proxy-manager';
 import { logger } from './logger';
 import { runGdtHealthCheck } from './cron/gdt-health-check';
 import { runAutoSyncCycle } from './cron/auto-sync';
+import { pool } from './db';
 
 logger.info('[Bot] GDT Crawler Bot starting', {
   concurrency: process.env['WORKER_CONCURRENCY'] ?? '2',
@@ -67,3 +68,25 @@ void (async () => {
 const HEALTH_CHECK_INTERVAL_MS = 15 * 60 * 1000; // 15 min
 void runGdtHealthCheck(); // Run immediately on startup
 setInterval(() => void runGdtHealthCheck(), HEALTH_CHECK_INTERVAL_MS);
+
+// BOT-REFACTOR-04: Daily cleanup — delete done/skipped detail queue rows older than 7 days.
+// This runs in index.ts (invone-bot process) so detail.worker stays simple (no scheduler).
+const DETAIL_QUEUE_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
+async function cleanupDetailQueue(): Promise<void> {
+  try {
+    const res = await pool.query(
+      `DELETE FROM invoice_detail_queue
+       WHERE status IN ('done','skipped')
+         AND done_at < NOW() - INTERVAL '7 days'`,
+    );
+    if ((res.rowCount ?? 0) > 0) {
+      logger.info('[Scheduler] Detail queue cleanup', { deleted: res.rowCount });
+    }
+  } catch (err) {
+    logger.warn('[Scheduler] Detail queue cleanup failed (non-fatal)', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+void cleanupDetailQueue(); // Run once on startup (catches any backlog)
+setInterval(() => void cleanupDetailQueue(), DETAIL_QUEUE_CLEANUP_INTERVAL_MS);
