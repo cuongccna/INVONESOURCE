@@ -323,7 +323,10 @@ export default function InvoiceGrid({
                             <span className="ml-1 text-xs bg-red-100 text-red-600 px-1 rounded" title="Hóa đơn đã bị hủy">⛔ Hủy</span>
                           )}
                           {inv.status === 'replaced' && (
-                            <span className="ml-1 text-xs bg-red-100 text-red-700 px-1 rounded" title="Hóa đơn đã bị thay thế bởi hóa đơn khác">⊘ Bị thay thế</span>
+                            <span className="ml-1 text-xs bg-yellow-100 text-yellow-700 px-1 rounded" title="Hóa đơn thay thế cho hóa đơn khác (tthai=5)">↺ Thay thế</span>
+                          )}
+                          {inv.status === 'replaced_original' && (
+                            <span className="ml-1 text-xs bg-orange-100 text-orange-700 px-1 rounded" title="Hóa đơn gốc đã bị thay thế bởi hóa đơn khác (tthai=4)">🔄 Bị thay thế</span>
                           )}
                           {inv.status === 'adjusted' && (
                             <span className="ml-1 text-xs bg-blue-100 text-blue-700 px-1 rounded" title="Hóa đơn điều chỉnh cho hóa đơn khác">✏ Điều chỉnh</span>
