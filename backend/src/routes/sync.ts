@@ -58,6 +58,41 @@ function getRedis(): Redis {
 }
 const SYNC_LOCK_PREFIX = 'sync:lock:';
 const SYNC_LOCK_TTL = 30 * 60; // 30 min
+const BOT_WORKER_HEARTBEAT_KEY = 'bot:worker:heartbeat';
+const BOT_WORKER_OFFLINE_MESSAGE = 'BOT worker đang offline. Phiên đồng bộ đã được đóng để tránh treo trạng thái.';
+
+async function isBotWorkerAlive(): Promise<boolean> {
+  try {
+    return await getRedis().exists(BOT_WORKER_HEARTBEAT_KEY) === 1;
+  } catch {
+    // If Redis status check itself fails, do not turn that into a false offline signal.
+    return true;
+  }
+}
+
+async function markRunWorkerOffline(jobId: string, companyId: string): Promise<void> {
+  await Promise.all([
+    pool.query(
+      `UPDATE gdt_bot_runs
+       SET status = 'error',
+           finished_at = COALESCE(finished_at, NOW()),
+           error_detail = $1
+       WHERE id = $2
+         AND company_id = $3
+         AND status IN ('pending', 'delayed', 'running')`,
+      [BOT_WORKER_OFFLINE_MESSAGE, jobId, companyId],
+    ),
+    pool.query(
+      `UPDATE gdt_bot_configs
+       SET last_run_status = 'error',
+           last_error = $1,
+           updated_at = NOW()
+       WHERE company_id = $2
+         AND last_run_status IN ('pending', 'delayed', 'running')`,
+      [BOT_WORKER_OFFLINE_MESSAGE, companyId],
+    ),
+  ]).catch(() => undefined);
+}
 
 // ─── POST /api/sync/start — enqueue sync jobs (month or quarter) ────────────
 
@@ -170,6 +205,11 @@ router.get('/progress/:jobId', async (req: Request, res: Response) => {
   const qCompanyId = typeof req.query.companyId === 'string' ? req.query.companyId : null;
   const authCompanyId = qCompanyId || req.user!.companyId;
 
+  if (!authCompanyId) {
+    res.status(400).json({ success: false, error: { code: 'BAD_REQUEST', message: 'companyId is required' } });
+    return;
+  }
+
   if (qCompanyId) {
     const access = await pool.query(
       'SELECT 1 FROM user_companies WHERE user_id = $1 AND company_id = $2',
@@ -217,6 +257,24 @@ router.get('/progress/:jobId', async (req: Request, res: Response) => {
       const freshJob = result?.job ?? null;
 
       if (!freshJob) {
+        if (!(await isBotWorkerAlive())) {
+          await markRunWorkerOffline(jobId, authCompanyId);
+          res.write(`data: ${JSON.stringify({
+            jobId,
+            state: 'failed',
+            progress: 0,
+            invoicesFetched: 0,
+            currentPage: 0,
+            totalPages: null,
+            currentMonth: '',
+            message: 'BOT worker offline',
+            error: BOT_WORKER_OFFLINE_MESSAGE,
+          })}\n\n`);
+          return true;
+        }
+      }
+
+      if (!freshJob) {
         // Job not yet enqueued (bot is still processing the previous month in the chain).
         // Send a "waiting" event so the frontend shows "Chờ..." instead of timing out.
         if (Date.now() - connStart > SSE_MAX_DURATION) return true;
@@ -235,6 +293,26 @@ router.get('/progress/:jobId', async (req: Request, res: Response) => {
       }
 
       const state = await freshJob.getState();
+
+      if (state !== 'completed' && state !== 'failed' && !(await isBotWorkerAlive())) {
+        const progress = freshJob.progress as Record<string, unknown> | number;
+        const progressData = typeof progress === 'object' ? progress : { percent: progress };
+
+        await markRunWorkerOffline(jobId, authCompanyId);
+        res.write(`data: ${JSON.stringify({
+          jobId: freshJob.id,
+          state: 'failed',
+          progress: typeof progress === 'number' ? progress : (progressData.percent ?? 0),
+          invoicesFetched: progressData.invoicesFetched ?? 0,
+          currentPage: progressData.currentPage ?? 0,
+          totalPages: progressData.totalPages ?? null,
+          currentMonth: freshJob.data.label ?? '',
+          message: 'BOT worker offline',
+          error: BOT_WORKER_OFFLINE_MESSAGE,
+        })}\n\n`);
+        return true;
+      }
+
       const progress = freshJob.progress as Record<string, unknown> | number;
       const progressData = typeof progress === 'object' ? progress : { percent: progress };
 

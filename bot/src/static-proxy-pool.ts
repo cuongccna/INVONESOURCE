@@ -31,6 +31,22 @@ function buildProxyUrl(p: StaticProxy): string {
 
 export class StaticProxyPool {
   /**
+   * Return all active, non-expired static proxies in a stable order.
+   * AUTO jobs hash over this list via proxy_session_id to keep a sticky IP.
+   */
+  async listActiveUrls(): Promise<string[]> {
+    const result = await pgPool.query<StaticProxy>(
+      `SELECT id, host, port, protocol, username, password, label
+       FROM static_proxies
+       WHERE status = 'active'
+         AND (expires_at IS NULL OR expires_at > NOW())
+       ORDER BY created_at ASC, id ASC`,
+    );
+
+    return result.rows.map(buildProxyUrl);
+  }
+
+  /**
    * Get the currently assigned proxy for a user, or assign one if none exists.
    * Returns null if no proxies are available.
    */

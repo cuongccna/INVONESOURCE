@@ -148,8 +148,31 @@ export class ProxyManager extends EventEmitter {
     }
   }
 
-  nextForAutoSync(sessionSuffix: string): string | null {
-    return this.nextForCompany(sessionSuffix);
+  async nextForAutoSync(sessionSuffix: string): Promise<string | null> {
+    try {
+      const dbUrls = await staticProxyPool.listActiveUrls();
+      if (dbUrls.length === 0) {
+        logger.warn('[ProxyManager] Auto sync: no active static proxies in DB pool', {
+          sessionSuffix: sessionSuffix.slice(0, 8),
+        });
+        return null;
+      }
+
+      let available = dbUrls.filter(url => !this.failed.has(url));
+      if (available.length === 0) {
+        logger.warn('[ProxyManager] Auto sync: all static proxies are marked failed — resetting pool');
+        this.reset();
+        available = dbUrls;
+      }
+
+      return available[this._hashToIndex(sessionSuffix, available.length)] ?? null;
+    } catch (err) {
+      logger.error('[ProxyManager] Auto sync: static pool error', {
+        sessionSuffix: sessionSuffix.slice(0, 8),
+        error: (err as Error).message,
+      });
+      return null;
+    }
   }
 
   async markStaticBlocked(proxyId: string, userId: string, reason: string): Promise<string | null> {

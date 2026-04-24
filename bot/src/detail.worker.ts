@@ -385,7 +385,7 @@ async function processCompany(companyId: string): Promise<void> {
     return;
   }
 
-  const proxyUrl       = config.proxy_url ?? proxyManager.nextForAutoSync(config.proxy_session_id);
+  const proxyUrl       = config.proxy_url ?? await proxyManager.nextForAutoSync(config.proxy_session_id);
   const proxySessionId = config.proxy_session_id;
 
   const token = await getToken(companyId, proxySessionId, proxyUrl, creds.username, creds.password);

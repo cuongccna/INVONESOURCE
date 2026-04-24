@@ -687,7 +687,7 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     // ── 3. Sticky proxy per company ────────────────────────────────────────────
     // Proxy selection:
     //   Manual sync → static pool, per-user sticky from DB
-    //   Auto sync   → static pool, hash-keyed by proxy_session_id
+    //   Auto sync   → DB static pool, hash-keyed by proxy_session_id
     let proxySessionId = cfg.proxy_session_id;
     if (!proxySessionId) {
       proxySessionId = randomBytes(8).toString('hex'); // 16-char hex, e.g. 'a3f9b2c1d4e5f678'
@@ -723,8 +723,8 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       // SOCKS5 not available for static proxies (HTTP CONNECT only) — set null explicitly
       socks5ProxyUrl = null;
     } else {
-      // Auto sync: static proxy pool, keyed by session suffix
-      proxyUrl       = proxyManager.nextForAutoSync(proxySessionId);
+      // Auto sync: DB-backed static proxy pool, keyed by session suffix
+      proxyUrl       = await proxyManager.nextForAutoSync(proxySessionId);
       socks5ProxyUrl = proxyManager.nextSocks5ForCompany(proxySessionId);
       const maskedIp = proxyUrl ? _maskProxyUrl(proxyUrl) : 'none';
       logger.info('[SyncWorker] Proxy selected — AUTO (Static)', {
@@ -744,8 +744,8 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     if (!proxyUrl) {
       const allowDirect = process.env['ALLOW_DIRECT_CONNECTION'] === 'true';
       if (!allowDirect) {
-        logger.error('[SyncWorker] No proxy available — aborting sync. Set PROXY_LIST in .env or ALLOW_DIRECT_CONNECTION=true for dev only.', { companyId });
-        throw new UnrecoverableError('[SyncWorker] No proxy available — sync aborted for safety');
+        logger.error('[SyncWorker] No static proxy available — aborting sync. Assign an active proxy in Admin > Proxy or set ALLOW_DIRECT_CONNECTION=true for dev only.', { companyId });
+        throw new UnrecoverableError('[SyncWorker] No static proxy available — sync aborted for safety');
       }
       logger.warn(
         '[SyncWorker] No proxy — running with DIRECT connection (ALLOW_DIRECT_CONNECTION=true). ' +

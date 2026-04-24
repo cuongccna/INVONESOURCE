@@ -88,7 +88,7 @@ async function main(): Promise<void> {
       continue;
     }
 
-    const proxyUrl = proxyManager.nextForAutoSync('backfill');
+    const proxyUrl = await proxyManager.nextForAutoSync('backfill');
     const gdtApi   = new GdtDirectApiService(proxyUrl, null, undefined, companyId, null, null);
 
     try {

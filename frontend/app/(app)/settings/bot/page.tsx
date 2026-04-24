@@ -125,6 +125,9 @@ function formatDateTime(value: string | null): string {
 function humanizeBotError(message: string | null): string {
   if (!message) return 'Không có lỗi hiển thị';
   const normalized = message.toLowerCase();
+  if (normalized.includes('worker đang offline') || normalized.includes('worker offline')) {
+    return 'BOT worker đang tắt hoặc vừa restart. Phiên treo đã được đóng, bạn có thể chạy lại khi worker sẵn sàng.';
+  }
   if (normalized.includes('missing key for job')) {
     return 'Không đọc được tiến trình từ worker gần nhất. Hãy kiểm tra worker BOT rồi chạy lại.';
   }
@@ -332,6 +335,19 @@ export default function BotSettingsPage() {
     hydratedRunIdRef.current = latestRun.id;
     startSync([latestRun.id], activeCompanyId);
   }, [activeCompanyId, latestRun, startSync, syncJobIds.length]);
+
+  useEffect(() => {
+    if (!pageSyncActive || syncCompanyId !== activeCompanyId) return;
+
+    const activeJobId = syncJobIds[0];
+    if (!activeJobId) return;
+
+    const trackedRun = status?.lastRuns?.find(run => run.id === activeJobId) ?? historyRuns.find(run => run.id === activeJobId);
+    if (!trackedRun || ACTIVE_RUN_STATUSES.has(trackedRun.status)) return;
+
+    hydratedRunIdRef.current = activeJobId;
+    clearSync();
+  }, [activeCompanyId, clearSync, historyRuns, pageSyncActive, status?.lastRuns, syncCompanyId, syncJobIds]);
 
   useEffect(() => {
     if (!cfg && !pageSyncActive) return;

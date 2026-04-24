@@ -2,17 +2,62 @@
  * BOT-01 entry point
  */
 import 'dotenv/config';
+import Redis from 'ioredis';
 import { proxyManager } from './proxy-manager';
 import { logger } from './logger';
 import { runGdtHealthCheck } from './cron/gdt-health-check';
 import { runAutoSyncCycle } from './cron/auto-sync';
 import { pool } from './db';
 
+const BOT_WORKER_HEARTBEAT_KEY = 'bot:worker:heartbeat';
+const BOT_WORKER_HEARTBEAT_INTERVAL_MS = 15_000;
+const BOT_WORKER_HEARTBEAT_TTL_SEC = 45;
+
+const heartbeatRedis = new Redis(process.env['REDIS_URL'] ?? 'redis://127.0.0.1:6379', {
+  maxRetriesPerRequest: 3,
+});
+
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+async function writeBotHeartbeat(): Promise<void> {
+  try {
+    await heartbeatRedis.set(
+      BOT_WORKER_HEARTBEAT_KEY,
+      JSON.stringify({ pid: process.pid, updatedAt: new Date().toISOString() }),
+      'EX',
+      BOT_WORKER_HEARTBEAT_TTL_SEC,
+    );
+  } catch (err) {
+    logger.warn('[Bot] Heartbeat update failed (non-fatal)', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+function startBotHeartbeat(): void {
+  void writeBotHeartbeat();
+  heartbeatTimer = setInterval(() => {
+    void writeBotHeartbeat();
+  }, BOT_WORKER_HEARTBEAT_INTERVAL_MS);
+}
+
+async function stopBotHeartbeat(): Promise<void> {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+
+  await heartbeatRedis.del(BOT_WORKER_HEARTBEAT_KEY).catch(() => undefined);
+  await heartbeatRedis.quit().catch(() => undefined);
+}
+
 logger.info('[Bot] GDT Crawler Bot starting', {
   concurrency: process.env['WORKER_CONCURRENCY'] ?? '2',
   proxies:     proxyManager.size,
   nodeEnv:     process.env['NODE_ENV'] ?? 'development',
 });
+
+startBotHeartbeat();
 
 // Đợi ít nhất một slot proxy sẵn sàng trước khi workers được tạo/resume.
 // Tránh race condition khởi động: tất cả slot trả null trong 2–5 giây đầu
@@ -48,6 +93,7 @@ void (async () => {
       worker.close(),
       manualWorker.close(),
       autoWorker.close(),
+      stopBotHeartbeat(),
     ]);
     process.exit(0);
   }
