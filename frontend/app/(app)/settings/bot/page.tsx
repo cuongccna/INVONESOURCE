@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import apiClient from '../../../../lib/apiClient';
 import BackButton from '../../../../components/BackButton';
@@ -227,6 +227,7 @@ export default function BotSettingsPage() {
   const [isSavingConfig, setIsSavingConfig] = useState(false);
   const [actionLockUntil, setActionLockUntil] = useState<number | null>(null);
   const [acceptPasswordStorage, setAcceptPasswordStorage] = useState(false);
+  const hydratedRunIdRef = useRef<string | null>(null);
   const [form, setForm] = useState({
     password: '',
     has_otp: false,
@@ -299,6 +300,7 @@ export default function BotSettingsPage() {
     setShowSetup(false);
     setShowOtp(false);
     setShowDatePicker(false);
+    hydratedRunIdRef.current = null;
   }, [activeCompanyId]);
 
   useEffect(() => {
@@ -317,9 +319,17 @@ export default function BotSettingsPage() {
   const controlsDisabled = isBotBusy || actionLockActive || !proxyReady || isSavingConfig;
 
   useEffect(() => {
+    if (syncJobIds.length === 0) return;
+    hydratedRunIdRef.current = syncJobIds[0] ?? hydratedRunIdRef.current;
+  }, [syncJobIds]);
+
+  useEffect(() => {
     if (!activeCompanyId) return;
     if (syncJobIds.length > 0) return;
     if (!latestRun || !ACTIVE_RUN_STATUSES.has(latestRun.status)) return;
+    if (hydratedRunIdRef.current === latestRun.id) return;
+
+    hydratedRunIdRef.current = latestRun.id;
     startSync([latestRun.id], activeCompanyId);
   }, [activeCompanyId, latestRun, startSync, syncJobIds.length]);
 
@@ -444,7 +454,10 @@ export default function BotSettingsPage() {
       }>('/bot/run-now', body);
 
       const jobId = res.data.data.jobId;
-      if (jobId && activeCompanyId) startSync([jobId], activeCompanyId);
+      if (jobId && activeCompanyId) {
+        hydratedRunIdRef.current = jobId;
+        startSync([jobId], activeCompanyId);
+      }
       lockInteractions(3 * 60);
       setShowDatePicker(false);
       setHistoryMeta(prev => ({ ...prev, page: 1 }));
