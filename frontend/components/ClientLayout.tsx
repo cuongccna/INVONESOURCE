@@ -24,13 +24,15 @@ function SyncOverlay() {
   const { syncJobIds, syncCompanyId, clearSync } = useSyncContext();
   if (syncJobIds.length === 0 || pathname === '/settings/bot') return null;
   return (
-    <div className="fixed bottom-20 lg:bottom-6 inset-x-0 z-40 px-4" style={{ maxWidth: '42rem', left: '50%', transform: 'translateX(-50%)' }}>
-      <SyncProgressPanel
-        jobIds={syncJobIds}
-        companyId={syncCompanyId}
-        onClose={clearSync}
-        onDone={clearSync}
-      />
+    <div className="pointer-events-none fixed inset-x-0 top-[4.5rem] z-[70] px-4 lg:top-[5rem]">
+      <div className="pointer-events-auto mx-auto max-w-2xl lg:max-w-3xl">
+        <SyncProgressPanel
+          jobIds={syncJobIds}
+          companyId={syncCompanyId}
+          onClose={clearSync}
+          onDone={clearSync}
+        />
+      </div>
     </div>
   );
 }

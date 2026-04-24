@@ -60,6 +60,9 @@ const STUCK_PROCESSING_MIN = 10;
 const _redis        = new Redis(REDIS_URL, { maxRetriesPerRequest: 3, lazyConnect: true });
 const _sessionCache = new GdtSessionCache(_redis);
 const _detailCache  = new GdtDetailCache(_redis);
+let _hasInvoiceRawDetailColumn: boolean | null = null;
+let _skipInvoiceDetailSave = false;
+let _loggedInvoiceRawDetailWarning = false;
 
 // ── Row type from invoice_detail_queue ───────────────────────────────────────
 interface DetailQueueRow {
@@ -73,6 +76,45 @@ interface DetailQueueRow {
   priority:   number;
   attempts:   number;
   max_attempts: number;
+}
+
+function isMissingColumnError(message: string): boolean {
+  return /column\s+"[^"]+"\s+does not exist/i.test(message);
+}
+
+function logInvoiceRawDetailWarningOnce(message: string): void {
+  if (_loggedInvoiceRawDetailWarning) return;
+  _loggedInvoiceRawDetailWarning = true;
+  logger.warn('[DetailWorker] Invoice raw detail columns unavailable (non-fatal — run migration 038)', {
+    err: message,
+  });
+}
+
+async function hasInvoiceRawDetailColumn(): Promise<boolean> {
+  if (_hasInvoiceRawDetailColumn !== null) return _hasInvoiceRawDetailColumn;
+
+  try {
+    const res = await pool.query<{ exists: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1
+         FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'invoices'
+           AND column_name = 'raw_detail'
+       ) AS exists`,
+    );
+    _hasInvoiceRawDetailColumn = res.rows[0]?.exists === true;
+    if (!_hasInvoiceRawDetailColumn) {
+      logInvoiceRawDetailWarningOnce('column "raw_detail" does not exist');
+    }
+    return _hasInvoiceRawDetailColumn;
+  } catch (err) {
+    logger.warn('[DetailWorker] raw_detail schema probe failed (assuming migration exists)', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+    _hasInvoiceRawDetailColumn = true;
+    return _hasInvoiceRawDetailColumn;
+  }
 }
 
 // ── Helper: random delay ──────────────────────────────────────────────────────
@@ -226,13 +268,17 @@ async function processRow(
   gdtApi:  GdtDirectApiService,
 ): Promise<'done' | 'skipped' | 'failed'> {
   const { invoice_id: invoiceId, nbmst, khhdon, shdon, is_sco: isSco } = row;
+  const hasRawDetailColumn = await hasInvoiceRawDetailColumn();
 
   // Check if detail already fetched (race with another worker instance)
   const existingRes = await pool.query<{ has_detail: boolean; has_items: boolean; payment_method: string | null }>(
     `SELECT
-       (raw_detail IS NOT NULL)                                               AS has_detail,
-       (SELECT 1 FROM invoice_line_items WHERE invoice_id = $1 LIMIT 1) = 1  AS has_items,
-       (SELECT payment_method FROM invoices WHERE id = $1)                    AS payment_method`,
+       ${hasRawDetailColumn ? '(i.raw_detail IS NOT NULL)' : 'FALSE'}         AS has_detail,
+       EXISTS(SELECT 1 FROM invoice_line_items WHERE invoice_id = i.id)       AS has_items,
+       i.payment_method                                                       AS payment_method
+     FROM invoices i
+     WHERE i.id = $1
+     LIMIT 1`,
     [invoiceId],
   );
   const existing = existingRes.rows[0];
@@ -263,84 +309,99 @@ async function processRow(
   const paymentMethod = typeof detail.thtttoan === 'string' && detail.thtttoan.trim()
     ? detail.thtttoan.trim() : null;
 
-  await pool.query(
-    `UPDATE invoices SET
-       raw_detail          = $1::jsonb,
-       raw_detail_at       = NOW(),
-       gdt_invoice_id      = $2,
-       gdt_mhdon           = $3,
-       gdt_mtdtchieu       = $4,
-       gdt_khmshdon        = $5,
-       gdt_hdon            = $6,
-       gdt_hthdon          = $7,
-       gdt_htttoan         = $8,
-       gdt_dvtte           = $9,
-       gdt_tgia            = $10,
-       gdt_nky             = $11,
-       gdt_ttxly           = $12,
-       gdt_cqt             = $13,
-       gdt_tvandnkntt      = $14,
-       gdt_pban            = $15,
-       gdt_thlap           = $16,
-       gdt_thdon           = $17,
-       seller_address      = $18,
-       seller_bank_account = $19,
-       seller_bank_name    = $20,
-       seller_email        = $21,
-       seller_phone        = $22,
-       buyer_address       = $23,
-       buyer_bank_account  = $24,
-       gdt_ttcktmai        = $25,
-       gdt_tgtphi          = $26,
-       gdt_qrcode          = $27,
-       gdt_gchu            = $28,
-       gdt_nbcks           = $29,
-       gdt_cqtcks          = $30,
-       payment_method      = CASE
-         WHEN (payment_method IS NULL OR payment_method_source NOT IN ('manual','gdt_data'))
-         THEN $31 ELSE payment_method END,
-       payment_method_source = CASE
-         WHEN (payment_method IS NULL OR payment_method_source NOT IN ('manual','gdt_data'))
-           AND $31 IS NOT NULL
-         THEN 'gdt_data' ELSE payment_method_source END
-     WHERE id = $32`,
-    [
-      JSON.stringify(detail),                                                   // $1  raw_detail
-      d['id']          as string ?? null,                                       // $2  gdt_invoice_id
-      d['mhdon']       as string ?? null,                                       // $3  gdt_mhdon
-      d['mtdtchieu']   as string ?? null,                                       // $4  gdt_mtdtchieu
-      d['khmshdon']    as number ?? null,                                       // $5  gdt_khmshdon
-      d['hdon']        as string ?? null,                                       // $6  gdt_hdon
-      d['hthdon']      as number ?? null,                                       // $7  gdt_hthdon
-      d['htttoan']     as number ?? null,                                       // $8  gdt_htttoan
-      d['dvtte']       as string ?? null,                                       // $9  gdt_dvtte
-      d['tgia']        as number ?? null,                                       // $10 gdt_tgia
-      d['nky']         as string ?? null,                                       // $11 gdt_nky
-      d['ttxly']       as number ?? null,                                       // $12 gdt_ttxly
-      d['cqt']         as string ?? null,                                       // $13 gdt_cqt
-      d['tvandnkntt']  as string ?? null,                                       // $14 gdt_tvandnkntt
-      d['pban']        as string ?? null,                                       // $15 gdt_pban
-      d['thlap']       as number ?? null,                                       // $16 gdt_thlap
-      d['thdon']       as string ?? null,                                       // $17 gdt_thdon
-      d['nbdchi']      as string ?? null,                                       // $18 seller_address
-      d['nbstkhoan']   as string ?? null,                                       // $19 seller_bank_account
-      d['nbtnhang']    as string ?? null,                                       // $20 seller_bank_name
-      d['nbdctdtu']    as string ?? null,                                       // $21 seller_email
-      d['nbsdthoai']   as string ?? null,                                       // $22 seller_phone
-      d['nmdchi']      as string ?? null,                                       // $23 buyer_address
-      d['nmstkhoan']   as string ?? null,                                       // $24 buyer_bank_account
-      d['ttcktmai']    as number ?? null,                                       // $25 gdt_ttcktmai
-      d['tgtphi']      as number ?? null,                                       // $26 gdt_tgtphi
-      d['qrcode']      as string ?? null,                                       // $27 gdt_qrcode
-      d['gchu']        as string ?? null,                                       // $28 gdt_gchu
-      typeof d['nbcks']  === 'object'
-        ? JSON.stringify(d['nbcks'])  : d['nbcks']  as string ?? null,         // $29 gdt_nbcks
-      typeof d['cqtcks'] === 'object'
-        ? JSON.stringify(d['cqtcks']) : d['cqtcks'] as string ?? null,         // $30 gdt_cqtcks
-      paymentMethod,                                                            // $31 payment_method
-      invoiceId,                                                                // $32 WHERE id
-    ],
-  );
+  if (!_skipInvoiceDetailSave && hasRawDetailColumn) {
+    try {
+      await pool.query(
+        `UPDATE invoices SET
+           raw_detail          = $1::jsonb,
+           raw_detail_at       = NOW(),
+           gdt_invoice_id      = $2,
+           gdt_mhdon           = $3,
+           gdt_mtdtchieu       = $4,
+           gdt_khmshdon        = $5,
+           gdt_hdon            = $6,
+           gdt_hthdon          = $7,
+           gdt_htttoan         = $8,
+           gdt_dvtte           = $9,
+           gdt_tgia            = $10,
+           gdt_nky             = $11,
+           gdt_ttxly           = $12,
+           gdt_cqt             = $13,
+           gdt_tvandnkntt      = $14,
+           gdt_pban            = $15,
+           gdt_thlap           = $16,
+           gdt_thdon           = $17,
+           seller_address      = $18,
+           seller_bank_account = $19,
+           seller_bank_name    = $20,
+           seller_email        = $21,
+           seller_phone        = $22,
+           buyer_address       = $23,
+           buyer_bank_account  = $24,
+           gdt_ttcktmai        = $25,
+           gdt_tgtphi          = $26,
+           gdt_qrcode          = $27,
+           gdt_gchu            = $28,
+           gdt_nbcks           = $29,
+           gdt_cqtcks          = $30,
+           payment_method      = CASE
+             WHEN (payment_method IS NULL OR payment_method_source NOT IN ('manual','gdt_data'))
+             THEN $31 ELSE payment_method END,
+           payment_method_source = CASE
+             WHEN (payment_method IS NULL OR payment_method_source NOT IN ('manual','gdt_data'))
+               AND $31 IS NOT NULL
+             THEN 'gdt_data' ELSE payment_method_source END
+         WHERE id = $32`,
+        [
+          JSON.stringify(detail),                                                   // $1  raw_detail
+          d['id']          as string ?? null,                                       // $2  gdt_invoice_id
+          d['mhdon']       as string ?? null,                                       // $3  gdt_mhdon
+          d['mtdtchieu']   as string ?? null,                                       // $4  gdt_mtdtchieu
+          d['khmshdon']    as number ?? null,                                       // $5  gdt_khmshdon
+          d['hdon']        as string ?? null,                                       // $6  gdt_hdon
+          d['hthdon']      as number ?? null,                                       // $7  gdt_hthdon
+          d['htttoan']     as number ?? null,                                       // $8  gdt_htttoan
+          d['dvtte']       as string ?? null,                                       // $9  gdt_dvtte
+          d['tgia']        as number ?? null,                                       // $10 gdt_tgia
+          d['nky']         as string ?? null,                                       // $11 gdt_nky
+          d['ttxly']       as number ?? null,                                       // $12 gdt_ttxly
+          d['cqt']         as string ?? null,                                       // $13 gdt_cqt
+          d['tvandnkntt']  as string ?? null,                                       // $14 gdt_tvandnkntt
+          d['pban']        as string ?? null,                                       // $15 gdt_pban
+          d['thlap']       as number ?? null,                                       // $16 gdt_thlap
+          d['thdon']       as string ?? null,                                       // $17 gdt_thdon
+          d['nbdchi']      as string ?? null,                                       // $18 seller_address
+          d['nbstkhoan']   as string ?? null,                                       // $19 seller_bank_account
+          d['nbtnhang']    as string ?? null,                                       // $20 seller_bank_name
+          d['nbdctdtu']    as string ?? null,                                       // $21 seller_email
+          d['nbsdthoai']   as string ?? null,                                       // $22 seller_phone
+          d['nmdchi']      as string ?? null,                                       // $23 buyer_address
+          d['nmstkhoan']   as string ?? null,                                       // $24 buyer_bank_account
+          d['ttcktmai']    as number ?? null,                                       // $25 gdt_ttcktmai
+          d['tgtphi']      as number ?? null,                                       // $26 gdt_tgtphi
+          d['qrcode']      as string ?? null,                                       // $27 gdt_qrcode
+          d['gchu']        as string ?? null,                                       // $28 gdt_gchu
+          typeof d['nbcks']  === 'object'
+            ? JSON.stringify(d['nbcks'])  : d['nbcks']  as string ?? null,         // $29 gdt_nbcks
+          typeof d['cqtcks'] === 'object'
+            ? JSON.stringify(d['cqtcks']) : d['cqtcks'] as string ?? null,         // $30 gdt_cqtcks
+          paymentMethod,                                                            // $31 payment_method
+          invoiceId,                                                                // $32 WHERE id
+        ],
+      );
+    } catch (saveErr) {
+      const message = saveErr instanceof Error ? saveErr.message : String(saveErr);
+      if (isMissingColumnError(message)) {
+        _skipInvoiceDetailSave = true;
+        logInvoiceRawDetailWarningOnce(message);
+      } else {
+        logger.warn('[DetailWorker] raw_detail save failed (non-fatal — run migration 038)', {
+          invoiceId,
+          err: message,
+        });
+      }
+    }
+  }
 
   return 'done';
 }

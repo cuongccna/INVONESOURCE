@@ -61,6 +61,48 @@ const SYNC_LOCK_TTL = 30 * 60; // 30 min
 const BOT_WORKER_HEARTBEAT_KEY = 'bot:worker:heartbeat';
 const BOT_WORKER_OFFLINE_MESSAGE = 'BOT worker đang offline. Phiên đồng bộ đã được đóng để tránh treo trạng thái.';
 
+async function promoteNextDelayedManualJobForUser(userId: string, removedJobId?: string): Promise<void> {
+  const delayedJobs = await getManualQueue().getJobs(['delayed']);
+  const nextJob = delayedJobs
+    .filter((job) => {
+      if (removedJobId && String(job.id ?? '') === removedJobId) return false;
+      return (job.data as { triggeredByUserId?: string }).triggeredByUserId === userId;
+    })
+    .sort((left, right) => (left.timestamp ?? 0) - (right.timestamp ?? 0))[0];
+
+  if (!nextJob) return;
+
+  await nextJob.promote();
+
+  const nextRunId = (nextJob.data as { runId?: string }).runId ?? (typeof nextJob.id === 'string' ? nextJob.id : null);
+  const nextCompanyId = (nextJob.data as { companyId?: string }).companyId;
+  if (!nextRunId || !nextCompanyId) return;
+
+  await Promise.all([
+    pool.query(
+      `UPDATE gdt_bot_runs
+       SET status = 'pending',
+           error_detail = NULL,
+           finished_at = NULL,
+           started_at = NOW()
+       WHERE id = $1
+         AND company_id = $2
+         AND finished_at IS NULL
+         AND status = 'delayed'`,
+      [nextRunId, nextCompanyId],
+    ),
+    pool.query(
+      `UPDATE gdt_bot_configs
+       SET last_run_status = 'pending',
+           last_error = NULL,
+           updated_at = NOW()
+       WHERE company_id = $1
+         AND last_run_status = 'delayed'`,
+      [nextCompanyId],
+    ),
+  ]);
+}
+
 async function isBotWorkerAlive(): Promise<boolean> {
   try {
     return await getRedis().exists(BOT_WORKER_HEARTBEAT_KEY) === 1;
@@ -385,8 +427,15 @@ router.delete('/cancel', requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'), async (req
       manualQueue.getJobs(['delayed']),
     ]);
     let removed = 0;
+    const cancelledManualUsers = new Map<string, string>();
     for (const j of [...waitingJobs, ...delayedJobs, ...manualWaiting, ...manualDelayed]) {
       if (j.data.companyId === companyId) {
+        if ([...manualWaiting, ...manualDelayed].includes(j)) {
+          const userId = (j.data as { triggeredByUserId?: string }).triggeredByUserId;
+          if (userId) {
+            cancelledManualUsers.set(userId, String(j.id ?? ''));
+          }
+        }
         try { await j.remove(); removed++; } catch { /* ignore */ }
       }
     }
@@ -427,6 +476,12 @@ router.delete('/cancel', requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'), async (req
         [companyId],
       ).catch(() => undefined);
     }
+
+    await Promise.all(
+      [...cancelledManualUsers.entries()].map(([userId, removedJobId]) => {
+        return promoteNextDelayedManualJobForUser(userId, removedJobId).catch(() => undefined);
+      }),
+    );
 
     sendSuccess(res, { removed, activeCount }, activeCount > 0
       ? `Đã hủy ${removed} job đang chờ. Job đang chạy sẽ dừng trong giây lát.`

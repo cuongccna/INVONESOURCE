@@ -14,14 +14,11 @@ import IORedis from 'ioredis';
 import { env } from '../config/env';
 
 const _redis = new IORedis(env.REDIS_URL, { maxRetriesPerRequest: 3 });
-const MANUAL_COOLDOWN_PREFIX       = 'bot:manual:cooldown:';
-const MANUAL_COOLDOWN_TTL_SEC      = 3 * 60;  // max 3 minutes between manual syncs per company
-const QUICK_SYNC_COOLDOWN_PREFIX   = 'bot:manual:quickcooldown:';
-const QUICK_SYNC_COOLDOWN_TTL_SEC  = 5 * 60;  // 5 minutes cooldown for quick-sync (today only)
 const BOT_WORKER_HEARTBEAT_KEY     = 'bot:worker:heartbeat';
 const STALE_RUN_GRACE_MS           = 15_000;
 const BOT_WORKER_OFFLINE_MESSAGE   = 'BOT worker đang tắt hoặc vừa restart. Phiên treo đã được đóng, bạn có thể chạy lại khi worker sẵn sàng.';
 const BOT_MISSING_JOB_MESSAGE      = 'BOT job cũ không còn trong queue. Phiên treo đã được đóng để mở lại thao tác UI.';
+const MANUAL_USER_SERIAL_DELAY_MS  = 40 * 60 * 1000;
 
 const router = Router();
 router.use(authenticate);
@@ -211,6 +208,29 @@ async function getSyncJobFromAnyQueue(jobId: string): Promise<{ job: Awaited<Ret
     if (job) return { job, queue };
   }
   return null;
+}
+
+type ManualBotJobData = {
+  companyId?: string;
+  triggeredByUserId?: string;
+  runId?: string;
+};
+
+async function findBlockingManualJobForUser(userId: string): Promise<{ jobId: string; companyId: string; state: string } | null> {
+  const jobs = await getManualBotQueue().getJobs(['active', 'waiting', 'delayed']);
+  const match = jobs
+    .map((job) => ({ job, data: job.data as ManualBotJobData }))
+    .filter(({ data }) => data.triggeredByUserId === userId && typeof data.companyId === 'string')
+    .sort((left, right) => (left.job.timestamp ?? 0) - (right.job.timestamp ?? 0))[0];
+
+  if (!match) return null;
+
+  const state = await match.job.getState().catch(() => 'waiting');
+  return {
+    jobId: String(match.job.id ?? match.data.runId ?? ''),
+    companyId: match.data.companyId!,
+    state,
+  };
 }
 
 async function isBotWorkerAlive(): Promise<boolean> {
@@ -425,13 +445,6 @@ router.get(
         [companyId]
       );
 
-      // Expose remaining manual-trigger cooldown so the frontend can sync state on mount/refresh
-      const cooldownKey      = `${MANUAL_COOLDOWN_PREFIX}${companyId}`;
-      const quickCooldownKey = `${QUICK_SYNC_COOLDOWN_PREFIX}${companyId}`;
-      const [cooldownTtl, quickCooldownTtl] = cfgRes.rows.length > 0
-        ? await Promise.all([_redis.ttl(cooldownKey), _redis.ttl(quickCooldownKey)])
-        : [-1, -1];
-
       // ── Quota info for warning banner ─────────────────────────────────────
       const userId = req.user!.userId;
       const quotaRes = await pool.query(
@@ -465,8 +478,8 @@ router.get(
       sendSuccess(res, {
         config:                cfgRes.rows[0] ?? null,
         lastRuns:              runsRes.rows,
-        manualCooldownSec:     cooldownTtl      > 0 ? cooldownTtl      : 0,
-        quickSyncCooldownSec:  quickCooldownTtl > 0 ? quickCooldownTtl : 0,
+        manualCooldownSec:     0,
+        quickSyncCooldownSec:  0,
         quotaInfo,
         proxyAssigned,
       });
@@ -549,27 +562,6 @@ router.post(
         return;
       }
 
-      // ── Quick-sync (Đồng bộ hôm nay) uses a separate, shorter cooldown ────────
-      // Cooldown riêng 5 phút so với full-sync 6 phút, cho phép người dùng
-      // lấy HĐ mới nhất mà không ảnh hưởng đến lịch đồng bộ toàn bộ.
-      const cooldownKey = quick
-        ? `${QUICK_SYNC_COOLDOWN_PREFIX}${companyId}`
-        : `${MANUAL_COOLDOWN_PREFIX}${companyId}`;
-      const cooldownTtlSec = quick ? QUICK_SYNC_COOLDOWN_TTL_SEC : MANUAL_COOLDOWN_TTL_SEC;
-
-      const cooldownTtl = await _redis.ttl(cooldownKey);
-      if (cooldownTtl > 0) {
-        res.status(429).json({
-          success: false,
-          error: {
-            code:        'COOLDOWN',
-            waitMinutes: Math.ceil(cooldownTtl / 60),
-            message:     `Vui lòng chờ thêm ${Math.ceil(cooldownTtl / 60)} phút trước khi đồng bộ lại.`,
-          },
-        });
-        return;
-      }
-
       // Check if a job is currently RUNNING for this company (Redis lock held by worker).
       // If so, return 409 immediately — no point enqueuing a job that will fail with LOCK_CONFLICT.
       const syncLockKey = `bot:sync:lock:${companyId}`;
@@ -597,47 +589,11 @@ router.post(
         );
       }
 
-      // ── Per-user sequential gate (human-like stagger) ───────────────────────
-      // An accountant managing 2-20 companies uses ONE static IP.
-      // If they trigger 3 companies at once, GDT would see 3 simultaneous logins
-      // from the same IP — a clear bot pattern.
-      // Solution: gate each user's manual jobs so they start 1–6 min apart,
-      // mimicking a human who finishes one company then moves to the next.
-      //
-      // Quick-sync (Đồng bộ hôm nay) is exempt: it's a lightweight poll with its
-      // own short cooldown and different GDT endpoint behaviour.
-      const USER_SLOT_KEY = `bot:user:next_manual_slot:${req.user!.userId}`;
-      const USER_SLOT_TTL = 60 * 60; // 1h — auto-expire stale slot keys
-      const MIN_STAGGER_MS = 60_000;   // 1 min minimum gap
-      const MAX_STAGGER_MS = 360_000;  // 6 min maximum gap
-
-      let jobDelayMs = 0;
-      let estimatedStartAt: Date | null = null;
-
-      if (!quick) {
-        const now = Date.now();
-        const nextSlotRaw = await _redis.get(USER_SLOT_KEY);
-        const nextSlotMs  = nextSlotRaw ? parseInt(nextSlotRaw, 10) : 0;
-
-        if (nextSlotMs > now) {
-          // Another job for this user is already queued/starting — delay this one
-          jobDelayMs = nextSlotMs - now;
-          estimatedStartAt = new Date(nextSlotMs);
-        } else {
-          // No pending slot: this job starts immediately
-          jobDelayMs = 0;
-          estimatedStartAt = new Date(now);
-        }
-
-        // Advance the slot: reserve from (job start time) + random 1–6 min
-        const thisJobStartMs  = now + jobDelayMs;
-        const nextGapMs       = Math.floor(Math.random() * (MAX_STAGGER_MS - MIN_STAGGER_MS)) + MIN_STAGGER_MS;
-        const nextSlotNewMs   = thisJobStartMs + nextGapMs;
-        await _redis.set(USER_SLOT_KEY, String(nextSlotNewMs), 'EX', USER_SLOT_TTL);
-      }
-
       const runId = uuidv4();
-      const queuedStatus = jobDelayMs > 0 ? 'delayed' : 'pending';
+      const blockingManualRun = await findBlockingManualJobForUser(req.user!.userId);
+      const initialDelayMs = blockingManualRun ? MANUAL_USER_SERIAL_DELAY_MS : 0;
+      const estimatedStartAt = initialDelayMs > 0 ? null : new Date();
+      const queuedStatus = initialDelayMs > 0 ? 'delayed' : 'pending';
       // BOT-LICENSE-01: resolve user plan for proper rate limiting in the worker
       const userPlan = await licenseService.getPlanId(req.user!.userId);
       await pool.query(
@@ -658,7 +614,7 @@ router.post(
           triggeredBy: quick ? 'user_quick_sync' : 'user_manual',
         }, {
           jobId: runId,
-          delay:    jobDelayMs,   // 0 = immediate; >0 = human-like stagger
+          ...(initialDelayMs > 0 ? { delay: initialDelayMs } : {}),
           priority: 1,            // highest priority in manual queue
           attempts: 3,
           backoff:  { type: 'exponential', delay: 30_000 },
@@ -677,15 +633,12 @@ router.post(
         [queuedStatus, companyId],
       ).catch(() => undefined);
 
-      // Set cooldown key
-      await _redis.set(cooldownKey, '1', 'EX', cooldownTtlSec);
-
       sendSuccess(res, {
         queued:            true,
         jobId:             runId,
         quick:             quick ?? false,
         runStatus:         queuedStatus,
-        delayed_sec:       Math.round(jobDelayMs / 1000),
+        delayed_sec:       initialDelayMs > 0 ? Math.round(initialDelayMs / 1000) : 0,
         estimated_start:   estimatedStartAt?.toISOString() ?? null,
       });
     } catch (err) {

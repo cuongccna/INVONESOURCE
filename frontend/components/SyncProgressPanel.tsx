@@ -83,6 +83,7 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
   const retryTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const stallTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const openedAtRef = useRef(Date.now());
+  const doneNotifiedRef = useRef(false);
 
   const cleanup = useCallback(() => {
     eventSourcesRef.current.forEach((es) => es.close());
@@ -139,6 +140,7 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
     cleanup();
     retryCountRef.current = {};
     activeStartRef.current = {};
+    doneNotifiedRef.current = false;
     openedAtRef.current = Date.now();
 
     for (const jobId of jobIds) {
@@ -181,9 +183,14 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
   const totalFetched = Object.values(jobs).reduce((s, j) => s + (j.invoicesFetched ?? 0), 0);
 
   useEffect(() => {
-    if (allDone && !anyFailed && !cancelled && onDone) {
-      const t = setTimeout(onDone, 1500);
-      return () => clearTimeout(t);
+    if (!allDone) {
+      doneNotifiedRef.current = false;
+      return;
+    }
+
+    if (!anyFailed && !cancelled && onDone && !doneNotifiedRef.current) {
+      doneNotifiedRef.current = true;
+      onDone();
     }
   }, [allDone, anyFailed, cancelled, onDone]);
 

@@ -228,7 +228,6 @@ export default function BotSettingsPage() {
   const [runTo, setRunTo] = useState('');
   const [isSubmittingRun, setIsSubmittingRun] = useState(false);
   const [isSavingConfig, setIsSavingConfig] = useState(false);
-  const [actionLockUntil, setActionLockUntil] = useState<number | null>(null);
   const [acceptPasswordStorage, setAcceptPasswordStorage] = useState(false);
   const hydratedRunIdRef = useRef<string | null>(null);
   const [form, setForm] = useState({
@@ -237,24 +236,6 @@ export default function BotSettingsPage() {
     otp_method: 'sms' as 'sms' | 'email' | 'app',
     sync_frequency_hours: 6,
   });
-
-  const lockInteractions = useCallback((seconds: number) => {
-    if (seconds <= 0) return;
-    const endsAt = Date.now() + seconds * 1000;
-    setActionLockUntil(prev => (prev && prev > endsAt ? prev : endsAt));
-  }, []);
-
-  useEffect(() => {
-    if (!actionLockUntil) return;
-    const remainingMs = actionLockUntil - Date.now();
-    if (remainingMs <= 0) {
-      setActionLockUntil(null);
-      return;
-    }
-
-    const timer = setTimeout(() => setActionLockUntil(null), remainingMs);
-    return () => clearTimeout(timer);
-  }, [actionLockUntil]);
 
   const load = useCallback(async () => {
     try {
@@ -268,13 +249,12 @@ export default function BotSettingsPage() {
       const botData = botRes.data.data;
       setStatus(botData);
       if (importRes) setImportTotal(importRes.data.meta?.total ?? 0);
-      if (botData.manualCooldownSec > 0) lockInteractions(botData.manualCooldownSec);
     } catch {
       // Keep page shell visible even when background status fetch fails.
     } finally {
       setLoading(false);
     }
-  }, [lockInteractions]);
+  }, []);
 
   const loadHistory = useCallback(async (page = 1) => {
     setHistoryLoading(true);
@@ -299,7 +279,6 @@ export default function BotSettingsPage() {
     setImportTotal(null);
     setLoading(true);
     setHistoryLoading(true);
-    setActionLockUntil(null);
     setShowSetup(false);
     setShowOtp(false);
     setShowDatePicker(false);
@@ -315,11 +294,22 @@ export default function BotSettingsPage() {
   const latestRun = status?.lastRuns?.[0] ?? null;
   const lastStatus = latestRun?.status ?? cfg?.last_run_status ?? 'idle';
   const statusMeta = STATUS_META[lastStatus] ?? STATUS_META.idle;
-  const actionLockActive = actionLockUntil != null && actionLockUntil > Date.now();
   const pageSyncActive = syncJobIds.length > 0 && syncCompanyId === activeCompanyId;
   const isBotBusy = pageSyncActive || ACTIVE_RUN_STATUSES.has(lastStatus) || isSubmittingRun;
   const proxyReady = status?.proxyAssigned ?? true;
-  const controlsDisabled = isBotBusy || actionLockActive || !proxyReady || isSavingConfig;
+  const controlsDisabled = isBotBusy || !proxyReady || isSavingConfig;
+
+  const handleSyncPanelClose = useCallback(() => {
+    clearSync();
+    void load();
+    void loadHistory(historyMeta.page);
+  }, [clearSync, historyMeta.page, load, loadHistory]);
+
+  const handleSyncPanelDone = useCallback(() => {
+    clearSync();
+    void load();
+    void loadHistory(1);
+  }, [clearSync, load, loadHistory]);
 
   useEffect(() => {
     if (syncJobIds.length === 0) return;
@@ -406,16 +396,16 @@ export default function BotSettingsPage() {
         title: 'BOT đang xử lý',
         body: 'Process board đang theo dõi tiến độ theo thời gian thực. Trong lúc này toàn bộ nút thao tác sẽ bị khóa để tránh chồng job.',
       });
-    } else if (actionLockActive) {
+    } else if (lastStatus === 'delayed') {
       items.push({
         tone: 'info',
-        title: 'Vừa gửi yêu cầu đồng bộ',
-        body: 'Nút thao tác đang được khóa tạm thời. Sau tối đa 3 phút bạn có thể gửi một yêu cầu mới nếu BOT chưa tự cập nhật trạng thái.',
+        title: 'Phiên này đang lên lịch',
+        body: 'Công ty này đang chờ một phiên manual sync khác của cùng tài khoản hoàn tất. Khi phiên trước xong, BOT sẽ tự bắt đầu ngay.',
       });
     }
 
     return items;
-  }, [actionLockActive, cfg, lastStatus, pageSyncActive, proxyReady, status?.quotaInfo]);
+  }, [cfg, lastStatus, pageSyncActive, proxyReady, status?.quotaInfo]);
 
   const openSetupModal = () => {
     setAcceptPasswordStorage(false);
@@ -466,35 +456,29 @@ export default function BotSettingsPage() {
       if (params.toDate) body['to_date'] = params.toDate;
 
       const res = await apiClient.post<{
-        data: { jobId?: string; delayed_sec?: number; estimated_start?: string | null };
+        data: { jobId?: string; delayed_sec?: number; estimated_start?: string | null; runStatus?: string };
       }>('/bot/run-now', body);
 
       const jobId = res.data.data.jobId;
-      if (jobId && activeCompanyId) {
+      const runStatus = res.data.data.runStatus;
+      const shouldTrackHere = runStatus !== 'delayed' || syncJobIds.length === 0 || syncCompanyId === activeCompanyId;
+      if (jobId && activeCompanyId && shouldTrackHere) {
         hydratedRunIdRef.current = jobId;
         startSync([jobId], activeCompanyId);
       }
-      lockInteractions(3 * 60);
       setShowDatePicker(false);
       setHistoryMeta(prev => ({ ...prev, page: 1 }));
 
-      const delayedSec = res.data.data.delayed_sec ?? 0;
-      if (delayedSec > 30) {
-        toast.success(`${params.successMessage} Phiên chạy đã được đưa vào hàng chờ ưu tiên.`);
+      if (runStatus === 'delayed') {
+        toast.success('Đã lên lịch phiên đồng bộ này sau công ty đang chạy trước đó.');
       } else {
         toast.success(params.successMessage);
       }
-
-      setTimeout(() => {
-        void load();
-        void loadHistory(1);
-      }, 1500);
+      await load();
+      await loadHistory(1);
     } catch (err: unknown) {
       const apiErr = (err as { response?: { data?: { error?: { code?: string; message?: string; waitMinutes?: number } } } }).response?.data?.error;
-      if (apiErr?.code === 'COOLDOWN') {
-        lockInteractions((apiErr.waitMinutes ?? 3) * 60);
-        toast.error(`Yêu cầu mới sẽ được mở lại sau tối đa ${apiErr.waitMinutes ?? 3} phút.`);
-      } else if (apiErr?.code === 'ALREADY_RUNNING') {
+      if (apiErr?.code === 'ALREADY_RUNNING') {
         toast.error('BOT đang chạy một phiên đồng bộ khác.');
         void load();
       } else if (apiErr?.code === 'NO_PROXY_ASSIGNED') {
@@ -512,7 +496,7 @@ export default function BotSettingsPage() {
     void queueSync({
       fromDate: currentMonth.from,
       toDate: currentMonth.to,
-      successMessage: 'Đã xếp hàng đồng bộ tháng hiện tại.',
+      successMessage: 'Đã bắt đầu đồng bộ tháng hiện tại.',
     });
   };
 
@@ -521,7 +505,7 @@ export default function BotSettingsPage() {
     void queueSync({
       fromDate: today.from,
       toDate: today.to,
-      successMessage: 'Đã xếp hàng đồng bộ dữ liệu mới nhất.',
+      successMessage: 'Đã bắt đầu đồng bộ dữ liệu mới nhất.',
     });
   };
 
@@ -688,7 +672,7 @@ export default function BotSettingsPage() {
                   Live
                 </span>
               </div>
-              <SyncProgressPanel jobIds={syncJobIds} companyId={activeCompanyId} onClose={clearSync} onDone={clearSync} />
+              <SyncProgressPanel jobIds={syncJobIds} companyId={activeCompanyId} onClose={handleSyncPanelClose} onDone={handleSyncPanelDone} />
             </div>
           )}
 
@@ -791,10 +775,8 @@ export default function BotSettingsPage() {
 
                   <div className="mt-4 rounded-2xl border border-white bg-white px-4 py-3 text-sm text-slate-600">
                     {isBotBusy
-                      ? 'BOT đang chạy hoặc đang được xếp hàng. Tất cả thao tác cấu hình sẽ được mở lại khi phiên đồng bộ kết thúc.'
-                      : actionLockActive
-                        ? 'Yêu cầu vừa được gửi. Không hiển thị đếm ngược, nhưng nút sẽ tự mở lại sau tối đa 3 phút.'
-                        : proxyReady
+                      ? 'BOT đang chạy. Tất cả thao tác cấu hình sẽ được mở lại ngay khi phiên đồng bộ kết thúc.'
+                      : proxyReady
                           ? 'Sẵn sàng nhận lệnh đồng bộ. Bạn có thể chạy tháng hiện tại, dữ liệu mới nhất hoặc tự chọn kỳ.'
                           : 'Đồng bộ đang bị khóa do chưa có static proxy.'}
                   </div>
@@ -1112,7 +1094,7 @@ export default function BotSettingsPage() {
                   Hủy
                 </button>
                 <button
-                  onClick={() => void queueSync({ fromDate: runFrom, toDate: runTo, successMessage: 'Đã xếp hàng đồng bộ theo kỳ đã chọn.' })}
+                  onClick={() => void queueSync({ fromDate: runFrom, toDate: runTo, successMessage: 'Đã bắt đầu đồng bộ theo kỳ đã chọn.' })}
                   disabled={!runFrom || !runTo || !!dateError || controlsDisabled}
                   className="flex-1 rounded-2xl bg-slate-950 px-4 py-3 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
                 >

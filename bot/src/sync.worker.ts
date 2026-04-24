@@ -69,6 +69,64 @@ export const manualQueue = new Queue('gdt-sync-manual', {
     removeOnFail:      100,
   },
 });
+
+async function promoteNextDelayedManualJobForUser(userId: string, finishedJobId?: string): Promise<void> {
+  const delayedJobs = await manualQueue.getJobs(['delayed']);
+  const nextJob = delayedJobs
+    .filter((job) => {
+      if (finishedJobId && String(job.id ?? '') === finishedJobId) return false;
+      return job.data.triggeredByUserId === userId;
+    })
+    .sort((left, right) => (left.timestamp ?? 0) - (right.timestamp ?? 0))[0];
+
+  if (!nextJob) return;
+
+  try {
+    await nextJob.promote();
+
+    const nextRunId = nextJob.data.runId ?? (typeof nextJob.id === 'string' ? nextJob.id : null);
+    const nextCompanyId = nextJob.data.companyId;
+    if (nextRunId && nextCompanyId) {
+      await Promise.all([
+        pool.query(
+          `UPDATE gdt_bot_runs
+           SET status = 'pending',
+               error_detail = NULL,
+               finished_at = NULL,
+               started_at = NOW()
+           WHERE id = $1
+             AND company_id = $2
+             AND finished_at IS NULL
+             AND status = 'delayed'`,
+          [nextRunId, nextCompanyId],
+        ),
+        pool.query(
+          `UPDATE gdt_bot_configs
+           SET last_run_status = 'pending',
+               last_error = NULL,
+               updated_at = NOW()
+           WHERE company_id = $1
+             AND last_run_status = 'delayed'`,
+          [nextCompanyId],
+        ),
+      ]);
+    }
+
+    logger.info('[SyncWorker] Promoted delayed manual job for same user', {
+      finishedJobId,
+      nextJobId: nextJob.id,
+      nextCompanyId,
+      userId: userId.slice(0, 8) + '…',
+    });
+  } catch (err) {
+    logger.warn('[SyncWorker] Failed to promote delayed manual job (non-fatal)', {
+      finishedJobId,
+      userId: userId.slice(0, 8) + '…',
+      error: (err as Error).message,
+    });
+  }
+}
+
 export const autoQueue = new Queue('gdt-sync-auto', {
   connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
   defaultJobOptions: {
@@ -2249,6 +2307,30 @@ export const manualWorker = new Worker<SyncJobData>(
     limiter:     { max: 10, duration: 60_000 },
   }
 );
+
+manualWorker.on('completed', (job) => {
+  const userId = job.data.triggeredByUserId;
+  if (!userId) return;
+
+  void promoteNextDelayedManualJobForUser(userId, String(job.id ?? ''));
+});
+
+manualWorker.on('failed', (job, err) => {
+  if (!job?.data.triggeredByUserId) return;
+
+  void (async () => {
+    const state = await job.getState().catch(() => null);
+    if (state !== 'failed') return;
+
+    await promoteNextDelayedManualJobForUser(job.data.triggeredByUserId!, String(job.id ?? ''));
+  })().catch((promoteErr) => {
+    logger.warn('[SyncWorker] Failed to advance delayed manual queue after failure', {
+      jobId: job.id,
+      error: (promoteErr as Error).message,
+      originalError: err.message,
+    });
+  });
+});
 
 // ── Auto worker (concurrency 2 — background scheduled syncs) ─────────────────
 export const autoWorker = new Worker<SyncJobData>(
