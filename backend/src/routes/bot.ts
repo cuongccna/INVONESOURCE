@@ -18,6 +18,10 @@ const MANUAL_COOLDOWN_PREFIX       = 'bot:manual:cooldown:';
 const MANUAL_COOLDOWN_TTL_SEC      = 3 * 60;  // max 3 minutes between manual syncs per company
 const QUICK_SYNC_COOLDOWN_PREFIX   = 'bot:manual:quickcooldown:';
 const QUICK_SYNC_COOLDOWN_TTL_SEC  = 5 * 60;  // 5 minutes cooldown for quick-sync (today only)
+const BOT_WORKER_HEARTBEAT_KEY     = 'bot:worker:heartbeat';
+const STALE_RUN_GRACE_MS           = 15_000;
+const BOT_WORKER_OFFLINE_MESSAGE   = 'BOT worker đang tắt hoặc vừa restart. Phiên treo đã được đóng, bạn có thể chạy lại khi worker sẵn sàng.';
+const BOT_MISSING_JOB_MESSAGE      = 'BOT job cũ không còn trong queue. Phiên treo đã được đóng để mở lại thao tác UI.';
 
 const router = Router();
 router.use(authenticate);
@@ -190,6 +194,127 @@ function getManualBotQueue(): Queue {
   return manualBotQueue;
 }
 
+let autoBotQueue: Queue | null = null;
+function getAutoBotQueue(): Queue {
+  if (!autoBotQueue) {
+    autoBotQueue = new Queue('gdt-sync-auto', {
+      connection: { url: env.REDIS_URL } as unknown,
+    } as ConstructorParameters<typeof Queue>[1]);
+  }
+  return autoBotQueue;
+}
+
+async function getSyncJobFromAnyQueue(jobId: string): Promise<{ job: Awaited<ReturnType<Queue['getJob']>>; queue: Queue } | null> {
+  const queues: Queue[] = [getManualBotQueue(), getAutoBotQueue(), getBotQueue()];
+  for (const queue of queues) {
+    const job = await queue.getJob(jobId);
+    if (job) return { job, queue };
+  }
+  return null;
+}
+
+async function isBotWorkerAlive(): Promise<boolean> {
+  try {
+    return await _redis.exists(BOT_WORKER_HEARTBEAT_KEY) === 1;
+  } catch {
+    return true;
+  }
+}
+
+async function finalizeStaleRun(companyId: string, runId: string, message: string): Promise<void> {
+  await Promise.all([
+    pool.query(
+      `UPDATE gdt_bot_runs
+       SET status = 'error',
+           finished_at = COALESCE(finished_at, NOW()),
+           error_detail = $1
+       WHERE id = $2
+         AND company_id = $3
+         AND finished_at IS NULL
+         AND status IN ('pending', 'delayed', 'running')`,
+      [message, runId, companyId],
+    ),
+    pool.query(
+      `UPDATE gdt_bot_configs
+       SET last_run_status = 'error',
+           last_error = $1,
+           updated_at = NOW()
+       WHERE company_id = $2
+         AND last_run_status IN ('pending', 'delayed', 'running')`,
+      [message, companyId],
+    ),
+  ]);
+}
+
+async function reconcileCompanySyncState(companyId: string): Promise<void> {
+  const activeRunRes = await pool.query<{
+    id: string;
+    status: string;
+    started_at: string;
+  }>(
+    `SELECT id, status, started_at
+     FROM gdt_bot_runs
+     WHERE company_id = $1
+       AND finished_at IS NULL
+       AND status IN ('pending', 'delayed', 'running')
+     ORDER BY started_at DESC
+     LIMIT 1`,
+    [companyId],
+  );
+
+  const activeRun = activeRunRes.rows[0];
+  if (!activeRun) return;
+
+  const runAgeMs = Date.now() - new Date(activeRun.started_at).getTime();
+  if (runAgeMs < STALE_RUN_GRACE_MS) return;
+
+  const workerAlive = await isBotWorkerAlive();
+  if (!workerAlive) {
+    await finalizeStaleRun(companyId, activeRun.id, BOT_WORKER_OFFLINE_MESSAGE);
+    return;
+  }
+
+  const queued = await getSyncJobFromAnyQueue(activeRun.id);
+  if (!queued) {
+    await finalizeStaleRun(companyId, activeRun.id, BOT_MISSING_JOB_MESSAGE);
+    return;
+  }
+
+  const queueState = await queued.job!.getState();
+  if (queueState === 'failed') {
+    await finalizeStaleRun(
+      companyId,
+      activeRun.id,
+      queued.job!.failedReason || 'BOT job failed before DB status could be updated.',
+    );
+    return;
+  }
+
+  if (queueState === 'completed') {
+    await Promise.all([
+      pool.query(
+        `UPDATE gdt_bot_runs
+         SET status = 'success',
+             finished_at = COALESCE(finished_at, NOW())
+         WHERE id = $1
+           AND company_id = $2
+           AND finished_at IS NULL
+           AND status IN ('pending', 'delayed', 'running')`,
+        [activeRun.id, companyId],
+      ),
+      pool.query(
+        `UPDATE gdt_bot_configs
+         SET last_run_status = 'success',
+             last_error = NULL,
+             updated_at = NOW()
+         WHERE company_id = $1
+           AND last_run_status IN ('pending', 'delayed', 'running')`,
+        [companyId],
+      ),
+    ]);
+  }
+}
+
 // ── Schemas ──────────────────────────────────────────────────────────────────
 const setupSchema = z.object({
   password:             z.string().min(4).max(256),
@@ -281,6 +406,9 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const companyId = req.user!.companyId;
+      if (!companyId) throw new ValidationError('Company not associated');
+
+      await reconcileCompanySyncState(companyId);
 
       const cfgRes = await pool.query(
         `SELECT id, company_id, tax_code, has_otp, otp_method, is_active,
@@ -646,6 +774,10 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const companyId = req.user!.companyId;
+      if (!companyId) throw new ValidationError('Company not associated');
+
+      await reconcileCompanySyncState(companyId);
+
       const page     = Math.max(1, parseInt(String(req.query['page'] ?? '1'), 10));
       const pageSize = Math.min(50, Math.max(1, parseInt(String(req.query['pageSize'] ?? '20'), 10)));
       const offset   = (page - 1) * pageSize;
