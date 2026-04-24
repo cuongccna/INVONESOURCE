@@ -413,53 +413,9 @@ export async function checkManualRateLimit(
   userId: string,
   plan:   string,
 ): Promise<RateLimitResult> {
-  try {
-    // Admin bypass
-    const override = await _lockRedis.get(`ratelimit:override:${userId}`).catch(() => null);
-    if (override) return { allowed: true, tokensRemaining: 999 };
-
-    const cfg = RATE_LIMIT_PLANS[plan] ?? RATE_LIMIT_PLANS[RATE_LIMIT_DEFAULT_PLAN]!;
-    const key  = `ratelimit:manual:${userId}`;
-    const raw  = await _lockRedis.get(key).catch(() => null);
-
-    let state: RateLimitState;
-    if (raw) {
-      state = JSON.parse(raw) as RateLimitState;
-    } else {
-      // First call — start with full burst
-      state = { tokens: cfg.burstMax, lastRefill: Date.now(), plan };
-    }
-
-    // Continuous refill
-    const elapsedHours = (Date.now() - state.lastRefill) / 3_600_000;
-    const refillTokens = Math.floor(elapsedHours * cfg.tokensPerHour);
-    if (refillTokens > 0) {
-      state.tokens    = Math.min(cfg.burstMax, state.tokens + refillTokens);
-      state.lastRefill = Date.now();
-    }
-
-    if (state.tokens <= 0) {
-      const nextRefillMs = Math.ceil(3_600_000 / cfg.tokensPerHour);
-      await _lockRedis.set(key, JSON.stringify(state), 'EX', 86400).catch(() => {});
-      return {
-        allowed:      false,
-        retryAfterMs: nextRefillMs,
-        message:      `Bạn đã sync quá nhiều lần. Thử lại sau ${Math.ceil(nextRefillMs / 60_000)} phút.`,
-        suggestion:   'Hệ thống tự động sync mỗi 5–6 giờ. Bạn có thể chờ đợt sync tiếp theo.',
-      };
-    }
-
-    // Consume 1 token
-    state.tokens -= 1;
-    await _lockRedis.set(key, JSON.stringify(state), 'EX', 86400).catch(() => {});
-    return { allowed: true, tokensRemaining: state.tokens };
-  } catch (err) {
-    // Rate limit check failures are non-fatal — allow sync to proceed
-    logger.warn('[SyncWorker] checkManualRateLimit error (non-fatal, allowing sync)', {
-      userId, error: (err as Error).message,
-    });
-    return { allowed: true, tokensRemaining: -1 };
-  }
+  void userId;
+  void plan;
+  return { allowed: true, tokensRemaining: -1 };
 }
 
 type EnqueueResult =
