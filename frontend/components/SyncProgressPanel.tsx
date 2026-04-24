@@ -49,8 +49,17 @@ function formatStatusMsg(msg: string, pct: number, fetched: number, page: number
   const m = msg.toLowerCase();
   if (m.includes('kiểm tra proxy') || m.includes('proxy'))    return '🔌 Kiểm tra proxy...';
   if (m.includes('đăng nhập') || m.includes('login'))         return '🔐 Đang đăng nhập GDT...';
-  if (m.includes('đầu ra') || m.includes('output'))           return `📤 HĐ đầu ra — trang ${page}${totalPages ? '/' + totalPages : ''}`;
-  if (m.includes('đầu vào') || m.includes('input') || m.includes('mua vào')) return `📥 HĐ đầu vào — trang ${page}${totalPages ? '/' + totalPages : ''}`;
+  if (m.includes('đầu ra') || m.includes('output')) {
+    const stage = m.includes('sco') ? ' (SCO)' : '';
+    const pageLabel = page > 0 ? `trang ${page}${totalPages ? '/' + totalPages : ''}` : 'đang quét';
+    return `📤 HĐ đầu ra${stage} — ${pageLabel}${fetched > 0 ? ` · ${fetched} HĐ` : ''}`;
+  }
+  if (m.includes('đầu vào') || m.includes('input') || m.includes('mua vào')) {
+    const stage = m.includes('sco') ? ' (SCO)' : '';
+    const filter = msg.match(/TTXL\s*\d/i)?.[0]?.toUpperCase() ?? '';
+    const pageLabel = page > 0 ? `trang ${page}${totalPages ? '/' + totalPages : ''}` : 'đang quét';
+    return `📥 HĐ đầu vào${stage}${filter ? ` ${filter}` : ''} — ${pageLabel}${fetched > 0 ? ` · ${fetched} HĐ` : ''}`;
+  }
   if (m.includes('xml'))                                       return `📄 Đang lấy XML (${fetched} HĐ)`;
   if (m.includes('hoàn thành') || m.includes('done'))         return `✅ Xong — ${fetched} HĐ`;
 

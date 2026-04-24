@@ -285,6 +285,29 @@ interface FetchResult {
   reportedTotal: number;   // -1 = unknown (no total in response)
 }
 
+type GdtFetchStage = 'query' | 'sco';
+type GdtFetchScope = 'range' | 'week' | 'day' | 'status' | 'hour';
+
+interface GdtFetchProgressContext {
+  stage: GdtFetchStage;
+  scope: GdtFetchScope;
+  chunkIndex?: number;
+  chunkTotal?: number;
+}
+
+export interface GdtFetchProgressSnapshot extends GdtFetchProgressContext {
+  endpoint: 'sold' | 'purchase';
+  currentPage: number;
+  totalPages: number | null;
+  fetched: number;
+  reportedTotal: number | null;
+  from: string;
+  to: string;
+  filter?: string;
+}
+
+type GdtFetchProgressReporter = (snapshot: GdtFetchProgressSnapshot) => void | Promise<void>;
+
 // Status code → our status string
 const STATUS_MAP: Record<number, RawInvoice['status']> = {
   1: 'valid',
@@ -779,6 +802,7 @@ export class GdtDirectApiService {
   private _proxySessionSuffix:   string | null = null;
   // VĐ2: Cached headers for hot-swap axios recreate
   private _commonHeaders:        Record<string, string> = {};
+  private _fetchProgressReporter: GdtFetchProgressReporter | null = null;
 
   constructor(
     proxyUrl?:       string | null,
@@ -852,6 +876,19 @@ export class GdtDirectApiService {
   /** Returns the recipe currently active in this service instance (or null if using built-in defaults). */
   get activeRecipe(): CrawlerRecipe | null {
     return this.recipe;
+  }
+
+  setFetchProgressReporter(reporter: GdtFetchProgressReporter | null): void {
+    this._fetchProgressReporter = reporter;
+  }
+
+  private async _reportFetchProgress(snapshot: GdtFetchProgressSnapshot): Promise<void> {
+    if (!this._fetchProgressReporter) return;
+    try {
+      await this._fetchProgressReporter(snapshot);
+    } catch {
+      // Progress updates are best-effort only.
+    }
   }
 
   /**
@@ -1247,7 +1284,12 @@ export class GdtDirectApiService {
 
       try {
         const { rows: weekRows, reportedTotal: weekTotal } =
-          await this._fetchAllPagesBuffered(endpoint, from, to, undefined, scoPath);
+          await this._fetchAllPagesBuffered(endpoint, from, to, undefined, scoPath, {
+            stage: 'sco',
+            scope: 'week',
+            chunkIndex: i + 1,
+            chunkTotal: weekChunks.length,
+          });
 
         // ── Truncation check: dùng GDT's own reportedTotal ──────────────────
         // BUG FIX: GDT SCO pagination wraps around after ~200 items.
@@ -1294,7 +1336,12 @@ export class GdtDirectApiService {
 
           try {
             const { rows: dayRows, reportedTotal: dayTotal } =
-              await this._fetchAllPagesBuffered(endpoint, df, dt, undefined, scoPath);
+              await this._fetchAllPagesBuffered(endpoint, df, dt, undefined, scoPath, {
+                stage: 'sco',
+                scope: 'day',
+                chunkIndex: d + 1,
+                chunkTotal: dayChunks.length,
+              });
 
             // Use unique-count-based truncation check (same logic as weekly level)
             const dayUniqueSeen = new Set<string>(
@@ -1323,9 +1370,15 @@ export class GdtDirectApiService {
               const statusFilters = ['ttxly==5', 'ttxly==6', 'ttxly==8'];
               const dayRecovered = new Map<string, RawInvoice>();
               let statusFetched = 0;
-              for (const filter of statusFilters) {
+              for (let fi = 0; fi < statusFilters.length; fi++) {
+                const filter = statusFilters[fi]!;
                 try {
-                  const { rows: statusRows } = await this._fetchAllPagesBuffered(endpoint, df, dt, filter, scoPath);
+                  const { rows: statusRows } = await this._fetchAllPagesBuffered(endpoint, df, dt, filter, scoPath, {
+                    stage: 'sco',
+                    scope: 'status',
+                    chunkIndex: fi + 1,
+                    chunkTotal: statusFilters.length,
+                  });
                   statusFetched += statusRows.length;
                   for (const inv of statusRows) {
                     const key = invoiceIdentityKey(inv);
@@ -1385,7 +1438,12 @@ export class GdtDirectApiService {
                 const { from: hf, to: ht } = hourChunks[h]!;
                 try {
                   const { rows: hourRows, reportedTotal: hourTotal } =
-                    await this._fetchAllPagesBuffered(endpoint, hf, ht, undefined, scoPath);
+                    await this._fetchAllPagesBuffered(endpoint, hf, ht, undefined, scoPath, {
+                      stage: 'sco',
+                      scope: 'hour',
+                      chunkIndex: h + 1,
+                      chunkTotal: hourChunks.length,
+                    });
                   _deduplicateAndAdd(hourRows);
                   dailyTotal += hourRows.length;
 
@@ -1609,7 +1667,20 @@ export class GdtDirectApiService {
       const { from, to } = chunks[i]!;
       if (i > 0) await humanDelay(4_000, 8_000);
 
-      const chunkRows = await this._fetchQueryChunkRobust(endpoint, from, to, extraFilter, overridePath);
+      const chunkRows = await this._fetchQueryChunkRobust(
+        endpoint,
+        from,
+        to,
+        extraFilter,
+        overridePath,
+        0,
+        {
+          stage: overridePath?.includes('sco-query') ? 'sco' : 'query',
+          scope: 'range',
+          chunkIndex: i + 1,
+          chunkTotal: chunks.length,
+        },
+      );
       for (let offset = 0; offset < chunkRows.length; offset += pageSize) {
         yield chunkRows.slice(offset, offset + pageSize);
       }
@@ -1651,6 +1722,7 @@ export class GdtDirectApiService {
     extraFilter?: string,
     overridePath?: string,
     depth:        number = 0,
+    progressContext?: GdtFetchProgressContext,
   ): Promise<RawInvoice[]> {
     const MAX_QUERY_SPLIT_DEPTH = 24;
     const { rows, reportedTotal } = await this._fetchAllPagesBuffered(
@@ -1659,6 +1731,7 @@ export class GdtDirectApiService {
       toDate,
       extraFilter,
       overridePath,
+      progressContext,
     );
     const uniqueRows = dedupeInvoices(rows);
     if (isFetchComplete(uniqueRows.length, reportedTotal)) {
@@ -1699,6 +1772,7 @@ export class GdtDirectApiService {
       extraFilter,
       overridePath,
       depth + 1,
+      progressContext,
     );
     await humanDelay(250, 700);
     const rightRows = await this._fetchQueryChunkRobust(
@@ -1708,6 +1782,7 @@ export class GdtDirectApiService {
       extraFilter,
       overridePath,
       depth + 1,
+      progressContext,
     );
 
     return dedupeInvoices([...leftRows, ...rightRows]);
@@ -1890,6 +1965,7 @@ export class GdtDirectApiService {
     toDate:       Date,
     extraFilter?: string,
     overridePath?: string,
+    progressContext?: GdtFetchProgressContext,
   ): Promise<FetchResult> {   // ← Return type đổi từ Promise<RawInvoice[]> → Promise<FetchResult>
     if (!this.token) throw new Error('Not authenticated — call login() first');
 
@@ -1930,6 +2006,21 @@ export class GdtDirectApiService {
       endpoint, from, to, filter: extraFilter ?? 'none', startPage: page,
     });
 
+    await this._reportFetchProgress({
+      endpoint,
+      stage: progressContext?.stage ?? (overridePath?.includes('sco-query') ? 'sco' : 'query'),
+      scope: progressContext?.scope ?? 'range',
+      chunkIndex: progressContext?.chunkIndex,
+      chunkTotal: progressContext?.chunkTotal,
+      currentPage: page + 1,
+      totalPages: null,
+      fetched: 0,
+      reportedTotal: null,
+      from,
+      to,
+      filter: extraFilter,
+    });
+
     while (all.length < total) {
       const res = await this._getWithRetry<GdtPagedResponse>(
         endpointPath,
@@ -1967,6 +2058,25 @@ export class GdtDirectApiService {
           : undefined,
       }));
       all.push(...mapped);
+
+      const totalPages = Number.isFinite(total)
+        ? Math.max(1, Math.ceil(total / pageSize))
+        : null;
+
+      await this._reportFetchProgress({
+        endpoint,
+        stage: progressContext?.stage ?? (overridePath?.includes('sco-query') ? 'sco' : 'query'),
+        scope: progressContext?.scope ?? 'range',
+        chunkIndex: progressContext?.chunkIndex,
+        chunkTotal: progressContext?.chunkTotal,
+        currentPage: page + 1,
+        totalPages,
+        fetched: all.length,
+        reportedTotal: reportedTotal === -1 ? null : reportedTotal,
+        from,
+        to,
+        filter: extraFilter,
+      });
 
       logger.debug('[GdtDirect] Page fetched', {
         endpoint, page, rows: rows.length, soFar: all.length,

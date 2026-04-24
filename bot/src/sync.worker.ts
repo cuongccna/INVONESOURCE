@@ -15,6 +15,7 @@ import { pool } from './db';
 import { decryptCredentials } from './encryption.service';
 import { proxyManager } from './proxy-manager';
 import { GdtDirectApiService } from './gdt-direct-api.service';
+import type { GdtFetchProgressSnapshot } from './gdt-direct-api.service';
 import { GdtXmlParser } from './parsers/GdtXmlParser';
 import { logger } from './logger';
 import type { LineItem } from './parsers/GdtXmlParser';
@@ -900,6 +901,82 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     // Only NEWLY inserted invoices count against quota — updates are free.
     // outputCount/inputCount track total fetched (display), newInvoiceCount tracks billing.
     let newInvoiceCount = 0;
+    let outEst          = -1;
+    let inEst           = -1;
+    let lastFetchProgressAt = 0;
+    let lastFetchPercent = 5;
+    let lastFetchStatus  = 'Đang đăng nhập GDT...';
+
+    const emitFetchProgress = async (snapshot: GdtFetchProgressSnapshot): Promise<void> => {
+      const isOutput = snapshot.endpoint === 'sold';
+      const estimate = isOutput ? outEst : inEst;
+      const [minPercent, maxPercent] = isOutput
+        ? (snapshot.stage === 'sco' ? [32, 55] : [12, 32])
+        : (snapshot.stage === 'sco' ? [82, 96] : [55, 82]);
+
+      const ratios: number[] = [];
+      if (snapshot.reportedTotal && snapshot.reportedTotal > 0) {
+        ratios.push(snapshot.fetched / snapshot.reportedTotal);
+      }
+      if (estimate > 0) {
+        ratios.push(snapshot.fetched / estimate);
+      }
+      if (snapshot.totalPages && snapshot.totalPages > 0) {
+        ratios.push(snapshot.currentPage / snapshot.totalPages);
+      }
+
+      let relativeProgress = ratios.length > 0
+        ? Math.max(...ratios)
+        : (snapshot.currentPage > 1 ? Math.min(0.5, snapshot.currentPage / 5) : (snapshot.fetched > 0 ? 0.12 : 0.04));
+
+      if (snapshot.chunkTotal && snapshot.chunkTotal > 0) {
+        relativeProgress = ((snapshot.chunkIndex ?? 1) - 1 + Math.min(1, Math.max(relativeProgress, snapshot.fetched > 0 ? 0.08 : 0.03)))
+          / snapshot.chunkTotal;
+      }
+
+      const percent = Math.max(
+        lastFetchPercent,
+        Math.round(minPercent + Math.min(1, relativeProgress) * (maxPercent - minPercent)),
+      );
+
+      const chunkSuffix = snapshot.chunkTotal && snapshot.chunkTotal > 1
+        ? ` · đợt ${snapshot.chunkIndex ?? 1}/${snapshot.chunkTotal}`
+        : '';
+      const stageSuffix = snapshot.stage === 'sco' ? ' (SCO)' : '';
+      const filterSuffix = !isOutput && snapshot.filter
+        ? ` ${snapshot.filter.replace('ttxly==', 'TTXL ')}`
+        : '';
+      const statusMessage = isOutput
+        ? `Đang tải HĐ đầu ra${stageSuffix}${chunkSuffix}...`
+        : `Đang tải HĐ đầu vào${stageSuffix}${filterSuffix}${chunkSuffix}...`;
+
+      const fetchedForUi = isOutput
+        ? Math.max(outputCount, snapshot.fetched) + inputCount
+        : outputCount + Math.max(inputCount, snapshot.fetched);
+
+      const now = Date.now();
+      const shouldPush =
+        percent > lastFetchPercent ||
+        statusMessage !== lastFetchStatus ||
+        now - lastFetchProgressAt >= 1200 ||
+        snapshot.currentPage === 1;
+
+      if (!shouldPush) return;
+
+      lastFetchPercent = percent;
+      lastFetchStatus = statusMessage;
+      lastFetchProgressAt = now;
+
+      await job.updateProgress({
+        percent,
+        invoicesFetched: fetchedForUi,
+        currentPage: snapshot.currentPage,
+        totalPages: snapshot.totalPages,
+        statusMessage,
+      } as Record<string, unknown>);
+    };
+
+    gdtApi.setFetchProgressReporter(emitFetchProgress);
 
     try {
       // Date range priority:
@@ -956,7 +1033,7 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       // Fetch X-Total-Count from GDT with size=1 (no data downloaded) to warn
       // the user if the sync will take a very long time.
       // Runs in parallel (Promise.all) — both calls are lightweight (size=1 each).
-      const [outEst, inEst] = await Promise.all([
+      [outEst, inEst] = await Promise.all([
         runner.prefetchCount('sold', fromDate, toDate).catch(() => -1),
         runner.prefetchCount('purchase', fromDate, toDate).catch(() => -1),
       ]);
@@ -990,6 +1067,16 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
           } as Record<string, unknown>);
         }
       }
+
+      await job.updateProgress({
+        percent: Math.max(lastFetchPercent, 12),
+        invoicesFetched: 0,
+        currentPage: 1,
+        totalPages: outEst > 0 ? Math.max(1, Math.ceil(outEst / 50)) : null,
+        statusMessage: 'Đang tải HĐ đầu ra từ GDT...',
+      } as Record<string, unknown>);
+      lastFetchPercent = Math.max(lastFetchPercent, 12);
+      lastFetchStatus = 'Đang tải HĐ đầu ra từ GDT...';
 
       // Phase 8: Stream output invoices page-by-page (HĐ đầu ra)
       // Each page (~50 invoices) is deduped + upserted as it arrives — lower memory,
