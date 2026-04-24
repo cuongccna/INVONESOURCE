@@ -62,8 +62,7 @@ export const manualQueue = new Queue('gdt-sync-manual', {
   connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
   defaultJobOptions: {
     attempts:          5,
-    // FIX: Increased initial delay 60s→300s so retries don't hit the proxy pool
-    // during the TMProxy cooldown window (240–360s). Exponential: 5min→10min→20min.
+    // Exponential backoff: 5min→10min→20min between retries.
     backoff:           { type: 'exponential', delay: 300_000 },
     removeOnComplete:  200,
     removeOnFail:      100,
@@ -355,6 +354,7 @@ interface SyncJobGroupItem {
 }
 interface SyncJobData {
   companyId: string;
+  runId?: string;
   fromDate?: string; // YYYY-MM-DD, optional — job-specific override
   toDate?:   string; // YYYY-MM-DD, optional
   label?:    string; // display label (e.g. 'Tháng 1')
@@ -548,7 +548,7 @@ export async function enqueueSync(
 
 async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
   const { companyId, fromDate: jobFromDate, toDate: jobToDate } = job.data;
-  const runId     = uuidv4();
+  const runId     = job.data.runId ?? uuidv4();
   const startedAt = Date.now();
 
   // VĐ4: Enforce dynamic deadline from job data (set by enqueueSync based on volume estimate)
@@ -729,9 +729,9 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     }
 
     // ── 3. Sticky proxy per company ────────────────────────────────────────────
-    // Dual-mode proxy selection:
-    //   Manual sync → static residential proxy (per-user sticky from DB pool)
-    //   Auto sync   → TMProxy rotating pool (existing Mode A/C/B)
+    // Proxy selection:
+    //   Manual sync → static pool, per-user sticky from DB
+    //   Auto sync   → static pool, hash-keyed by proxy_session_id
     let proxySessionId = cfg.proxy_session_id;
     if (!proxySessionId) {
       proxySessionId = randomBytes(8).toString('hex'); // 16-char hex, e.g. 'a3f9b2c1d4e5f678'
@@ -767,11 +767,11 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       // SOCKS5 not available for static proxies (HTTP CONNECT only) — set null explicitly
       socks5ProxyUrl = null;
     } else {
-      // Auto sync: TMProxy rotating pool
+      // Auto sync: static proxy pool, keyed by session suffix
       proxyUrl       = proxyManager.nextForAutoSync(proxySessionId);
       socks5ProxyUrl = proxyManager.nextSocks5ForCompany(proxySessionId);
       const maskedIp = proxyUrl ? _maskProxyUrl(proxyUrl) : 'none';
-      logger.info('[SyncWorker] Proxy selected — AUTO (TMProxy)', {
+      logger.info('[SyncWorker] Proxy selected — AUTO (Static)', {
         companyId,
         taxCode:      cfg.tax_code,
         proxyIp:      maskedIp,
@@ -783,18 +783,12 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     // Safety guard: never login to GDT without proxy protection.
     // Running without a proxy exposes the real server IP — GDT can correlate multiple
     // company logins to one IP and flag the account.
-    // If TMProxy is out of credit (code 27), abort until the user tops up the plan.
-    //
     // ALLOW_DIRECT_CONNECTION=true bypasses this guard for local development only.
     // NEVER enable in production — real server IP would be exposed to GDT.
     if (!proxyUrl) {
       const allowDirect = process.env['ALLOW_DIRECT_CONNECTION'] === 'true';
       if (!allowDirect) {
-        logger.error('[SyncWorker] No proxy available — aborting sync to protect against GDT detection. ' +
-          'Possible causes: (1) TMProxy code=27 — key valid but session expired/never started ' +
-          '(bot will auto-request new IP on next restart); ' +
-          '(2) TMPROXY_API_KEY balance expired; (3) no PROXY_LIST set. ' +
-          'Dev workaround: set ALLOW_DIRECT_CONNECTION=true (NEVER in production)', { companyId });
+        logger.error('[SyncWorker] No proxy available — aborting sync. Set PROXY_LIST in .env or ALLOW_DIRECT_CONNECTION=true for dev only.', { companyId });
         throw new UnrecoverableError('[SyncWorker] No proxy available — sync aborted for safety');
       }
       logger.warn(
@@ -818,7 +812,7 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
           companyId,
           taxCode:  cfg.tax_code,
           proxyIp:  _maskProxyUrl(proxyUrl),
-          mode:     isManual ? 'MANUAL/static' : 'AUTO/TMProxy',
+          mode:     isManual ? 'MANUAL/static' : 'AUTO/static',
         });
         // Clear the DB proxy_session_id so next run gets a fresh session ID → fresh IP.
         await pool.query(
@@ -831,15 +825,29 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
         companyId,
         taxCode:  cfg.tax_code,
         proxyIp:  _maskProxyUrl(proxyUrl),
-        mode:     isManual ? 'MANUAL/static' : 'AUTO/TMProxy',
+        mode:     isManual ? 'MANUAL/static' : 'AUTO/static',
       });
     }
 
     // ── 4. Login via GDT Direct API ──────────────────────────────────────────────
-    await pool.query(
-      `INSERT INTO gdt_bot_runs (id, company_id, started_at, status) VALUES ($1, $2, NOW(), 'running')`,
-      [runId, companyId]
+    const existingRunRes = await pool.query(
+      `UPDATE gdt_bot_runs
+       SET started_at = NOW(),
+           finished_at = NULL,
+           status = 'running',
+           error_detail = NULL,
+           output_count = 0,
+           input_count = 0,
+           duration_ms = NULL
+       WHERE id = $1`,
+      [runId],
     );
+    if ((existingRunRes.rowCount ?? 0) === 0) {
+      await pool.query(
+        `INSERT INTO gdt_bot_runs (id, company_id, started_at, status) VALUES ($1, $2, NOW(), 'running')`,
+        [runId, companyId]
+      );
+    }
     // Mark config as running + clear previous error so the UI immediately reflects the new attempt.
     // Without this, gdt_bot_configs.last_run_status stays 'error' (from previous run) until
     // the new run completes — causing the UI to show stale error banners during active jobs.
@@ -863,9 +871,8 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     }
 
     // FIX-PERF-01: Check session cache — skip captcha+login if we have a valid token.
-    // BUG3 FIX: Manual sync MUST NOT reuse a cached token from auto-sync.
-    // Auto-sync uses TMProxy IP; manual uses a different static IP.
-    // GDT binds sessions to IP — reusing an auto-sync token on a static IP causes 401/session errors.
+    // Manual sync MUST NOT reuse a cached token from auto-sync.
+    // GDT binds sessions to IP — reusing a token across different proxy IPs causes 401.
     let cachedToken: string | null = null;
     if (!isManual) {
       try {
@@ -989,26 +996,6 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
       const yyyymm = `${fromDate.getFullYear()}${String(fromDate.getMonth() + 1).padStart(2, '0')}`;
 
-      // ── Pre-sync proxy freshness check ───────────────────────────────────────
-      // If the TMProxy IP expires within the next 3 minutes, rotate now so the
-      // IP never expires mid-fetch. getCurrent() gives ~45-min IPs; a sync for
-      // 200+ invoices can take 5-10 min, so expiry mid-run is a real risk.
-      if (proxyUrl) {
-        const rotated = await proxyManager.refreshIfExpiringSoon(proxySessionId!, 3 * 60_000);
-        if (rotated) {
-          // Re-read the fresh URL so the GDtDirectApiService gets the new IP.
-          const freshUrl       = proxyManager.nextForCompany(proxySessionId!);
-          const freshSocks5Url = proxyManager.nextSocks5ForCompany(proxySessionId!);
-          if (freshUrl && freshUrl !== proxyUrl) {
-            // Rebuild GdtDirectApiService with fresh proxy; re-login with the new IP.
-            const freshApi = new GdtDirectApiService(freshUrl, freshSocks5Url, undefined, companyId, _checkpoint, gdtRawCacheService);
-            await freshApi.login(creds.username, creds.password, isManual);
-            // Swap in-scope references
-            Object.assign(gdtApi, freshApi);
-          }
-        }
-      }
-
       // ── Phase 3: Pre-flight volume estimate ────────────────────────────────
       // Fetch X-Total-Count from GDT with size=1 (no data downloaded) to warn
       // the user if the sync will take a very long time.
@@ -1062,7 +1049,12 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       for await (const pageBatch of runner.fetchOutputInvoicesStream(fromDate, toDate)) {
         // Dedup check: pipeline SISMEMBER for this page batch
         const batchOutKeys = pageBatch.map(inv =>
-          _dedup.invoiceKey(inv.invoice_number ?? '', inv.serial_number ?? ''));
+          _dedup.invoiceKey(
+            inv.invoice_number ?? '',
+            inv.serial_number ?? '',
+            inv.invoice_date ?? '',
+            inv.seller_tax_code ?? '',
+          ));
         const outDedupPipe = _lockRedis.pipeline();
         for (const dk of batchOutKeys) outDedupPipe.sismember(outDedupSetKey, dk);
         const outDedupResults = await outDedupPipe.exec().catch(() => null);
@@ -1108,14 +1100,14 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
         checkDeadline(); // VĐ4: abort if dynamic timeout exceeded
         if (await checkCancellationRequested(companyId)) {
           logger.info('[SyncWorker] Hủy đồng bộ giữa chừng (HĐ đầu ra)', { companyId, outPageIdx });
-          throw new Error('CANCEL_SKIP: sync cancelled by user');
+          throw new UnrecoverableError('CANCEL_SKIP: sync cancelled by user');
         }
         if (!isManual) {
           const priorityOverride = await _lockRedis.get(`${BOT_PRIORITY_PREFIX}${companyId}`).catch(() => null);
           if (priorityOverride === 'manual') {
             await _lockRedis.del(`${BOT_PRIORITY_PREFIX}${companyId}`).catch(() => {});
             logger.info('[SyncWorker] YIELD_TO_MANUAL — auto job nhường chỗ cho manual (đầu ra)', { companyId, outPageIdx });
-            throw new Error(`YIELD_TO_MANUAL: Auto job yielding at output page ${outPageIdx}`);
+            throw new UnrecoverableError(`YIELD_TO_MANUAL: Auto job yielding at output page ${outPageIdx}`);
           }
         }
 
@@ -1139,7 +1131,12 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
       for await (const pageBatch of runner.fetchInputInvoicesStream(fromDate, toDate)) {
         const batchInKeys = pageBatch.map(inv =>
-          _dedup.invoiceKey(inv.invoice_number ?? '', inv.serial_number ?? ''));
+          _dedup.invoiceKey(
+            inv.invoice_number ?? '',
+            inv.serial_number ?? '',
+            inv.invoice_date ?? '',
+            inv.seller_tax_code ?? '',
+          ));
         const inDedupPipe = _lockRedis.pipeline();
         for (const dk of batchInKeys) inDedupPipe.sismember(inDedupSetKey, dk);
         const inDedupResults = await inDedupPipe.exec().catch(() => null);
@@ -1179,14 +1176,14 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
         checkDeadline();
         if (await checkCancellationRequested(companyId)) {
           logger.info('[SyncWorker] Hủy đồng bộ giữa chừng (HĐ đầu vào)', { companyId, inPageIdx });
-          throw new Error('CANCEL_SKIP: sync cancelled by user');
+          throw new UnrecoverableError('CANCEL_SKIP: sync cancelled by user');
         }
         if (!isManual) {
           const priorityOverride = await _lockRedis.get(`${BOT_PRIORITY_PREFIX}${companyId}`).catch(() => null);
           if (priorityOverride === 'manual') {
             await _lockRedis.del(`${BOT_PRIORITY_PREFIX}${companyId}`).catch(() => {});
             logger.info('[SyncWorker] YIELD_TO_MANUAL — auto job nhường chỗ cho manual (đầu vào)', { companyId, inPageIdx });
-            throw new Error(`YIELD_TO_MANUAL: Auto job yielding at input page ${inPageIdx}`);
+            throw new UnrecoverableError(`YIELD_TO_MANUAL: Auto job yielding at input page ${inPageIdx}`);
           }
         }
 
@@ -1330,6 +1327,26 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       }
       if (!isSkip && !isInfra) {
         await _failRun(runId, companyId, msg, false);
+      } else if (isSkip) {
+        const isCancelled = msg.startsWith('CANCEL_SKIP:');
+        await pool.query(
+          `UPDATE gdt_bot_runs
+           SET status = $1,
+               finished_at = NOW(),
+               error_detail = $2
+           WHERE id = $3`,
+          [isCancelled ? 'cancelled' : 'skipped', msg.slice(0, 1000), runId],
+        ).catch(() => undefined);
+        if (isCancelled) {
+          await pool.query(
+            `UPDATE gdt_bot_configs
+             SET last_run_status = 'cancelled',
+                 last_error = NULL,
+                 updated_at = NOW()
+             WHERE company_id = $1`,
+            [companyId],
+          ).catch(() => undefined);
+        }
       } else if (isInfra) {
         // Still update gdt_bot_runs status so the run is marked as error in the UI.
         await pool.query(
@@ -1378,7 +1395,7 @@ function _classifySerial(serialNumber: string | null | undefined): {
 
 /** Stable lookup key for the batch upsert return map. */
 function _invMapKey(inv: import('./parsers/GdtXmlParser').RawInvoice): string {
-  return `${inv.invoice_number ?? ''}|${inv.serial_number ?? ''}|${inv.seller_tax_code ?? ''}`;
+  return `${inv.invoice_number ?? ''}|${inv.serial_number ?? ''}|${inv.seller_tax_code ?? ''}|${inv.invoice_date ?? ''}`;
 }
 
 /**
@@ -1453,7 +1470,7 @@ async function _batchUpsertInvoices(
   const dirArr  = Array(invoices.length).fill(direction) as string[];
   const compArr = Array(invoices.length).fill(companyId) as string[];
 
-  const res = await pool.query(
+  const insertPrefixSql =
     `INSERT INTO invoices
      (id, company_id, invoice_number, serial_number, invoice_date, direction, status,
       seller_name, seller_tax_code, buyer_name, buyer_tax_code,
@@ -1480,9 +1497,10 @@ async function _batchUpsertInvoices(
        subtotal, total_amount, vat_amount, vat_rate, tax_category,
        invoice_group, serial_has_cqt, has_line_items, is_sco,
        tc_hdon, khhd_cl_quan, so_hd_cl_quan, original_invoice_date
-     )
-     ON CONFLICT (company_id, provider, invoice_number,
-       COALESCE(seller_tax_code, ''), COALESCE(serial_number, '')) DO UPDATE SET
+     )`;
+
+  const updateAndReturnSql =
+    ` DO UPDATE SET
        direction             = EXCLUDED.direction,
        status                = EXCLUDED.status,
        invoice_date          = EXCLUDED.invoice_date,
@@ -1509,22 +1527,74 @@ async function _batchUpsertInvoices(
        invoice_number,
        COALESCE(serial_number,    '') AS serial_number,
        COALESCE(seller_tax_code,  '') AS seller_tax_code,
-       (xmax = 0) AS is_new`,
-    [
-      ids, compArr, invNums, serials, dates, dirArr, statuses,
-      sellerNames, sellerTaxes, buyerNames, buyerTaxes,
-      subtotals, totals, vatAmounts, vatRates, taxCategories,
-      invoiceGroups, serialHasCqts, hasLineItemsArr, isScos,
-      tcHdons, khhdClQuans, soHdClQuans, originalInvDates,
-    ],
-  );
+       COALESCE(invoice_date::text, '') AS invoice_date,
+       (xmax = 0) AS is_new`;
+
+  const values = [
+    ids, compArr, invNums, serials, dates, dirArr, statuses,
+    sellerNames, sellerTaxes, buyerNames, buyerTaxes,
+    subtotals, totals, vatAmounts, vatRates, taxCategories,
+    invoiceGroups, serialHasCqts, hasLineItemsArr, isScos,
+    tcHdons, khhdClQuans, soHdClQuans, originalInvDates,
+  ];
+
+  const conflictTargets = [
+    {
+      name: 'coalesce_seller_date',
+      sql: ` ON CONFLICT (company_id, provider, invoice_number, COALESCE(seller_tax_code, ''), invoice_date)`,
+    },
+    {
+      name: 'plain_seller_date',
+      sql: ` ON CONFLICT (company_id, provider, invoice_number, seller_tax_code, invoice_date)`,
+    },
+    {
+      name: 'coalesce_seller_serial',
+      sql: ` ON CONFLICT (company_id, provider, invoice_number, COALESCE(seller_tax_code, ''), COALESCE(serial_number, ''))`,
+    },
+    {
+      name: 'plain_seller_serial',
+      sql: ` ON CONFLICT (company_id, provider, invoice_number, seller_tax_code, serial_number)`,
+    },
+  ] as const;
+
+  let res: { rows: unknown[] } | null = null;
+  let last42P10: unknown = null;
+  for (const target of conflictTargets) {
+    try {
+      res = await pool.query(`${insertPrefixSql}${target.sql}${updateAndReturnSql}`, values);
+      if (target.name !== 'coalesce_seller_date') {
+        logger.warn('[SyncWorker] Using compatibility conflict target for invoices upsert', {
+          companyId,
+          conflictTarget: target.name,
+        });
+      }
+      break;
+    } catch (err) {
+      const pgCode = (err as { code?: string })?.code;
+      if (pgCode !== '42P10') throw err;
+      last42P10 = err;
+    }
+  }
+  if (!res) {
+    throw last42P10 instanceof Error
+      ? last42P10
+      : new Error('No compatible unique/exclusion constraint found for invoices upsert');
+  }
 
   const resultMap = new Map<string, string>();
   let newCount = 0;
   for (const row of res.rows as Array<{
-    id: string; invoice_number: string; serial_number: string; seller_tax_code: string; is_new: boolean;
+    id: string;
+    invoice_number: string;
+    serial_number: string;
+    seller_tax_code: string;
+    invoice_date: string;
+    is_new: boolean;
   }>) {
-    resultMap.set(`${row.invoice_number}|${row.serial_number}|${row.seller_tax_code}`, row.id);
+    resultMap.set(
+      `${row.invoice_number}|${row.serial_number}|${row.seller_tax_code}|${row.invoice_date}`,
+      row.id,
+    );
     if (row.is_new) newCount++;
   }
 

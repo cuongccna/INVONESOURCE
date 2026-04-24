@@ -70,6 +70,7 @@ export class AutoCodeService {
   async ensureCustomer(companyId: string, taxCode: string, name: string, invoiceDate?: string | null): Promise<string> {
     const province = getProvince(taxCode);
     const prefix = `KH-${province}`;
+    const safeName = (name ?? '').trim().substring(0, 255);
 
     // Upsert — only assign code if not yet assigned
     const existing = await pool.query<{ customer_code: string | null }>(
@@ -86,7 +87,7 @@ export class AutoCodeService {
            last_invoice_date = GREATEST(last_invoice_date, $4::date),
            updated_at = NOW()
          WHERE company_id=$1 AND tax_code=$2`,
-        [companyId, taxCode, name, invoiceDate ?? null],
+        [companyId, taxCode, safeName, invoiceDate ?? null],
       );
       return existing.rows[0]!.customer_code;
     }
@@ -103,7 +104,7 @@ export class AutoCodeService {
          invoice_count_12m = customer_catalog.invoice_count_12m + 1,
          last_invoice_date = GREATEST(customer_catalog.last_invoice_date, EXCLUDED.last_invoice_date),
          updated_at = NOW()`,
-      [companyId, code, taxCode, name, province, invoiceDate ?? null],
+      [companyId, code, taxCode, safeName, province, invoiceDate ?? null],
     );
     return code;
   }
@@ -112,6 +113,7 @@ export class AutoCodeService {
   async ensureSupplier(companyId: string, taxCode: string, name: string, invoiceDate?: string | null): Promise<string> {
     const province = getProvince(taxCode);
     const prefix = `NCC-${province}`;
+    const safeName = (name ?? '').trim().substring(0, 255);
 
     const existing = await pool.query<{ supplier_code: string | null }>(
       `SELECT supplier_code FROM supplier_catalog WHERE company_id=$1 AND tax_code=$2`,
@@ -126,7 +128,7 @@ export class AutoCodeService {
            last_invoice_date = GREATEST(last_invoice_date, $4::date),
            updated_at = NOW()
          WHERE company_id=$1 AND tax_code=$2`,
-        [companyId, taxCode, name, invoiceDate ?? null],
+        [companyId, taxCode, safeName, invoiceDate ?? null],
       );
       return existing.rows[0]!.supplier_code;
     }
@@ -143,7 +145,7 @@ export class AutoCodeService {
          invoice_count_12m = supplier_catalog.invoice_count_12m + 1,
          last_invoice_date = GREATEST(supplier_catalog.last_invoice_date, EXCLUDED.last_invoice_date),
          updated_at = NOW()`,
-      [companyId, code, taxCode, name, invoiceDate ?? null],
+      [companyId, code, taxCode, safeName, invoiceDate ?? null],
     );
     return code;
   }
@@ -152,7 +154,8 @@ export class AutoCodeService {
   async ensureProduct(companyId: string, itemName: string): Promise<string> {
     const category = detectCategory(itemName);
     const prefix = `HH-${category.code}`;
-    const normalizedName = itemName.trim().toLowerCase();
+    const normalizedName = itemName.trim().toLowerCase().substring(0, 255);
+    const displayName = itemName.trim().substring(0, 255);
 
     const existing = await pool.query<{ item_code: string | null }>(
       `SELECT item_code FROM product_catalog WHERE company_id=$1 AND normalized_name=$2`,
@@ -174,7 +177,7 @@ export class AutoCodeService {
          category_code = EXCLUDED.category_code,
          category_name = EXCLUDED.category_name,
          is_service = EXCLUDED.is_service`,
-      [companyId, normalizedName, itemName.trim(), code, category.code, category.name, category.isService],
+      [companyId, normalizedName, displayName, code, category.code, category.name, category.isService],
     );
     return code;
   }

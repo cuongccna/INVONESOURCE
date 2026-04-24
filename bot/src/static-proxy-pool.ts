@@ -2,7 +2,7 @@
  * StaticProxyPool — DB-backed static residential proxy assignment
  *
  * Used for manual sync jobs: assigns a sticky proxy per user from the
- * static_proxies table. Auto sync continues to use TMProxy (Mode A).
+ * static_proxies table. Used for both manual and auto sync.
  *
  * - acquireForUser(): find or return existing assigned proxy
  * - releaseForUser(): release assignment

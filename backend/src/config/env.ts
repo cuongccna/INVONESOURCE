@@ -79,11 +79,6 @@ const envSchema = z.object({
   // Telegram bot — optional
   TELEGRAM_BOT_TOKEN: z.string().optional(),
 
-  // TMProxy keys for backend (company verification GDT proxy) — optional
-  // Same keys used by the bot. If set, CompanyVerificationService routes
-  // tracuunnt.gdt.gov.vn lookups through a residential proxy.
-  TMPROXY_API_KEYS: z.string().optional(),
-
   // DB pool size — default 50 for production concurrency
   DB_POOL_MAX: z.string().default('50').transform(Number),
 });

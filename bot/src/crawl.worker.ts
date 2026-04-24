@@ -42,7 +42,7 @@ import { InvoiceCacheService }         from './invoice-cache';
 import { GdtSessionPool, UA_PROFILES } from './session-pool';
 import type { PooledSession, UAProfile } from './session-pool';
 import { GdtCircuitBreaker, isNetworkLevelError, isGdtRateLimit } from './circuit-breaker';
-import { TmproxyManager }             from './proxy-manager-v2';
+import { ProxyManager } from './proxy-manager';
 import { Semaphore, AdaptiveDelayManager } from './adaptive-rate-limiter';
 
 // ─── Environment ─────────────────────────────────────────────────────────────
@@ -55,7 +55,7 @@ const REDIS_CONN    = { url: REDIS_URL } as ConnectionOptions;
 const redis          = new Redis(REDIS_URL, { maxRetriesPerRequest: 3 });
 const invoiceCache   = new InvoiceCacheService(redis);
 const sessionPool    = new GdtSessionPool(redis);
-const proxyManager   = new TmproxyManager();
+const proxyManager   = new ProxyManager();
 const adaptiveDelay  = new AdaptiveDelayManager();
 const captchaService = new CaptchaService();
 
@@ -740,11 +740,10 @@ async function processSyncJob(job: Job<SyncJobData>): Promise<Record<string, unk
     // ── Step 7: Proxy health check (20%) ──
     await job.updateProgress(20);
     if (session.proxyUrl) {
-      const health = await proxyManager.proxyHttpHealthCheck(session.proxyUrl);
-      if (!health.ok) {
+      const proxyOk = await proxyManager.probe(session.proxyUrl);
+      if (!proxyOk) {
         logger.warn('Proxy health check failed, getting new proxy', {
           tenantId,
-          error: health.error,
         });
         proxyManager.markFailed(session.proxyUrl);
         const newProxy = proxyManager.next();
@@ -1001,9 +1000,6 @@ let batchWorker: Worker<SyncJobData> | null = null;
  * Start the crawl workers.
  */
 export async function startWorkers(): Promise<void> {
-  // Initialize proxy manager
-  await proxyManager.init();
-
   highWorker = new Worker<SyncJobData>(
     'invoice-sync-high',
     async (job) => processSyncJob(job),
@@ -1051,7 +1047,6 @@ export async function stopWorkers(): Promise<void> {
   if (highWorker) await highWorker.close();
   if (batchWorker) await batchWorker.close();
 
-  proxyManager.shutdown();
   await redis.quit();
 
   logger.info('Crawl workers stopped');

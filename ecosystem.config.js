@@ -19,6 +19,7 @@ module.exports = {
       max_memory_restart: '512M',
       env: {
         NODE_ENV: 'production',
+        TZ: 'Asia/Ho_Chi_Minh',
       },
       error_file: '/opt/INVONESOURCE/logs/backend-error.log',
       out_file: '/opt/INVONESOURCE/logs/backend-out.log',
@@ -39,6 +40,7 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
         PORT: '3000',
+        TZ: 'Asia/Ho_Chi_Minh',
       },
       error_file: '/opt/INVONESOURCE/logs/frontend-error.log',
       out_file: '/opt/INVONESOURCE/logs/frontend-out.log',
@@ -60,6 +62,7 @@ module.exports = {
       kill_timeout: 10000,
       env: {
         NODE_ENV: 'production',
+        TZ: 'Asia/Ho_Chi_Minh',
       },
       error_file: '/opt/INVONESOURCE/logs/bot-error.log',
       out_file: '/opt/INVONESOURCE/logs/bot-out.log',
@@ -83,6 +86,7 @@ module.exports = {
       kill_timeout: 10000,
       env: {
         NODE_ENV: 'production',
+        TZ: 'Asia/Ho_Chi_Minh',
       },
       error_file: '/opt/INVONESOURCE/logs/detail-worker-error.log',
       out_file: '/opt/INVONESOURCE/logs/detail-worker-out.log',

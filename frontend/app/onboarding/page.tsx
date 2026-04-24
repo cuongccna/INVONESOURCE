@@ -15,9 +15,7 @@ interface ConnectorFormData {
 }
 
 const PROVIDERS = [
-  { id: 'misa', label: 'MISA meInvoice' },
-  { id: 'viettel', label: 'Viettel VInvoice' },
-  { id: 'bkav', label: 'BKAV eInvoice' },
+  { id: 'gdt_intermediary', label: 'GDT Intermediary' },
 ];
 
 const STEP_LABELS = [
@@ -34,7 +32,7 @@ export default function OnboardingPage() {
   const [syncDone, setSyncDone] = useState(false);
   const [addingConnector, setAddingConnector] = useState(false);
   const [connForm, setConnForm] = useState<ConnectorFormData>({
-    provider_type: 'misa',
+    provider_type: 'gdt_intermediary',
     username: '',
     password: '',
     company_tax_code: '',
@@ -82,7 +80,7 @@ export default function OnboardingPage() {
         company_tax_code: connForm.company_tax_code || activeCompany?.tax_code,
       });
       setConnectors((prev) => [...prev, connForm]);
-      setConnForm({ provider_type: 'misa', username: '', password: '', company_tax_code: '' });
+      setConnForm({ provider_type: 'gdt_intermediary', username: '', password: '', company_tax_code: '' });
     } catch (err: unknown) {
       const msg =
         (err as { response?: { data?: { error?: { message?: string } } } })?.response?.data?.error

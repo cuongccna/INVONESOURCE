@@ -37,10 +37,20 @@ export class InvoiceDeduplicator {
     await pipe.exec();
   }
 
-  /** Build the canonical dedup key for a single invoice. */
+  /**
+   * Build the canonical dedup key for a single invoice.
+   *
+   * SCO invoices can reuse invoice numbers across different days, so date must
+   * be part of the identity to avoid false duplicate drops.
+   */
   // eslint-disable-next-line @typescript-eslint/class-methods-use-this
-  invoiceKey(invoiceNumber: string, serialNumber: string): string {
-    return `${serialNumber}:${invoiceNumber}`;
+  invoiceKey(
+    invoiceNumber: string,
+    serialNumber: string,
+    invoiceDate: string,
+    sellerTaxCode: string,
+  ): string {
+    return `${sellerTaxCode}:${invoiceDate}:${serialNumber}:${invoiceNumber}`;
   }
 
   /** Returns true if this invoice was already processed (exists in the set). */

@@ -24,9 +24,6 @@ interface PaginatedResponse {
 
 /* ─── Helpers ─────────────────────────────────────────────────────────────── */
 const PROVIDER_LABELS: Record<string, string> = {
-  misa:             'MISA meInvoice',
-  viettel:          'Viettel VInvoice',
-  bkav:             'BKAV eInvoice',
   gdt_intermediary: 'GDT Intermediary',
 };
 

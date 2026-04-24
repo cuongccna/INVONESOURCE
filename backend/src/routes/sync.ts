@@ -326,6 +326,30 @@ router.delete('/cancel', requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'), async (req
     //    TTL: 10 min — enough to reach the next check point in any active job
     await redis.set(`bot:sync:cancel:${companyId}`, '1', 'EX', 10 * 60);
 
+    if (removed > 0) {
+      await pool.query(
+        `UPDATE gdt_bot_runs
+         SET status = 'cancelled',
+             finished_at = NOW(),
+             error_detail = COALESCE(error_detail, 'Đã hủy trước khi bắt đầu')
+         WHERE company_id = $1
+           AND finished_at IS NULL
+           AND status IN ('pending', 'delayed')`,
+        [companyId],
+      ).catch(() => undefined);
+    }
+
+    if (removed > 0 || activeCount > 0) {
+      await pool.query(
+        `UPDATE gdt_bot_configs
+         SET last_run_status = 'cancelled',
+             last_error = NULL,
+             updated_at = NOW()
+         WHERE company_id = $1`,
+        [companyId],
+      ).catch(() => undefined);
+    }
+
     sendSuccess(res, { removed, activeCount }, activeCount > 0
       ? `Đã hủy ${removed} job đang chờ. Job đang chạy sẽ dừng trong giây lát.`
       : `Đã hủy ${removed} job.`

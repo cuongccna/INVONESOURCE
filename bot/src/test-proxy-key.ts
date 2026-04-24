@@ -1,54 +1,28 @@
 /**
- * Diagnostic script — test TMProxy API key connectivity.
+ * Diagnostic script — test static proxy connectivity.
  * Run:  npx ts-node -r dotenv/config src/test-proxy-key.ts
  */
-import { TmproxyRefresher, TmproxyNoSessionError } from './tmproxy-refresher';
+import { ProxyManager } from './proxy-manager';
 
 async function main() {
-  const apiKey = process.env['TMPROXY_API_KEY'] ?? '';
-  if (!apiKey) {
-    console.error('ERROR: TMPROXY_API_KEY is not set in .env');
+  const proxyList = (process.env['PROXY_LIST'] ?? '').split(',').map(s => s.trim()).filter(Boolean);
+  if (proxyList.length === 0) {
+    console.error('ERROR: PROXY_LIST is not set in .env');
     process.exit(1);
   }
 
-  console.log(`\nTesting TMProxy API key: ${apiKey.slice(0, 8)}…\n`);
-  const refresher = new TmproxyRefresher(apiKey);
+  console.log(`\nTesting static proxy pool: ${proxyList.length} proxies\n`);
+  const manager = new ProxyManager(proxyList);
 
-  // ── Step 1: get-current-proxy ─────────────────────────────────────────────
-  console.log('[1/2] Calling getCurrent() (get-current-proxy) …');
-  try {
-    const session = await refresher.getCurrent();
-    console.log('  ✓ getCurrent() succeeded:');
-    console.log(`      publicIp  : ${session.publicIp}`);
-    console.log(`      url       : ${session.url.replace(/:([^@]+)@/, ':***@')}`);
-    console.log(`      expiresAt : ${session.expiresAt.toISOString()}`);
-    console.log(`      cooldownMs: ${session.minRefreshMs}`);
-  } catch (err) {
-    if (err instanceof TmproxyNoSessionError) {
-      console.warn(`  ⚠ getCurrent() returned code=${err.code} (no active session yet).`);
-      console.warn('    This is the expected cause of the "No proxy available" error.');
-      console.warn('    Proceeding to getNew() to start a session …\n');
-    } else {
-      console.error('  ✗ getCurrent() failed with unexpected error:', (err as Error).message);
-      process.exit(1);
-    }
+  for (const proxyUrl of proxyList) {
+    const masked = proxyUrl.replace(/:([^@:]+)@/, ':***@');
+    process.stdout.write(`  Probing ${masked} … `);
+    const ok = await manager.probe(proxyUrl, 8_000);
+    console.log(ok ? '✓ reachable' : '✗ unreachable');
   }
 
-  // ── Step 2: get-new-proxy ─────────────────────────────────────────────────
-  console.log('\n[2/2] Calling getNew() (get-new-proxy) …');
-  try {
-    const session = await refresher.getNew();
-    console.log('  ✓ getNew() succeeded (new session started):');
-    console.log(`      publicIp  : ${session.publicIp}`);
-    console.log(`      url       : ${session.url.replace(/:([^@]+)@/, ':***@')}`);
-    console.log(`      expiresAt : ${session.expiresAt.toISOString()}`);
-    console.log(`      cooldownMs: ${session.minRefreshMs}`);
-    console.log('\n✓ Proxy key is working. Restart the bot — it will now pick up the active session.');
-  } catch (err) {
-    console.error('  ✗ getNew() failed:', (err as Error).message);
-    console.error('    Possible causes: key balance expired, invalid API key, network error.');
-    process.exit(1);
-  }
+  console.log(`\nPool size: ${manager.size}, failed: ${manager.failedCount}`);
+  console.log(manager.failedCount === 0 ? '\n✅ All proxies reachable!' : '\n⚠ Some proxies unreachable — check PROXY_LIST.');
 }
 
 main().catch(err => { console.error('Unhandled error:', err); process.exit(1); });

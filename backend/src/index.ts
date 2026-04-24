@@ -42,9 +42,6 @@ import journalsRouter from './routes/journals';
 import profitLossRouter from './routes/profit-loss';
 import hkdRouter from './routes/hkd';
 import { registry } from './connectors/ConnectorRegistry';
-import { MisaConnector } from './connectors/MisaConnector';
-import { ViettelConnector } from './connectors/ViettelConnector';
-import { BkavConnector } from './connectors/BkavConnector';
 import { GdtIntermediaryConnector } from './connectors/GdtIntermediaryConnector';
 import { scheduleSyncCron } from './jobs/SyncWorker';
 import { gdtValidateWorker } from './jobs/GdtValidatorWorker';
@@ -166,9 +163,6 @@ app.use(errorHandler);
 
 // ─── Register connector plugins ─────────────────────────────────────────────
 function registerPlugins(): void {
-  registry.register(new MisaConnector());
-  registry.register(new ViettelConnector());
-  registry.register(new BkavConnector());
   registry.register(new GdtIntermediaryConnector());
   console.info('[Connectors] Registered plugins:', registry.getAll().map((p) => p.id));
 }

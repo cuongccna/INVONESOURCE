@@ -70,6 +70,11 @@ export interface RawInvoice {
    * null = chưa xác định
    */
   tax_category:    string | null;
+  /**
+   * Optional stable identity from source payload (e.g. GDT row id).
+   * Used for in-memory dedup when invoice_number/serial/date are not unique enough.
+   */
+  source_row_key?: string | null;
 }
 
 export interface LineItem {

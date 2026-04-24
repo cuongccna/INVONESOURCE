@@ -122,9 +122,7 @@ export class NotificationService {
   }
 
   async onSyncComplete(companyId: string, provider: string, count: number): Promise<void> {
-    const providerName = provider === 'misa' ? 'MISA' :
-      provider === 'viettel' ? 'Viettel' :
-      provider === 'bkav' ? 'BKAV' : provider;
+    const providerName = provider === 'gdt_intermediary' ? 'GDT' : provider;
     await this.createAndPush(
       companyId,
       'SYNC_COMPLETE',
@@ -159,9 +157,7 @@ export class NotificationService {
   }
 
   async onConnectorError(companyId: string, provider: string): Promise<void> {
-    const providerName = provider === 'misa' ? 'MISA' :
-      provider === 'viettel' ? 'Viettel' :
-      provider === 'bkav' ? 'BKAV' : provider;
+    const providerName = provider === 'gdt_intermediary' ? 'GDT' : provider;
     await this.createAndPush(
       companyId,
       'CONNECTOR_ERROR',

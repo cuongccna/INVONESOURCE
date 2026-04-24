@@ -400,6 +400,27 @@ router.post(
         }
       }
 
+      const queuedRunRes = await pool.query<{ id: string; status: string }>(
+        `SELECT id, status
+         FROM gdt_bot_runs
+         WHERE company_id = $1
+           AND finished_at IS NULL
+           AND status IN ('pending', 'delayed')
+         ORDER BY started_at DESC
+         LIMIT 1`,
+        [companyId],
+      );
+      if (queuedRunRes.rowCount !== null && queuedRunRes.rowCount > 0) {
+        res.status(409).json({
+          success: false,
+          error: {
+            code:    'ALREADY_RUNNING',
+            message: 'Bot đã có một phiên đồng bộ đang chờ trong hàng. Vui lòng đợi phiên đó bắt đầu hoặc hủy trước khi tạo phiên mới.',
+          },
+        });
+        return;
+      }
+
       // ── Quick-sync (Đồng bộ hôm nay) uses a separate, shorter cooldown ────────
       // Cooldown riêng 5 phút so với full-sync 6 phút, cho phép người dùng
       // lấy HĐ mới nhất mà không ảnh hưởng đến lịch đồng bộ toàn bộ.
@@ -487,32 +508,55 @@ router.post(
         await _redis.set(USER_SLOT_KEY, String(nextSlotNewMs), 'EX', USER_SLOT_TTL);
       }
 
-      const jobId = `gdt-bot-manual-${companyId}-${Date.now()}`;
+      const runId = uuidv4();
+      const queuedStatus = jobDelayMs > 0 ? 'delayed' : 'pending';
       // BOT-LICENSE-01: resolve user plan for proper rate limiting in the worker
       const userPlan = await licenseService.getPlanId(req.user!.userId);
-      // BOT-ENT-01: Push to dedicated manual queue (high priority, concurrency=10)
-      await getManualBotQueue().add('sync', {
-        companyId,
-        triggeredByUserId: req.user!.userId,  // BUG2 FIX: proxy acquired for triggering user
-        userPlan,
-        ...(from_date ? { fromDate: from_date } : {}),
-        ...(to_date   ? { toDate:   to_date   } : {}),
-        triggeredBy: quick ? 'user_quick_sync' : 'user_manual',
-      }, {
-        jobId,
-        delay:    jobDelayMs,   // 0 = immediate; >0 = human-like stagger
-        priority: 1,            // highest priority in manual queue
-        attempts: 3,
-        backoff:  { type: 'exponential', delay: 30_000 },
-      });
+      await pool.query(
+        `INSERT INTO gdt_bot_runs (id, company_id, started_at, status)
+         VALUES ($1, $2, NOW(), $3)`,
+        [runId, companyId, queuedStatus],
+      );
+
+      try {
+        // BOT-ENT-01: Push to dedicated manual queue (high priority, concurrency=10)
+        await getManualBotQueue().add('sync', {
+          companyId,
+          runId,
+          triggeredByUserId: req.user!.userId,  // BUG2 FIX: proxy acquired for triggering user
+          userPlan,
+          ...(from_date ? { fromDate: from_date } : {}),
+          ...(to_date   ? { toDate:   to_date   } : {}),
+          triggeredBy: quick ? 'user_quick_sync' : 'user_manual',
+        }, {
+          jobId: runId,
+          delay:    jobDelayMs,   // 0 = immediate; >0 = human-like stagger
+          priority: 1,            // highest priority in manual queue
+          attempts: 3,
+          backoff:  { type: 'exponential', delay: 30_000 },
+        });
+      } catch (queueErr) {
+        await pool.query(`DELETE FROM gdt_bot_runs WHERE id = $1`, [runId]).catch(() => undefined);
+        throw queueErr;
+      }
+
+      await pool.query(
+        `UPDATE gdt_bot_configs
+         SET last_run_status = $1,
+             last_error = NULL,
+             updated_at = NOW()
+         WHERE company_id = $2`,
+        [queuedStatus, companyId],
+      ).catch(() => undefined);
 
       // Set cooldown key
       await _redis.set(cooldownKey, '1', 'EX', cooldownTtlSec);
 
       sendSuccess(res, {
         queued:            true,
-        jobId,
+        jobId:             runId,
         quick:             quick ?? false,
+        runStatus:         queuedStatus,
         delayed_sec:       Math.round(jobDelayMs / 1000),
         estimated_start:   estimatedStartAt?.toISOString() ?? null,
       });

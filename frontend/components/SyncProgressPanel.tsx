@@ -179,18 +179,15 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
   }, [allDone, anyFailed, cancelled, onDone]);
 
   const retryCount = (id: string) => retryCountRef.current[id] ?? 0;
-
-  /** Compute ETA string for an active job given current progress % */
-  const etaLabel = (id: string, pct: number): string | null => {
-    if (pct < 5) return null; // not enough data for reliable ETA
-    const startedAt = activeStartRef.current[id];
-    if (!startedAt) return null;
-    const elapsed = (Date.now() - startedAt) / 1000;
-    const totalEstSec = elapsed / (pct / 100);
-    const remainSec = totalEstSec - elapsed;
-    if (remainSec <= 0) return null;
-    return `~${formatSec(remainSec)} còn lại`;
-  };
+  const overallProgress = jobIds.length === 0
+    ? 0
+    : Math.round(jobIds.reduce((sum, id) => {
+      const job = jobs[id];
+      if (stalledJobs.has(id)) return sum + 100;
+      if (!job) return sum;
+      if (job.state === 'completed') return sum + 100;
+      return sum + Math.min(100, Math.max(0, job.progress));
+    }, 0) / jobIds.length);
 
   return (
     <div className="bg-white rounded-2xl shadow-lg border border-gray-100 p-4 space-y-3">
@@ -211,9 +208,16 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
               : 'Đang đồng bộ hóa đơn...'}
           </h4>
         </div>
-        {(allDone || showForceClose) && (
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-700 text-sm">✕</button>
-        )}
+        <div className="flex items-center gap-2">
+          {!allDone && (
+            <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-600">
+              {overallProgress}%
+            </span>
+          )}
+          {(allDone || showForceClose) && (
+            <button onClick={onClose} className="text-gray-400 hover:text-gray-700 text-sm">✕</button>
+          )}
+        </div>
       </div>
 
       {/* Job rows */}
@@ -238,28 +242,26 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
           } else if (j.state === 'delayed') {
             stateLabel = '⏳ Đã lên lịch...';
           } else if (j.state === 'active') {
-            const msgLabel = formatStatusMsg(j.message, pct, j.invoicesFetched, j.currentPage, j.totalPages);
-            const eta = etaLabel(id, pct);
-            stateLabel = eta ? `${msgLabel} · ${eta}` : msgLabel;
+            stateLabel = formatStatusMsg(j.message, pct, j.invoicesFetched, j.currentPage, j.totalPages);
           } else if (j.state === 'completed') {
             stateLabel = `✅ ${j.invoicesFetched} HĐ`;
           } else {
             // Failed — show concise error
             const err = j.error ?? 'Lỗi không xác định';
             const isProxy = /proxy|407|PROXY_DEAD/i.test(err);
-            const isTimeout = /TIMEOUT/i.test(err);
-            stateLabel = isProxy ? '❌ Lỗi proxy — sẽ thử lại'
-              : isTimeout ? '❌ Quá thời gian — sẽ thử lại'
-              : `❌ ${err.slice(0, 60)}`;
+            stateLabel = isProxy ? '🔌 Lỗi proxy / IP' : `❌ ${err}`;
           }
 
           return (
             <div key={id}>
-              <div className="flex items-center justify-between text-xs mb-1">
-                <span className="text-gray-600 font-medium">{label}</span>
-                <span className={`${stalled ? 'text-amber-500' : j?.state === 'failed' ? 'text-red-500' : 'text-gray-500'} text-right max-w-[180px] truncate`}>
-                  {stateLabel}
-                </span>
+              <div className="mb-1 flex items-start justify-between gap-3 text-xs">
+                <span className="font-medium text-gray-600">{label}</span>
+                <div className="text-right">
+                  <p className="font-semibold text-slate-700">{stalled ? 100 : pct}%</p>
+                  <span className={`${stalled ? 'text-amber-500' : j?.state === 'failed' ? 'text-red-500' : 'text-gray-500'} block max-w-[210px] truncate`}>
+                    {stateLabel}
+                  </span>
+                </div>
               </div>
               <div className="w-full bg-gray-100 rounded-full h-2 overflow-hidden">
                 <div
@@ -283,6 +285,12 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
           );
         })}
       </div>
+
+      {!allDone && showForceClose && (
+        <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          Không nhận được cập nhật mới sau {formatSec(STALL_TIMEOUT_MS / 1000)}. Bạn có thể đóng bảng này, BOT sẽ tiếp tục chạy nền nếu worker chưa dừng.
+        </div>
+      )}
 
       {/* Actions */}
       <div className="flex gap-2 pt-1">
@@ -308,7 +316,7 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
             onClick={onClose}
             className="flex-1 text-sm py-2 bg-primary-600 text-white rounded-xl font-medium"
           >
-            Xem hóa đơn vừa đồng bộ
+            Đóng process board
           </button>
         )}
         {allDone && (anyFailed || cancelled) && (

@@ -34,25 +34,10 @@ async function checkBalance(apiKey: string): Promise<number> {
 }
 
 async function getProxyUrl(): Promise<string | undefined> {
-  // 1. Explicit PROXY_URL or PROXY_LIST env (manual override)
-  const explicit = process.env['PROXY_URL']
+  // Use PROXY_URL or first entry from PROXY_LIST (static proxy pool)
+  return process.env['PROXY_URL']
     ?? (process.env['PROXY_LIST'] ?? '').split(',')[0]?.trim()
     ?? undefined;
-  if (explicit) return explicit;
-
-  // 2. TMProxy — same env vars as bot (TMPROXY_API_KEYS or TMPROXY_API_KEY)
-  const keysEnv  = process.env['TMPROXY_API_KEYS'] ?? '';
-  const singleEnv = process.env['TMPROXY_API_KEY']?.trim() ?? '';
-  const key = keysEnv.split(',').map(s => s.trim()).filter(Boolean)[0]
-             ?? (singleEnv || undefined);
-  if (key) {
-    const { TmproxyRefresher } = await import('./tmproxy-refresher');
-    const refresher = new TmproxyRefresher(key);
-    const session   = await refresher.getCurrent();
-    console.log(`  ✓ TMProxy session: ip=${session.publicIp}`);
-    return session.url;
-  }
-  return undefined;
 }
 
 async function fetchGdtCaptchaSvg(proxyUrl?: string): Promise<{ key: string; svgContent: string }> {

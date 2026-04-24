@@ -61,9 +61,6 @@ const STATUS_LABELS: Record<string, { label: string; color: string }> = {
 };
 
 const PROVIDER_LABELS: Record<string, string> = {
-  misa: 'MISA',
-  viettel: 'Viettel',
-  bkav: 'BKAV',
   gdt_intermediary: 'GDT',
   manual: 'Manual',
 };

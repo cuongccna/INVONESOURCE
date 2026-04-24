@@ -1,321 +1,545 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import apiClient from '../../../../lib/apiClient';
 import BackButton from '../../../../components/BackButton';
+import SyncProgressPanel from '../../../../components/SyncProgressPanel';
 import { useToast } from '../../../../components/ToastProvider';
 import { useCompany } from '../../../../contexts/CompanyContext';
+import { useSyncContext } from '../../../../contexts/SyncContext';
 
 interface BotConfig {
-  id:                    string;
-  company_id:            string;
-  tax_code:              string;
-  has_otp:               boolean;
-  otp_method:            string | null;
-  is_active:             boolean;
-  sync_frequency_hours:  number;
-  last_run_at:           string | null;
-  last_run_status:       string | null;
+  id: string;
+  company_id: string;
+  tax_code: string;
+  has_otp: boolean;
+  otp_method: string | null;
+  is_active: boolean;
+  sync_frequency_hours: number;
+  last_run_at: string | null;
+  last_run_status: string | null;
   last_run_output_count: number;
-  last_run_input_count:  number;
-  last_error:            string | null;
-  blocked_until:         string | null;
-}
-
-interface BotStatus {
-  config:               BotConfig | null;
-  lastRuns:             BotRun[];
-  manualCooldownSec:    number;
-  quickSyncCooldownSec: number;
-  quotaInfo:            { quota_used: number; quota_total: number; quota_reset_at: string | null } | null;
-  proxyAssigned:        boolean;
+  last_run_input_count: number;
+  last_error: string | null;
+  blocked_until: string | null;
 }
 
 interface BotRun {
-  id:            string;
-  started_at:    string;
-  finished_at:   string | null;
-  status:        string;
-  output_count:  number;
-  input_count:   number;
-  duration_ms:   number | null;
-  error_detail:  string | null;
+  id: string;
+  started_at: string;
+  finished_at: string | null;
+  status: string;
+  output_count: number;
+  input_count: number;
+  duration_ms: number | null;
+  error_detail: string | null;
 }
 
-const STATUS_DOT: Record<string, string> = {
-  success:      'bg-green-500',
-  error:        'bg-red-500',
-  otp_required: 'bg-amber-500',
-  blocked:      'bg-orange-600',
-  running:      'bg-blue-500 animate-pulse',
+interface BotStatus {
+  config: BotConfig | null;
+  lastRuns: BotRun[];
+  manualCooldownSec: number;
+  quickSyncCooldownSec: number;
+  quotaInfo: { quota_used: number; quota_total: number; quota_reset_at: string | null } | null;
+  proxyAssigned: boolean;
+}
+
+interface PaginationMeta {
+  total: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+}
+
+type NoticeTone = 'info' | 'success' | 'warning' | 'danger';
+
+const HISTORY_PAGE_SIZE = 5;
+const ACTIVE_RUN_STATUSES = new Set(['pending', 'delayed', 'running']);
+
+const STATUS_META: Record<string, { label: string; dot: string; pill: string }> = {
+  idle: {
+    label: 'Chưa chạy',
+    dot: 'bg-slate-400',
+    pill: 'bg-slate-100 text-slate-700',
+  },
+  success: {
+    label: 'Hoạt động ổn định',
+    dot: 'bg-emerald-500',
+    pill: 'bg-emerald-100 text-emerald-700',
+  },
+  error: {
+    label: 'Cần xử lý',
+    dot: 'bg-rose-500',
+    pill: 'bg-rose-100 text-rose-700',
+  },
+  otp_required: {
+    label: 'Chờ OTP',
+    dot: 'bg-amber-500',
+    pill: 'bg-amber-100 text-amber-700',
+  },
+  blocked: {
+    label: 'Tạm khóa',
+    dot: 'bg-orange-500',
+    pill: 'bg-orange-100 text-orange-700',
+  },
+  pending: {
+    label: 'Đang xếp hàng',
+    dot: 'bg-sky-500',
+    pill: 'bg-sky-100 text-sky-700',
+  },
+  delayed: {
+    label: 'Đã lên lịch',
+    dot: 'bg-indigo-500',
+    pill: 'bg-indigo-100 text-indigo-700',
+  },
+  running: {
+    label: 'Đang xử lý',
+    dot: 'bg-blue-500',
+    pill: 'bg-blue-100 text-blue-700',
+  },
+  cancelled: {
+    label: 'Đã hủy',
+    dot: 'bg-slate-500',
+    pill: 'bg-slate-100 text-slate-700',
+  },
+  skipped: {
+    label: 'Đã bỏ qua',
+    dot: 'bg-slate-400',
+    pill: 'bg-slate-100 text-slate-700',
+  },
 };
 
-const STATUS_LABEL: Record<string, string> = {
-  success:      '✅ Đang hoạt động',
-  error:        '❌ Lỗi',
-  otp_required: '🔐 Cần xác thực OTP',
-  blocked:      '🚫 Bị tạm khóa',
-  running:      '⏳ Đang chạy...',
-};
+function toLocalDateStr(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function formatDateTime(value: string | null): string {
+  if (!value) return 'Chưa có';
+  return new Date(value).toLocaleString('vi-VN');
+}
+
+function humanizeBotError(message: string | null): string {
+  if (!message) return 'Không có lỗi hiển thị';
+  const normalized = message.toLowerCase();
+  if (normalized.includes('missing key for job')) {
+    return 'Không đọc được tiến trình từ worker gần nhất. Hãy kiểm tra worker BOT rồi chạy lại.';
+  }
+  if (normalized.includes('already_running') || normalized.includes('already running')) {
+    return 'Một phiên đồng bộ khác đang chạy. Chờ BOT hoàn tất rồi thử lại.';
+  }
+  if (normalized.includes('no_proxy_assigned')) {
+    return 'Tài khoản chưa được gán IP tĩnh nên không thể chạy đồng bộ.';
+  }
+  if (normalized.includes('deadline_exceeded')) {
+    return 'BOT vượt quá thời gian xử lý dự kiến và đã tự dừng để bảo toàn hàng đợi.';
+  }
+  return message;
+}
+
+function getCurrentMonthWindow(): { from: string; to: string; month: string } {
+  const now = new Date();
+  return {
+    from: toLocalDateStr(new Date(now.getFullYear(), now.getMonth(), 1)),
+    to: toLocalDateStr(now),
+    month: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`,
+  };
+}
+
+function getTodayWindow(): { from: string; to: string } {
+  const now = new Date();
+  return {
+    from: toLocalDateStr(new Date(now.getTime() - 24 * 60 * 60 * 1000)),
+    to: toLocalDateStr(now),
+  };
+}
+
+function MetricTile(props: {
+  label: string;
+  value: string;
+  hint: string;
+  tone?: 'neutral' | 'blue' | 'green' | 'amber';
+}) {
+  const toneClass = {
+    neutral: 'border-slate-200 bg-slate-50 text-slate-900',
+    blue: 'border-blue-200 bg-blue-50 text-slate-900',
+    green: 'border-emerald-200 bg-emerald-50 text-slate-900',
+    amber: 'border-amber-200 bg-amber-50 text-slate-900',
+  }[props.tone ?? 'neutral'];
+
+  return (
+    <div className={`rounded-2xl border p-4 ${toneClass}`}>
+      <p className="text-xs font-medium uppercase tracking-[0.12em] text-slate-500">{props.label}</p>
+      <p className="mt-3 text-3xl font-semibold leading-none">{props.value}</p>
+      <p className="mt-2 text-sm text-slate-500">{props.hint}</p>
+    </div>
+  );
+}
+
+function NoticeCard(props: { tone: NoticeTone; title: string; body: string }) {
+  const toneClass = {
+    info: 'border-blue-200 bg-blue-50 text-blue-900',
+    success: 'border-emerald-200 bg-emerald-50 text-emerald-900',
+    warning: 'border-amber-200 bg-amber-50 text-amber-900',
+    danger: 'border-rose-200 bg-rose-50 text-rose-900',
+  }[props.tone];
+
+  return (
+    <div className={`rounded-2xl border p-4 ${toneClass}`}>
+      <p className="text-sm font-semibold">{props.title}</p>
+      <p className="mt-1 text-sm leading-6 opacity-90">{props.body}</p>
+    </div>
+  );
+}
 
 export default function BotSettingsPage() {
   const toast = useToast();
   const router = useRouter();
   const { activeCompany } = useCompany();
+  const { syncJobIds, syncCompanyId, startSync, clearSync } = useSyncContext();
+
   const isAdmin = activeCompany?.role === 'OWNER' || activeCompany?.role === 'ADMIN';
+  const activeCompanyId = activeCompany?.id ?? '';
+
+  const [status, setStatus] = useState<BotStatus | null>(null);
+  const [historyRuns, setHistoryRuns] = useState<BotRun[]>([]);
+  const [historyMeta, setHistoryMeta] = useState<PaginationMeta>({
+    total: 0,
+    page: 1,
+    pageSize: HISTORY_PAGE_SIZE,
+    totalPages: 1,
+  });
   const [importTotal, setImportTotal] = useState<number | null>(null);
-  const [status, setStatus]       = useState<BotStatus | null>(null);
-  const [loading, setLoading]     = useState(true);
+  const [loading, setLoading] = useState(true);
+  const [historyLoading, setHistoryLoading] = useState(true);
   const [showSetup, setShowSetup] = useState(false);
-  const [otp, setOtp]             = useState('');
-  const [showOtp, setShowOtp]     = useState(false);
-  const [running, setRunning]         = useState(false);
+  const [showOtp, setShowOtp] = useState(false);
   const [showDatePicker, setShowDatePicker] = useState(false);
+  const [otp, setOtp] = useState('');
+  const [dateError, setDateError] = useState('');
   const [selectedMonth, setSelectedMonth] = useState('');
-  const [runFrom, setRunFrom]         = useState('');
-  const [runTo, setRunTo]             = useState('');
-  const [dateError, setDateError]     = useState('');
-  const [quickRunning, setQuickRunning]       = useState(false);
-  const [quickCooldownEndsAt, setQuickCooldownEndsAt] = useState<number | null>(null);
-  const [quickCooldownSec, setQuickCooldownSec]       = useState(0);
-  const quickCooldownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const startQuickCooldown = (durationSec: number, endsAtOverride?: number) => {
-    const endsAt = endsAtOverride ?? Date.now() + durationSec * 1000;
-    const lsKey = `bot_qcooldown_ends_${activeCompany?.id ?? 'default'}`;
-    localStorage.setItem(lsKey, String(endsAt));
-    setQuickCooldownEndsAt(endsAt);
-    if (quickCooldownTimerRef.current) clearInterval(quickCooldownTimerRef.current);
-    quickCooldownTimerRef.current = setInterval(() => {
-      const rem = Math.max(0, Math.round((endsAt - Date.now()) / 1000));
-      setQuickCooldownSec(rem);
-      if (rem <= 0) {
-        clearInterval(quickCooldownTimerRef.current!);
-        setQuickCooldownEndsAt(null);
-        localStorage.removeItem(lsKey);
-      }
-    }, 1000);
-    setQuickCooldownSec(Math.max(0, Math.round((endsAt - Date.now()) / 1000)));
-  };
-
-  useEffect(() => () => {
-    if (quickCooldownTimerRef.current) clearInterval(quickCooldownTimerRef.current);
-  }, []);
-
-  // Progressive cooldown: starts at 5 min, doubles each time (cap 60 min)
-  // cooldownEndsAt persisted to localStorage so page refresh preserves the countdown.
-  const [cooldownEndsAt, setCooldownEndsAt] = useState<number | null>(null);
-  const [cooldownSec, setCooldownSec]       = useState(0);
-  const cooldownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const startCooldown = (durationSec: number, endsAtOverride?: number) => {
-    const endsAt = endsAtOverride ?? Date.now() + durationSec * 1000;
-    const lsEndsKey = `bot_cooldown_ends_${activeCompany?.id ?? 'default'}`;
-    localStorage.setItem(lsEndsKey, String(endsAt));
-    setCooldownEndsAt(endsAt);
-    if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
-    cooldownTimerRef.current = setInterval(() => {
-      const rem = Math.max(0, Math.round((endsAt - Date.now()) / 1000));
-      setCooldownSec(rem);
-      if (rem <= 0) {
-        clearInterval(cooldownTimerRef.current!);
-        setCooldownEndsAt(null);
-        localStorage.removeItem(lsEndsKey);
-      }
-    }, 1000);
-    setCooldownSec(Math.max(0, Math.round((endsAt - Date.now()) / 1000)));
-  };
-
-  useEffect(() => () => { if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current); }, []);
-
-  /** Format Date → YYYY-MM-DD dùng giờ địa phương (không bị lệch múi giờ UTC). */
-  const toLocalDateStr = (d: Date): string => {
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, '0');
-    const day = String(d.getDate()).padStart(2, '0');
-    return `${y}-${m}-${day}`;
-  };
-
-  /** Khi người dùng chọn tháng từ month-picker, auto điền từ ngày 1 đến cuối tháng (giới hạn hôm nay). */
-  const handleMonthSelect = (val: string) => {
-    setSelectedMonth(val);
-    setDateError('');
-    if (!val) return;
-    const [y, mo] = val.split('-').map(Number);
-    const first = toLocalDateStr(new Date(y, mo - 1, 1));
-    const last  = toLocalDateStr(new Date(y, mo, 0));          // ngày 0 của tháng kế = cuối tháng
-    const today = toLocalDateStr(new Date());
-    setRunFrom(first);
-    setRunTo(last > today ? today : last);
-  };
-
-  /** Khi người dùng chọn Từ ngày thủ công, tự động điền Đến ngày = cuối tháng đó (giới hạn hôm nay). */
-  const validateAndSetFrom = (val: string) => {
-    setRunFrom(val);
-    setSelectedMonth('');   // clear month picker khi chọn ngày thủ công
-    setDateError('');
-    if (!val) return;
-    const today = toLocalDateStr(new Date());
-    const d = new Date(val + 'T00:00:00');                     // local time
-    const endOfMonth = toLocalDateStr(new Date(d.getFullYear(), d.getMonth() + 1, 0));
-    const autoTo = endOfMonth > today ? today : endOfMonth;
-    setRunTo(autoTo);
-  };
-  const validateAndSetTo = (val: string) => {
-    setRunTo(val);
-    setDateError('');
-    if (!val || !runFrom) return;
-    const diffMs = new Date(val + 'T00:00:00').getTime() - new Date(runFrom + 'T00:00:00').getTime();
-    if (diffMs < 0) { setDateError('Đến ngày phải lớn hơn Từ ngày'); return; }
-    if (diffMs > 31 * 24 * 60 * 60 * 1000) {
-      // Cap fromDate = toDate - 31 days (dùng local time)
-      const capped = new Date(new Date(val + 'T00:00:00').getTime() - 31 * 24 * 60 * 60 * 1000);
-      setRunFrom(toLocalDateStr(capped));
-      setDateError('');
-    }
-  };
-
-  // Setup form
+  const [runFrom, setRunFrom] = useState('');
+  const [runTo, setRunTo] = useState('');
+  const [isSubmittingRun, setIsSubmittingRun] = useState(false);
+  const [isSavingConfig, setIsSavingConfig] = useState(false);
+  const [actionLockUntil, setActionLockUntil] = useState<number | null>(null);
+  const [acceptPasswordStorage, setAcceptPasswordStorage] = useState(false);
   const [form, setForm] = useState({
-    password:            '',
-    has_otp:             false,
-    otp_method:          'sms' as 'sms' | 'email' | 'app',
+    password: '',
+    has_otp: false,
+    otp_method: 'sms' as 'sms' | 'email' | 'app',
     sync_frequency_hours: 6,
   });
+
+  const lockInteractions = useCallback((seconds: number) => {
+    if (seconds <= 0) return;
+    const endsAt = Date.now() + seconds * 1000;
+    setActionLockUntil(prev => (prev && prev > endsAt ? prev : endsAt));
+  }, []);
+
+  useEffect(() => {
+    if (!actionLockUntil) return;
+    const remainingMs = actionLockUntil - Date.now();
+    if (remainingMs <= 0) {
+      setActionLockUntil(null);
+      return;
+    }
+
+    const timer = setTimeout(() => setActionLockUntil(null), remainingMs);
+    return () => clearTimeout(timer);
+  }, [actionLockUntil]);
 
   const load = useCallback(async () => {
     try {
       const [botRes, importRes] = await Promise.all([
         apiClient.get<{ data: BotStatus }>('/bot/status'),
-        apiClient.get<{ meta: { total: number } }>('/invoices', { params: { provider: 'manual', pageSize: 1 } }).catch(() => null),
+        apiClient
+          .get<{ meta: { total: number } }>('/invoices', { params: { provider: 'manual', pageSize: 1 } })
+          .catch(() => null),
       ]);
+
       const botData = botRes.data.data;
       setStatus(botData);
       if (importRes) setImportTotal(importRes.data.meta?.total ?? 0);
-
-      // Sync cooldown state from two sources (highest remaining time wins):
-      // 1. localStorage — persisted from previous click on this browser.
-      // 2. Backend Redis key — authoritative, survives cross-tab / cross-device.
-      const compId = botData?.config?.company_id;
-      if (compId) {
-
-        // Full-sync cooldown
-        const lsEndsKey = `bot_cooldown_ends_${compId}`;
-        const lsEndsAt  = parseInt(localStorage.getItem(lsEndsKey) ?? '0', 10);
-        const backendEndsAt = botData.manualCooldownSec > 0
-          ? Date.now() + botData.manualCooldownSec * 1000
-          : 0;
-        const bestEndsAt = Math.max(lsEndsAt, backendEndsAt);
-        if (bestEndsAt > Date.now() + 2000) startCooldown(0, bestEndsAt);
-
-        // Quick-sync cooldown
-        const lsQKey = `bot_qcooldown_ends_${compId}`;
-        const lsQEndsAt  = parseInt(localStorage.getItem(lsQKey) ?? '0', 10);
-        const backendQEndsAt = (botData.quickSyncCooldownSec ?? 0) > 0
-          ? Date.now() + botData.quickSyncCooldownSec * 1000
-          : 0;
-        const bestQEndsAt = Math.max(lsQEndsAt, backendQEndsAt);
-        if (bestQEndsAt > Date.now() + 2000) startQuickCooldown(0, bestQEndsAt);
-      }
-    } catch { /* silent */ } finally {
+      if (botData.manualCooldownSec > 0) lockInteractions(botData.manualCooldownSec);
+    } catch {
+      // Keep page shell visible even when background status fetch fails.
+    } finally {
       setLoading(false);
     }
-  // activeCompany.id must be a dep so the page reloads when company switches
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeCompany?.id]);
+  }, [lockInteractions]);
 
-  // Reset status when company changes — prevents stale data flash
+  const loadHistory = useCallback(async (page = 1) => {
+    setHistoryLoading(true);
+    try {
+      const res = await apiClient.get<{ data: BotRun[]; meta: PaginationMeta }>('/bot/runs', {
+        params: { page, pageSize: HISTORY_PAGE_SIZE },
+      });
+      setHistoryRuns(res.data.data ?? []);
+      setHistoryMeta(res.data.meta ?? { total: 0, page, pageSize: HISTORY_PAGE_SIZE, totalPages: 1 });
+    } catch {
+      setHistoryRuns([]);
+      setHistoryMeta({ total: 0, page, pageSize: HISTORY_PAGE_SIZE, totalPages: 1 });
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     setStatus(null);
+    setHistoryRuns([]);
+    setHistoryMeta({ total: 0, page: 1, pageSize: HISTORY_PAGE_SIZE, totalPages: 1 });
+    setImportTotal(null);
     setLoading(true);
-    if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
-    setCooldownEndsAt(null);
-    if (quickCooldownTimerRef.current) clearInterval(quickCooldownTimerRef.current);
-    setQuickCooldownEndsAt(null);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeCompany?.id]);
+    setHistoryLoading(true);
+    setActionLockUntil(null);
+    setShowSetup(false);
+    setShowOtp(false);
+    setShowDatePicker(false);
+  }, [activeCompanyId]);
 
-  useEffect(() => { void load(); }, [load]);
-
-  // Auto-poll every 5 s while the bot is running OR queued (pending)
-  const isActivelySyncing = status?.config?.last_run_status === 'running'
-                         || status?.config?.last_run_status === 'pending';
   useEffect(() => {
-    if (!isActivelySyncing) return;
-    const interval = setInterval(() => void load(), 5000);
-    return () => clearInterval(interval);
-  }, [isActivelySyncing, load]);
+    void load();
+    void loadHistory(1);
+  }, [load, loadHistory, activeCompanyId]);
+
+  const cfg = status?.config ?? null;
+  const latestRun = status?.lastRuns?.[0] ?? null;
+  const lastStatus = latestRun?.status ?? cfg?.last_run_status ?? 'idle';
+  const statusMeta = STATUS_META[lastStatus] ?? STATUS_META.idle;
+  const actionLockActive = actionLockUntil != null && actionLockUntil > Date.now();
+  const pageSyncActive = syncJobIds.length > 0 && syncCompanyId === activeCompanyId;
+  const isBotBusy = pageSyncActive || ACTIVE_RUN_STATUSES.has(lastStatus) || isSubmittingRun;
+  const proxyReady = status?.proxyAssigned ?? true;
+  const controlsDisabled = isBotBusy || actionLockActive || !proxyReady || isSavingConfig;
+
+  useEffect(() => {
+    if (!activeCompanyId) return;
+    if (syncJobIds.length > 0) return;
+    if (!latestRun || !ACTIVE_RUN_STATUSES.has(latestRun.status)) return;
+    startSync([latestRun.id], activeCompanyId);
+  }, [activeCompanyId, latestRun, startSync, syncJobIds.length]);
+
+  useEffect(() => {
+    if (!cfg && !pageSyncActive) return;
+    if (ACTIVE_RUN_STATUSES.has(lastStatus) || pageSyncActive) {
+      const interval = setInterval(() => {
+        void load();
+        if (historyMeta.page === 1) {
+          void loadHistory(1);
+        }
+      }, 5000);
+      return () => clearInterval(interval);
+    }
+  }, [cfg, historyMeta.page, lastStatus, load, loadHistory, pageSyncActive]);
+
+  const notices = useMemo(() => {
+    const items: Array<{ tone: NoticeTone; title: string; body: string }> = [];
+    if (!proxyReady) {
+      items.push({
+        tone: 'danger',
+        title: 'Chưa được cấp IP tĩnh',
+        body: 'Tài khoản này chưa được Admin gán static proxy nên toàn bộ thao tác đồng bộ GDT sẽ bị khóa.',
+      });
+    }
+
+    if (cfg?.blocked_until && new Date(cfg.blocked_until) > new Date()) {
+      items.push({
+        tone: 'warning',
+        title: 'BOT đang bị tạm khóa',
+        body: `Hệ thống sẽ mở lại sau ${formatDateTime(cfg.blocked_until)}. Trong lúc này chỉ nên kiểm tra log và tránh gửi thêm yêu cầu.`,
+      });
+    }
+
+    const quota = status?.quotaInfo;
+    if (quota && quota.quota_total > 0) {
+      const ratio = quota.quota_used / quota.quota_total;
+      if (ratio >= 0.8) {
+        items.push({
+          tone: ratio >= 0.95 ? 'danger' : 'warning',
+          title: ratio >= 0.95 ? 'Hạn mức gần cạn' : 'Hạn mức sắp hết',
+          body: `Đã dùng ${quota.quota_used.toLocaleString('vi-VN')}/${quota.quota_total.toLocaleString('vi-VN')} hóa đơn.${quota.quota_reset_at ? ` Reset vào ${new Date(quota.quota_reset_at).toLocaleDateString('vi-VN')}.` : ''}`,
+        });
+      }
+    }
+
+    if (cfg?.last_error && lastStatus !== 'running') {
+      items.push({
+        tone: 'danger',
+        title: 'Lỗi gần nhất',
+        body: humanizeBotError(cfg.last_error),
+      });
+    }
+
+    if (pageSyncActive) {
+      items.push({
+        tone: 'info',
+        title: 'BOT đang xử lý',
+        body: 'Process board đang theo dõi tiến độ theo thời gian thực. Trong lúc này toàn bộ nút thao tác sẽ bị khóa để tránh chồng job.',
+      });
+    } else if (actionLockActive) {
+      items.push({
+        tone: 'info',
+        title: 'Vừa gửi yêu cầu đồng bộ',
+        body: 'Nút thao tác đang được khóa tạm thời. Sau tối đa 3 phút bạn có thể gửi một yêu cầu mới nếu BOT chưa tự cập nhật trạng thái.',
+      });
+    }
+
+    return items;
+  }, [actionLockActive, cfg, lastStatus, pageSyncActive, proxyReady, status?.quotaInfo]);
+
+  const openSetupModal = () => {
+    setAcceptPasswordStorage(false);
+    setShowSetup(true);
+  };
 
   const saveConfig = async () => {
+    if (!acceptPasswordStorage || !form.password || isBotBusy) return;
+    setIsSavingConfig(true);
     try {
       await apiClient.post('/bot/setup', form);
-      toast.success('✅ Đã lưu cấu hình GDT Bot. Nhấn "Lấy từ GDT" để bắt đầu đồng bộ.');
+      toast.success('Đã lưu cấu hình GDT. BOT sẵn sàng đồng bộ.');
       setShowSetup(false);
-      setForm(p => ({ ...p, password: '' }));
+      setAcceptPasswordStorage(false);
+      setForm(prev => ({ ...prev, password: '' }));
       await load();
     } catch (err: unknown) {
-      const e = err as { response?: { data?: { error?: { message?: string } } } };
-      toast.error(e?.response?.data?.error?.message ?? 'Lỗi lưu cấu hình');
+      const apiErr = (err as { response?: { data?: { error?: { message?: string } } } }).response?.data?.error;
+      toast.error(apiErr?.message ?? 'Không thể lưu cấu hình GDT');
+    } finally {
+      setIsSavingConfig(false);
     }
   };
 
-  const runNow = async (fromDate?: string, toDate?: string) => {
-    if (running || cooldownEndsAt) return;
+  const queueSync = async (params: {
+    fromDate?: string;
+    toDate?: string;
+    successMessage: string;
+  }) => {
+    if (!cfg || !isAdmin || controlsDisabled) return;
 
-    // ── Quota warning: warn if >= 80% used ───────────────────────────────────
-    const qi = status?.quotaInfo;
-    if (qi && qi.quota_total > 0) {
-      const pct = qi.quota_used / qi.quota_total;
-      if (pct >= 0.8) {
-        const remaining = qi.quota_total - qi.quota_used;
-        const ok = confirm(
-          `⚠️ Hạn mức gần hết!\n\nBạn đã dùng ${qi.quota_used.toLocaleString('vi-VN')}/${qi.quota_total.toLocaleString('vi-VN')} hóa đơn (${Math.round(pct * 100)}%).\n` +
-          `Còn lại: ${remaining.toLocaleString('vi-VN')} hóa đơn.\n\nTiếp tục đồng bộ?`
+    const quota = status?.quotaInfo;
+    if (quota && quota.quota_total > 0) {
+      const ratio = quota.quota_used / quota.quota_total;
+      if (ratio >= 0.8) {
+        const remaining = quota.quota_total - quota.quota_used;
+        const confirmed = confirm(
+          `Bạn đã dùng ${quota.quota_used.toLocaleString('vi-VN')}/${quota.quota_total.toLocaleString('vi-VN')} hóa đơn.\nCòn lại ${remaining.toLocaleString('vi-VN')} hóa đơn.\n\nTiếp tục đồng bộ?`,
         );
-        if (!ok) return;
+        if (!confirmed) return;
       }
     }
 
-    setRunning(true);
+    setIsSubmittingRun(true);
     try {
       const body: Record<string, string> = {};
-      if (fromDate) body['from_date'] = fromDate;
-      if (toDate)   body['to_date']   = toDate;
-      const res = await apiClient.post<{ data: { queued: boolean; delayed_sec?: number; estimated_start?: string } }>('/bot/run-now', body);
-      const delaySec = res.data.data?.delayed_sec ?? 0;
-      if (delaySec > 30) {
-        const delayMin = Math.round(delaySec / 60);
-        toast.success(
-          fromDate
-            ? `⏱ Xếp hàng lấy dữ liệu từ ${fromDate} — sẽ bắt đầu sau ~${delayMin} phút (xếp lịch tránh đăng nhập đồng thời)`
-            : `⏱ Đã xếp hàng — sẽ bắt đầu sau ~${delayMin} phút (xếp lịch tránh đăng nhập đồng thời)`
-        );
+      if (params.fromDate) body['from_date'] = params.fromDate;
+      if (params.toDate) body['to_date'] = params.toDate;
+
+      const res = await apiClient.post<{
+        data: { jobId?: string; delayed_sec?: number; estimated_start?: string | null };
+      }>('/bot/run-now', body);
+
+      const jobId = res.data.data.jobId;
+      if (jobId && activeCompanyId) startSync([jobId], activeCompanyId);
+      lockInteractions(3 * 60);
+      setShowDatePicker(false);
+      setHistoryMeta(prev => ({ ...prev, page: 1 }));
+
+      const delayedSec = res.data.data.delayed_sec ?? 0;
+      if (delayedSec > 30) {
+        toast.success(`${params.successMessage} Phiên chạy đã được đưa vào hàng chờ ưu tiên.`);
       } else {
-        toast.success(fromDate ? `Đã xếp hàng lấy dữ liệu từ ${fromDate}` : 'Đã thêm vào hàng đợi đồng bộ');
+        toast.success(params.successMessage);
       }
-      // Random cooldown 1–3 phút sau mỗi lần click (không tăng lũy tiến).
-      const cooldownSec = Math.floor(Math.random() * 120) + 60; // 60–180 giây
-      const endsAt = Date.now() + cooldownSec * 1000;
-      startCooldown(cooldownSec, endsAt);
-      setTimeout(() => void load(), 2000);
+
+      setTimeout(() => {
+        void load();
+        void loadHistory(1);
+      }, 1500);
     } catch (err: unknown) {
-      const e = err as { response?: { data?: { error?: { code?: string; waitMinutes?: number; message?: string } } } };
-      const apiErr = e?.response?.data?.error;
+      const apiErr = (err as { response?: { data?: { error?: { code?: string; message?: string; waitMinutes?: number } } } }).response?.data?.error;
       if (apiErr?.code === 'COOLDOWN') {
-        const waitSec = (apiErr.waitMinutes ?? 5) * 60;
-        startCooldown(waitSec);
-        toast.error(`⏳ Bot đang trong thời gian nghỉ. Vui lòng chờ thêm ${apiErr.waitMinutes} phút.`);
+        lockInteractions((apiErr.waitMinutes ?? 3) * 60);
+        toast.error(`Yêu cầu mới sẽ được mở lại sau tối đa ${apiErr.waitMinutes ?? 3} phút.`);
       } else if (apiErr?.code === 'ALREADY_RUNNING') {
-        toast.error('⏳ Bot đang chạy job đồng bộ. Chờ hoàn tất rồi thử lại.');
-        void load(); // refresh status display
+        toast.error('BOT đang chạy một phiên đồng bộ khác.');
+        void load();
       } else if (apiErr?.code === 'NO_PROXY_ASSIGNED') {
-        toast.error('⛔ ' + (apiErr.message ?? 'Tài khoản chưa được cấp IP tĩnh. Vui lòng liên hệ Admin.'));
+        toast.error(apiErr.message ?? 'Tài khoản chưa được cấp IP tĩnh.');
       } else {
-        toast.error(apiErr?.message ?? 'Lỗi kích hoạt đồng bộ');
+        toast.error(apiErr?.message ?? 'Không thể khởi chạy đồng bộ GDT');
       }
     } finally {
-      setRunning(false);
+      setIsSubmittingRun(false);
+    }
+  };
+
+  const runCurrentMonthSync = () => {
+    const currentMonth = getCurrentMonthWindow();
+    void queueSync({
+      fromDate: currentMonth.from,
+      toDate: currentMonth.to,
+      successMessage: 'Đã xếp hàng đồng bộ tháng hiện tại.',
+    });
+  };
+
+  const runTodaySync = () => {
+    const today = getTodayWindow();
+    void queueSync({
+      fromDate: today.from,
+      toDate: today.to,
+      successMessage: 'Đã xếp hàng đồng bộ dữ liệu mới nhất.',
+    });
+  };
+
+  const openDateRangePicker = () => {
+    const currentMonth = getCurrentMonthWindow();
+    setSelectedMonth(currentMonth.month);
+    setRunFrom(currentMonth.from);
+    setRunTo(currentMonth.to);
+    setDateError('');
+    setShowDatePicker(true);
+  };
+
+  const handleMonthSelect = (value: string) => {
+    setSelectedMonth(value);
+    setDateError('');
+    if (!value) return;
+    const [year, month] = value.split('-').map(Number);
+    const firstDay = toLocalDateStr(new Date(year, month - 1, 1));
+    const lastDay = toLocalDateStr(new Date(year, month, 0));
+    const today = toLocalDateStr(new Date());
+    setRunFrom(firstDay);
+    setRunTo(lastDay > today ? today : lastDay);
+  };
+
+  const validateAndSetFrom = (value: string) => {
+    setRunFrom(value);
+    setSelectedMonth('');
+    setDateError('');
+    if (!value) return;
+    const date = new Date(`${value}T00:00:00`);
+    const endOfMonth = toLocalDateStr(new Date(date.getFullYear(), date.getMonth() + 1, 0));
+    const today = toLocalDateStr(new Date());
+    setRunTo(endOfMonth > today ? today : endOfMonth);
+  };
+
+  const validateAndSetTo = (value: string) => {
+    setRunTo(value);
+    setDateError('');
+    if (!value || !runFrom) return;
+    const diffMs = new Date(`${value}T00:00:00`).getTime() - new Date(`${runFrom}T00:00:00`).getTime();
+    if (diffMs < 0) {
+      setDateError('Đến ngày phải lớn hơn hoặc bằng Từ ngày.');
+      return;
+    }
+    if (diffMs > 31 * 24 * 60 * 60 * 1000) {
+      const capped = new Date(new Date(`${value}T00:00:00`).getTime() - 31 * 24 * 60 * 60 * 1000);
+      setRunFrom(toLocalDateStr(capped));
     }
   };
 
@@ -323,414 +547,463 @@ export default function BotSettingsPage() {
     if (otp.length < 6) return;
     try {
       await apiClient.post('/bot/submit-otp', { otp });
-      toast.success('Đã gửi OTP — tiếp tục đồng bộ');
+      toast.success('Đã gửi OTP. BOT sẽ tiếp tục phiên đang chờ.');
       setShowOtp(false);
       setOtp('');
       await load();
     } catch {
-      toast.error('OTP không hợp lệ hoặc đã hết hạn');
-    }
-  };
-
-  /**
-   * Quick-sync: chỉ lấy HĐ trong ngày hôm nay (và hôm qua để dự phòng).
-   * Cooldown riêng 5 phút — độc lập với cooldown full-sync.
-   * Dùng khi người dùng muốn kiểm tra HĐ mới nhất ngay mà không cần đợi lịch định kỳ.
-   */
-  const runQuickSync = async () => {
-    if (quickRunning || quickCooldownEndsAt || isJobRunning) return;
-    setQuickRunning(true);
-    try {
-      const today     = toLocalDateStr(new Date());
-      const yesterday = toLocalDateStr(new Date(Date.now() - 24 * 60 * 60 * 1000));
-      await apiClient.post('/bot/run-now', {
-        from_date: yesterday,
-        to_date:   today,
-        quick:     true,
-      });
-      toast.success('⚡ Đã xếp hàng đồng bộ hôm nay — HĐ mới nhất sẽ cập nhật sau vài phút');
-      const endsAt = Date.now() + 5 * 60 * 1000;
-      startQuickCooldown(5 * 60, endsAt);
-      setTimeout(() => void load(), 2000);
-    } catch (err: unknown) {
-      const e = err as { response?: { data?: { error?: { code?: string; waitMinutes?: number; message?: string } } } };
-      const apiErr = e?.response?.data?.error;
-      if (apiErr?.code === 'COOLDOWN') {
-        const waitSec = (apiErr.waitMinutes ?? 5) * 60;
-        startQuickCooldown(waitSec);
-        toast.error(`⏳ Vui lòng chờ thêm ${apiErr.waitMinutes} phút.`);
-      } else if (apiErr?.code === 'ALREADY_RUNNING') {
-        toast.error('⏳ Bot đang chạy. Chờ hoàn tất rồi thử lại.');
-        void load();
-      } else if (apiErr?.code === 'NO_PROXY_ASSIGNED') {
-        toast.error('⛔ ' + (apiErr.message ?? 'Tài khoản chưa được cấp IP tĩnh. Vui lòng liên hệ Admin.'));
-      } else {
-        toast.error(apiErr?.message ?? 'Lỗi kích hoạt đồng bộ nhanh');
-      }
-    } finally {
-      setQuickRunning(false);
+      toast.error('OTP không hợp lệ hoặc đã hết hạn.');
     }
   };
 
   const deleteConfig = async () => {
-    if (!confirm('Xóa cấu hình GDT Bot? Dữ liệu hóa đơn đã nhập sẽ không bị xóa.')) return;
+    if (!cfg || isBotBusy) return;
+    const confirmed = confirm('Xóa cấu hình GDT BOT? Dữ liệu hóa đơn đã đồng bộ sẽ không bị xóa.');
+    if (!confirmed) return;
+
     try {
       await apiClient.delete('/bot/config');
-      toast.success('Đã xóa cấu hình');
+      clearSync();
+      toast.success('Đã xóa cấu hình GDT.');
       await load();
     } catch {
-      toast.error('Lỗi xóa cấu hình');
+      toast.error('Không thể xóa cấu hình GDT.');
     }
   };
 
-  const cfg = status?.config;
-  // Prefer the live status from gdt_bot_runs (lastRuns[0]) over gdt_bot_configs.last_run_status.
-  // gdt_bot_configs.last_run_status is only updated at run completion, so a job that is currently
-  // running would still show the previous run's status (e.g. 'error') from cfg alone.
-  const lastStatus = status?.lastRuns?.[0]?.status ?? cfg?.last_run_status ?? null;
-  // Block all interactions when bot job is actively running
-  const isJobRunning = lastStatus === 'running' || running;
+  const configSummary = useMemo(() => {
+    if (!cfg) return [];
+    return [
+      { label: 'MST', value: cfg.tax_code },
+      { label: 'Tần suất', value: cfg.sync_frequency_hours > 0 ? `${cfg.sync_frequency_hours} giờ/lần` : 'Thủ công' },
+      { label: 'OTP', value: cfg.has_otp ? `Có (${cfg.otp_method ?? 'OTP'})` : 'Không' },
+      { label: 'Proxy', value: proxyReady ? 'Sẵn sàng' : 'Chưa có' },
+    ];
+  }, [cfg, proxyReady]);
 
-  if (loading) return (
-    <div className="flex justify-center py-24">
-      <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600" />
-    </div>
-  );
+  if (loading) {
+    return (
+      <div className="flex justify-center py-24">
+        <div className="h-8 w-8 animate-spin rounded-full border-b-2 border-primary-600" />
+      </div>
+    );
+  }
 
   return (
-    <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto pb-24 space-y-5">
-      {/* ── Running progress indicator ── */}
-      {lastStatus === 'running' && (
-        <div className="sticky top-14 -mx-4 px-4 py-2.5 bg-blue-600 text-white z-30 flex items-center gap-3 shadow-sm">
-          <div className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent flex-shrink-0" />
-          <div className="flex-1 min-w-0">
-            <span className="text-sm font-semibold">⚙️ Bot đang đồng bộ hóa đơn</span>
-            <span className="text-xs text-blue-100 ml-2 hidden sm:inline">· tự động cập nhật sau 5 giây</span>
-          </div>
-        </div>
-      )}
+    <div className="mx-auto max-w-6xl space-y-6 p-4 pb-24">
       <BackButton fallbackHref="/settings/connectors" />
-      <div>
-        <h1 className="text-2xl font-bold text-gray-900">GDT Crawler Bot</h1>
-        <p className="text-sm text-gray-500">Tự động thu thập HĐ đầu vào &amp; đầu ra từ hoadondientu.gdt.gov.vn</p>
-      </div>
 
-      {/* ── Explain banner ── */}
-      <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 text-xs text-blue-800 space-y-1.5">
-        <p className="font-semibold">🏦 Tại sao cần GDT Bot?</p>
-        <p>GDT là nơi DUY NHẤT nhận toàn bộ HĐ từ mọi nhà mạng — cả hai chiều.
-        Bot tự đăng nhập cổng thuế, tải file XML theo lịch và cập nhật vào hệ thống.</p>
-        <p className="text-blue-700">🔒 Thông tin đăng nhập được mã hóa AES-256-GCM và chỉ dùng để kết nối cổng thuế.</p>
-      </div>
-
-      {/* ── No proxy warning banner ── */}
-      {status && !status.proxyAssigned && (
-        <div className="bg-red-50 border border-red-300 rounded-xl p-4 flex items-start gap-3">
-          <span className="text-red-500 text-xl flex-shrink-0">⛔</span>
-          <div className="text-sm">
-            <p className="font-semibold text-red-800">Chưa được cấp IP tĩnh</p>
-            <p className="text-red-700 mt-0.5">
-              Tài khoản của bạn chưa được Admin gán IP tĩnh (Static Proxy).
-              Chức năng đồng bộ thủ công sẽ bị chặn cho đến khi được cấp.
-            </p>
-            <p className="text-red-600 mt-1 font-medium">
-              📞 Vui lòng liên hệ Admin để được gán quyền đồng bộ.
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* ── Quota warning banner ── */}
-      {(() => {
-        const qi = status?.quotaInfo;
-        if (!qi || qi.quota_total === 0) return null;
-        const pct = qi.quota_used / qi.quota_total;
-        if (pct < 0.8) return null;
-        const remaining = qi.quota_total - qi.quota_used;
-        const isNearEmpty = pct >= 0.95;
-        return (
-          <div className={`border rounded-xl p-4 flex items-start gap-3 ${isNearEmpty ? 'bg-red-50 border-red-300' : 'bg-amber-50 border-amber-300'}`}>
-            <span className={`text-xl flex-shrink-0 ${isNearEmpty ? 'text-red-500' : 'text-amber-500'}`}>
-              {isNearEmpty ? '🔴' : '⚠️'}
-            </span>
-            <div className="text-sm">
-              <p className={`font-semibold ${isNearEmpty ? 'text-red-800' : 'text-amber-800'}`}>
-                {isNearEmpty ? 'Hạn mức gần cạn!' : 'Hạn mức sắp hết'}
-              </p>
-              <p className={`mt-0.5 ${isNearEmpty ? 'text-red-700' : 'text-amber-700'}`}>
-                Đã dùng <strong>{qi.quota_used.toLocaleString('vi-VN')}</strong>/{qi.quota_total.toLocaleString('vi-VN')} hóa đơn
-                ({Math.round(pct * 100)}%) — còn lại <strong>{remaining.toLocaleString('vi-VN')}</strong> hóa đơn
-                {qi.quota_reset_at && (
-                  <span className="ml-1">
-                    (reset {new Date(qi.quota_reset_at).toLocaleDateString('vi-VN')})
-                  </span>
-                )}.
-              </p>
-            </div>
-          </div>
-        );
-      })()}
-
-      {/* ── Status card — Not configured ── */}
-      {!cfg && (
-        <div className="bg-white rounded-xl border border-gray-100 p-6 text-center space-y-3">
-          <p className="text-4xl">🤖</p>
-          <p className="font-semibold text-gray-900">Chưa thiết lập GDT Bot</p>
-          <p className="text-sm text-gray-500">Cần thông tin đăng nhập hoadondientu.gdt.gov.vn</p>
-          {isAdmin ? (
-            <button onClick={() => setShowSetup(true)}
-              className="bg-blue-600 text-white text-sm px-6 py-2.5 rounded-xl font-medium hover:bg-blue-700">
-              🔧 Thiết lập ngay
-            </button>
-          ) : (
-            <p className="text-xs text-gray-400 italic">Liên hệ OWNER/ADMIN để thiết lập bot.</p>
-          )}
-        </div>
-      )}
-
-      {/* ── Status card — Configured ── */}
-      {cfg && (
-        <div className="bg-white rounded-xl border border-gray-100 p-4 space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <span className={`w-2.5 h-2.5 rounded-full ${STATUS_DOT[lastStatus ?? 'success'] ?? 'bg-gray-400'}`} />
-              <span className="font-medium text-gray-900">
-                {STATUS_LABEL[lastStatus ?? 'success'] ?? 'Chưa chạy'}
+      <section className="overflow-hidden rounded-[28px] border border-gray-200 bg-white shadow-sm">
+        <div className="bg-gradient-to-r from-slate-950 via-slate-900 to-blue-950 px-6 py-6 text-white">
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+            <div className="space-y-2">
+              <span className="inline-flex w-fit rounded-full border border-white/15 bg-white/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-white/80">
+                Settings / GDT Crawl
               </span>
-            </div>
-            <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${cfg.is_active ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500'}`}>
-              {cfg.is_active ? 'Hoạt động' : 'Tắt'}
-            </span>
-          </div>
-
-          <div className="text-xs text-gray-500 space-y-1">
-            <p>MST: <strong className="text-gray-700 font-mono">{cfg.tax_code}</strong></p>
-            <p>Tần suất: mỗi <strong className="text-gray-700">{cfg.sync_frequency_hours} giờ</strong></p>
-            {cfg.last_run_at && (
-              <p>Lần cuối: <strong className="text-gray-700">{new Date(cfg.last_run_at).toLocaleString('vi-VN')}</strong>
-                {' '}· HĐ ra: {cfg.last_run_output_count} · vào: {cfg.last_run_input_count}
-              </p>
-            )}
-            {cfg.blocked_until && new Date(cfg.blocked_until) > new Date() && (
-              <p className="text-orange-600">⏳ Tạm khóa đến: {new Date(cfg.blocked_until).toLocaleString('vi-VN')}</p>
-            )}
-          </div>
-
-          {cfg.last_error && !isJobRunning && (
-            <div className="bg-red-50 rounded-lg px-3 py-2 text-xs text-red-700 break-all">
-              ⚠️ {cfg.last_error}
-            </div>
-          )}
-
-          {lastStatus === 'otp_required' && (
-            <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-2">
-              <p className="text-sm font-medium text-amber-800">🔐 Bot cần mã OTP để tiếp tục</p>
-              <button onClick={() => setShowOtp(true)}
-                className="w-full bg-amber-600 text-white text-sm py-2 rounded-lg font-medium">
-                Nhập OTP ngay
-              </button>
-            </div>
-          )}
-
-          <div className="flex gap-2">
-            {isAdmin ? (
-              <>
-                {/* "Lấy từ GDT" — disabled while job running OR cooldown active */}
-                <button
-                  onClick={() => {
-                    if (isJobRunning || cooldownEndsAt) return;
-                    const today = new Date();
-                    const todayStr = toLocalDateStr(today);
-                    const firstOfMonth = toLocalDateStr(new Date(today.getFullYear(), today.getMonth(), 1));
-                    const ym = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}`;
-                    setSelectedMonth(ym);
-                    setRunFrom(firstOfMonth);
-                    setRunTo(todayStr);
-                    setDateError('');
-                    setShowDatePicker(true);
-                  }}
-                  disabled={isJobRunning || !!cooldownEndsAt}
-                  title={
-                    isJobRunning ? 'Đang có job đang chạy — chờ hoàn tất'
-                    : cooldownEndsAt ? `Chờ thêm ${Math.ceil(cooldownSec / 60)} phút nữa`
-                    : 'Lấy hóa đơn từ GDT'
-                  }
-                  className="flex-1 bg-blue-600 text-white rounded-xl py-2.5 text-sm font-medium disabled:opacity-50 hover:bg-blue-700 transition-colors flex items-center justify-center gap-2"
-                >
-                  {isJobRunning ? (
-                    <>
-                      <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                      </svg>
-                      Đang chạy...
-                    </>
-                  ) : cooldownEndsAt ? (
-                    <>
-                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-                      </svg>
-                      Chờ {cooldownSec >= 60
-                        ? `${Math.floor(cooldownSec / 60)}p${cooldownSec % 60 > 0 ? String(cooldownSec % 60).padStart(2, '0') + 's' : ''}`
-                        : `${cooldownSec}s`}
-                    </>
-                  ) : (
-                    <>▶ Lấy từ GDT</>
-                  )}
-                </button>
-
-                {/* ⚡ Đồng bộ hôm nay — quick sync: lấy HĐ 48h gần nhất, cooldown riêng 5 phút */}
-                <button
-                  onClick={() => void runQuickSync()}
-                  disabled={isJobRunning || !!quickCooldownEndsAt}
-                  title={
-                    isJobRunning ? 'Đang có job đang chạy — chờ hoàn tất'
-                    : quickCooldownEndsAt ? `Vừa đồng bộ nhanh — chờ ${Math.ceil(quickCooldownSec / 60)} phút`
-                    : 'Đồng bộ nhanh: lấy HĐ hôm nay và hôm qua ngay lập tức'
-                  }
-                  className="border border-amber-300 text-amber-700 rounded-xl px-3 py-2.5 text-sm hover:bg-amber-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-1 whitespace-nowrap"
-                >
-                  {quickRunning ? (
-                    <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                    </svg>
-                  ) : quickCooldownEndsAt ? (
-                    <span className="text-xs">{quickCooldownSec >= 60
-                      ? `${Math.floor(quickCooldownSec / 60)}p`
-                      : `${quickCooldownSec}s`}</span>
-                  ) : (
-                    <span>⚡</span>
-                  )}
-                  <span className="hidden sm:inline">Hôm nay</span>
-                </button>
-
-                {/* Sửa — disabled while job running */}
-                <button onClick={() => setShowSetup(true)} disabled={isJobRunning}
-                  title={isJobRunning ? 'Không thể sửa khi bot đang chạy' : 'Sửa cấu hình'}
-                  className="border border-gray-300 text-gray-700 rounded-xl px-4 py-2.5 text-sm hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
-                  ✏️ Sửa
-                </button>
-                <button onClick={deleteConfig} disabled={isJobRunning}
-                  title={isJobRunning ? 'Không thể xóa khi bot đang chạy' : 'Xóa cấu hình'}
-                  className="border border-red-200 text-red-600 rounded-xl px-4 py-2.5 text-sm hover:bg-red-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
-                  🗑
-                </button>
-              </>
-            ) : (
-              <p className="text-xs text-gray-400 italic">Chỉ OWNER/ADMIN mới có thể thao tác bot.</p>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* ── Last runs log ── */}
-      {status?.lastRuns && status.lastRuns.length > 0 && (
-        <div className="bg-white rounded-xl border border-gray-100 p-4">
-          <p className="text-sm font-semibold text-gray-700 mb-3">Lịch sử chạy gần đây</p>
-          <div className="space-y-2">
-            {status.lastRuns.map(run => (
-              <div key={run.id} className="flex items-center justify-between text-xs py-1 border-b border-gray-50 last:border-0">
-                <div>
-                  <span className={`inline-block w-2 h-2 rounded-full mr-1.5 ${run.status === 'success' ? 'bg-green-400' : run.status === 'error' ? 'bg-red-400' : 'bg-amber-400'}`} />
-                  {new Date(run.started_at).toLocaleString('vi-VN')}
-                  {run.error_detail && <span className="block text-red-500 mt-0.5 truncate max-w-[200px]">{run.error_detail}</span>}
-                </div>
-                <div className="text-right text-gray-500">
-                  <p>Ra: {run.output_count} · Vào: {run.input_count}</p>
-                  {run.duration_ms && <p>{(run.duration_ms / 1000).toFixed(0)}s</p>}
-                </div>
+              <div>
+                <h1 className="text-2xl font-semibold tracking-tight">Điều khiển GDT Crawl</h1>
               </div>
-            ))}
-          </div>
-        </div>
-      )}
+            </div>
 
-      {/* ── Setup modal ── */}
-      {showSetup && (
-        <div className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-4">
-          <div className="bg-white rounded-2xl w-full max-w-md shadow-xl">
-            <div className="p-5 space-y-4">
-              <div className="flex items-center justify-between">
-                <h2 className="font-bold text-gray-900">Cấu hình GDT Bot</h2>
-                <button onClick={() => setShowSetup(false)} className="text-gray-400 hover:text-gray-700 text-xl">✕</button>
-              </div>
-
-              {/* Warning if job running */}
-              {isJobRunning && (
-                <div className="bg-amber-50 border border-amber-300 rounded-lg px-3 py-2 text-xs text-amber-800 flex items-center gap-2">
-                  <svg className="w-4 h-4 animate-pulse flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                  </svg>
-                  Bot đang chạy job — không thể lưu cấu hình lúc này. Chờ job hoàn tất.
-                </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/10 px-3 py-1.5 text-sm font-medium text-white">
+                <span className={`h-2.5 w-2.5 rounded-full ${statusMeta.dot}`} />
+                {statusMeta.label}
+              </span>
+              {cfg && (
+                <span className="rounded-full border border-white/15 bg-white/10 px-3 py-1.5 text-xs font-medium text-white/85">
+                  MST {cfg.tax_code}
+                </span>
               )}
+            </div>
+          </div>
+        </div>
 
-              <div className="bg-blue-50 rounded-lg p-3 text-xs text-blue-800">
-                ℹ️ <strong>Mật khẩu cổng thuế</strong> — là mật khẩu đăng nhập{' '}
-                <strong>hoadondientu.gdt.gov.vn</strong> (khác với mật khẩu MISA/Viettel).
+        <div className="space-y-6 p-6">
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+            <MetricTile
+              label="HĐ đầu ra"
+              value={(cfg?.last_run_output_count ?? 0).toLocaleString('vi-VN')}
+              hint="Kết quả lần chạy gần nhất"
+              tone="blue"
+            />
+            <MetricTile
+              label="HĐ đầu vào"
+              value={(cfg?.last_run_input_count ?? 0).toLocaleString('vi-VN')}
+              hint="Kết quả lần chạy gần nhất"
+              tone="green"
+            />
+            <MetricTile
+              label="Tần suất"
+              value={cfg ? (cfg.sync_frequency_hours > 0 ? `${cfg.sync_frequency_hours}h` : 'Manual') : '--'}
+              hint={cfg ? 'Chu kỳ đang áp dụng' : 'Chưa cấu hình'}
+              tone="amber"
+            />
+            <MetricTile
+              label="Lần chạy cuối"
+              value={cfg?.last_run_at ? new Date(cfg.last_run_at).toLocaleDateString('vi-VN') : '--'}
+              hint={cfg?.last_run_at ? formatDateTime(cfg.last_run_at) : 'Chưa có lịch sử'}
+            />
+          </div>
+
+          {pageSyncActive && activeCompanyId && (
+            <div className="rounded-3xl border border-blue-200 bg-blue-50/80 p-4">
+              <div className="mb-4 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                <div>
+                  <p className="text-sm font-semibold text-slate-900">Process Board</p>
+                  <p className="text-sm text-slate-500">
+                    Tiến trình đang hiển thị theo thời gian thực. Khi BOT chạy, toàn bộ thao tác trên trang sẽ bị khóa.
+                  </p>
+                </div>
+                <span className="inline-flex w-fit rounded-full bg-blue-100 px-3 py-1 text-xs font-semibold uppercase tracking-[0.12em] text-blue-700">
+                  Live
+                </span>
               </div>
+              <SyncProgressPanel jobIds={syncJobIds} companyId={activeCompanyId} onClose={clearSync} onDone={clearSync} />
+            </div>
+          )}
 
-              <div className="space-y-3">
+          {notices.length > 0 && (
+            <div className="grid gap-3 md:grid-cols-2">
+              {notices.map(notice => (
+                <NoticeCard key={`${notice.title}-${notice.body}`} tone={notice.tone} title={notice.title} body={notice.body} />
+              ))}
+            </div>
+          )}
+
+          <div className="grid gap-6 xl:grid-cols-[1.25fr_0.85fr]">
+            <div className="rounded-3xl border border-slate-200 bg-slate-50/70 p-5">
+              <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
                 <div>
-                  <label className="text-xs font-medium text-gray-600 block mb-1">Mật khẩu cổng thuế *</label>
-                  <input
-                    type="password"
-                    value={form.password}
-                    onChange={e => setForm(p => ({ ...p, password: e.target.value }))}
-                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
-                    placeholder="Mật khẩu hoadondientu.gdt.gov.vn"
-                    autoComplete="new-password"
-                  />
+                  <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">GDT Crawl</p>
+                  <h2 className="mt-2 text-xl font-semibold text-slate-950">Điều khiển đồng bộ</h2>
+                  <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">
+                    Tách riêng khối lấy dữ liệu GDT để thao tác chạy, sửa cấu hình, OTP và kiểm soát lỗi gọn hơn.
+                  </p>
                 </div>
 
-                <div>
-                  <label className="text-xs font-medium text-gray-600 block mb-1">Tần suất đồng bộ</label>
-                  <select
-                    value={form.sync_frequency_hours}
-                    onChange={e => setForm(p => ({ ...p, sync_frequency_hours: Number(e.target.value) }))}
-                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white"
-                  >
-                    <option value={1}>Mỗi 1 giờ</option>
-                    <option value={3}>Mỗi 3 giờ</option>
-                    <option value={6}>Mỗi 6 giờ (khuyến nghị)</option>
-                    <option value={12}>Mỗi 12 giờ</option>
-                    <option value={24}>Mỗi 24 giờ</option>
-                    <option value={0}>Thủ công (không tự chạy)</option>
-                  </select>
-                </div>
-
-                <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
-                  <input type="checkbox" checked={form.has_otp}
-                    onChange={e => setForm(p => ({ ...p, has_otp: e.target.checked }))}
-                    className="w-4 h-4 rounded" />
-                  Tài khoản có xác thực 2 bước (OTP)
-                </label>
-
-                {form.has_otp && (
-                  <div>
-                    <label className="text-xs font-medium text-gray-600 block mb-1">Phương thức OTP</label>
-                    <select
-                      value={form.otp_method}
-                      onChange={e => setForm(p => ({ ...p, otp_method: e.target.value as typeof form.otp_method }))}
-                      className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white"
-                    >
-                      <option value="sms">SMS</option>
-                      <option value="email">Email</option>
-                      <option value="app">App xác thực</option>
-                    </select>
+                {cfg && (
+                  <div className="grid gap-2 text-sm text-slate-600 sm:grid-cols-2">
+                    {configSummary.map(item => (
+                      <div key={item.label} className="rounded-2xl border border-white bg-white px-3 py-2">
+                        <p className="text-[11px] font-medium uppercase tracking-[0.12em] text-slate-400">{item.label}</p>
+                        <p className="mt-1 font-medium text-slate-800">{item.value}</p>
+                      </div>
+                    ))}
                   </div>
                 )}
               </div>
 
-              <p className="text-xs text-gray-400">🔒 Mật khẩu được mã hóa AES-256-GCM và không lưu dạng văn bản thô.</p>
+              {!cfg ? (
+                <div className="mt-6 rounded-3xl border border-dashed border-slate-300 bg-white p-6 text-center">
+                  <p className="text-sm font-semibold text-slate-900">Chưa có cấu hình GDT cho công ty này</p>
+                  <p className="mt-2 text-sm text-slate-500">
+                    Lưu mật khẩu GDT đã mã hóa để BOT có thể tự kết nối và đồng bộ hóa đơn.
+                  </p>
+                  {isAdmin ? (
+                    <button
+                      onClick={openSetupModal}
+                      className="mt-4 inline-flex items-center justify-center rounded-2xl bg-slate-950 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-slate-800"
+                    >
+                      Thiết lập GDT
+                    </button>
+                  ) : (
+                    <p className="mt-4 text-xs text-slate-400">Chỉ OWNER/ADMIN mới có thể thiết lập BOT.</p>
+                  )}
+                </div>
+              ) : (
+                <>
+                  <div className="mt-6 flex flex-wrap gap-2">
+                    <button
+                      onClick={runCurrentMonthSync}
+                      disabled={!isAdmin || controlsDisabled}
+                      className="inline-flex items-center justify-center rounded-2xl bg-slate-950 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
+                    >
+                      Lấy từ GDT
+                    </button>
+                    <button
+                      onClick={runTodaySync}
+                      disabled={!isAdmin || controlsDisabled}
+                      className="inline-flex items-center justify-center rounded-2xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:border-slate-400 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      Hôm nay
+                    </button>
+                    <button
+                      onClick={openDateRangePicker}
+                      disabled={!isAdmin || controlsDisabled}
+                      className="inline-flex items-center justify-center rounded-2xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:border-slate-400 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      Chọn kỳ
+                    </button>
+                    <button
+                      onClick={openSetupModal}
+                      disabled={!isAdmin || isBotBusy}
+                      className="inline-flex items-center justify-center rounded-2xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:border-slate-400 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      Sửa
+                    </button>
+                    <button
+                      onClick={deleteConfig}
+                      disabled={!isAdmin || isBotBusy}
+                      className="inline-flex items-center justify-center rounded-2xl border border-rose-200 bg-white px-4 py-2.5 text-sm font-medium text-rose-600 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      Xóa
+                    </button>
+                    {lastStatus === 'otp_required' && (
+                      <button
+                        onClick={() => setShowOtp(true)}
+                        disabled={!isAdmin}
+                        className="inline-flex items-center justify-center rounded-2xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-sm font-medium text-amber-700 transition hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        Nhập OTP
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="mt-4 rounded-2xl border border-white bg-white px-4 py-3 text-sm text-slate-600">
+                    {isBotBusy
+                      ? 'BOT đang chạy hoặc đang được xếp hàng. Tất cả thao tác cấu hình sẽ được mở lại khi phiên đồng bộ kết thúc.'
+                      : actionLockActive
+                        ? 'Yêu cầu vừa được gửi. Không hiển thị đếm ngược, nhưng nút sẽ tự mở lại sau tối đa 3 phút.'
+                        : proxyReady
+                          ? 'Sẵn sàng nhận lệnh đồng bộ. Bạn có thể chạy tháng hiện tại, dữ liệu mới nhất hoặc tự chọn kỳ.'
+                          : 'Đồng bộ đang bị khóa do chưa có static proxy.'}
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="rounded-3xl border border-slate-200 bg-white p-5">
+              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Lịch sử</p>
+              <h2 className="mt-2 text-xl font-semibold text-slate-950">Phiên gần đây</h2>
+              <p className="mt-2 text-sm leading-6 text-slate-500">
+                Tập trung lỗi, thời gian chạy và thống kê đầu ra/đầu vào để nhìn trạng thái BOT nhanh hơn.
+              </p>
+
+              {historyLoading ? (
+                <div className="mt-5 rounded-3xl border border-dashed border-slate-200 bg-slate-50 px-4 py-8 text-center text-sm text-slate-500">
+                  Đang tải lịch sử đồng bộ...
+                </div>
+              ) : historyRuns.length > 0 ? (
+                <div className="mt-5 space-y-3">
+                  {historyRuns.map(run => {
+                    const runMeta = STATUS_META[run.status] ?? STATUS_META.idle;
+                    return (
+                      <div key={run.id} className="rounded-2xl border border-slate-200 p-4">
+                        <div className="flex items-start justify-between gap-4">
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <span className={`h-2.5 w-2.5 rounded-full ${runMeta.dot}`} />
+                              <p className="text-sm font-semibold text-slate-900">{runMeta.label}</p>
+                            </div>
+                            <p className="mt-2 text-sm text-slate-500">{formatDateTime(run.started_at)}</p>
+                          </div>
+                          <span className={`rounded-full px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.12em] ${runMeta.pill}`}>
+                            {run.output_count + run.input_count} HĐ
+                          </span>
+                        </div>
+
+                        <div className="mt-4 grid grid-cols-3 gap-2 text-sm text-slate-600">
+                          <div className="rounded-2xl bg-slate-50 px-3 py-2">
+                            <p className="text-[11px] uppercase tracking-[0.12em] text-slate-400">Đầu ra</p>
+                            <p className="mt-1 font-semibold text-slate-900">{run.output_count}</p>
+                          </div>
+                          <div className="rounded-2xl bg-slate-50 px-3 py-2">
+                            <p className="text-[11px] uppercase tracking-[0.12em] text-slate-400">Đầu vào</p>
+                            <p className="mt-1 font-semibold text-slate-900">{run.input_count}</p>
+                          </div>
+                          <div className="rounded-2xl bg-slate-50 px-3 py-2">
+                            <p className="text-[11px] uppercase tracking-[0.12em] text-slate-400">Thời lượng</p>
+                            <p className="mt-1 font-semibold text-slate-900">
+                              {run.duration_ms ? `${Math.max(1, Math.round(run.duration_ms / 1000))}s` : '--'}
+                            </p>
+                          </div>
+                        </div>
+
+                        {run.error_detail && (
+                          <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+                            {humanizeBotError(run.error_detail)}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+
+                  {historyMeta.totalPages > 1 && (
+                    <div className="flex items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-600">
+                      <button
+                        onClick={() => void loadHistory(historyMeta.page - 1)}
+                        disabled={historyMeta.page <= 1 || historyLoading}
+                        className="rounded-xl border border-slate-300 bg-white px-3 py-1.5 font-medium text-slate-700 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        Trang trước
+                      </button>
+                      <span>
+                        Trang {historyMeta.page}/{historyMeta.totalPages} · {historyMeta.total} phiên
+                      </span>
+                      <button
+                        onClick={() => void loadHistory(historyMeta.page + 1)}
+                        disabled={historyMeta.page >= historyMeta.totalPages || historyLoading}
+                        className="rounded-xl border border-slate-300 bg-white px-3 py-1.5 font-medium text-slate-700 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        Trang sau
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="mt-5 rounded-3xl border border-dashed border-slate-200 bg-slate-50 px-4 py-8 text-center text-sm text-slate-500">
+                  Chưa có lịch sử đồng bộ để hiển thị.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section className="overflow-hidden rounded-[28px] border border-amber-100 bg-white shadow-sm">
+        <div className="grid gap-6 p-6 lg:grid-cols-[0.95fr_1.05fr] lg:items-center">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-amber-600">Import thủ công</p>
+            <h2 className="mt-2 text-2xl font-semibold text-slate-950">Tách riêng luồng nhập file</h2>
+            <p className="mt-3 max-w-2xl text-sm leading-6 text-slate-500">
+              Dùng khi cần nạp XML hoặc ZIP lấy trực tiếp từ GDT mà không phụ thuộc vào lịch BOT. Luồng này được gom tách riêng để thao tác rõ ràng hơn.
+            </p>
+          </div>
+
+          <div className="rounded-3xl border border-amber-200 bg-amber-50 p-5">
+            <div className="grid gap-4 md:grid-cols-[0.8fr_1.2fr] md:items-center">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.16em] text-amber-700">Tổng import</p>
+                <p className="mt-3 text-4xl font-semibold text-slate-950">
+                  {(importTotal ?? 0).toLocaleString('vi-VN')}
+                </p>
+                <p className="mt-2 text-sm text-amber-900/70">Số hóa đơn đã nhập thủ công vào hệ thống.</p>
+              </div>
+
+              <div className="space-y-4 rounded-2xl border border-white/70 bg-white/70 p-4">
+                <div>
+                  <p className="text-sm font-semibold text-slate-900">Tệp hỗ trợ</p>
+                  <p className="mt-1 text-sm text-slate-500">XML chi tiết hoặc ZIP chứa nhiều XML từ hoadondientu.gdt.gov.vn.</p>
+                </div>
+                <button
+                  onClick={() => router.push('/import')}
+                  className="inline-flex w-full items-center justify-center rounded-2xl bg-slate-950 px-4 py-3 text-sm font-medium text-white transition hover:bg-slate-800"
+                >
+                  Mở trang Import
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {showSetup && (
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/50 p-4 sm:items-center">
+          <div className="w-full max-w-lg rounded-3xl bg-white shadow-2xl">
+            <div className="space-y-5 p-6">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Bảo mật GDT</p>
+                  <h2 className="mt-2 text-xl font-semibold text-slate-950">Cấu hình kết nối BOT</h2>
+                </div>
+                <button onClick={() => setShowSetup(false)} className="text-xl text-slate-400 transition hover:text-slate-700">
+                  ×
+                </button>
+              </div>
+
+              {isBotBusy && (
+                <NoticeCard
+                  tone="warning"
+                  title="BOT đang bận"
+                  body="Phiên đồng bộ hiện tại chưa kết thúc nên cấu hình đang tạm khóa để tránh thay đổi giữa chừng."
+                />
+              )}
+
+              <div className="grid gap-4">
+                <div>
+                  <label className="mb-1.5 block text-sm font-medium text-slate-700">Mật khẩu cổng thuế</label>
+                  <input
+                    type="password"
+                    value={form.password}
+                    onChange={event => setForm(prev => ({ ...prev, password: event.target.value }))}
+                    placeholder="Mật khẩu hoadondientu.gdt.gov.vn"
+                    autoComplete="new-password"
+                    className="w-full rounded-2xl border border-slate-300 px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-slate-900"
+                  />
+                </div>
+
+                <div>
+                  <label className="mb-1.5 block text-sm font-medium text-slate-700">Tần suất tự động</label>
+                  <select
+                    value={form.sync_frequency_hours}
+                    onChange={event => setForm(prev => ({ ...prev, sync_frequency_hours: Number(event.target.value) }))}
+                    className="w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-slate-900"
+                  >
+                    <option value={1}>Mỗi 1 giờ</option>
+                    <option value={3}>Mỗi 3 giờ</option>
+                    <option value={6}>Mỗi 6 giờ</option>
+                    <option value={12}>Mỗi 12 giờ</option>
+                    <option value={24}>Mỗi 24 giờ</option>
+                    <option value={0}>Chỉ chạy thủ công</option>
+                  </select>
+                </div>
+
+                <label className="flex items-start gap-3 rounded-2xl border border-slate-200 px-4 py-3 text-sm text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={form.has_otp}
+                    onChange={event => setForm(prev => ({ ...prev, has_otp: event.target.checked }))}
+                    className="mt-0.5 h-4 w-4 rounded border-slate-300"
+                  />
+                  <span>
+                    Tài khoản GDT có OTP hai lớp.
+                    <span className="mt-1 block text-xs text-slate-400">Khi BOT yêu cầu OTP, nút nhập OTP sẽ xuất hiện tại khối GDT Crawl.</span>
+                  </span>
+                </label>
+
+                {form.has_otp && (
+                  <div>
+                    <label className="mb-1.5 block text-sm font-medium text-slate-700">Nguồn OTP</label>
+                    <select
+                      value={form.otp_method}
+                      onChange={event => setForm(prev => ({ ...prev, otp_method: event.target.value as 'sms' | 'email' | 'app' }))}
+                      className="w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-slate-900"
+                    >
+                      <option value="sms">SMS</option>
+                      <option value="email">Email</option>
+                      <option value="app">Authenticator App</option>
+                    </select>
+                  </div>
+                )}
+
+                <label className="flex items-start gap-3 rounded-2xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={acceptPasswordStorage}
+                    onChange={event => setAcceptPasswordStorage(event.target.checked)}
+                    className="mt-0.5 h-4 w-4 rounded border-slate-300"
+                  />
+                  <span>
+                    Tôi đồng ý lưu mật khẩu GDT đã mã hóa để BOT tự động kết nối cổng thuế.
+                    <span className="mt-1 block text-xs text-slate-500">Mật khẩu chỉ phục vụ kết nối BOT và không hiển thị lại dưới dạng văn bản thô.</span>
+                  </span>
+                </label>
+              </div>
 
               <div className="flex gap-3">
-                <button onClick={() => setShowSetup(false)}
-                  className="flex-1 border border-gray-300 rounded-xl py-2.5 text-sm">
+                <button
+                  onClick={() => setShowSetup(false)}
+                  className="flex-1 rounded-2xl border border-slate-300 px-4 py-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50"
+                >
                   Hủy
                 </button>
-                <button onClick={saveConfig} disabled={!form.password || isJobRunning}
-                  className="flex-1 bg-blue-600 text-white rounded-xl py-2.5 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed">
-                  Lưu & Kết nối
+                <button
+                  onClick={saveConfig}
+                  disabled={!form.password || !acceptPasswordStorage || isBotBusy || isSavingConfig}
+                  className="flex-1 rounded-2xl bg-slate-950 px-4 py-3 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
+                >
+                  {isSavingConfig ? 'Đang lưu...' : 'Lưu cấu hình'}
                 </button>
               </div>
             </div>
@@ -738,139 +1011,140 @@ export default function BotSettingsPage() {
         </div>
       )}
 
-      {/* ── Date picker modal — Lấy dữ liệu lịch sử ── */}
       {showDatePicker && (
-        <div className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-4">
-          <div className="bg-white rounded-2xl w-full max-w-sm shadow-xl p-5 space-y-4">
-            <div className="flex items-center justify-between">
-              <h2 className="font-bold text-gray-900">🕒 Lấy dữ liệu theo khoảng thời gian</h2>
-              <button onClick={() => setShowDatePicker(false)} className="text-gray-400 hover:text-gray-700 text-xl">✕</button>
-            </div>
-            <p className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-              ⚠️ Quy định GDT: chỉ được phép tra cứu tối đa <strong>31 ngày</strong> mỗi lần.
-            </p>
-            <div className="space-y-3">
-              {/* Chọn nhanh theo tháng */}
-              <div>
-                <label className="text-xs font-medium text-gray-600 block mb-1">📅 Chọn nhanh theo tháng</label>
-                <input
-                  type="month"
-                  value={selectedMonth}
-                  max={`${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`}
-                  onChange={e => handleMonthSelect(e.target.value)}
-                  className="w-full border border-blue-300 bg-blue-50 rounded-lg px-3 py-2 text-sm"
-                />
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/50 p-4 sm:items-center">
+          <div className="w-full max-w-md rounded-3xl bg-white shadow-2xl">
+            <div className="space-y-5 p-6">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Phạm vi dữ liệu</p>
+                  <h2 className="mt-2 text-xl font-semibold text-slate-950">Chọn kỳ đồng bộ</h2>
+                </div>
+                <button onClick={() => setShowDatePicker(false)} className="text-xl text-slate-400 transition hover:text-slate-700">
+                  ×
+                </button>
               </div>
-              <div className="flex items-center gap-2 text-xs text-gray-400">
-                <div className="flex-1 border-t border-gray-200" />
-                <span>hoặc nhập ngày cụ thể</span>
-                <div className="flex-1 border-t border-gray-200" />
+
+              <NoticeCard
+                tone="warning"
+                title="Giới hạn GDT"
+                body="Mỗi lần lấy dữ liệu chỉ được tra cứu tối đa 31 ngày. Nếu chọn dài hơn, hệ thống sẽ tự co lại theo giới hạn này."
+              />
+
+              <div className="space-y-4">
+                <div>
+                  <label className="mb-1.5 block text-sm font-medium text-slate-700">Chọn nhanh theo tháng</label>
+                  <input
+                    type="month"
+                    value={selectedMonth}
+                    onChange={event => handleMonthSelect(event.target.value)}
+                    max={`${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`}
+                    className="w-full rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-slate-900"
+                  />
+                </div>
+
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div>
+                    <label className="mb-1.5 block text-sm font-medium text-slate-700">Từ ngày</label>
+                    <input
+                      type="date"
+                      value={runFrom}
+                      max={runTo || toLocalDateStr(new Date())}
+                      onChange={event => validateAndSetFrom(event.target.value)}
+                      className="w-full rounded-2xl border border-slate-300 px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-slate-900"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1.5 block text-sm font-medium text-slate-700">Đến ngày</label>
+                    <input
+                      type="date"
+                      value={runTo}
+                      min={runFrom}
+                      max={toLocalDateStr(new Date())}
+                      onChange={event => validateAndSetTo(event.target.value)}
+                      className="w-full rounded-2xl border border-slate-300 px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-slate-900"
+                    />
+                  </div>
+                </div>
+
+                {dateError && <p className="text-sm text-rose-600">{dateError}</p>}
+                {runFrom && runTo && !dateError && (
+                  <p className="text-sm text-emerald-600">
+                    Khoảng đồng bộ: {Math.round((new Date(`${runTo}T00:00:00`).getTime() - new Date(`${runFrom}T00:00:00`).getTime()) / 86400000)} ngày.
+                  </p>
+                )}
               </div>
-              <div>
-                <label className="text-xs font-medium text-gray-600 block mb-1">Từ ngày</label>
-                <input
-                  type="date"
-                  value={runFrom}
-                  max={runTo || new Date().toISOString().slice(0, 10)}
-                  onChange={e => validateAndSetFrom(e.target.value)}
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
-                />
+
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setShowDatePicker(false)}
+                  className="flex-1 rounded-2xl border border-slate-300 px-4 py-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50"
+                >
+                  Hủy
+                </button>
+                <button
+                  onClick={() => void queueSync({ fromDate: runFrom, toDate: runTo, successMessage: 'Đã xếp hàng đồng bộ theo kỳ đã chọn.' })}
+                  disabled={!runFrom || !runTo || !!dateError || controlsDisabled}
+                  className="flex-1 rounded-2xl bg-slate-950 px-4 py-3 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
+                >
+                  Đồng bộ kỳ này
+                </button>
               </div>
-              <div>
-                <label className="text-xs font-medium text-gray-600 block mb-1">Đến ngày</label>
-                <input
-                  type="date"
-                  value={runTo}
-                  min={runFrom}
-                  max={new Date().toISOString().slice(0, 10)}
-                  onChange={e => validateAndSetTo(e.target.value)}
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
-                />
-              </div>
-              {dateError && <p className="text-xs text-red-600">{dateError}</p>}
-              {runFrom && runTo && !dateError && (() => {
-                const diffDays = Math.round((new Date(runTo).getTime() - new Date(runFrom).getTime()) / 86400000);
-                return <p className="text-xs text-green-600">✓ Khoảng: {diffDays} ngày</p>;
-              })()}
-            </div>
-            <div className="flex gap-3">
-              <button onClick={() => setShowDatePicker(false)}
-                className="flex-1 border border-gray-300 rounded-xl py-2.5 text-sm">
-                Hủy
-              </button>
-              <button
-                onClick={() => {
-                  if (!runFrom || !runTo || dateError) return;
-                  setShowDatePicker(false);
-                  void runNow(runFrom, runTo);
-                }}
-                disabled={!runFrom || !runTo || !!dateError || running}
-                className="flex-1 bg-blue-600 text-white rounded-xl py-2.5 text-sm font-medium disabled:opacity-50"
-              >
-                Lấy dữ liệu
-              </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* ── OTP modal ── */}
       {showOtp && (
-        <div className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-4">
-          <div className="bg-white rounded-2xl w-full max-w-sm shadow-xl p-5 space-y-4">
-            <h2 className="font-bold text-gray-900">🔐 Nhập mã OTP</h2>
-            <p className="text-sm text-gray-600">
-              Mã OTP đã được gửi đến {cfg?.otp_method === 'sms' ? 'điện thoại' : cfg?.otp_method === 'email' ? 'email' : 'app xác thực'} của bạn.
-            </p>
-            <input
-              type="text"
-              inputMode="numeric"
-              maxLength={6}
-              value={otp}
-              onChange={e => setOtp(e.target.value.replace(/\D/g, ''))}
-              className="w-full border border-gray-300 rounded-xl px-4 py-3 text-center text-2xl font-mono tracking-widest"
-              placeholder="000000"
-            />
-            <div className="flex gap-3">
-              <button onClick={() => { setShowOtp(false); setOtp(''); }}
-                className="flex-1 border border-gray-300 rounded-xl py-2.5 text-sm">
-                Hủy
-              </button>
-              <button onClick={submitOtp} disabled={otp.length < 6}
-                className="flex-1 bg-blue-600 text-white rounded-xl py-2.5 text-sm font-medium disabled:opacity-50">
-                Xác nhận
-              </button>
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/50 p-4 sm:items-center">
+          <div className="w-full max-w-sm rounded-3xl bg-white shadow-2xl">
+            <div className="space-y-5 p-6">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">OTP</p>
+                  <h2 className="mt-2 text-xl font-semibold text-slate-950">Xác thực phiên chờ</h2>
+                </div>
+                <button onClick={() => setShowOtp(false)} className="text-xl text-slate-400 transition hover:text-slate-700">
+                  ×
+                </button>
+              </div>
+
+              <p className="text-sm leading-6 text-slate-500">
+                Nhập mã OTP từ {cfg?.otp_method === 'sms' ? 'SMS' : cfg?.otp_method === 'email' ? 'email' : 'ứng dụng xác thực'} để BOT tiếp tục phiên đang chờ.
+              </p>
+
+              <input
+                type="text"
+                inputMode="numeric"
+                maxLength={6}
+                value={otp}
+                onChange={event => setOtp(event.target.value.replace(/\D/g, ''))}
+                placeholder="000000"
+                className="w-full rounded-2xl border border-slate-300 px-4 py-4 text-center font-mono text-2xl tracking-[0.3em] text-slate-900 outline-none transition focus:border-slate-900"
+              />
+
+              <div className="flex gap-3">
+                <button
+                  onClick={() => {
+                    setShowOtp(false);
+                    setOtp('');
+                  }}
+                  className="flex-1 rounded-2xl border border-slate-300 px-4 py-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50"
+                >
+                  Hủy
+                </button>
+                <button
+                  onClick={submitOtp}
+                  disabled={otp.length < 6}
+                  className="flex-1 rounded-2xl bg-slate-950 px-4 py-3 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
+                >
+                  Gửi OTP
+                </button>
+              </div>
             </div>
           </div>
         </div>
       )}
-
-      {/* ── Import Hóa Đơn Thủ Công ── */}
-      <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
-        <div className="p-5">
-          <div className="flex items-center gap-3 mb-3">
-            <span className="text-2xl">📁</span>
-            <div>
-              <h2 className="font-bold text-gray-900">Import Hóa Đơn Thủ Công</h2>
-              <p className="text-xs text-gray-500">
-                Tải file từ hoadondientu.gdt.gov.vn và import vào hệ thống.
-                Hỗ trợ: XML (chi tiết), ZIP (chứa nhiều file XML).
-              </p>
-            </div>
-          </div>
-          {importTotal != null && importTotal > 0 && (
-            <p className="text-xs text-gray-500 mb-3">
-              Đã import {importTotal.toLocaleString('vi-VN')} hóa đơn qua import thủ công.
-            </p>
-          )}
-          <button
-            onClick={() => router.push('/import')}
-            className="w-full bg-primary-600 text-white rounded-xl py-2.5 text-sm font-medium hover:bg-primary-700"
-          >
-            Đi đến trang Import
-          </button>
-        </div>
-      </div>
     </div>
   );
 }

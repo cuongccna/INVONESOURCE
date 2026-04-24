@@ -51,7 +51,7 @@ export class CrossValidationService {
       `SELECT id, invoice_number, seller_tax_code, invoice_date, total_amount, provider
        FROM invoices
        WHERE company_id = $1
-         AND provider IN ('misa', 'viettel', 'bkav')
+         AND provider IN ('gdt_intermediary')
          AND deleted_at IS NULL
          AND EXTRACT(MONTH FROM invoice_date) = $2
          AND EXTRACT(YEAR FROM invoice_date) = $3`,

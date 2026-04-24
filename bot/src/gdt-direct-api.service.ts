@@ -99,7 +99,7 @@ const MAX_RETRIES   = 3;
 const RETRY_DELAY   = 3_000; // ms
 const REQUEST_TIMEOUT = 30_000;
 // Binary downloads (XML ZIP, XLSX) can be large and GDT server is slow to generate them.
-// TMProxy and residential proxies have short idle timeouts — give generous room.
+// Give generous room for slow responses over the proxy tunnel.
 const BINARY_TIMEOUT = 120_000; // 2 min — override with recipe.timing.binaryTimeoutMs
 
 // ── Peak period detection ─────────────────────────────────────────────────────
@@ -272,6 +272,19 @@ interface GdtPagedResponse {
   total?: number;
 }
 
+/**
+ * Result of _fetchAllPagesBuffered.
+ * rows:          actual invoice objects fetched.
+ * reportedTotal: total count GDT reported in the FIRST page's response body.
+ *                This is the ground truth — used by _fetchScoByWeeks to detect
+ *                TRUE truncation (fetched < reportedTotal) vs complete fetch.
+ *                -1 if GDT did not return a total field (treat as complete).
+ */
+interface FetchResult {
+  rows:          RawInvoice[];
+  reportedTotal: number;   // -1 = unknown (no total in response)
+}
+
 // Status code → our status string
 const STATUS_MAP: Record<number, RawInvoice['status']> = {
   1: 'valid',
@@ -304,6 +317,20 @@ function formatGdtDate(d: Date): string {
 /** Parse ISO-ish invoice date from GDT → YYYY-MM-DD */
 function parseInvoiceDate(raw: unknown): string | null {
   if (!raw) return null;
+
+  // GDT SCO (/sco-query/) returns tdlap as a Unix millisecond timestamp (number or numeric string).
+  // e.g. 1738425600000 → 2026-02-01 UTC → 2026-02-02 00:00 VN → "2026-02-02"
+  // Must handle BEFORE the String(raw) path below, because "1738425600000" matches no regex.
+  const asNum = typeof raw === 'number' ? raw : (typeof raw === 'string' && /^\d{12,13}$/.test(raw.trim()) ? parseInt(raw.trim(), 10) : NaN);
+  if (!isNaN(asNum) && asNum > 1_000_000_000_000) { // > year 2001 in ms
+    const vnMs = asNum + 7 * 3_600_000; // UTC → UTC+7
+    const vn = new Date(vnMs);
+    const yyyy = vn.getUTCFullYear();
+    const mm   = String(vn.getUTCMonth() + 1).padStart(2, '0');
+    const dd   = String(vn.getUTCDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
   const s = String(raw);
   // ISO timestamp with time component — GDT API returns UTC strings (e.g. "2026-04-03T17:00:00Z")
   // which is Vietnam midnight (UTC+7 = 2026-04-04 00:00). Must convert to VN timezone before
@@ -458,6 +485,42 @@ function splitIntoDays(from: Date, to: Date): Array<{ from: Date; to: Date }> {
   return chunks;
 }
 
+/**
+ * Split một day window thành N-hour sub-windows.
+ * Dùng khi daily chunk bị truncate (> pageSize HĐ trong 1 ngày).
+ * hoursPerChunk=2 → 12 windows/ngày → mỗi window ~2-5 HĐ cho hầu hết công ty.
+ *
+ * TIMEZONE NOTE: Dùng getHours() — theo local time của process.
+ * VPS phải chạy với TZ=Asia/Ho_Chi_Minh để khớp với GDT Vietnam timezone.
+ */
+function splitIntoHours(
+  from:          Date,
+  to:            Date,
+  hoursPerChunk: number = 2,
+): Array<{ from: Date; to: Date }> {
+  const chunks: Array<{ from: Date; to: Date }> = [];
+  let cur = new Date(from);
+  cur.setMinutes(0, 0, 0);
+
+  const end = new Date(to);
+  end.setMinutes(59, 59, 999);
+
+  while (cur <= end) {
+    const chunkEnd = new Date(cur);
+    chunkEnd.setHours(chunkEnd.getHours() + hoursPerChunk - 1);
+    chunkEnd.setMinutes(59, 59, 999);
+
+    const actualEnd = chunkEnd < end ? chunkEnd : new Date(end);
+    chunks.push({ from: new Date(cur), to: actualEnd });
+
+    const next = new Date(cur);
+    next.setHours(next.getHours() + hoursPerChunk);
+    next.setMinutes(0, 0, 0);
+    cur = next;
+  }
+  return chunks;
+}
+
 // ── Map GDT JSON row → RawInvoice ─────────────────────────────────────────────
 
 interface MapInvoiceOpts {
@@ -466,6 +529,100 @@ interface MapInvoiceOpts {
   fields?:          RecipeFields;
   statusMap?:       Record<string, string>;
   xmlAvailableTtxly?: Set<number>;
+  rawIdentityKey?:  string | null;
+}
+
+function extractRawIdentityKey(row: GdtInvoiceRaw): string | null {
+  const r = row as Record<string, unknown>;
+  const directId = pick(
+    r,
+    'id',
+    'idhdon',
+    'id_hoadon',
+    'idhoadon',
+    'invoiceId',
+    'invoice_id',
+    'mahoadon',
+    'ma_hd',
+    'mhdon',
+  );
+  if (directId != null) {
+    const s = String(directId).trim();
+    if (s) return `id:${s}`;
+  }
+
+  const tdlapRaw = pick(r, 'tdlap', 'ngayLap', 'ngay_lap', 'ngaylap', 'nlap', 'tglap');
+  const shdonRaw = pick(r, 'shdon', 'soHoaDon', 'so_hd', 'ma_hd');
+  const khhdRaw = pick(r, 'khhdon', 'kyHieuHoaDon', 'ky_hieu_hd');
+  const nbmstRaw = pick(r, 'nbmst', 'msttcgpbh', 'mst_ban', 'msttcgp_ban', 'mstNguoiBan');
+  const totalRaw = pick(r, 'tgtttbso', 'thanh_toan', 'tongThanhToan', 'tongTien');
+  const vatRaw = pick(r, 'tgtthue', 'tien_thue', 'tienThue');
+
+  const signature = [tdlapRaw, shdonRaw, khhdRaw, nbmstRaw, totalRaw, vatRaw]
+    .map(v => String(v ?? '').trim())
+    .join('|');
+  return signature.replace(/\|/g, '').length > 0 ? `sig:${signature}` : null;
+}
+
+function invoiceIdentityKey(inv: RawInvoice): string {
+  if (inv.source_row_key && inv.source_row_key.trim()) return inv.source_row_key;
+  return `${inv.invoice_number ?? ''}|${inv.serial_number ?? ''}|${inv.invoice_date ?? ''}|${inv.seller_tax_code ?? ''}`;
+}
+
+function dedupeInvoices(invoices: RawInvoice[]): RawInvoice[] {
+  const unique = new Map<string, RawInvoice>();
+  for (let index = 0; index < invoices.length; index++) {
+    const inv = invoices[index]!;
+    const identity = invoiceIdentityKey(inv);
+    const dedupeKey = identity !== '|||' ? identity : `fallback:${index}:${inv.direction ?? ''}:${inv.total_amount ?? ''}`;
+    if (!unique.has(dedupeKey)) unique.set(dedupeKey, inv);
+  }
+  return Array.from(unique.values());
+}
+
+function isFetchComplete(uniqueCount: number, reportedTotal: number): boolean {
+  return reportedTotal < 0 || uniqueCount >= reportedTotal;
+}
+
+function splitRangeBySecondMidpoint(
+  from: Date,
+  to: Date,
+): { left: { from: Date; to: Date }; right: { from: Date; to: Date } } | null {
+  const fromSec = Math.floor(from.getTime() / 1000);
+  const toSec = Math.floor(to.getTime() / 1000);
+  if (toSec - fromSec < 1) return null;
+
+  const middleSec = Math.floor((fromSec + toSec) / 2);
+  if (middleSec <= fromSec || middleSec >= toSec) return null;
+
+  return {
+    left: {
+      from: new Date(from),
+      to: new Date(middleSec * 1000),
+    },
+    right: {
+      from: new Date((middleSec + 1) * 1000),
+      to: new Date(to),
+    },
+  };
+}
+
+function mergeFiqlFilter(extraFilter: string | undefined, ...clauses: Array<string | null | undefined>): string | undefined {
+  const parts = [extraFilter, ...clauses]
+    .map(part => String(part ?? '').trim())
+    .filter(Boolean);
+  return parts.length > 0 ? parts.join(';') : undefined;
+}
+
+function extractInvoiceNumberRange(invoices: RawInvoice[]): { min: number; max: number } | null {
+  const numbers = invoices
+    .map(inv => Number(inv.invoice_number))
+    .filter(num => Number.isFinite(num));
+  if (numbers.length === 0) return null;
+  return {
+    min: Math.min(...numbers),
+    max: Math.max(...numbers),
+  };
 }
 
 function mapInvoice(
@@ -504,7 +661,7 @@ function mapInvoice(
 
   const invoiceNum = String(pick(r, ...(fields?.invoiceNum ?? ['shdon', 'soHoaDon', 'so_hd', 'ma_hd'])) ?? '').trim() || null;
   const serial     = String(pick(r, ...(fields?.serial    ?? ['khhdon', 'kyHieuHoaDon', 'ky_hieu_hd'])) ?? '').trim() || null;
-  const dateRaw    = pick(r, ...(fields?.date             ?? ['tdlap', 'ngayLap', 'ngay_lap']));
+  const dateRaw    = pick(r, ...(fields?.date             ?? ['tdlap', 'ngayLap', 'ngay_lap', 'ngaylap', 'nlap', 'tglap']));
 
   const subtotal   = num(pick(r, ...(fields?.subtotal  ?? ['tgtcthue', 'tien_chua_thue', 'tienHangChuaThue'])));
   const vatAmount  = num(pick(r, ...(fields?.vatAmount  ?? ['tgtthue', 'tien_thue', 'tienThue'])));
@@ -582,6 +739,7 @@ function mapInvoice(
                     return null;
                   })(),
     tax_category: taxCategory,
+    source_row_key: opts.rawIdentityKey ?? null,
   };
 }
 
@@ -938,7 +1096,7 @@ export class GdtDirectApiService {
     const seen   = new Set<string>();
     const merged: RawInvoice[] = [];
     for (const inv of [...queryResult, ...scoResult]) {
-      const key = `${inv.invoice_number ?? ''}|${inv.serial_number ?? ''}|${inv.invoice_date ?? ''}`;
+      const key = invoiceIdentityKey(inv);
       if (!seen.has(key)) {
         seen.add(key);
         merged.push(inv);
@@ -973,12 +1131,16 @@ export class GdtDirectApiService {
    */
   async fetchInputInvoices(fromDate: Date, toDate: Date): Promise<RawInvoice[]> {
     const scoPurchasePath = this.recipe?.api.endpoints.scoPurchase ?? GDT_SCO_PURCHASE;
+    const purchaseFilters = this._getPurchaseFilters();
 
     // HĐ điện tử via /query (separate calls needed because /query requires ttxly filter)
-    const q5 = await this._fetchRangeByMonth('purchase', fromDate, toDate, 'ttxly==5');
-    await humanDelay(1_500, 3_000);
-    const q6 = await this._fetchRangeByMonth('purchase', fromDate, toDate, 'ttxly==6');
-    await humanDelay(1_500, 3_000);
+    const queryBuckets: RawInvoice[][] = [];
+    for (let i = 0; i < purchaseFilters.length; i++) {
+      if (i > 0) await humanDelay(1_500, 3_000);
+      queryBuckets.push(
+        await this._fetchRangeByMonth('purchase', fromDate, toDate, purchaseFilters[i]),
+      );
+    }
 
     // HĐ MTTTT via /sco-query — weekly chunks with NO ttxly filter.
     // The SCO endpoint returns all types (5/6/8) in one paginated response.
@@ -990,16 +1152,19 @@ export class GdtDirectApiService {
     // Dedup key: invoice_number + seller_tax_code + invoice_date
     const seen   = new Set<string>();
     const merged: RawInvoice[] = [];
-    for (const inv of [...q5, ...q6, ...scoAll]) {
-      const key = `${inv.invoice_number ?? ''}|${inv.seller_tax_code ?? ''}|${inv.invoice_date ?? ''}`;
+    for (const inv of [...queryBuckets.flat(), ...scoAll]) {
+      const key = invoiceIdentityKey(inv);
       if (!seen.has(key)) {
         seen.add(key);
         merged.push(inv);
       }
     }
+
+    const queryCounts = Object.fromEntries(
+      purchaseFilters.map((filter, index) => [filter, queryBuckets[index]?.length ?? 0]),
+    );
     logger.info('[GdtDirect] Purchase invoices merged', {
-      ttxly5_query: q5.length,
-      ttxly6_query: q6.length,
+      queryCounts,
       sco_all: scoAll.length,
       merged: merged.length,
     });
@@ -1007,147 +1172,396 @@ export class GdtDirectApiService {
   }
 
   /**
-   * Fetch SCO invoices by splitting the date range into WEEKLY chunks.
+   * Fetch SCO invoices cho một date range với auto-recovery khi bị truncation.
    *
-   * Root cause of the SCO 50-item limit (GDT bug):
-   *   /sco-query endpoints return X-Total-Count equal to the page size (50) instead of
-   *   the true total, OR return HTTP 500 on page > 0 for companies with > 50 MTT invoices
-   *   per month. Both cases cause _fetchAllPagesBuffered / _streamPages to stop after
-   *   exactly one page — silently truncating results.
+   * STRATEGY (đúng, không còn timezone risk):
+   *   1. GDT probe → biết tổng số HĐ trong full range (reportedTotal)
+   *   2. Chia range thành weekly chunks → fetch từng chunk
+   *   3. Sau mỗi chunk: so sánh fetched vs GDT's own reportedTotal cho CHUNK ĐÓ
+   *      - fetched == reportedTotal → HOÀN TOÀN ĐẦY ĐỦ, không cần làm gì thêm
+   *      - fetched <  reportedTotal → THỰC SỰ BỊ TRUNCATE (GDT bảo có nhiều hơn)
+   *        → chia chunk đó thành daily sub-splits và fetch lại
+   *   4. Với daily sub-splits: cũng kiểm tra fetched vs reportedTotal của từng ngày
+   *      - Nếu ngày đó vẫn truncated → chia thành 2-hour sub-sub-splits
+   *   5. Sau tất cả: dedup theo invoice_number+serial trong bộ nhớ
+   *      → loại bỏ duplicate từ boundary overlap trước khi đưa vào DB
    *
-   * Fix: split the range into 7-day windows. Each chunk has ~10-25 invoices (far below
-   * page size = 50), so only one page is ever needed per chunk — the GDT limit is never hit.
-   * Errors per chunk are caught non-fatally so one bad week doesn't abort the full sync.
-   */
-  /**
-   * Fetch SCO invoices with auto-fallback: weekly → daily when truncation detected.
+   * TIMEZONE SAFETY:
+   *   Không tự đoán ranh giới HĐ theo giờ (nguy cơ miss HĐ 00:00-07:00 VN)
+   *   Dùng GDT reportedTotal làm ground truth → biết chắc có thiếu không
+   *   Khi daily chunk thiếu → split 2h window → GDT bảo đủ → dừng
    *
-   * Truncation detection:
-   *   result.length % pageSize === 0 AND result.length > 0
-   *   → GDT may have HTTP 500'd on page > 0 (chunk > pageSize invoices).
-   *   → Automatically retry that week with daily sub-splits.
-   *
-   * Applies to:
-   *   - /sco-query/invoices/sold    (HĐ máy tính tiền bán ra)
-   *   - /sco-query/invoices/purchase (HĐ máy tính tiền mua vào)
-   * Does NOT apply to /query (no HTTP-500-on-page-1 bug).
-   *
-   * Low-volume  (< 50 HĐ/week): weekly only — 4–5 API calls/month.
-   * High-volume (> 50 HĐ/week): auto daily sub-split — 28–31 API calls/month.
+   * Áp dụng cho /sco-query/invoices/sold và /sco-query/invoices/purchase.
+   * Không cần cho /query (pagination thông thường hoạt động đúng).
    */
   private async _fetchScoByWeeks(
-    endpoint:     'sold' | 'purchase',
-    fromDate:     Date,
-    toDate:       Date,
-    scoPath:      string,
+    endpoint: 'sold' | 'purchase',
+    fromDate: Date,
+    toDate:   Date,
+    scoPath:  string,
   ): Promise<RawInvoice[]> {
-    const pageSize   = this.recipe?.api.pagination.pageSize ?? PAGE_SIZE;
     const weekChunks = splitIntoWeeks(fromDate, toDate);
 
-    // ── Fast probe: single no-retry call to check SCO availability ──────────
-    // prefetchCount() uses this.http.get() DIRECTLY — no _getWithRetry retries.
-    // Fails in <5s on HTTP 500 vs ~2 min if we let _getWithRetry exhaust all
-    // peak-period retries (5 × exponential 8s backoff) per chunk.
-    //
-    // GDT returns HTTP 500 (not 200+[]) for companies with NO MTT/SCO setup.
-    // Returning -1 here means: skip the entire weekly loop immediately.
+    // ── Probe: lấy tổng số HĐ GDT report cho full range ────────────────────────
     const probeCount = await this.prefetchCount(endpoint, fromDate, toDate, undefined, scoPath);
     if (probeCount < 0) {
-      logger.info('[GdtDirect] SCO probe: endpoint returned error — no MTT/SCO setup for this company, skipping weekly loop', {
+      logger.info('[GdtDirect] SCO probe: no SCO/MTT setup for this company', {
         endpoint, from: formatGdtDate(fromDate), to: formatGdtDate(toDate),
-        hint: 'GDT returns HTTP 500 (not 200+[]) for companies without SCO/MTT configuration.',
       });
       return [];
     }
-    logger.info('[GdtDirect] SCO probe OK — proceeding with weekly fetch', {
-      endpoint, probeCount, totalWeekChunks: weekChunks.length,
+    logger.info('[GdtDirect] SCO probe OK', {
+      endpoint, probeTotal: probeCount, totalWeekChunks: weekChunks.length,
       from: formatGdtDate(fromDate), to: formatGdtDate(toDate),
     });
 
-    const all: RawInvoice[] = [];
+    // ── Collect all invoices (raw, may have duplicates from window overlaps) ───
+    // KEY BUG FIX: POS (SCO/MTTTT) receipts reset their receipt number (shdon) daily.
+    // Receipt #1 on Feb-01 and receipt #1 on Feb-02 share the same shdon + khhdon + nbmst,
+    // so the old key (invoice_number|serial|seller_tax_code) caused cross-date collisions
+    // that silently dropped up to ~83% of invoices (e.g. 608 → 200).
+    // Fix: include invoice_date in the key to make it unique per calendar day.
+    // This matches the key used by fetchOutputInvoices for the final cross-stream dedup.
+    const seen = new Map<string, RawInvoice>(); // key = invoice_number|serial|invoice_date
+    let _firstDateSample: string | null = null; // for diagnostics
 
+    const _deduplicateAndAdd = (invoices: RawInvoice[]): number => {
+      let added = 0;
+      for (const inv of invoices) {
+        // Sample first invoice_date for diagnostics (logged in SCO fetch complete below)
+        if (_firstDateSample === null) _firstDateSample = inv.invoice_date ?? 'null';
+        const key = invoiceIdentityKey(inv);
+        // Skip rows where ALL three discriminating fields are null (unfetchable dedup key).
+        if (key !== '|||' && !seen.has(key)) {
+          seen.set(key, inv);
+          added++;
+        }
+      }
+      return added;
+    };
+
+    // ── Process weekly chunks ─────────────────────────────────────────────────
     for (let i = 0; i < weekChunks.length; i++) {
       if (i > 0) await humanDelay(2_000, 4_000);
       const { from, to } = weekChunks[i]!;
 
       try {
-        const weekResult = await this._fetchAllPagesBuffered(endpoint, from, to, undefined, scoPath);
+        const { rows: weekRows, reportedTotal: weekTotal } =
+          await this._fetchAllPagesBuffered(endpoint, from, to, undefined, scoPath);
 
-        // Truncation detection: result is an exact multiple of pageSize (50, 100, 150...)
-        // → GDT likely HTTP 500'd on page 1+ (real count is higher).
-        if (weekResult.length > 0 && weekResult.length % pageSize === 0) {
-          logger.warn('[GdtDirect] SCO chunk suspected truncation — retrying with daily sub-splits', {
-            endpoint, weekChunk: i + 1,
-            weekResult: weekResult.length, pageSize,
-            from: formatGdtDate(from), to: formatGdtDate(to),
-          });
-
-          const dayChunks  = splitIntoDays(from, to);
-          const dayResults: RawInvoice[] = [];
-
-          for (let d = 0; d < dayChunks.length; d++) {
-            if (d > 0) await humanDelay(1_200, 2_500);
-            const { from: df, to: dt } = dayChunks[d]!;
-            try {
-              const dayResult = await this._fetchAllPagesBuffered(endpoint, df, dt, undefined, scoPath);
-              dayResults.push(...dayResult);
-              logger.debug('[GdtDirect] SCO day sub-chunk', {
-                day: d + 1, of: dayChunks.length, count: dayResult.length,
-                date: formatGdtDate(df).slice(0, 10),
-              });
-            } catch (dayErr) {
-              logger.warn('[GdtDirect] SCO day sub-chunk failed (non-fatal)', {
-                day: d + 1, date: formatGdtDate(df).slice(0, 10),
-                err: dayErr instanceof Error ? dayErr.message : String(dayErr),
-              });
-            }
-          }
-
-          // Use daily results if they recovered more than weekly
-          if (dayResults.length > weekResult.length) {
-            logger.info('[GdtDirect] SCO daily sub-split recovered more invoices', {
-              endpoint, weekChunk: i + 1,
-              weekly: weekResult.length, daily: dayResults.length,
-              gained: dayResults.length - weekResult.length,
-            });
-            all.push(...dayResults);
-          } else {
-            // Exact multiple was coincidence, or daily also failed — keep weekly result
-            all.push(...weekResult);
-          }
-        } else {
-          // Normal: no truncation suspected
-          all.push(...weekResult);
-          logger.debug('[GdtDirect] SCO weekly chunk OK', {
-            chunk: i + 1, of: weekChunks.length, count: weekResult.length,
+        // ── Truncation check: dùng GDT's own reportedTotal ──────────────────
+        // BUG FIX: GDT SCO pagination wraps around after ~200 items.
+        // Raw fetched count (e.g. 350) >= reportedTotal (310) → old check says "complete".
+        // But pages 4-6 silently REPEAT pages 0-2, so only 200 unique items are accessible.
+        // Fix: compute UNIQUE count within this chunk and compare vs reportedTotal.
+        // If unique < reported → GDT is hiding invoices behind the pagination wrap → split daily.
+        const chunkUniqueSeen = new Set<string>(
+          weekRows.map(invoiceIdentityKey).filter(k => k !== '|||'),
+        );
+        const isTruncated = weekTotal > 0 && chunkUniqueSeen.size < weekTotal;
+        if (!isTruncated && weekRows.length > chunkUniqueSeen.size) {
+          logger.warn('[GdtDirect] SCO chunk pagination wrap detected (non-fatal — using raw count)', {
+            endpoint, chunk: i + 1, fetched: weekRows.length,
+            unique: chunkUniqueSeen.size, reported: weekTotal,
           });
         }
+
+        if (!isTruncated) {
+          // Hoàn toàn đầy đủ — không cần chia nhỏ
+          const added = _deduplicateAndAdd(weekRows);
+          logger.debug('[GdtDirect] SCO weekly chunk complete', {
+            chunk: i + 1, of: weekChunks.length,
+            fetched: weekRows.length, reportedTotal: weekTotal, added,
+          });
+          continue;
+        }
+
+        // ── Chunk bị truncate → thử daily sub-splits ────────────────────────
+        logger.warn('[GdtDirect] SCO chunk truncated (GDT confirms) — retrying with daily', {
+          endpoint, weekChunk: i + 1,
+          fetched: weekRows.length, reportedTotal: weekTotal,
+          unique: chunkUniqueSeen.size,
+          missing: weekTotal - chunkUniqueSeen.size,
+          from: formatGdtDate(from), to: formatGdtDate(to),
+        });
+
+        const dayChunks = splitIntoDays(from, to);
+        let dailyTotal  = 0;
+
+        for (let d = 0; d < dayChunks.length; d++) {
+          if (d > 0) await humanDelay(1_200, 2_500);
+          const { from: df, to: dt } = dayChunks[d]!;
+
+          try {
+            const { rows: dayRows, reportedTotal: dayTotal } =
+              await this._fetchAllPagesBuffered(endpoint, df, dt, undefined, scoPath);
+
+            // Use unique-count-based truncation check (same logic as weekly level)
+            const dayUniqueSeen = new Set<string>(
+              dayRows.map(invoiceIdentityKey).filter(k => k !== '|||'),
+            );
+            const isDayTruncated = dayTotal > 0 && dayUniqueSeen.size < dayTotal;
+
+            if (!isDayTruncated) {
+              // Ngày này đầy đủ
+              const added = _deduplicateAndAdd(dayRows);
+              dailyTotal += dayRows.length;
+              logger.debug('[GdtDirect] SCO day chunk complete', {
+                day: d + 1, of: dayChunks.length,
+                fetched: dayRows.length, reportedTotal: dayTotal, added,
+                date: formatGdtDate(df).slice(0, 10),
+              });
+            } else {
+              // ── Day bị truncate: thử partition theo ttxly trước ────────────
+              // Một số company bị GDT cap pagination theo truy vấn tổng, nhưng truy vấn
+              // theo từng status (ttxly) thì trả đủ. Đây là recovery tổng quát hơn split giờ.
+              logger.warn('[GdtDirect] SCO day chunk truncated — retrying with status filters', {
+                day: d + 1, fetched: dayRows.length, reportedTotal: dayTotal,
+                date: formatGdtDate(df).slice(0, 10),
+              });
+
+              const statusFilters = ['ttxly==5', 'ttxly==6', 'ttxly==8'];
+              const dayRecovered = new Map<string, RawInvoice>();
+              let statusFetched = 0;
+              for (const filter of statusFilters) {
+                try {
+                  const { rows: statusRows } = await this._fetchAllPagesBuffered(endpoint, df, dt, filter, scoPath);
+                  statusFetched += statusRows.length;
+                  for (const inv of statusRows) {
+                    const key = invoiceIdentityKey(inv);
+                    if (key !== '|||' && !dayRecovered.has(key)) dayRecovered.set(key, inv);
+                  }
+                } catch (filterErr) {
+                  // Some tenants/providers do not support certain ttxly values on SCO sold.
+                  logger.debug('[GdtDirect] SCO status-filter partition failed (non-fatal)', {
+                    filter,
+                    day: d + 1,
+                    err: filterErr instanceof Error ? filterErr.message : String(filterErr),
+                  });
+                }
+              }
+
+              if (dayRecovered.size >= dayTotal) {
+                const recoveredRows = Array.from(dayRecovered.values());
+                _deduplicateAndAdd(recoveredRows);
+                dailyTotal += recoveredRows.length;
+                logger.info('[GdtDirect] SCO day recovery by status filters succeeded', {
+                  day: d + 1,
+                  reportedTotal: dayTotal,
+                  fetchedAcrossFilters: statusFetched,
+                  recoveredUnique: dayRecovered.size,
+                });
+                continue;
+              }
+
+              const rangeRecovered = await this._fetchScoByInvoiceNumberRanges(
+                endpoint,
+                df,
+                dt,
+                scoPath,
+              );
+              if (rangeRecovered.length >= dayTotal) {
+                _deduplicateAndAdd(rangeRecovered);
+                dailyTotal += rangeRecovered.length;
+                logger.info('[GdtDirect] SCO day recovery by shdon ranges succeeded', {
+                  day: d + 1,
+                  reportedTotal: dayTotal,
+                  recoveredUnique: rangeRecovered.length,
+                });
+                continue;
+              }
+
+              // ── Status filter vẫn chưa đủ → fallback split theo giờ ───────
+              logger.warn('[GdtDirect] SCO status/shdon recovery insufficient — retrying with 2h windows', {
+                day: d + 1,
+                reportedTotal: dayTotal,
+                recoveredUnique: dayRecovered.size,
+                rangeRecovered: rangeRecovered.length,
+              });
+
+              const hourChunks = splitIntoHours(df, dt, 2); // 2-hour windows
+              for (let h = 0; h < hourChunks.length; h++) {
+                if (h > 0) await humanDelay(600, 1_500);
+                const { from: hf, to: ht } = hourChunks[h]!;
+                try {
+                  const { rows: hourRows, reportedTotal: hourTotal } =
+                    await this._fetchAllPagesBuffered(endpoint, hf, ht, undefined, scoPath);
+                  _deduplicateAndAdd(hourRows);
+                  dailyTotal += hourRows.length;
+
+                  const hourUnique = new Set(
+                    hourRows.map(invoiceIdentityKey).filter(k => k !== '|||'),
+                  ).size;
+                  if (hourTotal > 0 && hourUnique < hourTotal) {
+                    logger.error('[GdtDirect] SCO 2h window STILL truncated — data loss possible', {
+                      window: `${h+1}/${hourChunks.length}`,
+                      fetched: hourRows.length, unique: hourUnique, reportedTotal: hourTotal,
+                      from: formatGdtDate(hf), to: formatGdtDate(ht),
+                      hint: 'Company has >50 invoices per 2-hour window. Contact admin.',
+                    });
+                  }
+                } catch (hourErr) {
+                  logger.warn('[GdtDirect] SCO 2h window failed (non-fatal)', {
+                    window: h + 1, err: hourErr instanceof Error ? hourErr.message : String(hourErr),
+                  });
+                }
+              }
+            }
+          } catch (dayErr) {
+            logger.warn('[GdtDirect] SCO day chunk failed (non-fatal)', {
+              day: d + 1, date: formatGdtDate(df).slice(0, 10),
+              err: dayErr instanceof Error ? dayErr.message : String(dayErr),
+            });
+          }
+        }
+
+        logger.info('[GdtDirect] SCO daily recovery complete', {
+          endpoint, weekChunk: i + 1,
+          weekReportedTotal: weekTotal, dailyFetched: dailyTotal,
+          uniqueSoFar: seen.size,
+        });
+
       } catch (err) {
         logger.warn('[GdtDirect] SCO weekly chunk failed (non-fatal)', {
           chunk: i + 1, of: weekChunks.length,
           from: formatGdtDate(from), to: formatGdtDate(to),
           err: err instanceof Error ? err.message : String(err),
         });
-
-        if (all.length === 0) {
-          // Fast-fail: first chunk failure with no results collected yet.
-          // GDT returns HTTP 500 (not 200+[]) for companies with no MTT/SCO setup.
-          // All subsequent chunks would also return 500 — skip them to avoid
-          // wasting getPeakMaxRetries() × exponential-backoff per chunk
-          // (during peak = 5 retries × 8s base = ~2 min per chunk × N chunks).
-          logger.info('[GdtDirect] SCO fast-fail: first chunk failed with no prior results — assuming no SCO invoices', {
-            endpoint,
-            skippingChunks: weekChunks.length - (i + 1),
-            hint: 'Company likely has no MTT/SCO setup. GDT returns 500 for non-SCO companies.',
-          });
+        // fast-fail nếu chunk đầu không có gì (company không có SCO)
+        if (seen.size === 0 && i === 0) {
+          logger.info('[GdtDirect] SCO fast-fail: first chunk failed with 0 results', { endpoint });
           break;
         }
-        // Subsequent chunk failures (all.length > 0): log and continue (might be transient)
       }
     }
 
-    logger.info('[GdtDirect] SCO fetch complete', { endpoint, total: all.length });
-    return all;
+    const result = Array.from(seen.values());
+    logger.info('[GdtDirect] SCO fetch complete', {
+      endpoint, total: result.length, probeTotal: probeCount,
+      complete: result.length >= probeCount,
+      discrepancy: probeCount - result.length,
+      sampleInvoiceDate: _firstDateSample, // 'null' = tdlap missing/unparseable in SCO response
+    });
+    return result;
+  }
+
+  private async _fetchScoFirstPage(
+    endpoint: 'sold' | 'purchase',
+    fromDate: Date,
+    toDate: Date,
+    extraFilter: string | undefined,
+    scoPath: string,
+    sort: string,
+  ): Promise<FetchResult> {
+    if (!this.token) throw new Error('Not authenticated — call login() first');
+
+    const direction: 'output' | 'input' = endpoint === 'sold' ? 'output' : 'input';
+    const from = formatGdtDate(fromDate);
+    const to = formatGdtDate(toDate);
+    const search = extraFilter
+      ? `tdlap=ge=${from};tdlap=le=${to};${extraFilter}`
+      : `tdlap=ge=${from};tdlap=le=${to}`;
+
+    const res = await this._getWithRetry<GdtPagedResponse>(
+      scoPath,
+      { sort, size: PAGE_SIZE, page: 0, search },
+    );
+
+    const rows = res.data.datas ?? res.data.data ?? [];
+    const headerTotal = parseInt(res.headers['x-total-count'] ?? '', 10);
+    const bodyTotal = res.data.total != null ? Number(res.data.total) : NaN;
+    const reportedTotal = !isNaN(headerTotal)
+      ? headerTotal
+      : (!isNaN(bodyTotal) ? bodyTotal : rows.length);
+
+    const mapped = rows.map(row => mapInvoice(row, direction, {
+      isSco: true,
+      fields: this.recipe?.fields,
+      statusMap: this.recipe?.statusMap,
+      rawIdentityKey: extractRawIdentityKey(row),
+      xmlAvailableTtxly: this.recipe
+        ? new Set(this.recipe.api.query.xmlAvailableTtxly)
+        : undefined,
+    }));
+
+    return { rows: mapped, reportedTotal };
+  }
+
+  private async _fetchScoByInvoiceNumberRanges(
+    endpoint: 'sold' | 'purchase',
+    fromDate: Date,
+    toDate: Date,
+    scoPath: string,
+    baseFilter?: string,
+  ): Promise<RawInvoice[]> {
+    const lowSample = await this._fetchScoFirstPage(endpoint, fromDate, toDate, baseFilter, scoPath, 'shdon:asc');
+    const highSample = await this._fetchScoFirstPage(endpoint, fromDate, toDate, baseFilter, scoPath, 'shdon:desc');
+    const range = extractInvoiceNumberRange([...lowSample.rows, ...highSample.rows]);
+
+    if (!range) {
+      logger.warn('[GdtDirect] SCO shdon-range recovery unavailable — invoice_number not numeric', {
+        endpoint,
+        from: formatGdtDate(fromDate),
+        to: formatGdtDate(toDate),
+      });
+      return [];
+    }
+
+    const collected = new Map<string, RawInvoice>();
+    const maxDepth = 16;
+
+    const visitRange = async (minValue: number, maxValue: number, depth: number): Promise<void> => {
+      if (minValue > maxValue || depth > maxDepth) return;
+
+      const filter = mergeFiqlFilter(baseFilter, `shdon=ge=${minValue}`, `shdon=le=${maxValue}`);
+      const { rows, reportedTotal } = await this._fetchScoFirstPage(
+        endpoint,
+        fromDate,
+        toDate,
+        filter,
+        scoPath,
+        'shdon:asc',
+      );
+
+      const uniqueRows = new Map<string, RawInvoice>();
+      for (const inv of rows) {
+        const key = invoiceIdentityKey(inv);
+        if (key !== '|||' && !uniqueRows.has(key)) uniqueRows.set(key, inv);
+      }
+
+      const resolvedRows = Array.from(uniqueRows.values());
+      const isCompleteRange = reportedTotal <= resolvedRows.length || reportedTotal <= PAGE_SIZE;
+      if (isCompleteRange || minValue === maxValue) {
+        for (const inv of resolvedRows) {
+          const key = invoiceIdentityKey(inv);
+          if (key !== '|||' && !collected.has(key)) collected.set(key, inv);
+        }
+        return;
+      }
+
+      const middle = Math.floor((minValue + maxValue) / 2);
+      if (middle <= minValue) {
+        logger.error('[GdtDirect] SCO shdon-range recovery stalled at minimal interval', {
+          endpoint,
+          minValue,
+          maxValue,
+          reportedTotal,
+          fetched: resolvedRows.length,
+        });
+        for (const inv of resolvedRows) {
+          const key = invoiceIdentityKey(inv);
+          if (key !== '|||' && !collected.has(key)) collected.set(key, inv);
+        }
+        return;
+      }
+
+      await visitRange(minValue, middle, depth + 1);
+      await humanDelay(250, 700);
+      await visitRange(middle + 1, maxValue, depth + 1);
+    };
+
+    await visitRange(range.min, range.max, 0);
+    return Array.from(collected.values());
   }
 
   /**
@@ -1165,25 +1579,7 @@ export class GdtDirectApiService {
     extraFilter?: string,
     overridePath?: string,
   ): Promise<RawInvoice[]> {
-    // FIX-6: Pre-check count and choose chunk strategy
-    const LARGE_VOLUME_THRESHOLD = 5_000;
-    let chunks: Array<{ from: Date; to: Date }>;
-    try {
-      const estimated = await this.prefetchCount(
-        endpoint === 'sold' ? 'sold' : 'purchase',
-        fromDate, toDate, extraFilter, overridePath,
-      );
-      if (estimated > LARGE_VOLUME_THRESHOLD) {
-        logger.info('[GdtDirect] Khối lượng lớn — dùng chunk theo tuần', {
-          endpoint, estimated, threshold: LARGE_VOLUME_THRESHOLD,
-        });
-        chunks = splitIntoWeeks(fromDate, toDate);
-      } else {
-        chunks = splitIntoMonths(fromDate, toDate);
-      }
-    } catch {
-      chunks = splitIntoMonths(fromDate, toDate);
-    }
+    const chunks = await this._planRangeChunks(endpoint, fromDate, toDate, extraFilter, overridePath);
 
     const all: RawInvoice[] = [];
     for (let i = 0; i < chunks.length; i++) {
@@ -1193,10 +1589,128 @@ export class GdtDirectApiService {
       // Without this, consecutive month requests arrive < 1s apart — GDT detects bot pattern
       // and responds with 429 after ~20 rapid requests.
       if (i > 0) await humanDelay(4_000, 8_000);
-      const chunk = await this._fetchAllPagesBuffered(endpoint, from, to, extraFilter, overridePath);
+      const chunk = await this._fetchQueryChunkRobust(endpoint, from, to, extraFilter, overridePath);
       all.push(...chunk);
     }
-    return all;
+    return dedupeInvoices(all);
+  }
+
+  private async *_streamRangeByMonth(
+    endpoint:     'sold' | 'purchase',
+    fromDate:     Date,
+    toDate:       Date,
+    extraFilter?: string,
+    overridePath?: string,
+  ): AsyncGenerator<RawInvoice[]> {
+    const chunks = await this._planRangeChunks(endpoint, fromDate, toDate, extraFilter, overridePath);
+    const pageSize = this.recipe?.api.pagination.pageSize ?? PAGE_SIZE;
+
+    for (let i = 0; i < chunks.length; i++) {
+      const { from, to } = chunks[i]!;
+      if (i > 0) await humanDelay(4_000, 8_000);
+
+      const chunkRows = await this._fetchQueryChunkRobust(endpoint, from, to, extraFilter, overridePath);
+      for (let offset = 0; offset < chunkRows.length; offset += pageSize) {
+        yield chunkRows.slice(offset, offset + pageSize);
+      }
+    }
+  }
+
+  private async _planRangeChunks(
+    endpoint:     'sold' | 'purchase',
+    fromDate:     Date,
+    toDate:       Date,
+    extraFilter?: string,
+    overridePath?: string,
+  ): Promise<Array<{ from: Date; to: Date }>> {
+    const LARGE_VOLUME_THRESHOLD = 5_000;
+    try {
+      const estimated = await this.prefetchCount(
+        endpoint === 'sold' ? 'sold' : 'purchase',
+        fromDate, toDate, extraFilter, overridePath,
+      );
+      if (estimated > LARGE_VOLUME_THRESHOLD) {
+        logger.info('[GdtDirect] Khối lượng lớn — dùng chunk theo tuần', {
+          endpoint,
+          estimated,
+          threshold: LARGE_VOLUME_THRESHOLD,
+          filter: extraFilter ?? 'none',
+        });
+        return splitIntoWeeks(fromDate, toDate);
+      }
+    } catch {
+      // Fall back to month chunks when the preflight count is unavailable.
+    }
+    return splitIntoMonths(fromDate, toDate);
+  }
+
+  private async _fetchQueryChunkRobust(
+    endpoint:     'sold' | 'purchase',
+    fromDate:     Date,
+    toDate:       Date,
+    extraFilter?: string,
+    overridePath?: string,
+    depth:        number = 0,
+  ): Promise<RawInvoice[]> {
+    const MAX_QUERY_SPLIT_DEPTH = 24;
+    const { rows, reportedTotal } = await this._fetchAllPagesBuffered(
+      endpoint,
+      fromDate,
+      toDate,
+      extraFilter,
+      overridePath,
+    );
+    const uniqueRows = dedupeInvoices(rows);
+    if (isFetchComplete(uniqueRows.length, reportedTotal)) {
+      return uniqueRows;
+    }
+
+    const split = splitRangeBySecondMidpoint(fromDate, toDate);
+    if (!split || depth >= MAX_QUERY_SPLIT_DEPTH) {
+      logger.error('[GdtDirect] Query chunk still truncated at minimal time window', {
+        endpoint,
+        path: overridePath ?? (endpoint === 'sold' ? 'query/sold' : 'query/purchase'),
+        filter: extraFilter ?? 'none',
+        from: formatGdtDate(fromDate),
+        to: formatGdtDate(toDate),
+        fetched: rows.length,
+        uniqueFetched: uniqueRows.length,
+        reportedTotal,
+        depth,
+      });
+      return uniqueRows;
+    }
+
+    logger.warn('[GdtDirect] Query chunk truncated — bisecting time range', {
+      endpoint,
+      filter: extraFilter ?? 'none',
+      from: formatGdtDate(fromDate),
+      to: formatGdtDate(toDate),
+      fetched: rows.length,
+      uniqueFetched: uniqueRows.length,
+      reportedTotal,
+      depth,
+    });
+
+    const leftRows = await this._fetchQueryChunkRobust(
+      endpoint,
+      split.left.from,
+      split.left.to,
+      extraFilter,
+      overridePath,
+      depth + 1,
+    );
+    await humanDelay(250, 700);
+    const rightRows = await this._fetchQueryChunkRobust(
+      endpoint,
+      split.right.from,
+      split.right.to,
+      extraFilter,
+      overridePath,
+      depth + 1,
+    );
+
+    return dedupeInvoices([...leftRows, ...rightRows]);
   }
 
   // ── Export XML (per invoice) ───────────────────────────────────────────────
@@ -1376,45 +1890,45 @@ export class GdtDirectApiService {
     toDate:       Date,
     extraFilter?: string,
     overridePath?: string,
-  ): Promise<RawInvoice[]> {
+  ): Promise<FetchResult> {   // ← Return type đổi từ Promise<RawInvoice[]> → Promise<FetchResult>
     if (!this.token) throw new Error('Not authenticated — call login() first');
 
     const direction: 'output' | 'input' = endpoint === 'sold' ? 'output' : 'input';
-    const pageSize  = this.recipe?.api.pagination.pageSize ?? PAGE_SIZE;
-    // Resolve the actual API path: overridePath takes precedence (used for sco-query endpoints),
-    // then recipe setting, then hardcoded default.
+    const pageSize    = this.recipe?.api.pagination.pageSize ?? PAGE_SIZE;
     const endpointPath = overridePath
       ?? (endpoint === 'sold'
         ? (this.recipe?.api.endpoints.sold     ?? '/query/invoices/sold')
         : (this.recipe?.api.endpoints.purchase ?? '/query/invoices/purchase'));
+
     const from   = formatGdtDate(fromDate);
     const to     = formatGdtDate(toDate);
-    // Build FIQL search string.
-    // extraFilter is caller-supplied, e.g. 'ttxly==5' or 'ttxly==6'.
-    // For sold invoices no extra filter is needed.
     const search = extraFilter
       ? `tdlap=ge=${from};tdlap=le=${to};${extraFilter}`
       : `tdlap=ge=${from};tdlap=le=${to}`;
-    const all:   RawInvoice[] = [];
-    let   total  = Infinity;
+    const checkpointScope = this._buildCheckpointScope(endpointPath, search);
+    const rawCacheEndpoint = `${endpointPath}?search=${search}`;
 
-    // FIX-2: Pagination checkpoint — resume from last saved page after a crash.
-    // Key: gdt:checkpoint:{companyId}:{yyyymm}:{direction}, TTL 1h.
+    const all: RawInvoice[] = [];
+    let total         = Infinity;
+    let reportedTotal = -1;    // ← GDT's own reported count, captured on first page
+
+    // Checkpoint resume
     const yyyymm = this._companyId
       ? `${fromDate.getFullYear()}${String(fromDate.getMonth() + 1).padStart(2, '0')}`
       : null;
     let page = 0;
     if (this._checkpoint && this._companyId && yyyymm) {
-      page = await this._checkpoint.loadStartPage(this._companyId, yyyymm, direction).catch(() => 0);
+      page = await this._checkpoint.loadStartPage(this._companyId, yyyymm, direction, checkpointScope).catch(() => 0);
       if (page > 0) {
-        logger.info('[GdtDirect] Đang tiếp tục từ checkpoint', {
-          companyId: this._companyId, page, direction,
-          message: `Đang tiếp tục từ trang ${page}, bỏ qua ${page * pageSize} hóa đơn đã lấy`,
+        logger.info('[GdtDirect] Resuming from checkpoint', {
+          companyId: this._companyId, page, direction, filter: extraFilter ?? 'none',
         });
       }
     }
 
-    logger.info('[GdtDirect] Fetching invoices', { endpoint, from, to, filter: extraFilter ?? 'none', startPage: page });
+    logger.info('[GdtDirect] Fetching invoices', {
+      endpoint, from, to, filter: extraFilter ?? 'none', startPage: page,
+    });
 
     while (all.length < total) {
       const res = await this._getWithRetry<GdtPagedResponse>(
@@ -1424,13 +1938,19 @@ export class GdtDirectApiService {
 
       const rows = res.data.datas ?? res.data.data ?? [];
 
-      // BUG-FIX: Same X-Total-Count trust fix as _streamPages.
-      // Only update total when the header reports more than one full page.
-      const headerTotal = parseInt(res.headers['x-total-count'] ?? '', 10);
-      if (!isNaN(headerTotal) && headerTotal > pageSize) {
-        total = headerTotal;
-      } else if (res.data.total != null && Number(res.data.total) > pageSize) {
-        total = Number(res.data.total);
+      // ── Capture GDT's reported total (ground truth) on FIRST page only ──────
+      // Subsequent pages may return different/stale total values.
+      // First page is most reliable.
+      if (reportedTotal === -1) {
+        const headerTotal = parseInt(res.headers['x-total-count'] ?? '', 10);
+        if (!isNaN(headerTotal) && headerTotal >= 0) {
+          reportedTotal = headerTotal;
+          total = reportedTotal > 0 ? reportedTotal : Infinity;
+        } else if (res.data.total != null && Number(res.data.total) >= 0) {
+          reportedTotal = Number(res.data.total);
+          total = reportedTotal > 0 ? reportedTotal : Infinity;
+        }
+        // If reportedTotal still -1: GDT gave no total → loop until empty page
       }
 
       if (rows.length === 0) break;
@@ -1441,6 +1961,7 @@ export class GdtDirectApiService {
         isSco,
         fields:           this.recipe?.fields,
         statusMap:        this.recipe?.statusMap,
+        rawIdentityKey:   extractRawIdentityKey(r),
         xmlAvailableTtxly: this.recipe
           ? new Set(this.recipe.api.query.xmlAvailableTtxly)
           : undefined,
@@ -1448,40 +1969,48 @@ export class GdtDirectApiService {
       all.push(...mapped);
 
       logger.debug('[GdtDirect] Page fetched', {
-        endpoint, page, rows: rows.length, soFar: all.length, total,
+        endpoint, page, rows: rows.length, soFar: all.length,
+        reportedTotal: reportedTotal === -1 ? 'unknown' : reportedTotal,
       });
 
-      // BOT-CACHE-02: Store raw page response in gdt_raw_cache for replay/debugging (non-fatal)
+      // Raw cache (non-fatal)
       if (this._rawCache && this._companyId) {
         const period = `${fromDate.getFullYear()}-${String(fromDate.getMonth() + 1).padStart(2, '0')}`;
         void this._rawCache.upsertPage({
           companyId: this._companyId,
-          endpoint:  endpointPath,
-          page,
+          endpoint:  rawCacheEndpoint,
+          page:      page,       // ← Fix bug: pass as number explicitly
           period,
           rawJson:   res.data,
         });
       }
 
-      // FIX-2: Save checkpoint after each successful page (non-fatal)
+      // Checkpoint (non-fatal)
       if (this._checkpoint && this._companyId && yyyymm) {
-        await this._checkpoint.save(this._companyId, yyyymm, direction, page).catch(() => {});
+        await this._checkpoint.save(this._companyId, yyyymm, direction, page, checkpointScope).catch(() => {});
       }
 
       if (all.length >= total) break;
-      if (rows.length < pageSize) break; // Partial page = natural end of stream
+      if (rows.length < pageSize) break;   // Natural end of stream
       page++;
-      // Random 0.8-2.5s between pages — mimics human scrolling through results.
-      // Fixed delays are a bot fingerprint; randomised intervals are harder to detect.
       await humanDelay(800, 2500);
     }
 
-    logger.info('[GdtDirect] Fetch complete', { endpoint, total: all.length });
-    // FIX-2: Clear checkpoint on success — next run starts fresh from page 0.
+    const uniqueFetched = dedupeInvoices(all).length;
+    logger.info('[GdtDirect] Fetch complete', {
+      endpoint,
+      fetched: all.length,
+      uniqueFetched,
+      reportedTotal: reportedTotal === -1 ? 'unknown' : reportedTotal,
+      complete: reportedTotal === -1 ? 'unknown' : uniqueFetched >= reportedTotal,
+    });
+
+    // Checkpoint clear on success
     if (this._checkpoint && this._companyId && yyyymm) {
-      await this._checkpoint.clear(this._companyId, yyyymm, direction).catch(() => {});
+      await this._checkpoint.clear(this._companyId, yyyymm, direction, checkpointScope).catch(() => {});
     }
-    return all;
+
+    return { rows: all, reportedTotal };
   }
 
   // ── Phase 8: Streaming (async generator) ──────────────────────────────────
@@ -1511,13 +2040,14 @@ export class GdtDirectApiService {
     const search = extraFilter
       ? `tdlap=ge=${from};tdlap=le=${to};${extraFilter}`
       : `tdlap=ge=${from};tdlap=le=${to}`;
+    const checkpointScope = this._buildCheckpointScope(endpointPath, search);
 
     const yyyymm = this._companyId
       ? `${fromDate.getFullYear()}${String(fromDate.getMonth() + 1).padStart(2, '0')}`
       : null;
     let page = 0;
     if (this._checkpoint && this._companyId && yyyymm) {
-      page = await this._checkpoint.loadStartPage(this._companyId, yyyymm, direction).catch(() => 0);
+      page = await this._checkpoint.loadStartPage(this._companyId, yyyymm, direction, checkpointScope).catch(() => 0);
     }
 
     const isSco  = overridePath?.includes('sco-query') ?? false;
@@ -1560,6 +2090,7 @@ export class GdtDirectApiService {
         isSco,
         fields:            this.recipe?.fields,
         statusMap:         this.recipe?.statusMap,
+        rawIdentityKey:    extractRawIdentityKey(r),
         xmlAvailableTtxly: this.recipe
           ? new Set(this.recipe.api.query.xmlAvailableTtxly)
           : undefined,
@@ -1568,7 +2099,7 @@ export class GdtDirectApiService {
       fetched += mapped.length;
 
       if (this._checkpoint && this._companyId && yyyymm) {
-        await this._checkpoint.save(this._companyId, yyyymm, direction, page).catch(() => {});
+        await this._checkpoint.save(this._companyId, yyyymm, direction, page, checkpointScope).catch(() => {});
       }
 
       yield mapped;
@@ -1582,7 +2113,7 @@ export class GdtDirectApiService {
     }
 
     if (this._checkpoint && this._companyId && yyyymm) {
-      await this._checkpoint.clear(this._companyId, yyyymm, direction).catch(() => {});
+      await this._checkpoint.clear(this._companyId, yyyymm, direction, checkpointScope).catch(() => {});
     }
   }
 
@@ -1596,8 +2127,8 @@ export class GdtDirectApiService {
     toDate:   Date,
   ): AsyncGenerator<RawInvoice[]> {
     const scoPath = this.recipe?.api.endpoints.scoSold ?? GDT_SCO_SOLD;
-    // Main endpoint — paginated over full date range
-    for await (const batch of this._streamPages('sold', fromDate, toDate)) {
+    // Main endpoint — use the same truncation-aware chunking as buffered fetches.
+    for await (const batch of this._streamRangeByMonth('sold', fromDate, toDate)) {
       yield batch;
     }
     await humanDelay(1_500, 3_000);
@@ -1616,7 +2147,7 @@ export class GdtDirectApiService {
    * The main /query/invoices/purchase endpoint requires a ttxly filter.
    * We drive the filter list from config.api.query.purchaseFilters so that
    * future filter additions require no code change.
-   * Default filters: ['ttxly==5', 'ttxly==6'] (ttxly==8 is MTTTT-only, handled by SCO).
+   * Default filters: ['ttxly==5', 'ttxly==6', 'ttxly==8'].
    */
   async *fetchInputInvoicesStream(
     fromDate: Date,
@@ -1626,13 +2157,13 @@ export class GdtDirectApiService {
 
     // Main /query endpoint: each ttxly type needs a separate paginated stream
     // because the endpoint requires exactly one ttxly filter.
-    // Config-driven: defaults to ['ttxly==5', 'ttxly==6'] if not set.
-    const purchaseFilters = this.recipe?.api.query?.purchaseFilters ?? ['ttxly==5', 'ttxly==6'];
+    // Config-driven: defaults to ['ttxly==5', 'ttxly==6', 'ttxly==8'] if not set.
+    const purchaseFilters = this._getPurchaseFilters();
     for (let fi = 0; fi < purchaseFilters.length; fi++) {
       if (fi > 0) await humanDelay(1_500, 3_000);
       const filter = purchaseFilters[fi]!;
       logger.info('[GdtDirect] Fetching purchase invoices (main /query)', { filter, from: formatGdtDate(fromDate), to: formatGdtDate(toDate) });
-      for await (const batch of this._streamPages('purchase', fromDate, toDate, filter)) {
+      for await (const batch of this._streamRangeByMonth('purchase', fromDate, toDate, filter)) {
         yield batch;
       }
     }
@@ -1722,6 +2253,22 @@ export class GdtDirectApiService {
       }
     }
     throw lastErr ?? new Error(`Failed to GET ${url} after ${maxRetries} retries`);
+  }
+
+  private _getPurchaseFilters(): string[] {
+    const configured = this.recipe?.api.query?.purchaseFilters;
+    if (Array.isArray(configured) && configured.length > 0) {
+      return [...new Set(configured.map(filter => String(filter).trim()).filter(Boolean))];
+    }
+    return ['ttxly==5', 'ttxly==6', 'ttxly==8'];
+  }
+
+  private _buildCheckpointScope(endpointPath: string, search: string): string {
+    return Buffer.from(`${endpointPath}|${search}`, 'utf8')
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/g, '');
   }
 
   /**

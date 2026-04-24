@@ -192,15 +192,15 @@ async function upsertInvoices(
             inv.serialNumber, inv.issuedDate, inv.sellerTaxCode, inv.sellerName,
             inv.buyerTaxCode, inv.buyerName, inv.subtotal, safeVatRate,
             inv.vatAmount, inv.total, inv.currency, inv.status,
-            provider === 'bkav' ? true : false,
+            false,
             inv.rawXml ?? null, inv.externalId
           ]
         );
         const row = result.rows[0];
         if (row?.is_new) created++; else updated++;
 
-        // Enqueue input invoices (non-BKAV) for GDT validation
-        if (row && inv.direction === 'input' && provider !== 'bkav') {
+        // Enqueue input invoices for GDT validation
+        if (row && inv.direction === 'input') {
           const issuedDateStr = inv.issuedDate instanceof Date
             ? inv.issuedDate.toISOString().split('T')[0]!
             : String(inv.issuedDate);

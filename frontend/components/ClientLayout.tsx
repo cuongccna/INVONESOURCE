@@ -20,8 +20,9 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 
 /** Renders the floating sync progress panel, persists across all page navigations. */
 function SyncOverlay() {
+  const pathname = usePathname();
   const { syncJobIds, syncCompanyId, clearSync } = useSyncContext();
-  if (syncJobIds.length === 0) return null;
+  if (syncJobIds.length === 0 || pathname === '/settings/bot') return null;
   return (
     <div className="fixed bottom-20 lg:bottom-6 inset-x-0 z-40 px-4" style={{ maxWidth: '42rem', left: '50%', transform: 'translateX(-50%)' }}>
       <SyncProgressPanel

@@ -4,7 +4,7 @@
  * Saves the last successfully processed page index so a failed sync job
  * can resume from where it left off instead of restarting from page 0.
  *
- * Key:  gdt:checkpoint:{companyId}:{yyyymm}:{direction}
+ * Key:  gdt:checkpoint:{companyId}:{yyyymm}:{direction}:{scope}
  * TTL:  3 600 s  (1 h)
  */
 import type { Redis } from 'ioredis';
@@ -19,8 +19,13 @@ interface CheckpointData {
 export class SyncCheckpoint {
   constructor(private readonly redis: Redis) {}
 
-  private key(companyId: string, yyyymm: string, direction: 'output' | 'input'): string {
-    return `gdt:checkpoint:${companyId}:${yyyymm}:${direction}`;
+  private key(
+    companyId: string,
+    yyyymm: string,
+    direction: 'output' | 'input',
+    scope: string = 'default',
+  ): string {
+    return `gdt:checkpoint:${companyId}:${yyyymm}:${direction}:${scope}`;
   }
 
   /** Persist the checkpoint after processing a page. */
@@ -29,10 +34,11 @@ export class SyncCheckpoint {
     yyyymm: string,
     direction: 'output' | 'input',
     lastPage: number,
+    scope: string = 'default',
   ): Promise<void> {
     const data: CheckpointData = { lastPage, savedAt: Date.now() };
     await this.redis.set(
-      this.key(companyId, yyyymm, direction),
+      this.key(companyId, yyyymm, direction, scope),
       JSON.stringify(data),
       'EX',
       TTL_SECONDS,
@@ -47,8 +53,9 @@ export class SyncCheckpoint {
     companyId: string,
     yyyymm: string,
     direction: 'output' | 'input',
+    scope: string = 'default',
   ): Promise<number> {
-    const raw = await this.redis.get(this.key(companyId, yyyymm, direction));
+    const raw = await this.redis.get(this.key(companyId, yyyymm, direction, scope));
     if (!raw) return 0;
     try {
       const data: CheckpointData = JSON.parse(raw) as CheckpointData;
@@ -59,7 +66,12 @@ export class SyncCheckpoint {
   }
 
   /** Remove the checkpoint after a successful full sync. */
-  async clear(companyId: string, yyyymm: string, direction: 'output' | 'input'): Promise<void> {
-    await this.redis.del(this.key(companyId, yyyymm, direction));
+  async clear(
+    companyId: string,
+    yyyymm: string,
+    direction: 'output' | 'input',
+    scope: string = 'default',
+  ): Promise<void> {
+    await this.redis.del(this.key(companyId, yyyymm, direction, scope));
   }
 }

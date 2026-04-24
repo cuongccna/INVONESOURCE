@@ -74,7 +74,7 @@ interface AnomalyReport {
 
 /* ─── Constants ───────────────────────────────────────────────────────────── */
 const PROVIDER_LABELS: Record<string, string> = {
-  misa: 'MISA', viettel: 'Viettel', bkav: 'BKAV', gdt_intermediary: 'GDT',
+  gdt_intermediary: 'GDT',
 };
 /* ─── Formatters ──────────────────────────────────────────────────────────── */
 import { formatVND, formatVNDShort, formatVNDFull, formatVNDCompact } from '../../../utils/formatCurrency';
