@@ -6,36 +6,16 @@ import axios from 'axios';
 import { setAccessToken } from '../lib/apiClient';
 import { CompanyProvider } from '../contexts/CompanyContext';
 import { ViewProvider, useView } from '../contexts/ViewContext';
-import { SyncProvider, useSyncContext } from '../contexts/SyncContext';
+import { SyncProvider } from '../contexts/SyncContext';
 import { AuthProvider } from '../contexts/AuthContext';
 import Header from './Header';
 import BottomNav from './BottomNav';
-import SyncProgressPanel from './SyncProgressPanel';
 import { useCompany } from '../contexts/CompanyContext';
 import { usePushSubscription } from '../lib/usePushSubscription';
 import BackButton from './BackButton';
 import { buildRouteKey, pushNavigationEntry } from '../lib/navigationHistory';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
-
-/** Renders the floating sync progress panel, persists across all page navigations. */
-function SyncOverlay() {
-  const pathname = usePathname();
-  const { syncJobIds, syncCompanyId, clearSync } = useSyncContext();
-  if (syncJobIds.length === 0 || pathname === '/settings/bot') return null;
-  return (
-    <div className="pointer-events-none fixed inset-x-0 top-[4.5rem] z-[70] px-4 lg:top-[5rem]">
-      <div className="pointer-events-auto mx-auto max-w-2xl lg:max-w-3xl">
-        <SyncProgressPanel
-          jobIds={syncJobIds}
-          companyId={syncCompanyId}
-          onClose={clearSync}
-          onDone={clearSync}
-        />
-      </div>
-    </div>
-  );
-}
 
 /** Redirects to company creation when user has no companies yet, except on the settings page itself. */
 function NoCompanyGuard() {
@@ -158,7 +138,6 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
               <GlobalBackStrip />
               {children}
             </main>
-            <SyncOverlay />
             <BottomNav />
           </div>
         </ViewProvider>
