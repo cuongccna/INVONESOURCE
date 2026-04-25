@@ -34,7 +34,8 @@ export class TaxDeclarationEngine {
               invoice_date, seller_tax_code, seller_name, buyer_tax_code, buyer_name,
               total_amount, vat_amount, payment_method, gdt_validated,
               invoice_group, serial_has_cqt, has_line_items,
-              mccqt, tc_hdon, lhd_cl_quan, khhd_cl_quan, so_hd_cl_quan
+              mccqt, tc_hdon, lhd_cl_quan, khhd_cl_quan, so_hd_cl_quan,
+              invoice_relation_type, cross_period_flag
        FROM invoices
        WHERE company_id = $1
          AND deleted_at IS NULL
@@ -43,6 +44,40 @@ export class TaxDeclarationEngine {
       [companyId, startDate, endDate]
     );
     return rows;
+  }
+
+  /**
+   * Compute auto ct37/ct38 from cross-period OUTPUT adjustment invoices.
+   *
+   * Cross-period output adjustments (invoice_relation_type='adjustment' AND cross_period_flag=true)
+   * are NOT included in the regular output VAT totals (ct40a) because the original invoice was in a
+   * prior period.  Instead, their VAT delta goes into ct37 (underpayment top-up) or ct38 (overpayment
+   * reduction) of the 01/GTGT form.
+   *
+   * Sign convention:
+   *   vat_amount > 0 → adjustment ADDS to output VAT (prior underpayment) → ct37_auto_decrease
+   *   vat_amount < 0 → adjustment REDUCES output VAT (prior overpayment)  → ct38_auto_increase
+   */
+  private async computeCrossPeriodAdjustments(
+    companyId: string,
+    startDate: Date,
+    endDate: Date,
+    crossPeriodOutputIds: string[],
+  ): Promise<{ ct37_auto: number; ct38_auto: number }> {
+    if (crossPeriodOutputIds.length === 0) return { ct37_auto: 0, ct38_auto: 0 };
+
+    const { rows } = await pool.query<{ auto_decrease: string; auto_increase: string }>(
+      `SELECT
+         COALESCE(SUM(CASE WHEN vat_amount > 0 THEN vat_amount ELSE 0 END), 0)  AS auto_decrease,
+         COALESCE(SUM(CASE WHEN vat_amount < 0 THEN ABS(vat_amount) ELSE 0 END), 0) AS auto_increase
+       FROM invoices
+       WHERE id = ANY($1)`,
+      [crossPeriodOutputIds],
+    );
+    return {
+      ct37_auto: Math.round(parseFloat(rows[0]!.auto_decrease) || 0),
+      ct38_auto: Math.round(parseFloat(rows[0]!.auto_increase) || 0),
+    };
   }
 
   /** Lookup the tax_code (MST) for a companyId. */
@@ -83,8 +118,19 @@ export class TaxDeclarationEngine {
     // Split valid IDs by direction — critical to prevent input-only IDs from filtering
     // output queries (and zeroing out ct40a). Each direction is filtered independently.
     const validIdSet = new Set(validInvoiceIds);
+
+    // Cross-period output adjustment invoices are routed to ct37/ct38 separately; exclude
+    // them from the regular output VAT totals to avoid double-counting.
+    const crossPeriodOutputIds = invoices.filter(
+      inv => inv.direction === 'output'
+          && validIdSet.has(inv.id)
+          && inv.invoice_relation_type === 'adjustment'
+          && inv.cross_period_flag === true,
+    ).map(inv => inv.id);
+    const crossPeriodSet = new Set(crossPeriodOutputIds);
+
     const validInputIds  = invoices.filter(inv => inv.direction === 'input'  && validIdSet.has(inv.id)).map(inv => inv.id);
-    const validOutputIds = invoices.filter(inv => inv.direction === 'output' && validIdSet.has(inv.id)).map(inv => inv.id);
+    const validOutputIds = invoices.filter(inv => inv.direction === 'output' && validIdSet.has(inv.id) && !crossPeriodSet.has(inv.id)).map(inv => inv.id);
 
     // Step 1: Get VAT summary — restricted to validated invoice IDs by direction
     const vat = await this.vatService.calculatePeriod(companyId, month, year,
@@ -97,22 +143,27 @@ export class TaxDeclarationEngine {
     // Step 2b: Preserve manual fields from existing row (if any) — do NOT overwrite on recalculate
     const existingManuals = await this.getManualFields(companyId, month, year, 'monthly');
 
+    // Step 2c: Compute auto ct37/ct38 from cross-period output adjustment invoices
+    const { ct37_auto, ct38_auto } = await this.computeCrossPeriodAdjustments(
+      companyId, startDate, endDate, crossPeriodOutputIds,
+    );
+
     // [25] = [23] + [24]
     const ct25 = vat.ct23_deductible_input_vat + ct24;
 
-    // NQ142/NQ204: giảm thuế = 2% × doanh thu đầu ra 8%
-    const ct36_nq = Math.round(vat.ct34_revenue_8pct * 0.02);
+    // NQ142/NQ204 invoices are already issued at 8% rate — the reduced VAT is reflected directly
+    // in ct40a (actual VAT collected). Do NOT subtract an additional NQ reduction here, that would
+    // be double-counting. ct36_nq_vat_reduction is stored as informational data only.
+    const ct36_nq = Math.round(vat.ct34_revenue_8pct * 0.02); // stored for display only
+    const ct40a_adjusted = Math.round(vat.ct40a_total_output_vat); // use actual VAT, no extra reduction
 
-    // [40a] sau NQ142 = tổng thuế đầu ra - giảm NQ
-    const ct40a_adjusted = Math.round(vat.ct40a_total_output_vat) - ct36_nq;
-
-    // net = [40a_adj] - [25] + [37_adj_decrease] - [38_adj_increase]
-    // [37] điều chỉnh giảm: giảm số được khấu trừ → tăng số phải nộp (cộng vào net)
-    // [38] điều chỉnh tăng: tăng số được khấu trừ → giảm số phải nộp (trừ khỏi net)
+    // net = [40a] - [25] + ([37_auto + 37_manual]) - ([38_auto + 38_manual])
+    // ct37 = prior-period adjustments that ADD to output VAT (underpayment top-up)
+    // ct38 = prior-period adjustments that REDUCE output VAT (overpayment correction)
     const ct37_manual = existingManuals.ct37_adjustment_decrease ?? 0;
     const ct38_manual = existingManuals.ct38_adjustment_increase ?? 0;
     const ct40b_manual = existingManuals.ct40b_investment_vat ?? 0;
-    const net = ct40a_adjusted - ct25 + ct37_manual - ct38_manual;
+    const net = ct40a_adjusted - ct25 + (ct37_auto + ct37_manual) - (ct38_auto + ct38_manual);
 
     // [40] = MAX(0, net) - ct40b (bù trừ dự án đầu tư)
     const ct40_pay = Math.max(0, Math.max(0, net) - ct40b_manual);
@@ -138,13 +189,14 @@ export class TaxDeclarationEngine {
         ct36_nq_vat_reduction,
         ct40_total_output_revenue, ct40a_total_output_vat,
         ct41_payable_vat, ct43_carry_forward_vat,
+        ct37_auto_decrease, ct38_auto_increase,
         ct37_adjustment_decrease, ct38_adjustment_increase, ct40b_investment_vat,
         ct21_no_activity,
         submission_status, updated_at
       ) VALUES (
         $1,$2,$3,$4,'01/GTGT','monthly',
         $5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,
-        $26,$27,$28,$29,$30,NOW()
+        $26,$27,$28,$29,$30,$31,$32,NOW()
       )
       ON CONFLICT (company_id, period_month, period_year, form_type, period_type)
       DO UPDATE SET
@@ -169,6 +221,9 @@ export class TaxDeclarationEngine {
         ct40a_total_output_vat = EXCLUDED.ct40a_total_output_vat,
         ct41_payable_vat = EXCLUDED.ct41_payable_vat,
         ct43_carry_forward_vat = EXCLUDED.ct43_carry_forward_vat,
+        -- Auto fields: always recomputed from invoice data on each recalculation
+        ct37_auto_decrease = EXCLUDED.ct37_auto_decrease,
+        ct38_auto_increase = EXCLUDED.ct38_auto_increase,
         -- Manual fields: only update if the existing row has NOT been manually set
         -- (preserve user-entered adjustments across recalculations)
         ct37_adjustment_decrease = COALESCE(tax_declarations.ct37_adjustment_decrease, EXCLUDED.ct37_adjustment_decrease),
@@ -178,6 +233,8 @@ export class TaxDeclarationEngine {
         submission_status = CASE WHEN tax_declarations.submission_status IN ('submitted','accepted')
                                  THEN tax_declarations.submission_status
                                  ELSE 'draft' END,
+        xml_content = NULL,
+        xml_generated_at = NULL,
         updated_at = NOW()`,
       [
         id, companyId, month, year,
@@ -202,6 +259,8 @@ export class TaxDeclarationEngine {
         Math.round(vat.ct40a_total_output_vat),
         Math.round(ct40_pay),
         Math.round(ct43),
+        ct37_auto,
+        ct38_auto,
         ct37_manual,
         ct38_manual,
         ct40b_manual,
@@ -249,26 +308,37 @@ export class TaxDeclarationEngine {
 
     const validInvoiceIds = validationOutput.valid_invoices;
 
-    // Split valid IDs by direction
+    // Split valid IDs by direction; exclude cross-period output adjustments from regular totals
     const validIdSet = new Set(validInvoiceIds);
+    const crossPeriodOutputIds = invoices.filter(
+      inv => inv.direction === 'output'
+          && validIdSet.has(inv.id)
+          && inv.invoice_relation_type === 'adjustment'
+          && inv.cross_period_flag === true,
+    ).map(inv => inv.id);
+    const crossPeriodSet = new Set(crossPeriodOutputIds);
+
     const validInputIds  = invoices.filter(inv => inv.direction === 'input'  && validIdSet.has(inv.id)).map(inv => inv.id);
-    const validOutputIds = invoices.filter(inv => inv.direction === 'output' && validIdSet.has(inv.id)).map(inv => inv.id);
+    const validOutputIds = invoices.filter(inv => inv.direction === 'output' && validIdSet.has(inv.id) && !crossPeriodSet.has(inv.id)).map(inv => inv.id);
 
     const vat  = await this.vatService.calculateQuarter(companyId, quarter, year,
       validInvoiceIds.length > 0 ? { inputIds: validInputIds, outputIds: validOutputIds } : undefined
     );
     const ct24 = await this.getCarryForwardQuarterly(companyId, quarter, year);
     const existingManuals = await this.getManualFields(companyId, quarter, year, 'quarterly');
+    const { ct37_auto, ct38_auto } = await this.computeCrossPeriodAdjustments(
+      companyId, startDate, endDate, crossPeriodOutputIds,
+    );
     const ct25 = vat.ct23_deductible_input_vat + ct24;
 
-    // NQ142/NQ204: giảm thuế = 2% × doanh thu đầu ra 8%
+    // NQ142/NQ204: stored for display; NOT subtracted from ct40a (invoices already at 8% rate)
     const ct36_nq = Math.round(vat.ct34_revenue_8pct * 0.02);
-    const ct40a_adjusted = Math.round(vat.ct40a_total_output_vat) - ct36_nq;
+    const ct40a_adjusted = Math.round(vat.ct40a_total_output_vat); // actual VAT, no extra reduction
 
     const ct37_manual  = existingManuals.ct37_adjustment_decrease ?? 0;
     const ct38_manual  = existingManuals.ct38_adjustment_increase ?? 0;
     const ct40b_manual = existingManuals.ct40b_investment_vat ?? 0;
-    const net = ct40a_adjusted - ct25 + ct37_manual - ct38_manual;
+    const net = ct40a_adjusted - ct25 + (ct37_auto + ct37_manual) - (ct38_auto + ct38_manual);
     const ct40_pay = Math.max(0, Math.max(0, net) - ct40b_manual);
     const ct41 = Math.max(0, -net) + Math.max(0, ct40b_manual - Math.max(0, net));
     const ct43 = ct41;
@@ -287,13 +357,14 @@ export class TaxDeclarationEngine {
         ct36_nq_vat_reduction,
         ct40_total_output_revenue, ct40a_total_output_vat,
         ct41_payable_vat, ct43_carry_forward_vat,
+        ct37_auto_decrease, ct38_auto_increase,
         ct37_adjustment_decrease, ct38_adjustment_increase, ct40b_investment_vat,
         ct21_no_activity,
         submission_status, updated_at
       ) VALUES (
         $1,$2,$3,$4,'01/GTGT','quarterly',
         $5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,
-        $26,$27,$28,$29,$30,NOW()
+        $26,$27,$28,$29,$30,$31,$32,NOW()
       )
       ON CONFLICT (company_id, period_month, period_year, form_type, period_type)
       DO UPDATE SET
@@ -318,6 +389,8 @@ export class TaxDeclarationEngine {
         ct40a_total_output_vat = EXCLUDED.ct40a_total_output_vat,
         ct41_payable_vat = EXCLUDED.ct41_payable_vat,
         ct43_carry_forward_vat = EXCLUDED.ct43_carry_forward_vat,
+        ct37_auto_decrease = EXCLUDED.ct37_auto_decrease,
+        ct38_auto_increase = EXCLUDED.ct38_auto_increase,
         ct37_adjustment_decrease = COALESCE(tax_declarations.ct37_adjustment_decrease, EXCLUDED.ct37_adjustment_decrease),
         ct38_adjustment_increase = COALESCE(tax_declarations.ct38_adjustment_increase, EXCLUDED.ct38_adjustment_increase),
         ct40b_investment_vat     = COALESCE(tax_declarations.ct40b_investment_vat,     EXCLUDED.ct40b_investment_vat),
@@ -325,6 +398,8 @@ export class TaxDeclarationEngine {
         submission_status = CASE WHEN tax_declarations.submission_status IN ('submitted','accepted')
                                  THEN tax_declarations.submission_status
                                  ELSE 'draft' END,
+        xml_content = NULL,
+        xml_generated_at = NULL,
         updated_at = NOW()`,
       [
         id, companyId, quarter, year,
@@ -343,6 +418,7 @@ export class TaxDeclarationEngine {
         Math.round(vat.ct40_total_output_revenue),
         Math.round(vat.ct40a_total_output_vat),
         Math.round(ct40_pay), Math.round(ct43),
+        ct37_auto, ct38_auto,
         ct37_manual, ct38_manual, ct40b_manual,
         existingManuals.ct21_no_activity ?? false,
         'draft',

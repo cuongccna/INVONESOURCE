@@ -110,13 +110,13 @@ export class HtkkXmlGenerator {
     // [36] = [35] - [25] = Thuế GTGT phát sinh trong kỳ (chưa tính kết chuyển và điều chỉnh)
     const xml_ct36 = xml_ct35_total - xml_ct25;
 
-    // [37] Điều chỉnh giảm = tự nhập (giảm số được khấu trừ kỳ trước)
-    // KHÔNG bao gồm giảm NQ142 (NQ142 giảm thuế phải nộp → thuộc ct38)
-    const xml_ct37 = n(d.ct37_adjustment_decrease ?? 0);
+    // [37] = prior-period adjustments that increase output VAT + manual override
+    const xml_ct37 = n(d.ct37_auto_decrease ?? 0) + n(d.ct37_adjustment_decrease ?? 0);
 
-    // [38] Điều chỉnh tăng = giảm thuế NQ142 + tăng khấu trừ kỳ trước (tự nhập)
-    // NQ142 GIẢM thuế phải nộp → đưa vào [38] "tăng" để trừ khỏi [40a]
-    const xml_ct38 = plucOutputSumReduction + n(d.ct38_adjustment_increase ?? 0);
+    // [38] = prior-period adjustments that reduce output VAT / increase deductible + manual override.
+    // NQ142 invoices are already issued at 8% rate — their actual VAT is in [35] directly.
+    // Do NOT include plucOutputSumReduction here: that would be a double-reduction.
+    const xml_ct38 = n(d.ct38_auto_increase ?? 0) + n(d.ct38_adjustment_increase ?? 0);
 
     // [40a] = MAX(0, [36] - [22] + [37] - [38])
     // FIX: dấu [22] phải là trừ (kết chuyển làm giảm số phải nộp)

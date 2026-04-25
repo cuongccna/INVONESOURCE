@@ -186,6 +186,8 @@ export interface TaxDeclaration {
   ct26_kct_revenue?: number;
   ct29_0pct_revenue?: number;
   ct32a_kkknt_revenue?: number;
+  ct37_auto_decrease?: number | null;
+  ct38_auto_increase?: number | null;
   ct37_adjustment_decrease?: number | null;
   ct38_adjustment_increase?: number | null;
   ct40b_investment_vat?: number | null;

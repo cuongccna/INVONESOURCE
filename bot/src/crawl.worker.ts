@@ -280,7 +280,7 @@ function simulateReadTime(itemCount: number): Promise<void> {
 async function maybeUserBreak(): Promise<void> {
   requestCounter++;
   if (requestCounter >= nextBreak) {
-    const pauseMs = 30_000 + Math.random() * 60_000; // 30-90s
+    const pauseMs = 10_000 + Math.random() * 20_000; // 10-30s
     logger.debug('Simulating user break', { requests: requestCounter, pauseMs: Math.round(pauseMs) });
     await new Promise(r => setTimeout(r, pauseMs));
     requestCounter = 0;
@@ -311,7 +311,7 @@ async function fetchDetailsWithConcurrency(
   isSco: boolean,
   direction: 'purchase' | 'sold',
 ): Promise<Map<string, Record<string, unknown>>> {
-  const concurrency = isSco ? 2 : 3;
+  const concurrency = isSco ? 4 : 6;
   const endpoint    = isSco ? config.api.endpoints.detailSco : config.api.endpoints.detail;
   const actionHeader = direction === 'purchase' ? ACTIONS.detailPurchase : ACTIONS.detailSold;
   const sem = new Semaphore(concurrency);
@@ -320,7 +320,7 @@ async function fetchDetailsWithConcurrency(
   await Promise.all(invoices.map(async (inv) => {
     const release = await sem.acquire();
     try {
-      await jitteredDelay(500, 1000);
+      await jitteredDelay(200, 500);
 
       const detail = await requestWithProxySwap(
         async (client) => {

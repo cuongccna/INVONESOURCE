@@ -194,9 +194,7 @@ auto-sync (mỗi 5 phút)
 - **Jitter:** Random delay 0–3 phút giữa các job để tránh storm
 
 ### Proxy & Anti-detection
-- IPRoyal sticky sessions (VN IP, 30 phút/session) — ưu tiên
-- TMProxy API keys (per-company IP affinity)
-- Static proxy list (fallback)
+- Static proxy pool (DB-managed, per-company IP affinity) — nguồn duy nhất
 - User-Agent rotation, human-like read pauses, custom param serialization
 
 ### Bảo vệ & resilience
@@ -312,8 +310,7 @@ GEMINI_MODEL                    — gemini-2.0-flash (hoặc tương đương)
 
 # Bot
 TWO_CAPTCHA_API_KEY             — 2Captcha API key
-IPROYAL_PROXY_LIST              — Danh sách proxy IPRoyal
-TMPROXY_API_KEYS                — TMProxy keys (cách nhau bởi dấu phẩy)
+PROXY_LIST                      — Static proxy list (HTTP CONNECT), quản lý qua DB
 GDT_CANARY_COMPANY_ID           — ID công ty dùng để health check
 ```
 

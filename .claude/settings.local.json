@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(npm run *)"
+      "Bash(npm run *)",
+      "Bash(npx tsc *)",
+      "Bash(PGPASSWORD=Cuongnv123456 psql -U user_invone -h localhost -d invone_db -c \"SELECT id, tax_code, name FROM companies WHERE tax_code = '0317342919';\")"
     ]
   }
 }

@@ -132,7 +132,7 @@ router.patch(
 
       // Fetch current declaration to recalculate ct25, ct41, ct43
       const { rows } = await pool.query(
-        `SELECT ct23_deductible_input_vat, ct40a_total_output_vat, ct36_nq_vat_reduction
+        `SELECT ct23_deductible_input_vat, ct40a_total_output_vat
          FROM tax_declarations WHERE id = $1 AND company_id = $2`,
         [req.params.id, req.user!.companyId]
       );
@@ -141,11 +141,11 @@ router.patch(
       const ct24 = opening_balance;
       const ct23 = Number(rows[0].ct23_deductible_input_vat ?? 0);
       const ct40a_raw = Number(rows[0].ct40a_total_output_vat ?? 0);
-      const ct36_nq  = Number(rows[0].ct36_nq_vat_reduction ?? 0);
       const ct25 = ct23 + ct24;
-      const ct40a_adj = ct40a_raw - ct36_nq;
-      const ct41 = Math.max(0, ct40a_adj - ct25);
-      const ct43 = Math.max(0, ct25 - ct40a_adj);
+      // FIX: Do NOT subtract ct36_nq_vat_reduction — NQ142 invoices are already issued at 8%,
+      // their VAT is correctly reflected in ct40a. Subtracting again is a double-reduction.
+      const ct41 = Math.max(0, ct40a_raw - ct25);
+      const ct43 = Math.max(0, ct25 - ct40a_raw);
 
       const result = await pool.query(
         `UPDATE tax_declarations
@@ -187,9 +187,8 @@ router.patch(
         ct23_deductible_input_vat: string;
         ct24_carried_over_vat: string;
         ct40a_total_output_vat: string;
-        ct36_nq_vat_reduction: string;
       }>(
-        `SELECT ct23_deductible_input_vat, ct24_carried_over_vat, ct40a_total_output_vat, ct36_nq_vat_reduction
+        `SELECT ct23_deductible_input_vat, ct24_carried_over_vat, ct40a_total_output_vat
          FROM tax_declarations WHERE id = $1 AND company_id = $2`,
         [req.params.id, req.user!.companyId]
       );
@@ -199,13 +198,14 @@ router.patch(
       const ct24  = Number(rows[0].ct24_carried_over_vat ?? 0);
       const ct25  = ct23 + ct24;
       const ct40a = Number(rows[0].ct40a_total_output_vat ?? 0);
-      const nqRed = Number(rows[0].ct36_nq_vat_reduction ?? 0);
 
       const ct37_manual  = body.ct37  ?? 0;
       const ct38_manual  = body.ct38  ?? 0;
       const ct40b_manual = body.ct40b ?? 0;
 
-      const net      = ct40a - nqRed - ct25 + ct37_manual - ct38_manual;
+      // FIX: Do NOT subtract ct36_nq_vat_reduction — NQ142 invoices are already issued at 8%,
+      // their VAT is correctly reflected in ct40a. Subtracting again is a double-reduction.
+      const net      = ct40a - ct25 + ct37_manual - ct38_manual;
       const ct40_pay = Math.max(0, Math.max(0, net) - ct40b_manual);
       const ct41     = Math.max(0, -net) + Math.max(0, ct40b_manual - Math.max(0, net));
       const ct43     = ct41;

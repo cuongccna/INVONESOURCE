@@ -18,6 +18,9 @@ interface JobProgress {
   state: 'waiting' | 'delayed' | 'active' | 'completed' | 'failed';
   progress: number;
   invoicesFetched: number;
+  totalInvoicesExpected: number | null;
+  outputCount: number;
+  inputCount: number;
   currentPage: number;
   totalPages: number | null;
   currentMonth: string;
@@ -195,15 +198,31 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
   }, [allDone, anyFailed, cancelled, onDone]);
 
   const retryCount = (id: string) => retryCountRef.current[id] ?? 0;
+
+  // Use actual invoice counts when available (totalInvoicesExpected emitted by bot).
+  // Falls back to averaging job.progress when counts aren't known yet.
+  // null until ALL active jobs have reported totalInvoicesExpected
+  const totalExpectedAll = jobIds.reduce((s, id) => {
+    if (s === null) return null;
+    const j = jobs[id];
+    if (!j || j.totalInvoicesExpected == null) return null;
+    return s + j.totalInvoicesExpected;
+  }, 0 as number | null);
+  const totalFetchedAll = jobIds.reduce((s, id) => s + (jobs[id]?.invoicesFetched ?? 0), 0);
+  const totalOutputAll  = jobIds.reduce((s, id) => s + (jobs[id]?.outputCount ?? 0), 0);
+  const totalInputAll   = jobIds.reduce((s, id) => s + (jobs[id]?.inputCount ?? 0), 0);
+
   const overallProgress = jobIds.length === 0
     ? 0
+    : totalExpectedAll != null && totalExpectedAll > 0
+    ? Math.min(99, Math.round((totalFetchedAll / totalExpectedAll) * 100))
     : Math.round(jobIds.reduce((sum, id) => {
-      const job = jobs[id];
-      if (stalledJobs.has(id)) return sum + 100;
-      if (!job) return sum;
-      if (job.state === 'completed') return sum + 100;
-      return sum + Math.min(100, Math.max(0, job.progress));
-    }, 0) / jobIds.length);
+        const job = jobs[id];
+        if (stalledJobs.has(id)) return sum + 100;
+        if (!job) return sum;
+        if (job.state === 'completed') return sum + 100;
+        return sum + Math.min(100, Math.max(0, job.progress));
+      }, 0) / jobIds.length);
 
   return (
     <div className="bg-white rounded-2xl shadow-lg border border-gray-100 p-4 space-y-3">
@@ -235,6 +254,17 @@ export default function SyncProgressPanel({ jobIds, companyId, onClose, onDone }
           )}
         </div>
       </div>
+
+      {/* Breakdown: output / input counts when available */}
+      {!allDone && (totalOutputAll > 0 || totalInputAll > 0) && (
+        <div className="flex gap-3 text-[11px] text-slate-500">
+          <span>📤 Đầu ra: <span className="font-semibold text-slate-700">{totalOutputAll.toLocaleString('vi-VN')}</span>{totalExpectedAll != null ? '' : ' HĐ'}</span>
+          <span>📥 Đầu vào: <span className="font-semibold text-slate-700">{totalInputAll.toLocaleString('vi-VN')}</span>{totalExpectedAll != null ? '' : ' HĐ'}</span>
+          {totalExpectedAll != null && (
+            <span className="ml-auto text-slate-400">/ {totalExpectedAll.toLocaleString('vi-VN')} HĐ ước tính</span>
+          )}
+        </div>
+      )}
 
       {/* Job rows */}
       <div className="space-y-2">

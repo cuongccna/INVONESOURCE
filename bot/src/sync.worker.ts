@@ -141,13 +141,13 @@ const _dlqQueue = new Queue('gdt-sync-dlq', {
   connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
 });
 const JITTER_EVERY = 10;
-const JITTER_MIN   = 3500;
-const JITTER_MAX   = 6500;
+const JITTER_MIN   = 1200;
+const JITTER_MAX   = 2500;
 // Longer "read pause" — simulates user stopping to examine an invoice
 const READ_PAUSE_EVERY_MIN = 25;
 const READ_PAUSE_EVERY_MAX = 40;
-const READ_PAUSE_MIN = 10_000;
-const READ_PAUSE_MAX = 30_000;
+const READ_PAUSE_MIN = 3_000;
+const READ_PAUSE_MAX = 10_000;
 
 const FREE_TIER_MONTHLY_QUOTA = 100;
 
@@ -877,7 +877,7 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     // Simulates an accountant opening a browser and navigating to the portal.
     // Manual syncs use a shorter pause (0.5–2s) to stay within the 3-minute target.
     await job.updateProgress({ percent: 5, statusMessage: 'Đang đăng nhập GDT...' } as Record<string, unknown>);
-    await thinkTime(isManual ? 500 : 3_000, isManual ? 2_000 : 15_000);
+    await thinkTime(isManual ? 300 : 1_000, isManual ? 1_000 : 5_000);
 
     const gdtApi = new GdtDirectApiService(proxyUrl, socks5ProxyUrl, undefined, companyId, _checkpoint, gdtRawCacheService);
     // VĐ1: Wire proxy manager for mid-request proxy swap on TCP drops
@@ -1212,19 +1212,25 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
           }
         }
 
-        // Progress update — anchored to Phase 3 estimate if available
-        const estOut = outEst >= 0 ? outEst : outputCount;
-        const pct = Math.min(49, Math.round((outputCount / Math.max(estOut, 1)) * 50));
+        // Progress = total fetched / total expected (all types: output + input)
+        const totalEst = (outEst >= 0 ? outEst : 0) + (inEst >= 0 ? inEst : 0);
+        const totalFetched = outputCount + inputCount;
+        const pct = totalEst > 0
+          ? Math.min(98, Math.round((totalFetched / totalEst) * 100))
+          : Math.min(49, Math.round((outputCount / Math.max(outputCount, 1)) * 49));
         await job.updateProgress({
           percent: pct,
-          invoicesFetched: outputCount + inputCount,
+          invoicesFetched: totalFetched,
+          totalInvoicesExpected: totalEst > 0 ? totalEst : null,
+          outputCount,
+          inputCount,
           statusMessage: `Đang tải HĐ đầu ra: ${outputCount.toLocaleString('vi-VN')} hóa đơn...`,
           batchSize: toUpsertOut.length,
         } as Record<string, unknown>);
       }
 
-      // Human-like pause between output and input fetch (2–8s)
-      if (outputCount > 0) await thinkTime(2_000, 8_000);
+      // Human-like pause between output and input fetch
+      if (outputCount > 0) await thinkTime(600, 2_000);
 
       // Phase 8: Stream input invoices page-by-page (HĐ đầu vào)
       const inDedupSetKey = `gdt:dedup:${companyId}:${yyyymm}:input`;
@@ -1288,11 +1294,17 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
           }
         }
 
-        const estIn = inEst >= 0 ? inEst : inputCount;
-        const pct = 50 + Math.min(49, Math.round((inputCount / Math.max(estIn, 1)) * 50));
+        const totalEstIn = (outEst >= 0 ? outEst : 0) + (inEst >= 0 ? inEst : 0);
+        const totalFetchedIn = outputCount + inputCount;
+        const pctIn = totalEstIn > 0
+          ? Math.min(98, Math.round((totalFetchedIn / totalEstIn) * 100))
+          : 50 + Math.min(48, Math.round((inputCount / Math.max(inputCount, 1)) * 48));
         await job.updateProgress({
-          percent: pct,
-          invoicesFetched: outputCount + inputCount,
+          percent: pctIn,
+          invoicesFetched: totalFetchedIn,
+          totalInvoicesExpected: totalEstIn > 0 ? totalEstIn : null,
+          outputCount,
+          inputCount,
           statusMessage: `Đang tải HĐ đầu vào: ${inputCount.toLocaleString('vi-VN')} hóa đơn...`,
           batchSize: toUpsertIn.length,
         } as Record<string, unknown>);
@@ -1309,11 +1321,16 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       const detailQueued = parseInt(detailQueuedRes.rows[0]?.count ?? '0', 10);
 
       // Final progress update — Phase 1 complete, Phase 2 starting in background
+      const totalFetchedFinal = outputCount + inputCount;
+      const totalEstFinal = (outEst >= 0 ? outEst : 0) + (inEst >= 0 ? inEst : 0);
       await job.updateProgress({
         percent: 100,
-        invoicesFetched: outputCount + inputCount,
+        invoicesFetched: totalFetchedFinal,
+        totalInvoicesExpected: totalEstFinal > 0 ? totalEstFinal : totalFetchedFinal,
+        outputCount,
+        inputCount,
         detailQueued,
-        statusMessage: `Đã tải ${outputCount + inputCount} hóa đơn. Đang xử lý chi tiết ${detailQueued} HĐ trong nền...`,
+        statusMessage: `Đã tải ${totalFetchedFinal.toLocaleString('vi-VN')} hóa đơn (📤 ${outputCount.toLocaleString('vi-VN')} đầu ra, 📥 ${inputCount.toLocaleString('vi-VN')} đầu vào). Đang xử lý chi tiết ${detailQueued} HĐ trong nền...`,
       } as Record<string, unknown>);
 
       const durationMs = Date.now() - startedAt;
@@ -1540,13 +1557,10 @@ async function _batchUpsertInvoices(
     invNums.push(inv.invoice_number ?? null);
     serials.push(inv.serial_number ?? null);
     dates.push(inv.invoice_date ?? null);
-    // If this invoice IS a replacement (tc_hdon=1) or adjustment (tc_hdon=2), its DB status
-    // must reflect that — GDT list API may return tthai=1 (valid) for these invoices.
-    const resolvedStatus =
-      inv.tc_hdon === 1 ? 'replaced' :
-      inv.tc_hdon === 2 ? 'adjusted' :
-      (inv.status ?? 'valid');
-    statuses.push(resolvedStatus);
+    // Keep GDT's own status for the invoice itself. tc_hdon indicates the TYPE (replacement/
+    // adjustment), not the invoice's validity. The ORIGINAL invoice's status ('replaced_original',
+    // 'adjusted') comes from GDT's ttxly mapping in gdt-config.ts statusMap.
+    statuses.push(inv.status ?? 'valid');
     sellerNames.push(inv.seller_name ?? null);
     sellerTaxes.push(inv.seller_tax_code ?? '');
     buyerNames.push(inv.buyer_name ?? null);
@@ -1577,7 +1591,8 @@ async function _batchUpsertInvoices(
       seller_name, seller_tax_code, buyer_name, buyer_tax_code,
       subtotal, total_amount, vat_amount, vat_rate, tax_category, gdt_validated, source, provider,
       invoice_group, serial_has_cqt, has_line_items, is_sco,
-      tc_hdon, khhd_cl_quan, so_hd_cl_quan, original_invoice_date, created_at)
+      tc_hdon, khhd_cl_quan, so_hd_cl_quan, original_invoice_date,
+      invoice_relation_type, related_invoice_number, created_at)
      SELECT
        t.id, t.company_id, t.invoice_number, t.serial_number,
        COALESCE(t.invoice_date::date, CURRENT_DATE), t.direction, t.status,
@@ -1585,7 +1600,12 @@ async function _batchUpsertInvoices(
        t.subtotal, t.total_amount, t.vat_amount, t.vat_rate, t.tax_category,
        true, 'gdt_bot', 'gdt_bot',
        t.invoice_group, t.serial_has_cqt, t.has_line_items, t.is_sco,
-       t.tc_hdon, t.khhd_cl_quan, t.so_hd_cl_quan, t.original_invoice_date, NOW()
+       t.tc_hdon, t.khhd_cl_quan, t.so_hd_cl_quan, t.original_invoice_date,
+       CASE WHEN t.tc_hdon = 1 THEN 'replacement'
+            WHEN t.tc_hdon = 2 THEN 'adjustment'
+            ELSE NULL END,
+       CASE WHEN t.tc_hdon IN (1,2) THEN t.so_hd_cl_quan ELSE NULL END,
+       NOW()
      FROM UNNEST(
        $1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::text[], $6::invoice_direction[], $7::invoice_status[],
        $8::text[], $9::text[], $10::text[], $11::text[],
@@ -1623,6 +1643,8 @@ async function _batchUpsertInvoices(
        khhd_cl_quan          = COALESCE(EXCLUDED.khhd_cl_quan,   invoices.khhd_cl_quan),
        so_hd_cl_quan         = COALESCE(EXCLUDED.so_hd_cl_quan,  invoices.so_hd_cl_quan),
        original_invoice_date = COALESCE(EXCLUDED.original_invoice_date, invoices.original_invoice_date),
+       invoice_relation_type = COALESCE(EXCLUDED.invoice_relation_type, invoices.invoice_relation_type),
+       related_invoice_number = COALESCE(EXCLUDED.related_invoice_number, invoices.related_invoice_number),
        updated_at            = NOW()
      RETURNING id,
        invoice_number,
@@ -2332,14 +2354,14 @@ manualWorker.on('failed', (job, err) => {
   });
 });
 
-// ── Auto worker (concurrency 2 — background scheduled syncs) ─────────────────
+// ── Auto worker (concurrency 5 — background scheduled syncs) ─────────────────
 export const autoWorker = new Worker<SyncJobData>(
   'gdt-sync-auto',
   processGdtSync,
   {
     connection:  { url: REDIS_URL } as import('bullmq').ConnectionOptions,
-    concurrency: 2,
-    limiter:     { max: 2, duration: 60_000 },
+    concurrency: 5,
+    limiter:     { max: 5, duration: 60_000 },
   }
 );
 
