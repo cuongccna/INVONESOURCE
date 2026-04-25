@@ -38,8 +38,12 @@ import type { LineItem }         from './parsers/GdtXmlParser';
 // ── Constants ─────────────────────────────────────────────────────────────────
 const REDIS_URL = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
 
-/** Seconds between PostgreSQL polls when queue is empty. Internal only — never sent to GDT. */
-const DB_POLL_INTERVAL_MS = 5_000;
+/**
+ * Milliseconds between PostgreSQL polls (DB only — not GDT).
+ * Randomized each cycle so the poll pattern is not a fixed heartbeat.
+ */
+const DB_POLL_MIN_MS = 4_000;
+const DB_POLL_MAX_MS = 8_000;
 
 /** Max invoices claimed per company per poll cycle. */
 const BATCH_PER_COMPANY = 5;
@@ -47,9 +51,20 @@ const BATCH_PER_COMPANY = 5;
 /** Max parallel company workers per poll cycle. */
 const MAX_CONCURRENT_COMPANIES = 20;
 
-/** Jitter between GDT detail calls (ms). */
-const GDT_JITTER_MIN_MS = 2_000;
-const GDT_JITTER_MAX_MS = 4_500;
+/**
+ * Jitter between consecutive GDT detail-API calls within one company batch.
+ * 3–15s mimics human browsing cadence and avoids fixed-interval bot detection.
+ */
+const GDT_JITTER_MIN_MS = 3_000;
+const GDT_JITTER_MAX_MS = 15_000;
+
+/**
+ * Stagger delay injected before each company's batch starts when multiple
+ * companies run in the same poll cycle. Prevents a "sync storm" where N
+ * companies all hit GDT simultaneously.
+ */
+const COMPANY_STAGGER_MIN_MS = 0;
+const COMPANY_STAGGER_MAX_MS = 5_000;
 
 /** GDT JWT is valid for 30 min; refresh 5 min early = 25 min max age. */
 const JWT_MAX_AGE_MS = 25 * 60_000;
@@ -196,10 +211,25 @@ async function hasInvoiceRawDetailColumn(): Promise<boolean> {
 
 // ── Helper: random delay ──────────────────────────────────────────────────────
 function jitterMs(min: number, max: number): number {
-  return min + Math.random() * (max - min);
+  return Math.floor(min + Math.random() * (max - min));
 }
+
+/** Delay between consecutive GDT detail-API calls (3–15s). */
 async function jitterDelay(): Promise<void> {
-  await new Promise<void>(resolve => setTimeout(resolve, jitterMs(GDT_JITTER_MIN_MS, GDT_JITTER_MAX_MS)));
+  const ms = jitterMs(GDT_JITTER_MIN_MS, GDT_JITTER_MAX_MS);
+  logger.debug('[DetailWorker] GDT jitter delay', { ms });
+  await new Promise<void>(resolve => setTimeout(resolve, ms));
+}
+
+/** Stagger delay before a company batch starts (0–5s). Prevents GDT storm when N companies fire at once. */
+async function staggerDelay(): Promise<void> {
+  const ms = jitterMs(COMPANY_STAGGER_MIN_MS, COMPANY_STAGGER_MAX_MS);
+  if (ms > 0) await new Promise<void>(resolve => setTimeout(resolve, ms));
+}
+
+/** Randomized DB poll interval (4–8s). Avoids fixed-heartbeat pattern on PostgreSQL. */
+function dbPollIntervalMs(): number {
+  return jitterMs(DB_POLL_MIN_MS, DB_POLL_MAX_MS);
 }
 
 // ── Bulk-insert line items (mirrors _bulkInsertLineItems in sync.worker.ts) ──
@@ -562,6 +592,9 @@ async function processCompany(companyId: string): Promise<void> {
   const gdtApi = new GdtDirectApiService(proxyUrl ?? undefined, null, undefined, companyId, null, gdtRawCacheService);
   gdtApi.setToken(token);
 
+  // Stagger start — prevents N companies from hammering GDT simultaneously
+  await staggerDelay();
+
   const rows = await claimBatch(companyId);
   if (rows.length === 0) return;
 
@@ -632,7 +665,9 @@ let _running = true;
 
 async function pollLoop(): Promise<void> {
   logger.info('[DetailWorker] Poll loop started', {
-    DB_POLL_INTERVAL_MS, BATCH_PER_COMPANY, MAX_CONCURRENT_COMPANIES,
+    dbPollRange: `${DB_POLL_MIN_MS}–${DB_POLL_MAX_MS}ms`,
+    gdtJitterRange: `${GDT_JITTER_MIN_MS}–${GDT_JITTER_MAX_MS}ms`,
+    BATCH_PER_COMPANY, MAX_CONCURRENT_COMPANIES,
   });
 
   while (_running) {
@@ -659,8 +694,10 @@ async function pollLoop(): Promise<void> {
       });
     }
 
-    // Wait before next poll
-    await new Promise<void>(resolve => setTimeout(resolve, DB_POLL_INTERVAL_MS));
+    // Wait before next poll — randomized to avoid fixed-heartbeat pattern
+    const waitMs = dbPollIntervalMs();
+    logger.debug('[DetailWorker] Next DB poll in', { waitMs });
+    await new Promise<void>(resolve => setTimeout(resolve, waitMs));
   }
 }
 
