@@ -23,11 +23,12 @@
  */
 
 import Redis                     from 'ioredis';
+import { Queue }                 from 'bullmq';
 import { v4 as uuidv4 }          from 'uuid';
 import { pool }                  from './db';
 import { decryptCredentials }    from './encryption.service';
 import { proxyManager }          from './proxy-manager';
-import { GdtDirectApiService }   from './gdt-direct-api.service';
+import { GdtDirectApiService, GdtAuthError } from './gdt-direct-api.service';
 import { logger }                from './logger';
 import { GdtSessionCache }       from './crawl-cache/GdtSessionCache';
 import { GdtDetailCache }        from './crawl-cache/GdtDetailCache';
@@ -60,7 +61,11 @@ const STUCK_PROCESSING_MIN = 10;
 const _redis        = new Redis(REDIS_URL, { maxRetriesPerRequest: 3, lazyConnect: true });
 const _sessionCache = new GdtSessionCache(_redis);
 const _detailCache  = new GdtDetailCache(_redis);
-let _hasInvoiceRawDetailColumn: boolean | null = null;
+// Notification queue — tells backend (SyncNotificationWorker) to send push to user.
+// Uses same Redis URL as sync.worker. Same queue name 'sync-notifications'.
+const _notifQueue   = new Queue('sync-notifications', {
+  connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
+});let _hasInvoiceRawDetailColumn: boolean | null = null;
 let _skipInvoiceDetailSave = false;
 let _loggedInvoiceRawDetailWarning = false;
 
@@ -82,60 +87,74 @@ function isMissingColumnError(message: string): boolean {
   return /column\s+"[^"]+"\s+does not exist/i.test(message);
 }
 
-// ── Unrecoverable GDT auth error detection ────────────────────────────────────
+// ── Unrecoverable auth error ───────────────────────────────────────────────────────────────────────────────────
 /**
- * Thrown when GDT returns a permanent auth failure (wrong credentials, account
- * locked, account does not exist). Must NEVER retry — causes account lockout.
+ * Thrown when a GdtAuthError is caught inside getToken().
+ * Signals processCompany() to stop immediately without any retry.
  */
 class AuthUnrecoverableError extends Error {
-  constructor(message: string) {
+  public readonly gdtErrorCode: number | string | null;
+  constructor(message: string, gdtErrorCode: number | string | null = null) {
     super(message);
     this.name = 'AuthUnrecoverableError';
+    this.gdtErrorCode = gdtErrorCode;
   }
 }
 
-/** Vietnamese GDT error messages that indicate permanent/unrecoverable auth failure. */
-const UNRECOVERABLE_AUTH_PATTERNS = [
-  'bị khoá',                                      // account locked
-  'bi khoa',                                       // no diacritics
-  'sai thông tin quá số lần',                      // too many wrong attempts → locked
-  'tên đăng nhập hoặc mật khẩu không đúng',        // wrong username or password
-  'tài khoản không tồn tại',                       // account does not exist
-  'tài khoản bị vô hiệu',                          // account deactivated
-  'account locked',
-  'invalid credentials',
-] as const;
-
-function isUnrecoverableAuthError(msg: string): boolean {
-  const lower = msg.toLowerCase();
-  return UNRECOVERABLE_AUTH_PATTERNS.some(p => lower.includes(p));
-}
-
 /**
- * Permanently deactivates a company's bot and exhausts ALL pending queue rows
- * so no future poll cycle retries them.
+ * Permanently deactivates a company's bot:
+ *   1. Sets gdt_bot_configs.is_active = false — prevents all future poll cycles.
+ *   2. Exhausts all pending queue rows — prevents detail.worker from retrying.
+ *   3. Sends push notification to company users via sync-notifications queue.
+ *
+ * Called immediately when GDT returns HTTP 400/401 non-captcha (GdtAuthError).
+ * At this point the account may not yet be locked — stopping here prevents lockout.
  */
-async function deactivateCompanyBot(companyId: string, reason: string): Promise<void> {
+async function deactivateCompanyBot(
+  companyId: string,
+  reason: string,
+  gdtErrorCode: number | string | null = null,
+): Promise<void> {
+  const errorLabel = gdtErrorCode != null ? ` [code=${gdtErrorCode}]` : '';
+  const fullReason = `${reason}${errorLabel}`;
+
   try {
     await pool.query(
-      `UPDATE gdt_bot_configs SET is_active = false WHERE company_id = $1`,
-      [companyId],
+      `UPDATE gdt_bot_configs
+       SET is_active = false, last_run_status = 'error', last_error = $2, updated_at = NOW()
+       WHERE company_id = $1`,
+      [companyId, fullReason.slice(0, 500)],
     );
     await pool.query(
       `UPDATE invoice_detail_queue
-       SET status = 'failed', attempts = max_attempts,
-           last_error = $2
+       SET status = 'failed', attempts = max_attempts, last_error = $2
        WHERE company_id = $1
          AND status IN ('pending', 'processing', 'failed')`,
-      [companyId, `Auth permanently failed — bot deactivated: ${reason}`.slice(0, 500)],
+      [companyId, `Bot deactivated — auth failed: ${fullReason}`.slice(0, 500)],
     );
-    logger.error('[DetailWorker] CRITICAL: Company bot deactivated due to unrecoverable auth error', {
-      companyId, reason,
+    logger.error('[DetailWorker] CRITICAL: Bot deactivated — GDT auth failed (will NOT retry)', {
+      companyId, reason, gdtErrorCode,
     });
   } catch (dbErr) {
     logger.error('[DetailWorker] Failed to deactivate company bot in DB', {
       companyId,
       err: dbErr instanceof Error ? dbErr.message : String(dbErr),
+    });
+  }
+
+  // ── Notify user immediately via push notification (bell icon) ──────────────────────
+  // The backend SyncNotificationWorker picks this up and sends web-push + DB record.
+  try {
+    await _notifQueue.add('bot-auth-failure', {
+      companyId,
+      errorMessage: fullReason,
+      gdtErrorCode,
+    }, { removeOnComplete: 100, removeOnFail: 50 });
+    logger.info('[DetailWorker] Auth failure notification enqueued', { companyId, gdtErrorCode });
+  } catch (notifErr) {
+    logger.warn('[DetailWorker] Failed to enqueue auth failure notification (non-fatal)', {
+      companyId,
+      err: notifErr instanceof Error ? notifErr.message : String(notifErr),
     });
   }
 }
@@ -313,13 +332,24 @@ async function getToken(
       return freshToken;
     }
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    logger.warn('[DetailWorker] GDT authentication failed', { companyId, err: msg });
-
-    // CRITICAL: permanent auth failures must NOT be retried — they cause account lockout.
-    if (isUnrecoverableAuthError(msg)) {
-      throw new AuthUnrecoverableError(msg);
+    // GdtAuthError = GDT explicitly rejected credentials (HTTP 400/401, non-captcha).
+    // This is the ONLY reliable signal — no string matching needed.
+    // Re-throw as AuthUnrecoverableError so processCompany() deactivates the bot.
+    if (err instanceof GdtAuthError) {
+      logger.error('[DetailWorker] GDT rejected credentials — STOP immediately (will not retry)', {
+        companyId,
+        gdtErrorCode: err.gdtErrorCode,
+        httpStatus:   err.httpStatus,
+        err:          err.message,
+      });
+      throw new AuthUnrecoverableError(err.message, err.gdtErrorCode);
     }
+
+    // Transient errors (network, proxy, captcha exhausted) — skip this cycle, retry next poll.
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn('[DetailWorker] GDT login failed (transient — will retry next cycle)', {
+      companyId, err: msg,
+    });
   }
   return null;
 }
@@ -516,8 +546,9 @@ async function processCompany(companyId: string): Promise<void> {
     token = await getToken(companyId, proxySessionId, proxyUrl, creds.username, creds.password);
   } catch (authErr) {
     if (authErr instanceof AuthUnrecoverableError) {
-      // Account locked / wrong credentials — deactivate bot immediately, no retry.
-      await deactivateCompanyBot(companyId, authErr.message);
+      // GDT rejected credentials (HTTP 400/401 non-captcha) — deactivate bot immediately.
+      // Also notifies the user via push notification.
+      await deactivateCompanyBot(companyId, authErr.message, authErr.gdtErrorCode);
       return;
     }
     throw authErr;

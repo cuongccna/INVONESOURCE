@@ -81,6 +81,33 @@ function humanDelay(minMs: number, maxMs: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
 }
 
+/**
+ * Thrown when GDT /security-taxpayer/authenticate returns HTTP 400 or 401
+ * for a NON-captcha reason (wrong password, account locked, account deactivated, etc.).
+ *
+ * Callers MUST treat this as unrecoverable — retrying will lock the account.
+ * Use gdtErrorCode to distinguish specific GDT failure types without string matching.
+ */
+export class GdtAuthError extends Error {
+  public readonly httpStatus: number;
+  /** Numeric or string error code from GDT JSON body (`errorCode` / `code` field), or null. */
+  public readonly gdtErrorCode: number | string | null;
+  public readonly gdtRawBody: unknown;
+
+  constructor(
+    message: string,
+    httpStatus: number,
+    gdtErrorCode: number | string | null,
+    gdtRawBody: unknown,
+  ) {
+    super(message);
+    this.name = 'GdtAuthError';
+    this.httpStatus = httpStatus;
+    this.gdtErrorCode = gdtErrorCode;
+    this.gdtRawBody = gdtRawBody;
+  }
+}
+
 const GDT_API_HTTPS = 'https://hoadondientu.gdt.gov.vn:30000';
 // When tunnelling through a proxy we use http:// as the base URL so that axios
 // routes through http.request (which uses httpAgent). Our httpAgent's
@@ -1100,9 +1127,21 @@ export class GdtDirectApiService {
             continue;
           }
 
-          // Wrong credentials → throw immediately (UnrecoverableError at caller)
+          // Wrong credentials / account locked → throw GdtAuthError immediately.
+          // Never retry — any 400/401 non-captcha response means GDT rejected the credentials.
+          // Retrying will increment GDT's failure counter and eventually lock the account.
           if (status === 400 || status === 401) {
-            throw new Error(`GDT auth failed: ${msg || `HTTP ${status}`}`);
+            const gdtCode = typeof (rawBody as Record<string, unknown>)?.['errorCode'] !== 'undefined'
+              ? (rawBody as Record<string, unknown>)['errorCode'] as number | string
+              : typeof (rawBody as Record<string, unknown>)?.['code'] !== 'undefined'
+                ? (rawBody as Record<string, unknown>)['code'] as number | string
+                : null;
+            throw new GdtAuthError(
+              `GDT auth failed: ${msg || `HTTP ${status}`}`,
+              status,
+              gdtCode,
+              rawBody,
+            );
           }
         }
         throw err;

@@ -177,6 +177,21 @@ export class NotificationService {
     );
   }
 
+  /**
+   * Gửi thông báo khẩn khi bot bị lỗi đăng nhập GDT không thể phục hồi.
+   * Bot đã tự động dừng để tránh bị khóa tài khoản thêm.
+   * User cần vào Cài đặt > Bot để xem lỗi và cập nhật mật khẩu.
+   */
+  async onBotAuthFailure(companyId: string, errorMessage: string): Promise<void> {
+    await this.createAndPush(
+      companyId,
+      'BOT_AUTH_FAILURE',
+      '🚨 Bot GDT: Lỗi đăng nhập nghiêm trọng',
+      `Bot đã dừng tự động để bảo vệ tài khoản. Lỗi: ${errorMessage.slice(0, 120)}`,
+      '/settings/bot'
+    );
+  }
+
   async onVatAnomaly(companyId: string, message: string): Promise<void> {
     await this.createAndPush(
       companyId,

@@ -14,7 +14,7 @@ import { randomBytes } from 'crypto';
 import { pool } from './db';
 import { decryptCredentials } from './encryption.service';
 import { proxyManager } from './proxy-manager';
-import { GdtDirectApiService } from './gdt-direct-api.service';
+import { GdtDirectApiService, GdtAuthError } from './gdt-direct-api.service';
 import type { GdtFetchProgressSnapshot } from './gdt-direct-api.service';
 import { GdtXmlParser } from './parsers/GdtXmlParser';
 import { logger } from './logger';
@@ -909,30 +909,31 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         const msgLc = msg.toLowerCase();
-        // Captcha failures (from gdt-direct-api after exhausting MAX_RETRIES) are transient —
-        // do NOT deactivate the account. GDT returns wrong-captcha for 400/401, so
-        // 'auth failed' can appear in the message even for captcha issues.
-        const isCaptchaFailure = msgLc.includes('captcha') || msgLc.includes('mã xác nhận');
-        const isInvalidCreds = !isCaptchaFailure && (
-          msgLc.includes('auth failed') ||
-          msgLc.includes('mật khẩu') ||
-          msgLc.includes('sai thông tin')
-        );
-        if (isInvalidCreds) {
+
+        // GdtAuthError = GDT explicitly rejected the login (HTTP 400/401, non-captcha error).
+        // This is the ONLY reliable signal for wrong credentials / locked account — no string matching.
+        // Captcha errors NEVER reach here: they are retried inside login() and only throw
+        // after MAX_RETRIES with 'GDT login failed after N captcha attempts'.
+        if (err instanceof GdtAuthError) {
           await _sessionCache.invalidate(companyId, proxySessionId ?? '').catch(() => {});
-          await _failRun(runId, companyId, msg, true);
-          throw new UnrecoverableError(`[SyncWorker] Invalid credentials: ${msg}`);
+          await _failRun(runId, companyId, msg, true); // deactivate = true
+          // Notify user immediately via push notification
+          await _notifQueue.add('bot-auth-failure', {
+            companyId,
+            errorMessage: msg,
+            gdtErrorCode: err.gdtErrorCode,
+            httpStatus:   err.httpStatus,
+          }, { removeOnComplete: 100, removeOnFail: 50 }).catch(() => {});
+          throw new UnrecoverableError(`[SyncWorker] GDT auth failed (HTTP ${err.httpStatus}): ${msg}`);
         }
-      // Non-credential failure (proxy blocked, GDT rate-limit, network error).
+
+        // Non-credential failure (proxy blocked, GDT rate-limit, network error, captcha exhausted).
         // Mark current proxy as failed and clear the sticky session —
         // next run will pick a fresh session ID = fresh IP for this company only.
         if (proxyUrl) proxyManager.markFailed(proxyUrl);
         // Detect if the error is a pre-GDT network/proxy/TLS failure.
         // In that case GDT never received any login attempt — no need for the
         // 15-minute cooldown. BullMQ backoff + consecutive_failures block handles protection.
-        // Use lowercase (msgLc) for case-insensitive matching.
-        // 'Proxy CONNECT failed' has capital P — msg.includes('proxy') missed it.
-        // 'stream has been aborted' also wasn't detected.
         const isProxyOrNetworkError =
           msgLc.includes('socket disconnected') ||
           msgLc.includes('econnreset') ||

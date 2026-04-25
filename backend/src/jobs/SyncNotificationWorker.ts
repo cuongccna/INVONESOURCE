@@ -29,6 +29,10 @@ interface SyncNotificationPayload {
   actualOutput?: number;
   actualInput?: number;
   hasDiscrepancy?: boolean;
+  /** Bot auth failure fields (job name = 'bot-auth-failure') */
+  errorMessage?: string;
+  gdtErrorCode?: number | string | null;
+  httpStatus?: number;
 }
 
 /** Xác định quý từ chuỗi ngày YYYY-MM-DD */
@@ -42,7 +46,23 @@ export const syncNotificationWorker = new Worker<SyncNotificationPayload>(
   'sync-notifications',
   async (job: Job<SyncNotificationPayload>) => {
     const { companyId, provider, count, fromDate, toDate,
-            gdtExpectedOutput, gdtExpectedInput, actualOutput, actualInput, hasDiscrepancy } = job.data;
+            gdtExpectedOutput, gdtExpectedInput, actualOutput, actualInput, hasDiscrepancy,
+            errorMessage, gdtErrorCode, httpStatus } = job.data;
+
+    // ── bot-auth-failure: GDT rejected credentials — notify user immediately ──
+    if (job.name === 'bot-auth-failure') {
+      const codeLabel = gdtErrorCode != null ? ` (mã lỗi GDT: ${gdtErrorCode})` : '';
+      const statusLabel = httpStatus ? ` HTTP ${httpStatus}` : '';
+      await notificationService.onBotAuthFailure(
+        companyId,
+        `${errorMessage ?? 'Đăng nhập thất bại'}${codeLabel}${statusLabel}`,
+      );
+      console.error(
+        `[SyncNotificationWorker] 🚨 Bot auth failure for company ${companyId}:`,
+        errorMessage, { gdtErrorCode, httpStatus },
+      );
+      return; // Do NOT run recalc or sync-complete notification
+    }
 
     // ── Bước 1: Gửi push notification ──────────────────────────────────────────
     await notificationService.onSyncComplete(companyId, provider, count);
