@@ -72,6 +72,16 @@ const JWT_MAX_AGE_MS = 25 * 60_000;
 /** Claim rows WHERE last_attempted_at < NOW() - STUCK_PROCESSING_MIN minutes (unstick). */
 const STUCK_PROCESSING_MIN = 10;
 
+/**
+ * Cleanup: delete completed rows older than this many days.
+ * Only rows with status='done' or status='skipped' are ever deleted.
+ * Rows with status='pending'/'processing'/'failed' are NEVER touched.
+ */
+const CLEANUP_RETENTION_DAYS = 30;
+
+/** Run cleanup at most once every 24 hours. */
+const CLEANUP_INTERVAL_MS = 24 * 60 * 60_000;
+
 // ── Singletons ────────────────────────────────────────────────────────────────
 const _redis        = new Redis(REDIS_URL, { maxRetriesPerRequest: 3, lazyConnect: true });
 const _sessionCache = new GdtSessionCache(_redis);
@@ -662,6 +672,48 @@ async function getPendingCompanyIds(): Promise<string[]> {
 }
 
 let _running = true;
+/** Epoch ms of last completed cleanup run. 0 = never run. */
+let _lastCleanupAt = 0;
+
+/**
+ * Deletes old finished rows from invoice_detail_queue.
+ *
+ * SAFE BY DESIGN — triple-gated WHERE clause:
+ *   1. status IN ('done', 'skipped')   — never touches pending/processing/failed
+ *   2. done_at IS NOT NULL             — row must have been explicitly completed
+ *   3. done_at < NOW() - INTERVAL      — only rows older than CLEANUP_RETENTION_DAYS
+ *
+ * Runs at most once per 24 hours (controlled by _lastCleanupAt in pollLoop).
+ */
+async function cleanupOldQueueRows(): Promise<void> {
+  try {
+    const result = await pool.query<{ deleted: string }>(
+      `WITH deleted AS (
+         DELETE FROM invoice_detail_queue
+         WHERE status IN ('done', 'skipped')
+           AND done_at IS NOT NULL
+           AND done_at < NOW() - ($1 || ' days')::INTERVAL
+         RETURNING id
+       )
+       SELECT COUNT(*) AS deleted FROM deleted`,
+      [CLEANUP_RETENTION_DAYS],
+    );
+    const deleted = parseInt(result.rows[0]?.deleted ?? '0', 10);
+    if (deleted > 0) {
+      logger.info('[DetailWorker] Cleanup: removed old completed rows from invoice_detail_queue', {
+        deleted,
+        retentionDays: CLEANUP_RETENTION_DAYS,
+      });
+    } else {
+      logger.debug('[DetailWorker] Cleanup: no expired rows found', { retentionDays: CLEANUP_RETENTION_DAYS });
+    }
+  } catch (err) {
+    // Non-fatal — log and continue. Cleanup will retry next day.
+    logger.warn('[DetailWorker] Cleanup failed (non-fatal — will retry in 24h)', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
 
 async function pollLoop(): Promise<void> {
   logger.info('[DetailWorker] Poll loop started', {
@@ -692,6 +744,12 @@ async function pollLoop(): Promise<void> {
       logger.error('[DetailWorker] Poll loop error', {
         err: err instanceof Error ? err.message : String(err),
       });
+    }
+
+    // ── Daily cleanup: remove done/skipped rows older than 30 days ──────────
+    if (Date.now() - _lastCleanupAt >= CLEANUP_INTERVAL_MS) {
+      _lastCleanupAt = Date.now();
+      void cleanupOldQueueRows(); // fire-and-forget — does not block poll loop
     }
 
     // Wait before next poll — randomized to avoid fixed-heartbeat pattern
