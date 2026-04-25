@@ -183,7 +183,7 @@ export class AutoCodeService {
   }
 
   /** Rebuild all catalogs for a company from existing invoice data. */
-  async rebuildCatalogs(companyId: string): Promise<void> {
+  async rebuildCatalogs(companyId: string): Promise<{ customers: number; suppliers: number; products: number }> {
     // Customers (from output invoices — exclude deleted)
     const customers = await pool.query<{ tax_code: string; name: string; date: string }>(
       `SELECT DISTINCT ON (buyer_tax_code) buyer_tax_code AS tax_code, buyer_name AS name, invoice_date::text AS date
@@ -236,13 +236,67 @@ export class AutoCodeService {
     const items = await pool.query<{ item_name: string }>(
       `SELECT DISTINCT ili.item_name FROM invoice_line_items ili
        JOIN invoices i ON i.id = ili.invoice_id
-       WHERE i.company_id=$1 AND i.deleted_at IS NULL
+       WHERE i.company_id=$1 AND i.deleted_at IS NULL AND ili.deleted_at IS NULL
          AND ili.item_name IS NOT NULL AND TRIM(ili.item_name) != ''`,
       [companyId],
     );
     for (const r of items.rows) {
       if (r.item_name?.trim()) await this.ensureProduct(companyId, r.item_name);
     }
+
+    // ── Backfill invoices.customer_code from catalogs (where not manually set) ──
+    await pool.query(
+      `UPDATE invoices i
+       SET customer_code = cc.customer_code
+       FROM customer_catalog cc
+       WHERE i.company_id = $1
+         AND cc.company_id = $1
+         AND i.direction = 'output'
+         AND i.buyer_tax_code = cc.tax_code
+         AND i.customer_code IS NULL
+         AND i.deleted_at IS NULL`,
+      [companyId],
+    );
+    await pool.query(
+      `UPDATE invoices i
+       SET customer_code = sc.supplier_code
+       FROM supplier_catalog sc
+       WHERE i.company_id = $1
+         AND sc.company_id = $1
+         AND i.direction = 'input'
+         AND i.seller_tax_code = sc.tax_code
+         AND i.customer_code IS NULL
+         AND i.deleted_at IS NULL`,
+      [companyId],
+    );
+
+    // Backfill invoices.item_code for invoices that have exactly one distinct item in line_items
+    await pool.query(
+      `UPDATE invoices i
+       SET item_code = sub.item_code
+       FROM (
+         SELECT li.invoice_id, pc.item_code
+         FROM invoice_line_items li
+         JOIN product_catalog pc
+           ON pc.company_id = (SELECT company_id FROM invoices WHERE id = li.invoice_id)
+          AND pc.normalized_name = LOWER(TRIM(li.item_name))
+         WHERE li.deleted_at IS NULL AND li.item_name IS NOT NULL AND TRIM(li.item_name) != ''
+           AND pc.item_code IS NOT NULL
+         GROUP BY li.invoice_id, pc.item_code
+         HAVING COUNT(DISTINCT pc.item_code) = 1
+       ) sub
+       WHERE i.id = sub.invoice_id
+         AND i.company_id = $1
+         AND i.item_code IS NULL
+         AND i.deleted_at IS NULL`,
+      [companyId],
+    );
+
+    return {
+      customers: customers.rowCount ?? 0,
+      suppliers: suppliers.rowCount ?? 0,
+      products: items.rowCount ?? 0,
+    };
   }
 }
 

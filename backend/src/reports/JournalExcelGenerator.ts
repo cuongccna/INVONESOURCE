@@ -161,6 +161,8 @@ export class JournalExcelGenerator {
          i.vat_rate        AS inv_vat_rate,
          i.vat_amount      AS inv_vat_amount,
          i.total_amount    AS inv_total,
+         i.buyer_address,
+         i.seller_address,
          li.id             AS li_id,
          COALESCE(li.item_code, pc.item_code)        AS item_code,
          li.item_name,
@@ -305,7 +307,7 @@ export class JournalExcelGenerator {
         partnerTax,                                        // I  MST
         '',                                                // J  CCCD (not stored)
         '',                                                // K  Hộ chiếu (not stored)
-        '',                                                // L  Địa chỉ (not stored)
+        safeStr(isSales ? r.buyer_address : r.seller_address), // L  Địa chỉ
         hasLineItem ? safeStr(r.item_code)  : '',          // M  Mã HH (từ catalog)
         hasLineItem ? safeStr(r.item_name)  : '',          // N  Tên HH
         hasLineItem ? safeStr(r.unit)       : '',          // O  ĐVT

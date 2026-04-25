@@ -56,6 +56,15 @@ export default function InvoicesPage() {
   const [debouncedSearch, setDebouncedSearch] = useState(search);
   const [pageSize, setPageSize] = useState(50);
 
+  // Count check modal state
+  const [countChecking, setCountChecking] = useState(false);
+  interface CountResult {
+    db_output: number; db_input: number; db_total: number;
+    last_run_output: number | null; last_run_input: number | null; last_run_total: number | null;
+    last_run_at: string | null; from_date: string | null; to_date: string | null;
+  }
+  const [countResult, setCountResult] = useState<CountResult | null>(null);
+
   // Selection
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
 
@@ -209,6 +218,25 @@ export default function InvoicesPage() {
     }
   };
 
+  const handleCheckCount = async () => {
+    if (countChecking) return;
+    setCountChecking(true);
+    setCountResult(null);
+    try {
+      const params = new URLSearchParams();
+      if (fromDate) params.set('fromDate', fromDate);
+      if (toDate)   params.set('toDate',   toDate);
+      const res = await apiClient.get<{ success: boolean; data: CountResult }>(
+        `/bot/invoice-count?${params.toString()}`
+      );
+      setCountResult(res.data.data);
+    } catch {
+      toast.error('Không thể kiểm tra số lượng. Vui lòng thử lại.');
+    } finally {
+      setCountChecking(false);
+    }
+  };
+
   const handleToggleNonDeductible = async (id: string, value: boolean) => {
     try {
       await apiClient.patch(`/invoices/${id}/non-deductible`, { non_deductible: value });
@@ -235,6 +263,18 @@ export default function InvoicesPage() {
           </div>
         </div>
         <div className="flex items-center gap-2">
+          {/* Count check button — compare DB count vs last bot run */}
+          <button
+            onClick={() => void handleCheckCount()}
+            disabled={countChecking}
+            title="So sánh số lượng hóa đơn trong DB với lần đồng bộ cuối"
+            className="flex items-center gap-2 bg-white border border-gray-300 text-gray-700 px-3 py-2 rounded-lg text-sm font-medium disabled:opacity-60 hover:bg-gray-50 transition-colors"
+          >
+            <svg className={`w-4 h-4 ${countChecking ? 'animate-spin' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
+            </svg>
+            {countChecking ? 'Đang kiểm tra...' : 'Kiểm tra số lượng'}
+          </button>
           {/* Refresh button — re-fetches data from DB, no GDT sync */}
           <button
             onClick={() => void handleRefresh()}
@@ -440,6 +480,74 @@ export default function InvoicesPage() {
               <button onClick={() => void handlePermanentIgnore()} disabled={ignoring}
                 className="flex-1 py-2.5 bg-red-600 text-white rounded-xl text-sm font-medium disabled:opacity-50">
                 {ignoring ? 'Đang xử lý...' : 'Bỏ qua vĩnh viễn'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Count Check Result Modal ── */}
+      {countResult && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="bg-white rounded-2xl w-full max-w-md p-5 shadow-xl">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-base font-bold text-gray-900">Kiểm tra số lượng hóa đơn</h3>
+              <button onClick={() => setCountResult(null)} className="text-gray-400 hover:text-gray-600">
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            {countResult.from_date || countResult.to_date ? (
+              <p className="text-xs text-gray-500 mb-3">
+                Khoảng thời gian: {countResult.from_date ?? '...'} — {countResult.to_date ?? 'nay'}
+              </p>
+            ) : (
+              <p className="text-xs text-gray-500 mb-3">Tất cả hóa đơn (không lọc ngày)</p>
+            )}
+
+            <div className="space-y-3">
+              {/* DB counts */}
+              <div className="bg-blue-50 rounded-xl p-3">
+                <p className="text-xs font-semibold text-blue-700 mb-2">📦 Trong database</p>
+                <div className="grid grid-cols-3 gap-2 text-center">
+                  <div><p className="text-lg font-bold text-blue-800">{countResult.db_output.toLocaleString('vi-VN')}</p><p className="text-xs text-blue-600">📤 Bán ra</p></div>
+                  <div><p className="text-lg font-bold text-blue-800">{countResult.db_input.toLocaleString('vi-VN')}</p><p className="text-xs text-blue-600">📥 Mua vào</p></div>
+                  <div><p className="text-lg font-bold text-blue-900">{countResult.db_total.toLocaleString('vi-VN')}</p><p className="text-xs text-blue-700 font-medium">Tổng</p></div>
+                </div>
+              </div>
+
+              {/* Last run counts */}
+              {countResult.last_run_total !== null ? (
+                <div className={`rounded-xl p-3 ${countResult.db_total < (countResult.last_run_total ?? 0) ? 'bg-red-50' : 'bg-green-50'}`}>
+                  <p className="text-xs font-semibold mb-2" style={{ color: countResult.db_total < (countResult.last_run_total ?? 0) ? '#b91c1c' : '#15803d' }}>
+                    🤖 Lần đồng bộ cuối {countResult.last_run_at ? `(${new Date(countResult.last_run_at).toLocaleDateString('vi-VN')})` : ''}
+                  </p>
+                  <div className="grid grid-cols-3 gap-2 text-center">
+                    <div><p className="text-lg font-bold">{(countResult.last_run_output ?? 0).toLocaleString('vi-VN')}</p><p className="text-xs">📤 Bán ra</p></div>
+                    <div><p className="text-lg font-bold">{(countResult.last_run_input ?? 0).toLocaleString('vi-VN')}</p><p className="text-xs">📥 Mua vào</p></div>
+                    <div><p className="text-lg font-bold">{countResult.last_run_total.toLocaleString('vi-VN')}</p><p className="text-xs font-medium">Tổng</p></div>
+                  </div>
+                  {countResult.db_total < (countResult.last_run_total ?? 0) && (
+                    <p className="mt-2 text-xs text-red-700 font-medium">
+                      ⚠️ DB thiếu {((countResult.last_run_total ?? 0) - countResult.db_total).toLocaleString('vi-VN')} hóa đơn so với lần đồng bộ cuối
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <div className="bg-gray-50 rounded-xl p-3 text-center">
+                  <p className="text-sm text-gray-500">Chưa có lịch sử đồng bộ thành công</p>
+                </div>
+              )}
+            </div>
+
+            <div className="mt-4 flex justify-end">
+              <button
+                onClick={() => setCountResult(null)}
+                className="px-4 py-2 bg-gray-900 text-white rounded-xl text-sm font-medium"
+              >
+                Đóng
               </button>
             </div>
           </div>

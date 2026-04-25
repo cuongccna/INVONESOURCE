@@ -3,7 +3,13 @@
     "allow": [
       "Bash(npm run *)",
       "Bash(npx tsc *)",
-      "Bash(PGPASSWORD=Cuongnv123456 psql -U user_invone -h localhost -d invone_db -c \"SELECT id, tax_code, name FROM companies WHERE tax_code = '0317342919';\")"
+      "Bash(PGPASSWORD=Cuongnv123456 psql -U user_invone -h localhost -d invone_db -c \"SELECT id, tax_code, name FROM companies WHERE tax_code = '0317342919';\")",
+      "Bash(Get-ChildItem \"D:\\\\projects\\\\INVONE\\\\INVONESOURCE\\\\frontend\\\\app\\\\\\(app\\)\\\\invoices\" -Recurse)",
+      "Bash(Select-Object FullName)",
+      "Bash(Head -20)",
+      "Bash(Get-ChildItem \"D:\\\\projects\\\\INVONE\\\\INVONESOURCE\\\\frontend\\\\app\\\\\\(app\\)\\\\admin\" -Recurse)",
+      "Bash(Head -30)",
+      "PowerShell(cd D:\\\\projects\\\\INVONE\\\\INVONESOURCE\\\\backend; npx tsc --noEmit; Write-Host \"Exit: $LASTEXITCODE\")"
     ]
   }
 }

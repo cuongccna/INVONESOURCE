@@ -23,6 +23,12 @@ interface SyncNotificationPayload {
   fromDate?: string;
   /** Ngày kết thúc kỳ đồng bộ (YYYY-MM-DD) */
   toDate?: string;
+  /** Count discrepancy info from bot */
+  gdtExpectedOutput?: number;
+  gdtExpectedInput?: number;
+  actualOutput?: number;
+  actualInput?: number;
+  hasDiscrepancy?: boolean;
 }
 
 /** Xác định quý từ chuỗi ngày YYYY-MM-DD */
@@ -35,11 +41,27 @@ function getQuarterFromDateStr(dateStr: string): { quarter: number; year: number
 export const syncNotificationWorker = new Worker<SyncNotificationPayload>(
   'sync-notifications',
   async (job: Job<SyncNotificationPayload>) => {
-    const { companyId, provider, count, fromDate, toDate } = job.data;
+    const { companyId, provider, count, fromDate, toDate,
+            gdtExpectedOutput, gdtExpectedInput, actualOutput, actualInput, hasDiscrepancy } = job.data;
 
     // ── Bước 1: Gửi push notification ──────────────────────────────────────────
     await notificationService.onSyncComplete(companyId, provider, count);
     console.log(`[SyncNotificationWorker] Notification sent: ${count} invoices from ${provider} for company ${companyId}`);
+
+    // ── Bước 1b: Cảnh báo nếu có chênh lệch số lượng so với GDT ──────────────
+    if (hasDiscrepancy && (gdtExpectedOutput !== undefined || gdtExpectedInput !== undefined)) {
+      const expectedTotal = (gdtExpectedOutput ?? 0) + (gdtExpectedInput ?? 0);
+      const actualTotal   = (actualOutput ?? 0) + (actualInput ?? 0);
+      const missing       = expectedTotal - actualTotal;
+      console.warn(
+        `[SyncNotificationWorker] ⚠️ Count discrepancy for company ${companyId}: ` +
+        `GDT expected ${expectedTotal} (out:${gdtExpectedOutput} in:${gdtExpectedInput}), ` +
+        `fetched ${actualTotal} (out:${actualOutput} in:${actualInput}), missing ${missing}`,
+      );
+      try {
+        await notificationService.onSyncCountWarning(companyId, expectedTotal, actualTotal, missing);
+      } catch { /* non-fatal */ }
+    }
 
     // ── Bước 2: Auto validation pipeline + recalc (non-fatal) ──────────────────
     if (count > 0 && (fromDate ?? toDate)) {

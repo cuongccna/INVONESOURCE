@@ -132,6 +132,16 @@ export class NotificationService {
     );
   }
 
+  async onSyncCountWarning(companyId: string, expected: number, actual: number, missing: number): Promise<void> {
+    await this.createAndPush(
+      companyId,
+      'SYNC_COUNT_WARNING',
+      '⚠️ Hóa đơn bị thiếu sau đồng bộ',
+      `GDT có ${expected.toLocaleString('vi-VN')} HĐ nhưng chỉ tải được ${actual.toLocaleString('vi-VN')}. Còn thiếu ${missing.toLocaleString('vi-VN')} HĐ — vui lòng đồng bộ lại.`,
+      '/settings/bot'
+    );
+  }
+
   async onInvalidInvoicesFound(companyId: string, count: number): Promise<void> {
     await this.createAndPush(
       companyId,

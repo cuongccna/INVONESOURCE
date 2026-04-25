@@ -82,6 +82,64 @@ function isMissingColumnError(message: string): boolean {
   return /column\s+"[^"]+"\s+does not exist/i.test(message);
 }
 
+// ── Unrecoverable GDT auth error detection ────────────────────────────────────
+/**
+ * Thrown when GDT returns a permanent auth failure (wrong credentials, account
+ * locked, account does not exist). Must NEVER retry — causes account lockout.
+ */
+class AuthUnrecoverableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AuthUnrecoverableError';
+  }
+}
+
+/** Vietnamese GDT error messages that indicate permanent/unrecoverable auth failure. */
+const UNRECOVERABLE_AUTH_PATTERNS = [
+  'bị khoá',                                      // account locked
+  'bi khoa',                                       // no diacritics
+  'sai thông tin quá số lần',                      // too many wrong attempts → locked
+  'tên đăng nhập hoặc mật khẩu không đúng',        // wrong username or password
+  'tài khoản không tồn tại',                       // account does not exist
+  'tài khoản bị vô hiệu',                          // account deactivated
+  'account locked',
+  'invalid credentials',
+] as const;
+
+function isUnrecoverableAuthError(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return UNRECOVERABLE_AUTH_PATTERNS.some(p => lower.includes(p));
+}
+
+/**
+ * Permanently deactivates a company's bot and exhausts ALL pending queue rows
+ * so no future poll cycle retries them.
+ */
+async function deactivateCompanyBot(companyId: string, reason: string): Promise<void> {
+  try {
+    await pool.query(
+      `UPDATE gdt_bot_configs SET is_active = false WHERE company_id = $1`,
+      [companyId],
+    );
+    await pool.query(
+      `UPDATE invoice_detail_queue
+       SET status = 'failed', attempts = max_attempts,
+           last_error = $2
+       WHERE company_id = $1
+         AND status IN ('pending', 'processing', 'failed')`,
+      [companyId, `Auth permanently failed — bot deactivated: ${reason}`.slice(0, 500)],
+    );
+    logger.error('[DetailWorker] CRITICAL: Company bot deactivated due to unrecoverable auth error', {
+      companyId, reason,
+    });
+  } catch (dbErr) {
+    logger.error('[DetailWorker] Failed to deactivate company bot in DB', {
+      companyId,
+      err: dbErr instanceof Error ? dbErr.message : String(dbErr),
+    });
+  }
+}
+
 function logInvoiceRawDetailWarningOnce(message: string): void {
   if (_loggedInvoiceRawDetailWarning) return;
   _loggedInvoiceRawDetailWarning = true;
@@ -255,9 +313,13 @@ async function getToken(
       return freshToken;
     }
   } catch (err) {
-    logger.warn('[DetailWorker] GDT authentication failed', {
-      companyId, err: err instanceof Error ? err.message : String(err),
-    });
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn('[DetailWorker] GDT authentication failed', { companyId, err: msg });
+
+    // CRITICAL: permanent auth failures must NOT be retried — they cause account lockout.
+    if (isUnrecoverableAuthError(msg)) {
+      throw new AuthUnrecoverableError(msg);
+    }
   }
   return null;
 }
@@ -449,7 +511,18 @@ async function processCompany(companyId: string): Promise<void> {
   const proxyUrl       = config.proxy_url ?? await proxyManager.nextForAutoSync(config.proxy_session_id);
   const proxySessionId = config.proxy_session_id;
 
-  const token = await getToken(companyId, proxySessionId, proxyUrl, creds.username, creds.password);
+  let token: string | null = null;
+  try {
+    token = await getToken(companyId, proxySessionId, proxyUrl, creds.username, creds.password);
+  } catch (authErr) {
+    if (authErr instanceof AuthUnrecoverableError) {
+      // Account locked / wrong credentials — deactivate bot immediately, no retry.
+      await deactivateCompanyBot(companyId, authErr.message);
+      return;
+    }
+    throw authErr;
+  }
+
   if (!token) {
     logger.warn('[DetailWorker] No valid token — skipping company this cycle', { companyId });
     return;
@@ -495,17 +568,29 @@ async function processCompany(companyId: string): Promise<void> {
 
 // ── Poll loop ─────────────────────────────────────────────────────────────────
 
-/** Get distinct company IDs that have pending/failed work. */
+/**
+ * Get one pending company per USER, ordered by oldest pending invoice (FIFO).
+ * This ensures:
+ *   - User A's 3 companies are processed ONE AT A TIME (sequential), not in parallel.
+ *   - Different users run concurrently (one company each).
+ *   - A single company that is slow does NOT starve other users.
+ */
 async function getPendingCompanyIds(): Promise<string[]> {
   const res = await pool.query<{ company_id: string }>(
-    `SELECT DISTINCT company_id
-     FROM invoice_detail_queue
-     WHERE (
-       status = 'pending'
-       OR (status = 'failed' AND attempts < max_attempts)
-       OR (status = 'processing' AND last_attempted_at < NOW() - ($1 || ' minutes')::INTERVAL)
+    `WITH pending AS (
+       SELECT company_id, MIN(enqueued_at) AS oldest_pending
+       FROM invoice_detail_queue
+       WHERE (
+         status = 'pending'
+         OR (status = 'failed' AND attempts < max_attempts)
+         OR (status = 'processing' AND last_attempted_at < NOW() - ($1 || ' minutes')::INTERVAL)
+       )
+       GROUP BY company_id
      )
-     ORDER BY company_id
+     SELECT DISTINCT ON (uc.user_id) p.company_id
+     FROM pending p
+     JOIN user_companies uc ON uc.company_id = p.company_id
+     ORDER BY uc.user_id, p.oldest_pending ASC
      LIMIT $2`,
     [STUCK_PROCESSING_MIN, MAX_CONCURRENT_COMPANIES],
   );

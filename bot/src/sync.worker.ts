@@ -1312,6 +1312,26 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
       if (proxyUrl) proxyManager.markHealthy(proxyUrl);
 
+      // ── Count discrepancy check ────────────────────────────────────────────────
+      // Compare what GDT said was available (outEst/inEst) vs what we actually fetched.
+      // Discrepancy > 5% AND > 5 invoices → warn user so they can re-sync.
+      const gdtExpectedOutput = outEst >= 0 ? outEst : 0;
+      const gdtExpectedInput  = inEst  >= 0 ? inEst  : 0;
+      const discrepancyOut    = gdtExpectedOutput > 0 ? gdtExpectedOutput - outputCount : 0;
+      const discrepancyIn     = gdtExpectedInput  > 0 ? gdtExpectedInput  - inputCount  : 0;
+      const discrepancyOutPct = gdtExpectedOutput > 0 ? Math.round((discrepancyOut / gdtExpectedOutput) * 100) : 0;
+      const discrepancyInPct  = gdtExpectedInput  > 0 ? Math.round((discrepancyIn  / gdtExpectedInput)  * 100) : 0;
+      const hasDiscrepancy    = (discrepancyOut > 5 && discrepancyOutPct > 5)
+                             || (discrepancyIn  > 5 && discrepancyInPct  > 5);
+
+      if (hasDiscrepancy) {
+        logger.warn('[SyncWorker] Count discrepancy detected — GDT reported more invoices than fetched', {
+          companyId,
+          gdtExpectedOutput, outputCount, discrepancyOut, discrepancyOutPct,
+          gdtExpectedInput,  inputCount,  discrepancyIn,  discrepancyInPct,
+        });
+      }
+
       // Đếm số HĐ đã enqueue detail trong 2h gần nhất cho company này
       const detailQueuedRes = await pool.query<{ count: string }>(
         `SELECT COUNT(*) AS count FROM invoice_detail_queue
@@ -1323,6 +1343,9 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       // Final progress update — Phase 1 complete, Phase 2 starting in background
       const totalFetchedFinal = outputCount + inputCount;
       const totalEstFinal = (outEst >= 0 ? outEst : 0) + (inEst >= 0 ? inEst : 0);
+      const discrepancyMsg = hasDiscrepancy
+        ? ` ⚠️ GDT có ${totalEstFinal.toLocaleString('vi-VN')} HĐ nhưng chỉ tải được ${totalFetchedFinal.toLocaleString('vi-VN')} — vui lòng đồng bộ lại.`
+        : '';
       await job.updateProgress({
         percent: 100,
         invoicesFetched: totalFetchedFinal,
@@ -1330,7 +1353,10 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
         outputCount,
         inputCount,
         detailQueued,
-        statusMessage: `Đã tải ${totalFetchedFinal.toLocaleString('vi-VN')} hóa đơn (📤 ${outputCount.toLocaleString('vi-VN')} đầu ra, 📥 ${inputCount.toLocaleString('vi-VN')} đầu vào). Đang xử lý chi tiết ${detailQueued} HĐ trong nền...`,
+        gdtExpectedOutput,
+        gdtExpectedInput,
+        hasDiscrepancy,
+        statusMessage: `Đã tải ${totalFetchedFinal.toLocaleString('vi-VN')} hóa đơn (📤 ${outputCount.toLocaleString('vi-VN')} đầu ra, 📥 ${inputCount.toLocaleString('vi-VN')} đầu vào). Đang xử lý chi tiết ${detailQueued} HĐ trong nền...${discrepancyMsg}`,
       } as Record<string, unknown>);
 
       const durationMs = Date.now() - startedAt;
@@ -1386,6 +1412,12 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
             // Truyền khoảng thời gian để backend tự xác định quý cần recalc
             fromDate: jobFromDate,
             toDate: jobToDate,
+            // Count discrepancy info — backend sends a warning notification if needed
+            gdtExpectedOutput,
+            gdtExpectedInput,
+            actualOutput: outputCount,
+            actualInput:  inputCount,
+            hasDiscrepancy,
           });
         } catch (notifErr) {
           logger.warn('[SyncWorker] Failed to enqueue notification (non-fatal)', { companyId, err: notifErr });

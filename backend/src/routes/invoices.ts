@@ -175,9 +175,20 @@ router.get('/export', async (req: Request, res: Response, next: NextFunction) =>
       `SELECT i.invoice_number, i.serial_number, i.invoice_date, i.direction, i.status,
               i.seller_name, i.seller_tax_code, i.buyer_name, i.buyer_tax_code,
               i.subtotal, i.total_amount, i.vat_amount, i.vat_rate,
-              i.payment_method, i.customer_code, i.item_code, i.notes,
+              i.payment_method, i.notes,
+              COALESCE(i.customer_code,
+                CASE WHEN i.direction = 'output'
+                  THEN (SELECT cc.customer_code FROM customer_catalog cc WHERE cc.company_id = i.company_id AND cc.tax_code = i.buyer_tax_code LIMIT 1)
+                  ELSE (SELECT sc.supplier_code FROM supplier_catalog sc WHERE sc.company_id = i.company_id AND sc.tax_code = i.seller_tax_code LIMIT 1)
+                END
+              ) AS customer_code,
               CASE WHEN i.direction='output' THEN i.buyer_name ELSE i.seller_name END AS party_name,
-              (SELECT STRING_AGG(li.item_name, '; ') FROM invoice_line_items li WHERE li.invoice_id = i.id LIMIT 3) AS item_name
+              COALESCE(i.item_code,
+                (SELECT COALESCE(pc.item_code, li.item_code) FROM invoice_line_items li
+                 LEFT JOIN product_catalog pc ON pc.company_id = i.company_id AND pc.normalized_name = LOWER(TRIM(li.item_name))
+                 WHERE li.invoice_id = i.id AND li.deleted_at IS NULL LIMIT 1)
+              ) AS item_code,
+              (SELECT STRING_AGG(li.item_name, '; ') FROM invoice_line_items li WHERE li.invoice_id = i.id AND li.deleted_at IS NULL LIMIT 3) AS item_name
        FROM invoices i WHERE ${where}
        ORDER BY i.invoice_date DESC
        LIMIT 5000`,

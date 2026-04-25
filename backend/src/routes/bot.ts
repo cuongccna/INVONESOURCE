@@ -1069,4 +1069,74 @@ router.get(
   }
 );
 
+// ── GET /api/bot/invoice-count — so sánh số HĐ trong DB vs lần sync cuối ───────
+// Trả về: db_output, db_input, last_run_output, last_run_input, last_run_at
+// Người dùng dùng để phát hiện hóa đơn bị thiếu sau khi bot đồng bộ.
+router.get(
+  '/invoice-count',
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const companyId = req.user!.companyId;
+      if (!companyId) throw new ValidationError('Company not associated');
+
+      const fromDate = req.query['fromDate'] as string | undefined;
+      const toDate   = req.query['toDate']   as string | undefined;
+
+      const dateFilter = fromDate && toDate
+        ? `AND invoice_date BETWEEN $2::date AND $3::date`
+        : fromDate
+          ? `AND invoice_date >= $2::date`
+          : toDate
+            ? `AND invoice_date <= $2::date`
+            : '';
+      const dateParams: unknown[] = fromDate && toDate
+        ? [companyId, fromDate, toDate]
+        : fromDate
+          ? [companyId, fromDate]
+          : toDate
+            ? [companyId, toDate]
+            : [companyId];
+
+      const [dbCountRes, lastRunRes] = await Promise.all([
+        pool.query<{ output: string; input: string }>(
+          `SELECT
+             COUNT(*) FILTER (WHERE direction = 'output') AS output,
+             COUNT(*) FILTER (WHERE direction = 'input')  AS input
+           FROM invoices
+           WHERE company_id = $1
+             AND deleted_at IS NULL
+             AND status NOT IN ('cancelled', 'replaced')
+             ${dateFilter}`,
+          dateParams,
+        ),
+        pool.query<{
+          output_count: number; input_count: number; started_at: string; status: string;
+        }>(
+          `SELECT output_count, input_count, started_at, status
+           FROM gdt_bot_runs
+           WHERE company_id = $1 AND status = 'success'
+           ORDER BY started_at DESC LIMIT 1`,
+          [companyId],
+        ),
+      ]);
+
+      const dbOutput  = parseInt(dbCountRes.rows[0]?.output ?? '0', 10);
+      const dbInput   = parseInt(dbCountRes.rows[0]?.input  ?? '0', 10);
+      const lastRun   = lastRunRes.rows[0] ?? null;
+
+      sendSuccess(res, {
+        db_output:       dbOutput,
+        db_input:        dbInput,
+        db_total:        dbOutput + dbInput,
+        last_run_output: lastRun?.output_count ?? null,
+        last_run_input:  lastRun?.input_count  ?? null,
+        last_run_total:  lastRun ? (lastRun.output_count + lastRun.input_count) : null,
+        last_run_at:     lastRun?.started_at ?? null,
+        from_date:       fromDate ?? null,
+        to_date:         toDate   ?? null,
+      });
+    } catch (err) { next(err); }
+  }
+);
+
 export default router;

@@ -297,10 +297,8 @@ export class TaxDeclarationExporter {
     const form27 = form29 + form30 + form32 + Number(decl.ct32a_kkknt_revenue ?? 0); // II.2 [27]
     const form28 = form31 + form33;                               // II.2 [28]
     const form34 = Number(decl.ct40_total_output_revenue);        // II.3 [34]
-    const nqRed  = Number(decl.ct36_nq_vat_reduction ?? 0);
-    const form35 = Number(decl.ct40a_total_output_vat);          // II.3 [35] (gross)
-    const form35net = form35 - nqRed;                            // net after NQ reduction
-    const form36 = form35net - form25;                           // III [36]
+    const form35 = Number(decl.ct40a_total_output_vat);          // II.3 [35] = ct40a (already net of NQ)
+    const form36 = form35 - form25;                              // III [36] = [35] - [25]
     const adj37  = Number(decl.ct37_adjustment_decrease ?? 0);   // IV.a [37]
     const adj38  = Number(decl.ct38_adjustment_increase ?? 0);   // IV.b [38]
     const form40a = Number(decl.ct41_payable_vat);               // VI.1 [40a] (already computed)
@@ -354,7 +352,7 @@ export class TaxDeclarationExporter {
     tableRow('3',
       'Tổng doanh thu và thuế GTGT của HHDV bán ra ([34]=[26]+[27]; [35]=[28])',
       form34 || null,
-      nqRed > 0 ? form35net : (form35 || null),
+      form35 || null,
       { bold: true });
 
     /* ── ROW III: Net VAT position [36] ── */
@@ -528,104 +526,267 @@ export class TaxDeclarationExporter {
     const outputInvoices = invoices.filter(i => i.direction === 'output');
     const inputInvoices  = invoices.filter(i => i.direction === 'input');
 
+    /* ── Computed values matching official 01/GTGT form ── */
+    const v22   = Number(decl.ct24_carried_over_vat);  // [22] = kỳ trước chuyển sang
+    const v23r  = Number(decl.ct23_input_subtotal);    // [23] doanh thu mua vào
+    const v23   = Number(decl.ct23_deductible_input_vat); // [23] thuế mua vào đủ ĐK
+    const v25   = Number(decl.ct25_total_deductible);
+    const v26   = Number(decl.ct26_kct_revenue ?? decl.ct30_exempt_revenue ?? 0);
+    const v29   = Number(decl.ct29_0pct_revenue ?? 0);
+    const v30   = Number(decl.ct32_revenue_5pct ?? 0);
+    const v31   = Number(decl.ct33_vat_5pct ?? 0);
+    const v32   = Number(decl.ct36_revenue_10pct ?? 0) + Number(decl.ct34_revenue_8pct ?? 0);
+    const v33   = Number(decl.ct37_vat_10pct ?? 0) + Number(decl.ct35_vat_8pct ?? 0);
+    const v32a  = Number(decl.ct32a_kkknt_revenue ?? 0);
+    const v27   = v29 + v30 + v32 + v32a;
+    const v28   = v31 + v33;
+    const v34   = Number(decl.ct40_total_output_revenue ?? 0);
+    const v35   = Number(decl.ct40a_total_output_vat ?? 0);
+    const v36   = v35 - v25;
+    const v37   = Number(decl.ct37_adjustment_decrease ?? 0);
+    const v38   = Number(decl.ct38_adjustment_increase ?? 0);
+    const v40a  = Number(decl.ct41_payable_vat ?? 0);
+    const v40b  = Number(decl.ct40b_investment_vat ?? 0);
+    const v40   = Math.max(0, v40a - v40b);
+    const v43   = Number(decl.ct43_carry_forward_vat ?? 0);
+
+    const periodStr     = periodLabel(decl);
+    const isFirstTime   = decl.submission_status !== 'supplementary';
+    const exportDateStr = new Date().toLocaleDateString('vi-VN');
+
+    function row(ct: string, label: string, rev: number | null, tax: number | null, opts: { bold?: boolean; section?: boolean; sub?: boolean } = {}) {
+      const sectionStyle  = opts.section ? 'background:#dce3f5;font-weight:bold;' : '';
+      const boldStyle     = opts.bold    ? 'font-weight:bold;'                    : '';
+      const subStyle      = opts.sub     ? 'padding-left:20px;'                   : '';
+      const taxCls        = ct === '[40a]' && tax !== null && tax > 0  ? 'color:#c00;font-weight:bold;'
+                          : ct === '[43]'  && tax !== null && tax > 0  ? 'color:#060;font-weight:bold;'
+                          : ct === '[36]'  && tax !== null && tax < 0  ? 'color:#060;font-weight:bold;'
+                          : boldStyle;
+      const revCell = rev !== null ? `<td style="text-align:right;${boldStyle}">${vnd(rev)}</td>` : `<td></td>`;
+      const taxCell = tax !== null ? `<td style="text-align:right;${taxCls}">${vnd(tax)}</td>` : `<td></td>`;
+      return `<tr style="${sectionStyle}">
+        <td style="text-align:center;white-space:nowrap;">${ct}</td>
+        <td style="${subStyle}">${label}</td>
+        ${revCell}${taxCell}
+      </tr>`;
+    }
+
+    function sectionRow(ct: string, label: string) {
+      return `<tr style="background:#dce3f5;">
+        <td style="text-align:center;font-weight:bold;">${ct}</td>
+        <td colspan="3" style="font-weight:bold;">${label}</td>
+      </tr>`;
+    }
+
+    function invRow(i: number, inv: InvoiceRow, dir: 'output' | 'input') {
+      const party = dir === 'output' ? inv.buyer_name    : inv.seller_name;
+      const tax   = dir === 'output' ? inv.buyer_tax_code : inv.seller_tax_code;
+      return `<tr>
+        <td style="text-align:center">${i}</td>
+        <td>${inv.invoice_number}</td>
+        <td>${inv.serial_number}</td>
+        <td style="white-space:nowrap">${new Date(inv.invoice_date).toLocaleDateString('vi-VN')}</td>
+        <td>${party}</td>
+        <td>${tax}</td>
+        <td style="text-align:right">${vnd(Number(inv.subtotal ?? 0))}</td>
+        <td style="text-align:right">${vnd(Number(inv.vat_amount))}</td>
+        <td style="text-align:right">${vnd(Number(inv.total_amount))}</td>
+      </tr>`;
+    }
+
     const html = `<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
 <style>
-  body { font-family: 'Times New Roman', serif; font-size: 11px; margin: 20px; color: #000; }
-  h1   { font-size: 14px; text-align: center; margin-bottom: 4px; }
-  h2   { font-size: 12px; margin-top: 16px; border-bottom: 1px solid #000; padding-bottom: 2px; }
-  .meta { text-align: center; font-size: 10px; color: #555; margin-bottom: 12px; }
-  table { width: 100%; border-collapse: collapse; font-size: 10px; margin-top: 6px; }
-  th, td { border: 1px solid #aaa; padding: 3px 5px; }
-  th { background: #DCE3F5; font-weight: bold; text-align: center; }
-  .num { text-align: right; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Times New Roman', Times, serif; font-size: 10.5pt; color: #000; background: #fff; }
+  .page { padding: 12mm 12mm 10mm; }
+  .center { text-align: center; }
   .bold { font-weight: bold; }
-  .red { color: #c00; }
-  .green { color: #060; }
-  .highlight-row td { background: #FFFDE7; }
-  @page { size: A4; margin: 15mm 12mm; }
+  .italic { font-style: italic; }
+  h1 { font-size: 13pt; font-weight: bold; text-align: center; margin-bottom: 2px; }
+  .decree { font-size: 9pt; text-align: center; font-style: italic; margin-bottom: 10px; }
+  .info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 12px; margin: 6px 0; font-size: 9.5pt; }
+  .info-label { font-weight: bold; }
+  .info-row { display: flex; gap: 8px; align-items: baseline; }
+  .unit-row { text-align: right; font-size: 9pt; font-style: italic; margin: 4px 0 2px; }
+  table { width: 100%; border-collapse: collapse; font-size: 9.5pt; }
+  th, td { border: 0.5pt solid #555; padding: 2px 4px; vertical-align: middle; }
+  th { background: #dce3f5; font-weight: bold; text-align: center; }
+  .main-table td:first-child { width: 38px; }
+  .main-table td:nth-child(2) { width: auto; }
+  .main-table td:nth-child(3),
+  .main-table td:nth-child(4) { width: 120px; text-align: right; }
+  .inv-table td { font-size: 8.5pt; }
+  .sig-section { margin-top: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .sig-block { text-align: center; }
+  .sig-title { font-weight: bold; font-size: 9.5pt; }
+  .sig-space { height: 40px; }
+  .footer { margin-top: 8px; font-size: 8pt; color: #666; text-align: right; border-top: 0.5pt solid #ccc; padding-top: 4px; }
+  @page { size: A4; margin: 0; }
+  @media print { .page-break { page-break-before: always; } }
 </style>
 </head>
 <body>
-<h1>TỜ KHAI THUẾ GIÁ TRỊ GIA TĂNG — MẪU 01/GTGT</h1>
-<div class="meta">
-  Công ty: <b>${company?.name ?? ''}</b> &nbsp;|&nbsp; MST: <b>${company?.tax_code ?? ''}</b>
-  &nbsp;|&nbsp; Kỳ kê khai: <b>${periodLabel(decl)}</b>
-  &nbsp;|&nbsp; Trạng thái: <b>${decl.submission_status.toUpperCase()}</b>
+<div class="page">
+
+<!-- ═══ HEADER ═══ -->
+<table style="border:none;margin-bottom:4px;" cellspacing="0">
+  <tr style="border:none;">
+    <td style="border:none;text-align:center;vertical-align:top;width:40%">
+      <div style="font-size:9pt;font-weight:bold;">CỘNG HÒA XÃ HỘI CHỦ NGHĨA VIỆT NAM</div>
+      <div style="font-size:9pt;">Độc lập - Tự do - Hạnh phúc</div>
+      <div style="font-size:8pt;margin-top:1px;">────────────────</div>
+    </td>
+    <td style="border:none;text-align:right;vertical-align:top;font-size:8pt;color:#444;">
+      Mẫu số: 01/GTGT<br/>
+      (Ban hành kèm theo Thông tư số 80/2021/TT-BTC<br/>ngày 29/9/2021 của Bộ Tài chính)
+    </td>
+  </tr>
+</table>
+
+<h1>TỜ KHAI THUẾ GIÁ TRỊ GIA TĂNG</h1>
+<div class="decree">(Dành cho người nộp thuế khai thuế GTGT theo phương pháp khấu trừ)</div>
+
+<!-- Period & declaration type -->
+<table style="border:none;margin-bottom:6px;font-size:9.5pt;" cellspacing="0">
+  <tr style="border:none;">
+    <td style="border:none;width:55%"><span class="bold">[01] Kỳ tính thuế:</span> ${periodStr}</td>
+    <td style="border:none;width:25%"><span class="bold">[02] Lần đầu:</span> ${isFirstTime ? '☑' : '☐'}</td>
+    <td style="border:none;width:20%"><span class="bold">[03] Bổ sung lần:</span> ${isFirstTime ? '' : '1'}</td>
+  </tr>
+</table>
+
+<!-- Company info -->
+<table style="border:none;font-size:9.5pt;margin-bottom:4px;" cellspacing="0">
+  <tr style="border:none;"><td style="border:none;width:40%;padding:1px 0"><span class="bold">[04] Tên người nộp thuế:</span> ${company?.name ?? ''}</td><td style="border:none;"></td></tr>
+  <tr style="border:none;"><td style="border:none;padding:1px 0"><span class="bold">[05] Mã số thuế:</span> ${company?.tax_code ?? ''}</td><td style="border:none;"></td></tr>
+  <tr style="border:none;"><td style="border:none;padding:1px 0" colspan="2"><span class="bold">[06] Địa chỉ:</span> </td></tr>
+  <tr style="border:none;">
+    <td style="border:none;padding:1px 0"><span class="bold">[07] Quận/Huyện:</span> </td>
+    <td style="border:none;padding:1px 0"><span class="bold">[08] Tỉnh/Thành phố:</span> </td>
+  </tr>
+  <tr style="border:none;">
+    <td style="border:none;padding:1px 0"><span class="bold">[09] Điện thoại:</span> </td>
+    <td style="border:none;padding:1px 0"><span class="bold">[10] Fax:</span> &nbsp;&nbsp;<span class="bold">[11] Email:</span> </td>
+  </tr>
+</table>
+
+<div class="unit-row">Đơn vị tính: VNĐ</div>
+
+<!-- ═══ MAIN DECLARATION TABLE ═══ -->
+<table class="main-table">
+  <thead>
+    <tr>
+      <th>Chỉ tiêu</th>
+      <th style="text-align:left">Nội dung</th>
+      <th>Giá trị HHDV<br/>(chưa có thuế GTGT)</th>
+      <th>Thuế GTGT</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="text-align:center">A</td>
+      <td colspan="3">Không phát sinh hoạt động mua, bán trong kỳ (đánh dấu "X" nếu không phát sinh): &nbsp;${decl.ct21_no_activity ? '☑' : '☐'}</td>
+    </tr>
+    <tr style="background:#f0f4ff;">
+      <td style="text-align:center;font-weight:bold;">B</td>
+      <td style="font-weight:bold;">Thuế GTGT còn được khấu trừ kỳ trước chuyển sang</td>
+      <td></td>
+      <td style="text-align:right;font-weight:bold;">${vnd(v22)}</td>
+    </tr>
+    ${sectionRow('C', 'KÊ KHAI THUẾ GTGT PHẢI NỘP NGÂN SÁCH NHÀ NƯỚC')}
+    ${sectionRow('I', 'Hàng hoá, dịch vụ (HHDV) mua vào trong kỳ')}
+    ${row('[23]', 'Giá trị HHDV mua vào', v23r, v23)}
+    ${row('[25]', 'Tổng số thuế GTGT được khấu trừ kỳ này ([25]=[23]+[24])', null, v25, { bold: true })}
+    ${sectionRow('II', 'Hàng hoá, dịch vụ bán ra trong kỳ')}
+    ${row('[26]', 'HHDV bán ra không chịu thuế GTGT', v26, null)}
+    ${row('[27]', 'HHDV bán ra chịu thuế GTGT ([27]=[29]+[30]+[32]+[32a])', v27, v28, { bold: true })}
+    ${row('[29]', 'HHDV bán ra chịu thuế suất 0%', v29, null, { sub: true })}
+    ${row('[30]', 'HHDV bán ra chịu thuế suất 5%', v30, v31, { sub: true })}
+    ${row('[32]', 'HHDV bán ra chịu thuế suất 10% (gồm 8% theo NQ)', v32, v33, { sub: true })}
+    ${v32a > 0 ? row('[32a]', 'HHDV bán ra không kê khai nộp thuế tại trụ sở', v32a, null, { sub: true }) : ''}
+    ${row('[34]', 'Tổng doanh thu và thuế GTGT của HHDV bán ra ([34]=[26]+[27])', v34, v35, { bold: true })}
+    ${sectionRow('III', 'Thuế GTGT phát sinh trong kỳ')}
+    ${row('[36]', 'Thuế GTGT phát sinh trong kỳ ([36]=[35]−[25])', null, v36, { bold: true })}
+    ${sectionRow('IV', 'Điều chỉnh tăng, giảm thuế GTGT của các kỳ trước')}
+    ${row('[37]', 'Điều chỉnh giảm', null, v37 || null)}
+    ${row('[38]', 'Điều chỉnh tăng', null, v38 || null)}
+    ${sectionRow('V', 'Thuế GTGT ở địa phương khác')}
+    ${row('[39]', 'Thuế GTGT ở địa phương khác phải nộp', null, null)}
+    ${sectionRow('VI', 'XÁC ĐỊNH NGHĨA VỤ THUẾ GTGT PHẢI NỘP TRONG KỲ')}
+    ${row('[40a]', 'Thuế GTGT phải nộp ([40a]=[36]−[22]+[37]−[38]−[39])≥0', null, v40a > 0 ? v40a : null, { bold: true })}
+    ${row('[40b]', 'Thuế GTGT mua vào của dự án đầu tư bù trừ', null, v40b || null)}
+    ${row('[40]', 'Thuế GTGT còn phải nộp ([40]=[40a]−[40b])', null, v40 > 0 ? v40 : null, { bold: true })}
+    ${row('[41]', 'Thuế GTGT chưa khấu trừ hết ([41]=[36]−[22]+[37]−[38]−[39]<0)', null, v40a === 0 && v36 < 0 ? Math.abs(v36) : null)}
+    ${row('[42]', 'Tổng số thuế GTGT đề nghị hoàn', null, null)}
+    ${row('[43]', 'Thuế GTGT còn được khấu trừ chuyển kỳ sau ([43]=[41]−[42])', null, v43 > 0 ? v43 : null, { bold: true })}
+  </tbody>
+</table>
+
+<!-- ═══ SIGNATURE ═══ -->
+<div class="sig-section" style="margin-top:10px;">
+  <div style="font-size:9.5pt;">
+    <p>Tôi cam đoan số liệu khai trên là đúng và chịu trách nhiệm trước pháp luật về những số liệu đã khai.</p>
+  </div>
+  <div style="text-align:center;font-size:9.5pt;">
+    <p>…………, ngày ${exportDateStr}</p>
+    <p style="margin-top:4px;font-weight:bold;">NGƯỜI NỘP THUẾ hoặc ĐẠI DIỆN HỢP PHÁP</p>
+    <p style="font-size:8.5pt;font-style:italic;">(Ký, ghi rõ họ tên; chức vụ và đóng dấu nếu có)</p>
+    <div style="height:50px;"></div>
+  </div>
 </div>
 
-<h2>I. Các chỉ tiêu tổng hợp</h2>
-<table>
+<!-- ═══ OUTPUT INVOICES ═══ -->
+<div class="page-break"></div>
+<h2 style="font-size:11pt;font-weight:bold;margin:8px 0 4px;">BẢNG KÊ HÓA ĐƠN HÀNG HÓA, DỊCH VỤ BÁN RA (${outputInvoices.length} hóa đơn)</h2>
+<p style="font-size:9pt;margin-bottom:4px;">Kỳ khai thuế: <b>${periodStr}</b> &nbsp;|&nbsp; MST: <b>${company?.tax_code ?? ''}</b></p>
+<table class="inv-table">
   <thead>
-    <tr><th width="60">Chỉ tiêu</th><th>Nội dung</th><th width="130">Giá trị (VNĐ)</th></tr>
-  </thead>
-  <tbody>
-    ${[
-      ['[22]', 'Tổng thuế GTGT đầu vào phát sinh', decl.ct22_total_input_vat, false],
-      ['[23]', 'Thuế GTGT đầu vào đủ điều kiện khấu trừ', decl.ct23_deductible_input_vat, false],
-      ['[24]', 'Thuế GTGT kỳ trước chuyển sang', decl.ct24_carried_over_vat, false],
-      ['[25]', 'Tổng thuế được khấu trừ ([23]+[24])', decl.ct25_total_deductible, true],
-      ['[29]', 'Tổng doanh thu hàng hoá, dịch vụ', decl.ct29_total_revenue, false],
-      ['[40]', 'Tổng doanh thu bán ra', decl.ct40_total_output_revenue, false],
-      ['[40a]','Tổng thuế GTGT đầu ra', decl.ct40a_total_output_vat, true],
-      ['[41]', 'Thuế GTGT còn phải nộp trong kỳ', decl.ct41_payable_vat, true],
-      ['[43]', 'Thuế GTGT khấu trừ kỳ sau', decl.ct43_carry_forward_vat, true],
-    ].map(([ct, label, val, bold]) => {
-      const n = Number(val);
-      const cls = ct === '[41]' && n > 0 ? 'red bold' : ct === '[43]' && n > 0 ? 'green bold' : bold ? 'bold' : '';
-      return `<tr><td>${ct}</td><td>${label}</td><td class="num ${cls}">${vnd(n)}</td></tr>`;
-    }).join('')}
-  </tbody>
-</table>
-
-<h2>II. Hóa đơn bán ra (${outputInvoices.length} hóa đơn)</h2>
-<table>
-  <thead>
-    <tr><th>#</th><th>Số HĐ</th><th>Ký hiệu</th><th>Ngày lập</th><th>Người mua</th><th>MST NM</th><th class="num">Tiền hàng</th><th class="num">Thuế</th><th class="num">Tổng</th></tr>
-  </thead>
-  <tbody>
-    ${outputInvoices.slice(0, 100).map((inv, i) => `
     <tr>
-      <td>${i + 1}</td>
-      <td>${inv.invoice_number}</td>
-      <td>${inv.serial_number}</td>
-      <td>${new Date(inv.invoice_date).toLocaleDateString('vi-VN')}</td>
-      <td>${inv.buyer_name}</td>
-      <td>${inv.buyer_tax_code}</td>
-      <td class="num">${vnd(Number(inv.subtotal ?? 0))}</td>
-      <td class="num">${vnd(Number(inv.vat_amount))}</td>
-      <td class="num">${vnd(Number(inv.total_amount))}</td>
-    </tr>`).join('')}
-    ${outputInvoices.length > 100 ? `<tr><td colspan="9" style="text-align:center;color:#888">… và ${outputInvoices.length - 100} hóa đơn khác (xem bản Excel đầy đủ)</td></tr>` : ''}
-  </tbody>
-</table>
-
-<h2>III. Hóa đơn mua vào (${inputInvoices.length} hóa đơn)</h2>
-<table>
-  <thead>
-    <tr><th>#</th><th>Số HĐ</th><th>Ký hiệu</th><th>Ngày lập</th><th>Người bán</th><th>MST NB</th><th class="num">Tiền hàng</th><th class="num">Thuế</th><th class="num">Tổng</th></tr>
+      <th width="28">#</th><th>Số HĐ</th><th>Ký hiệu</th><th>Ngày lập</th>
+      <th>Người mua</th><th>MST người mua</th>
+      <th style="text-align:right">Tiền hàng</th><th style="text-align:right">Thuế GTGT</th><th style="text-align:right">Tổng tiền</th>
+    </tr>
   </thead>
   <tbody>
-    ${inputInvoices.slice(0, 100).map((inv, i) => `
-    <tr>
-      <td>${i + 1}</td>
-      <td>${inv.invoice_number}</td>
-      <td>${inv.serial_number}</td>
-      <td>${new Date(inv.invoice_date).toLocaleDateString('vi-VN')}</td>
-      <td>${inv.seller_name}</td>
-      <td>${inv.seller_tax_code}</td>
-      <td class="num">${vnd(Number(inv.subtotal ?? 0))}</td>
-      <td class="num">${vnd(Number(inv.vat_amount))}</td>
-      <td class="num">${vnd(Number(inv.total_amount))}</td>
-    </tr>`).join('')}
-    ${inputInvoices.length > 100 ? `<tr><td colspan="9" style="text-align:center;color:#888">… và ${inputInvoices.length - 100} hóa đơn khác (xem bản Excel đầy đủ)</td></tr>` : ''}
+    ${outputInvoices.slice(0, 500).map((inv, i) => invRow(i + 1, inv, 'output')).join('')}
+    ${outputInvoices.length > 500 ? `<tr><td colspan="9" style="text-align:center;color:#888;padding:4px">… và ${(outputInvoices.length - 500).toLocaleString('vi-VN')} hóa đơn khác (xem bản Excel đầy đủ)</td></tr>` : ''}
+    <tr style="font-weight:bold;background:#f5f5f5;">
+      <td colspan="6" style="text-align:right">Tổng cộng</td>
+      <td style="text-align:right">${vnd(outputInvoices.reduce((s, i) => s + Number(i.subtotal ?? 0), 0))}</td>
+      <td style="text-align:right">${vnd(outputInvoices.reduce((s, i) => s + Number(i.vat_amount), 0))}</td>
+      <td style="text-align:right">${vnd(outputInvoices.reduce((s, i) => s + Number(i.total_amount), 0))}</td>
+    </tr>
   </tbody>
 </table>
 
-<div style="margin-top:16px;font-size:9px;color:#888;text-align:right">
-  Xuất ngày: ${new Date().toLocaleDateString('vi-VN')} — INVONE Platform
+<!-- ═══ INPUT INVOICES ═══ -->
+<div class="page-break"></div>
+<h2 style="font-size:11pt;font-weight:bold;margin:8px 0 4px;">BẢNG KÊ HÓA ĐƠN HÀNG HÓA, DỊCH VỤ MUA VÀO (${inputInvoices.length} hóa đơn)</h2>
+<p style="font-size:9pt;margin-bottom:4px;">Kỳ khai thuế: <b>${periodStr}</b> &nbsp;|&nbsp; MST: <b>${company?.tax_code ?? ''}</b></p>
+<table class="inv-table">
+  <thead>
+    <tr>
+      <th width="28">#</th><th>Số HĐ</th><th>Ký hiệu</th><th>Ngày lập</th>
+      <th>Người bán</th><th>MST người bán</th>
+      <th style="text-align:right">Tiền hàng</th><th style="text-align:right">Thuế GTGT</th><th style="text-align:right">Tổng tiền</th>
+    </tr>
+  </thead>
+  <tbody>
+    ${inputInvoices.slice(0, 500).map((inv, i) => invRow(i + 1, inv, 'input')).join('')}
+    ${inputInvoices.length > 500 ? `<tr><td colspan="9" style="text-align:center;color:#888;padding:4px">… và ${(inputInvoices.length - 500).toLocaleString('vi-VN')} hóa đơn khác (xem bản Excel đầy đủ)</td></tr>` : ''}
+    <tr style="font-weight:bold;background:#f5f5f5;">
+      <td colspan="6" style="text-align:right">Tổng cộng</td>
+      <td style="text-align:right">${vnd(inputInvoices.reduce((s, i) => s + Number(i.subtotal ?? 0), 0))}</td>
+      <td style="text-align:right">${vnd(inputInvoices.reduce((s, i) => s + Number(i.vat_amount), 0))}</td>
+      <td style="text-align:right">${vnd(inputInvoices.reduce((s, i) => s + Number(i.total_amount), 0))}</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="footer">Xuất ngày: ${exportDateStr} — INVONE Platform &nbsp;|&nbsp; MST: ${company?.tax_code ?? ''} &nbsp;|&nbsp; Kỳ: ${periodStr}</div>
 </div>
 </body>
 </html>`;
