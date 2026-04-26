@@ -91,8 +91,10 @@ if (!comp) throw new AppError('Company not found', 404, 'NOT_FOUND');
 router.get('/dashboard/kpi', async (req: Request, res: Response) => {
   const companyId = req.user!.companyId!;
   const now = new Date();
-  const month = parseInt(req.query.month as string) || now.getMonth() + 1;
-  const year  = parseInt(req.query.year  as string) || now.getFullYear();
+  const month     = parseInt(req.query.month      as string) || now.getMonth() + 1;
+  const year      = parseInt(req.query.year       as string) || now.getFullYear();
+  const monthFrom = parseInt(req.query.month_from as string) || month;
+  const monthTo   = parseInt(req.query.month_to   as string) || month;
   if (month < 1 || month > 12) throw new AppError('month must be 1-12', 400, 'VALIDATION');
 
   // Guard: household only
@@ -113,8 +115,8 @@ router.get('/dashboard/kpi', async (req: Request, res: Response) => {
   const isHousehold = comp.company_type === 'household' || ['HKD', 'HND', 'CA_NHAN'].includes(comp.business_type);
   if (!isHousehold) throw new AppError('Endpoint chỉ dành cho hộ kinh doanh', 400, 'VALIDATION');
 
-  const startDate = `${year}-${String(month).padStart(2, '0')}-01`;
-  const endDate   = new Date(year, month, 0).toISOString().split('T')[0];
+  const startDate = `${year}-${String(monthFrom).padStart(2, '0')}-01`;
+  const endDate   = new Date(year, monthTo, 0).toISOString().split('T')[0];
 
   const [outputRes, inputRes] = await Promise.all([
     pool.query<{ total: string; count: string }>(
@@ -153,33 +155,35 @@ router.get('/dashboard/kpi', async (req: Request, res: Response) => {
   else if (annualRevEst <= 500_000_000) monBai = 500_000;
   else                                   monBai = 1_000_000;
 
-  // Tax deadlines for HKD
+  // Tax deadlines for HKD — monthly + quarterly
   const now2 = new Date();
   const daysUntil = (d: Date) => Math.ceil((d.getTime() - now2.getTime()) / 86_400_000);
-  const q = Math.ceil(month / 3);
-  const taxDeadlines = [
-    {
-      label: `Thuế khoán T${month}/${year}`,
-      due: new Date(year, month, 20).toISOString().split('T')[0],
-      days_left: daysUntil(new Date(year, month, 20)),
-      type: 'hkd_khoan',
-    },
-    {
-      label: `Thuế khoán Q${q}/${year}`,
-      due: new Date(year, q * 3, 20).toISOString().split('T')[0],
-      days_left: daysUntil(new Date(year, q * 3, 20)),
+  const monthlyDeadlines = Array.from({ length: 12 }, (_, i) => {
+    const m = i + 1;
+    const dueMonth = m === 12 ? 1 : m + 1;
+    const dueYear  = m === 12 ? year + 1 : year;
+    return {
+      label: `Nộp thuế khoán T${m}/${year}`,
+      due: new Date(dueYear, dueMonth - 1, 20).toISOString().split('T')[0],
+      days_left: daysUntil(new Date(dueYear, dueMonth - 1, 20)),
+      type: 'hkd_monthly',
+    };
+  });
+  const quarterlyDeadlines = [1, 2, 3, 4].map((q) => {
+    const dueMonth = q * 3 + 1 > 12 ? 1 : q * 3 + 1;
+    const dueYear  = q === 4 ? year + 1 : year;
+    return {
+      label: `Nộp thuế khoán Q${q}/${year}`,
+      due: new Date(dueYear, dueMonth - 1, 20).toISOString().split('T')[0],
+      days_left: daysUntil(new Date(dueYear, dueMonth - 1, 20)),
       type: 'hkd_quarterly',
-    },
-    {
-      label: `Thuế môn bài ${year + 1}`,
-      due: `${year + 1}-01-30`,
-      days_left: daysUntil(new Date(year + 1, 0, 30)),
-      type: 'mon_bai',
-    },
-  ].sort((a, b) => a.days_left - b.days_left);
+    };
+  });
+  const taxDeadlines = [...monthlyDeadlines, ...quarterlyDeadlines]
+    .sort((a, b) => a.days_left - b.days_left);
 
   sendSuccess(res, {
-    period: { month, year },
+    period: { month, monthFrom, monthTo, year },
     revenue,
     input_purchases: inputTotal,
     input_invoice_count: Number(inputRes.rows[0]?.count    ?? 0),

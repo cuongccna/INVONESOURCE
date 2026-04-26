@@ -67,23 +67,39 @@ const FLAG_ICON: Record<string, string> = {
   MST_NOT_FOUND:       '🚫',
   MST_DISSOLVED:       '🪦',
   MST_SUSPENDED:       '⛔',
+  DKKD_NOT_FOUND:      '🔍',
+  DKKD_DISSOLVED:      '🚨',
+  DKKD_SUSPENDED:      '⚠️',
   NAME_MISMATCH:       '⚠️',
   NEW_COMPANY_BIG_INV: '🔔',
   SPLIT_INVOICE:       '✂️',
   ROUND_AMOUNTS:       '🔢',
   HIGH_FREQUENCY:      '📈',
   ZERO_HISTORY:        '📋',
+  BLACKLISTED:         '🚷',
+  VIRTUAL_OFFICE:      '🏢',
+  DIRECTOR_MULTI_CO:   '👤',
+  K_FACTOR_HIGH:       '📊',
+  UNREGISTERED_CATEGORY: '📋',
 };
 const FLAG_DEFAULT_MSG: Record<string, string> = {
   MST_NOT_FOUND:       'MST không tồn tại trên hệ thống GDT — hóa đơn có thể bị từ chối khấu trừ',
   MST_DISSOLVED:       'Doanh nghiệp đã giải thể hoặc phá sản — không hợp lệ để khấu trừ thuế đầu vào',
   MST_SUSPENDED:       'Doanh nghiệp đang tạm ngừng kinh doanh — cần xác minh trước khi kê khai',
+  DKKD_NOT_FOUND:      'Không tìm thấy trên cổng đăng ký kinh doanh DKKD (Bộ KH&ĐT) — cần xác minh thêm',
+  DKKD_DISSOLVED:      'DKKD xác nhận doanh nghiệp đã giải thể — hóa đơn không hợp lệ để khấu trừ',
+  DKKD_SUSPENDED:      'DKKD xác nhận doanh nghiệp đang tạm ngừng hoạt động',
   NAME_MISMATCH:       'Tên trên hóa đơn không khớp với tên đăng ký MST — dấu hiệu gian lận',
   NEW_COMPANY_BIG_INV: 'Doanh nghiệp mới thành lập (< 1 năm) với giá trị hóa đơn lớn — rủi ro cao',
   SPLIT_INVOICE:       'Nhiều hóa đơn giống nhau chia nhỏ dưới 20 triệu để né quy định thanh toán không dùng tiền mặt',
   ROUND_AMOUNTS:       'Nhiều hóa đơn có số tiền tròn bất thường — dấu hiệu lập hóa đơn khống',
   HIGH_FREQUENCY:      'Tần suất xuất hóa đơn bất thường trong thời gian ngắn',
   ZERO_HISTORY:        'Không có lịch sử giao dịch trước đây với đối tác này',
+  BLACKLISTED:         'MST nằm trong danh sách đen — cần ngừng giao dịch và kiểm tra các hóa đơn hiện có',
+  VIRTUAL_OFFICE:      'Địa chỉ đăng ký có dấu hiệu văn phòng ảo — cần xác minh địa chỉ thực tế',
+  DIRECTOR_MULTI_CO:   'Giám đốc đứng tên từ 3 công ty trở lên — rủi ro công ty vỏ bọc / ma',
+  K_FACTOR_HIGH:       'Hệ số K đầu ra/đầu vào bất thường ≥5x — có thể có giao dịch vòng với đối tác này',
+  UNREGISTERED_CATEGORY: 'Ngành nghề trên hóa đơn không có trong đăng ký kinh doanh của nhà cung cấp',
 };
 const MST_STATUS_LABEL: Record<string, { label: string; cls: string }> = {
   active:           { label: 'Đang hoạt động', cls: 'bg-green-100 text-green-700' },
@@ -119,6 +135,9 @@ export default function GhostCompaniesPage() {
   const [ackNote, setAckNote]     = useState('');
   const [ackConfirmed, setAckConfirmed] = useState(false);
   const [ackSaving, setAckSaving] = useState(false);
+  const [blacklistModal, setBlacklistModal] = useState<{ open: boolean; taxCode: string; name: string }>({ open: false, taxCode: '', name: '' });
+  const [blacklistReason, setBlacklistReason] = useState('');
+  const [blacklistSaving, setBlacklistSaving] = useState(false);
   const PAGE_SIZE = 20;
 
   /* ── Load summary ── */
@@ -181,6 +200,19 @@ export default function GhostCompaniesPage() {
     void loadSummary();
   };
 
+  const handleBlacklist = async () => {
+    if (!blacklistReason.trim()) return;
+    setBlacklistSaving(true);
+    try {
+      await apiClient.post('/audit/blacklist', { tax_code: blacklistModal.taxCode, reason: blacklistReason });
+      setBlacklistModal({ open: false, taxCode: '', name: '' });
+      setBlacklistReason('');
+      await Promise.all([load(page, filter), loadSummary()]);
+    } finally {
+      setBlacklistSaving(false);
+    }
+  };
+
   const openAckModal = (flag: RiskFlag) => {
     setAckModal({ open: true, flag });
     setAckNote('');
@@ -234,8 +266,8 @@ export default function GhostCompaniesPage() {
       {/* ── Header ── */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">Phát Hiện Công Ty Ma</h1>
-          <p className="text-sm text-gray-500 mt-0.5">Kiểm tra MST đối tác qua GDT · cập nhật từ hệ thống thuế</p>
+          <h1 className="text-2xl font-bold text-gray-900">Đánh Giá Rủi Ro Nhà Cung Cấp</h1>
+          <p className="text-sm text-gray-500 mt-0.5">Kiểm tra MST đối tác qua GDT · DKKD · cập nhật từ hệ thống thuế</p>
         </div>
         <button
           onClick={() => void runScan()}
@@ -287,14 +319,13 @@ export default function GhostCompaniesPage() {
           onClick={toggleExplain}
           className="w-full flex items-center justify-between px-4 py-3 text-left"
         >
-          <span className="font-semibold text-amber-800 text-sm">ℹ️ Công ty ma là gì? Rủi ro thuế như thế nào?</span>
+          <span className="font-semibold text-amber-800 text-sm">ℹ️ Đánh giá rủi ro nhà cung cấp là gì? Rủi ro thuế như thế nào?</span>
           <span className="text-amber-600 text-lg">{explainOpen ? '▲' : '▼'}</span>
         </button>
         {explainOpen && (
           <div className="px-4 pb-4 text-sm text-amber-900 space-y-2">
             <p>
-              <strong>Công ty ma</strong> là doanh nghiệp tồn tại trên giấy tờ nhưng không có hoạt động kinh doanh thực tế.
-              Hóa đơn từ các công ty này thường bị GDT từ chối, dẫn đến <strong>xuất toán thuế đầu vào</strong>.
+              <strong>Đánh giá rủi ro nhà cung cấp</strong> giúp phát hiện các đối tác có dấu hiệu bất thường: MST không hợp lệ, đã giải thể, tạm ngừng hoạt động, hoặc hành vi giao dịch đáng ngờ. Hóa đơn từ các nhà cung cấp rủi ro thường bị GDT từ chối, dẫn đến <strong>xuất toán thuế đầu vào</strong>.
             </p>
             <p>
               <strong>Hậu quả:</strong> Bị truy thu toàn bộ VAT đã khấu trừ + phạt 20% + lãi chậm nộp.
@@ -475,6 +506,12 @@ export default function GhostCompaniesPage() {
                     >
                       Bỏ qua toàn bộ HĐ
                     </button>
+                    <button
+                      onClick={() => { setBlacklistModal({ open: true, taxCode: flag.tax_code, name: flag.company_name ?? flag.tax_code }); setBlacklistReason(''); }}
+                      className="text-xs px-3 py-1.5 rounded-lg border border-red-300 text-red-600 hover:bg-red-50 font-medium"
+                    >
+                      🚷 Đưa vào danh sách đen
+                    </button>
                   </div>
                 )}
               </div>
@@ -571,6 +608,50 @@ export default function GhostCompaniesPage() {
                 className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 disabled:opacity-50"
               >
                 {ackSaving ? 'Đang lưu...' : 'Xác nhận'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Blacklist Modal ── */}
+      {blacklistModal.open && (
+        <div className="fixed inset-0 bg-black/50 flex items-end sm:items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6 space-y-4">
+            <div>
+              <h3 className="text-lg font-bold text-gray-900">🚷 Đưa vào danh sách đen</h3>
+              <p className="text-sm text-gray-500 mt-1">
+                <span className="font-mono font-semibold">{blacklistModal.taxCode}</span>&nbsp;—&nbsp;{blacklistModal.name}
+              </p>
+              <p className="text-xs text-red-600 mt-1">
+                Mọi hóa đơn mới từ MST này sẽ bị cảnh báo ngay khi đồng bộ.
+              </p>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Lý do đưa vào danh sách đen <span className="text-red-500">*</span>
+              </label>
+              <textarea
+                value={blacklistReason}
+                onChange={e => setBlacklistReason(e.target.value)}
+                rows={3}
+                placeholder="Ví dụ: Công ty ma, đã bị cơ quan thuế xử lý, không hợp tác..."
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-red-500 resize-none"
+              />
+            </div>
+            <div className="flex gap-2 justify-end pt-2">
+              <button
+                onClick={() => setBlacklistModal({ open: false, taxCode: '', name: '' })}
+                className="px-4 py-2 text-sm border border-gray-300 rounded-lg hover:bg-gray-50"
+              >
+                Hủy
+              </button>
+              <button
+                onClick={() => void handleBlacklist()}
+                disabled={!blacklistReason.trim() || blacklistSaving}
+                className="px-4 py-2 text-sm bg-red-600 text-white rounded-lg font-medium hover:bg-red-700 disabled:opacity-50"
+              >
+                {blacklistSaving ? 'Đang lưu...' : '🚷 Xác nhận đưa vào blacklist'}
               </button>
             </div>
           </div>

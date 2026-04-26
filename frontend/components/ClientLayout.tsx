@@ -130,15 +130,24 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
     <SyncProvider>
       <CompanyProvider>
         <ViewProvider>
-          <div className="min-h-screen bg-gray-50">
+          <div className="min-h-screen bg-gray-50 flex flex-col">
             <NoCompanyGuard />
             <NavigationHistoryTracker />
             <Header />
-            <main className="pb-20 lg:pb-6 pt-14 safe-bottom">
+            <main className="flex-1 pb-20 lg:pb-6 pt-14 safe-bottom">
               <GlobalBackStrip />
               {children}
             </main>
             <BottomNav />
+            <footer className="hidden lg:block bg-white border-t border-gray-200 py-2.5 px-4 text-center">
+              <p className="text-xs text-gray-400">
+                <span className="font-medium text-gray-500">CÔNG TY TNHH AUTOPOST VN</span>
+                <span className="mx-2 text-gray-300">·</span>
+                MST: 0319267826
+                <span className="mx-2 text-gray-300">·</span>
+                Địa chỉ: Thành phố Hồ Chí Minh
+              </p>
+            </footer>
           </div>
         </ViewProvider>
       </CompanyProvider>

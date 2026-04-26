@@ -21,7 +21,11 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
     const periodStart = new Date(year, monthFrom - 1, 1);
     const periodEnd   = new Date(year, monthTo, 1); // exclusive upper bound (first day of month AFTER range)
 
-    const [invoiceStats, vatStats, syncStats, ytdStats, riskStats] = await Promise.all([
+    // Previous period for carry_forward query
+    const prevMonth = monthFrom === 1 ? 12 : monthFrom - 1;
+    const prevYear  = monthFrom === 1 ? year - 1 : year;
+
+    const [invoiceStats, vatStats, syncStats, ytdStats, riskStats, deductibleRes, carryForwardRes] = await Promise.all([
       pool.query<{
         total: string; output_count: string; input_count: string;
         invalid_count: string; unvalidated_count: string; input_above_20m_count: string;
@@ -83,6 +87,27 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
          WHERE company_id = $1 AND is_acknowledged = false`,
         [companyId]
       ).catch(() => ({ rows: [{ critical: '0', high: '0', medium: '0' }] })),
+      // Deductible input VAT (tạm tính): input VAT excluding cash payments >20M
+      pool.query<{ deductible_vat: string }>(
+        `SELECT COALESCE(SUM(vat_amount), 0) AS deductible_vat
+         FROM invoices
+         WHERE company_id = $1
+           AND invoice_date >= $2
+           AND invoice_date <  $3
+           AND direction = 'input'
+           AND status != 'cancelled'
+           AND deleted_at IS NULL
+           AND NOT (total_amount > 20000000 AND payment_method = 'cash')`,
+        [companyId, periodStart.toISOString(), periodEnd.toISOString()]
+      ),
+      // Carry-forward VAT from previous period (CT43 → becomes CT24 this period)
+      pool.query<{ carry_forward_vat: string }>(
+        `SELECT COALESCE(ct43_carry_forward_vat, 0) AS carry_forward_vat
+         FROM tax_declarations
+         WHERE company_id = $1 AND period_month = $2 AND period_year = $3
+         ORDER BY created_at DESC LIMIT 1`,
+        [companyId, prevMonth, prevYear]
+      ).catch(() => ({ rows: [{ carry_forward_vat: '0' }] })),
     ]);
 
     // CIT estimate: YTD gross profit × 20%
@@ -92,6 +117,10 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
     const ytdProfit  = ytdRevenue - ytdCost;
     const citEstimate = Math.max(0, ytdProfit * 0.20);
 
+    // Deductible VAT & carry-forward
+    const deductibleVat  = Number(deductibleRes.rows[0]?.deductible_vat ?? 0);
+    const carryForwardVat = Number(carryForwardRes.rows[0]?.carry_forward_vat ?? 0);
+
     // Risk score: weighted, capped at 100
     const riskRow = riskStats.rows[0] ?? { critical: '0', high: '0', medium: '0' };
     const riskScore = Math.min(100,
@@ -100,42 +129,51 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
       Number(riskRow.medium)   *  5
     );
 
-    // Tax deadlines: next 3 upcoming filing dates (sorted by days remaining)
+    // Tax deadlines — monthly (all 12 months) + quarterly (4 quarters) + annual
     const now2 = new Date();
     const daysUntil = (d: Date) => Math.ceil((d.getTime() - now2.getTime()) / 86_400_000);
-    const q = Math.ceil(month / 3);
-    const taxDeadlines = [
-      {
-        label: `Thuế GTGT T${month}/${year}`,
-        due:   new Date(year, month, 20).toISOString().split('T')[0],
-        days_left: daysUntil(new Date(year, month, 20)),
-        type: 'gtgt',
-      },
-      {
-        label: `Tạm nộp TNDN Q${q}/${year}`,
-        due:   new Date(year, q * 3, 30).toISOString().split('T')[0],
-        days_left: daysUntil(new Date(year, q * 3, 30)),
-        type: 'cit_provisional',
-      },
+    const monthlyDeadlines = Array.from({ length: 12 }, (_, i) => {
+      const m = i + 1; // invoice month 1-12
+      const dueMonth = m === 12 ? 1 : m + 1;
+      const dueYear  = m === 12 ? year + 1 : year;
+      return {
+        label: `Nộp GTGT T${m}/${year}`,
+        due: new Date(dueYear, dueMonth - 1, 20).toISOString().split('T')[0],
+        days_left: daysUntil(new Date(dueYear, dueMonth - 1, 20)),
+        type: 'gtgt_monthly',
+      };
+    });
+    const quarterlyDeadlines = [1, 2, 3, 4].map((q) => {
+      const dueMonth = q * 3 + 1 > 12 ? 1 : q * 3 + 1;
+      const dueYear  = q === 4 ? year + 1 : year;
+      return {
+        label: `Nộp GTGT Q${q}/${year}`,
+        due: new Date(dueYear, dueMonth - 1, 20).toISOString().split('T')[0],
+        days_left: daysUntil(new Date(dueYear, dueMonth - 1, 20)),
+        type: 'gtgt_quarterly',
+      };
+    });
+    const taxDeadlines = [...monthlyDeadlines, ...quarterlyDeadlines,
       {
         label: `Quyết toán TNDN ${year}`,
-        due:   `${year + 1}-03-31`,
+        due: `${year + 1}-03-31`,
         days_left: daysUntil(new Date(year + 1, 2, 31)),
         type: 'cit_annual',
       },
     ].sort((a, b) => a.days_left - b.days_left);
 
+    const vatRow = vatStats.rows[0] ?? { output_vat: '0', input_vat: '0', payable_vat: '0' };
     sendSuccess(res, {
       period: { month, monthFrom, monthTo, year },
       invoices: invoiceStats.rows[0],
-      // vatStats always returns exactly 1 row (aggregate), ensure non-null
-      vat: vatStats.rows[0] ?? { output_vat: '0', input_vat: '0', payable_vat: '0' },
+      vat: { ...vatRow, deductible_vat: String(deductibleVat) },
       recentSyncs: syncStats.rows,
       cit_estimate: citEstimate,
       ytd_revenue: ytdRevenue,
       ytd_cost: ytdCost,
       ytd_profit: ytdProfit,
       risk_score: riskScore,
+      carry_forward_vat: carryForwardVat,
       tax_deadlines: taxDeadlines,
     });
   } catch (err) {

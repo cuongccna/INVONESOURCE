@@ -33,6 +33,9 @@ export class GhostCompanyDetector {
 
     const info = await companyVerificationService.verify(partnerTaxCode);
 
+    // Cross-check with DKKD (Bộ KH&ĐT business registry) — non-blocking
+    const dkkdStatus = await companyVerificationService.lookupFromDkkd(partnerTaxCode);
+
     const col = partnerType === 'seller' ? 'seller_tax_code' : 'buyer_tax_code';
     const nameCol = partnerType === 'seller' ? 'seller_name' : 'buyer_name';
 
@@ -81,6 +84,32 @@ export class GhostCompanyDetector {
         code: 'MST_SUSPENDED',
         level: 'high',
         message: `${info.company_name ?? partnerTaxCode} đang tạm ngừng hoạt động — HĐ có thể không hợp lệ để khấu trừ`,
+        vat_at_risk: totalVatAtRisk,
+      });
+    }
+
+    // FLAG DKKD: Cross-check với cổng đăng ký kinh doanh Bộ KH&ĐT
+    if (dkkdStatus === 'not_found' && info.mst_status !== 'not_found') {
+      flags.push({
+        code: 'DKKD_NOT_FOUND',
+        level: 'high',
+        message: `MST ${partnerTaxCode} không tìm thấy trên cổng đăng ký kinh doanh DKKD (Bộ KH&ĐT) — cần xác minh thêm`,
+        vat_at_risk: totalVatAtRisk,
+      });
+    }
+    if (dkkdStatus === 'dissolved' && info.mst_status !== 'dissolved') {
+      flags.push({
+        code: 'DKKD_DISSOLVED',
+        level: 'critical',
+        message: `DKKD xác nhận ${info.company_name ?? partnerTaxCode} đã giải thể — hóa đơn không hợp lệ để khấu trừ`,
+        vat_at_risk: totalVatAtRisk,
+      });
+    }
+    if (dkkdStatus === 'suspended' && info.mst_status !== 'suspended') {
+      flags.push({
+        code: 'DKKD_SUSPENDED',
+        level: 'high',
+        message: `DKKD xác nhận ${info.company_name ?? partnerTaxCode} đang tạm ngừng hoạt động`,
         vat_at_risk: totalVatAtRisk,
       });
     }
@@ -145,7 +174,113 @@ export class GhostCompanyDetector {
       }
     }
 
+    // FLAG 8: MST trong blacklist (công ty hoặc toàn hệ thống)
+    const blacklistRes = await pool.query<{ reason: string }>(
+      `SELECT reason FROM vendor_blacklist
+       WHERE tax_code = $1 AND (company_id = $2 OR company_id IS NULL)
+       LIMIT 1`,
+      [partnerTaxCode, companyId],
+    );
+    if (blacklistRes.rowCount && blacklistRes.rowCount > 0) {
+      flags.push({
+        code: 'BLACKLISTED',
+        level: 'critical',
+        message: `MST ${partnerTaxCode} nằm trong danh sách đen — ${blacklistRes.rows[0]?.reason ?? 'đã bị chặn'}`,
+        vat_at_risk: totalVatAtRisk,
+        details: { reason: blacklistRes.rows[0]?.reason },
+      });
+    }
+
+    // FLAG 9: Địa chỉ văn phòng ảo — từ khóa phổ biến của dịch vụ cho thuê địa chỉ ảo
+    if (info.address) {
+      const virtualKeywords = [
+        'văn phòng ảo', 'virtual office', 'coworking', 'co-working',
+        'tầng 1 chung cư', 'chung cư', 'căn hộ', 'apartment',
+        'regus', 'wework', 'toong', 'dreamplex',
+      ];
+      const addr = info.address.toLowerCase();
+      const matchedKeyword = virtualKeywords.find(kw => addr.includes(kw));
+      if (matchedKeyword) {
+        flags.push({
+          code: 'VIRTUAL_OFFICE',
+          level: 'medium',
+          message: `Địa chỉ đăng ký "${info.address}" có dấu hiệu văn phòng ảo (từ khóa: "${matchedKeyword}")`,
+          details: { address: info.address, matched_keyword: matchedKeyword },
+        });
+      }
+    }
+
+    // FLAG 10: Hệ số K — chênh lệch đầu ra/đầu vào của đối tác bất thường
+    // So sánh tổng HĐ đầu vào từ đối tác này vs tổng HĐ đầu ra của chúng ta đến đối tác
+    // (nếu có HĐ 2 chiều — công ty vừa mua vừa bán cho cùng đối tác)
+    if (invList.length >= 5) {
+      const inputTotal  = invList.filter(i => parseFloat(i.total_amount) > 0).reduce((s, i) => s + parseFloat(i.total_amount), 0);
+      // Check if we also issue output invoices to this partner (indicator of circular transactions)
+      const outputRes = await pool.query<{ total_output: string }>(
+        `SELECT COALESCE(SUM(total_amount), 0)::text AS total_output
+         FROM active_invoices
+         WHERE company_id = $1
+           AND direction = 'output'
+           AND buyer_tax_code = $2`,
+        [companyId, partnerTaxCode],
+      );
+      const outputTotal = parseFloat(outputRes.rows[0]?.total_output ?? '0');
+      if (outputTotal > 0 && inputTotal > 0) {
+        const kFactor = Math.max(inputTotal, outputTotal) / Math.min(inputTotal, outputTotal);
+        if (kFactor >= 5) {
+          flags.push({
+            code: 'K_FACTOR_HIGH',
+            level: 'high',
+            message: `Hệ số K = ${kFactor.toFixed(1)}x — chênh lệch đầu ra/đầu vào với đối tác này bất thường (có thể giao dịch vòng)`,
+            details: {
+              input_total: Math.round(inputTotal),
+              output_total: Math.round(outputTotal),
+              k_factor: Math.round(kFactor * 10) / 10,
+            },
+          });
+        }
+      }
+    }
+
+    // FLAG 11: Giám đốc đứng ≥3 công ty — cần dữ liệu legal_rep từ GDT
+    if (info.legal_rep && info.legal_rep.trim().length > 2) {
+      const legalRep = info.legal_rep.trim();
+      const directorRes = await pool.query<{ company_count: string }>(
+        `SELECT COUNT(DISTINCT tax_code)::text AS company_count
+         FROM company_verification_cache
+         WHERE legal_rep ILIKE $1`,
+        [legalRep],
+      );
+      const companyCount = parseInt(directorRes.rows[0]?.company_count ?? '0', 10);
+      if (companyCount >= 3) {
+        flags.push({
+          code: 'DIRECTOR_MULTI_CO',
+          level: 'medium',
+          message: `Giám đốc "${legalRep}" đứng tên ${companyCount} công ty — rủi ro công ty vỏ bọc`,
+          details: { legal_rep: legalRep, company_count: companyCount },
+        });
+      }
+    }
+
     return flags;
+  }
+
+  /**
+   * Scan a single tax code for a company — used when adding to blacklist
+   * or when "Re-verify now" is triggered from UI.
+   */
+  async runForTaxCode(companyId: string, taxCode: string): Promise<void> {
+    const invRes = await pool.query<{ total_vat: string }>(
+      `SELECT COALESCE(SUM(vat_amount), 0)::text AS total_vat
+       FROM active_invoices
+       WHERE company_id = $1 AND seller_tax_code = $2`,
+      [companyId, taxCode],
+    );
+    const totalVat = parseFloat(invRes.rows[0]?.total_vat ?? '0');
+    const flags = await this.analyzeCompany(companyId, taxCode, 'seller');
+    if (flags.length > 0) {
+      await this.saveRiskFlags(companyId, taxCode, 'seller', flags, totalVat);
+    }
   }
 
   /**

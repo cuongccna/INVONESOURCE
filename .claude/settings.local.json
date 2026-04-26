@@ -9,7 +9,8 @@
       "Bash(Head -20)",
       "Bash(Get-ChildItem \"D:\\\\projects\\\\INVONE\\\\INVONESOURCE\\\\frontend\\\\app\\\\\\(app\\)\\\\admin\" -Recurse)",
       "Bash(Head -30)",
-      "PowerShell(cd D:\\\\projects\\\\INVONE\\\\INVONESOURCE\\\\backend; npx tsc --noEmit; Write-Host \"Exit: $LASTEXITCODE\")"
+      "PowerShell(cd D:\\\\projects\\\\INVONE\\\\INVONESOURCE\\\\backend; npx tsc --noEmit; Write-Host \"Exit: $LASTEXITCODE\")",
+      "Bash(find D:\\\\\\\\projects\\\\\\\\INVONE\\\\\\\\INVONESOURCE\\\\\\\\backend\\\\\\\\src -name \"*.ts\" -type f)"
     ]
   }
 }

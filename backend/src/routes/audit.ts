@@ -294,4 +294,53 @@ router.patch('/tax-rates/:id/acknowledge', async (req: Request, res: Response) =
   sendSuccess(res, { ok: true });
 });
 
+// ── Vendor Blacklist ─────────────────────────────────────────────────────────
+
+// GET /api/audit/blacklist — list blacklisted vendors for this company (+ global)
+router.get('/blacklist', async (req: Request, res: Response) => {
+  const companyId = req.user!.companyId!;
+  const { rows } = await pool.query(
+    `SELECT b.id, b.tax_code, b.reason, b.notes, b.added_at,
+            COALESCE(b.company_id::text, 'global') AS scope,
+            u.email AS added_by_email
+     FROM vendor_blacklist b
+     LEFT JOIN users u ON u.id = b.added_by
+     WHERE b.company_id = $1 OR b.company_id IS NULL
+     ORDER BY b.added_at DESC`,
+    [companyId],
+  );
+  sendSuccess(res, { data: rows });
+});
+
+// POST /api/audit/blacklist — add a tax code to company blacklist
+router.post('/blacklist', async (req: Request, res: Response) => {
+  const companyId = req.user!.companyId!;
+  const userId    = req.user!.userId;
+  const { tax_code, reason, notes } = req.body as { tax_code: string; reason: string; notes?: string };
+  if (!tax_code || !reason) {
+    res.status(400).json({ success: false, error: { code: 'VALIDATION', message: 'tax_code and reason are required' } });
+    return;
+  }
+  const { rows } = await pool.query(
+    `INSERT INTO vendor_blacklist (tax_code, company_id, reason, notes, added_by)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (tax_code, company_id) DO UPDATE SET reason = EXCLUDED.reason, notes = EXCLUDED.notes, added_at = NOW()
+     RETURNING id`,
+    [tax_code.trim(), companyId, reason, notes ?? null, userId],
+  );
+  // Re-scan this vendor to immediately flag it
+  void ghostCompanyDetector.runForTaxCode(companyId, tax_code.trim()).catch(() => {});
+  sendSuccess(res, { id: rows[0]?.id });
+});
+
+// DELETE /api/audit/blacklist/:taxCode — remove from company blacklist
+router.delete('/blacklist/:taxCode', async (req: Request, res: Response) => {
+  const companyId = req.user!.companyId!;
+  await pool.query(
+    `DELETE FROM vendor_blacklist WHERE tax_code = $1 AND company_id = $2`,
+    [req.params.taxCode, companyId],
+  );
+  sendSuccess(res, { ok: true });
+});
+
 export default router;

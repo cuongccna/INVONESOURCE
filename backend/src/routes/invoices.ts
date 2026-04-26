@@ -40,7 +40,7 @@ const listSchema = z.object({
   page: z.coerce.number().int().positive().default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(50),
   direction: z.enum(['output', 'input']).optional(),
-  status: z.enum(['valid', 'cancelled', 'replaced', 'replaced_original', 'adjusted', 'invalid']).optional(),
+  status: z.enum(['valid', 'cancelled', 'replaced', 'replaced_original', 'adjusted', 'adjusted_original', 'invalid']).optional(),
   fromDate: z.string().optional(),
   toDate: z.string().optional(),
   search: z.string().optional(),

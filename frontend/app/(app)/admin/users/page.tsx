@@ -6,6 +6,7 @@
  */
 import { useEffect, useState, useCallback } from 'react';
 import apiClient from '../../../../lib/apiClient';
+import BackButton from '../../../../components/BackButton';
 
 interface UserRow {
   id: string;
@@ -55,6 +56,29 @@ export default function AdminUsersPage() {
   const [search, setSearch]   = useState('');
   const [planFilter, setPlanFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
+
+  // Create user modal
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [createForm, setCreateForm] = useState({ email: '', full_name: '', password: '' });
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState('');
+
+  const handleCreateUser = async () => {
+    if (!createForm.email || !createForm.password) return;
+    setCreating(true);
+    setCreateError('');
+    try {
+      await apiClient.post('/admin/users', createForm);
+      setShowCreateModal(false);
+      setCreateForm({ email: '', full_name: '', password: '' });
+      void load(1);
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { message?: string } } })?.response?.data?.message ?? 'Lỗi khi tạo tài khoản';
+      setCreateError(msg);
+    } finally {
+      setCreating(false);
+    }
+  };
 
   // Grant license modal
   const [grantTarget, setGrantTarget]     = useState<UserRow | null>(null);
@@ -127,11 +151,18 @@ export default function AdminUsersPage() {
 
   return (
     <div className="p-4 max-w-[1400px] mx-auto">
+      <BackButton fallbackHref="/admin" className="mb-3" />
       <div className="flex items-center justify-between mb-4">
         <div>
           <h1 className="text-xl font-bold text-gray-900">Quản lý Người dùng & License</h1>
           <p className="text-sm text-gray-500">{meta.total.toLocaleString('vi-VN')} người dùng</p>
         </div>
+        <button
+          onClick={() => { setShowCreateModal(true); setCreateError(''); }}
+          className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition-colors"
+        >
+          <span>+</span> Tạo tài khoản mới
+        </button>
       </div>
 
       {/* Filters */}
@@ -333,6 +364,63 @@ export default function AdminUsersPage() {
                 className="flex-1 py-2.5 bg-blue-600 text-white rounded-xl text-sm font-medium disabled:opacity-50 hover:bg-blue-700"
               >
                 {granting ? 'Đang cấp...' : 'Xác nhận cấp'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Create User Modal ─────────────────────────────────────────────────── */}
+      {showCreateModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6">
+            <h2 className="text-lg font-bold text-gray-900 mb-4">Tạo tài khoản mới</h2>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">Email <span className="text-red-500">*</span></label>
+                <input
+                  type="email"
+                  placeholder="user@example.com"
+                  value={createForm.email}
+                  onChange={e => setCreateForm(f => ({ ...f, email: e.target.value }))}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">Họ tên</label>
+                <input
+                  type="text"
+                  placeholder="Nguyễn Văn A"
+                  value={createForm.full_name}
+                  onChange={e => setCreateForm(f => ({ ...f, full_name: e.target.value }))}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">Mật khẩu <span className="text-red-500">*</span></label>
+                <input
+                  type="password"
+                  placeholder="Tối thiểu 8 ký tự"
+                  value={createForm.password}
+                  onChange={e => setCreateForm(f => ({ ...f, password: e.target.value }))}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+              {createError && <p className="text-xs text-red-600">{createError}</p>}
+            </div>
+            <div className="flex gap-2 mt-5">
+              <button
+                onClick={() => { setShowCreateModal(false); setCreateForm({ email: '', full_name: '', password: '' }); setCreateError(''); }}
+                className="flex-1 py-2.5 border border-gray-300 rounded-xl text-sm font-medium text-gray-700 hover:bg-gray-50"
+              >
+                Hủy
+              </button>
+              <button
+                onClick={() => void handleCreateUser()}
+                disabled={creating || !createForm.email || !createForm.password}
+                className="flex-1 py-2.5 bg-blue-600 text-white rounded-xl text-sm font-medium disabled:opacity-50 hover:bg-blue-700"
+              >
+                {creating ? 'Đang tạo...' : 'Tạo tài khoản'}
               </button>
             </div>
           </div>

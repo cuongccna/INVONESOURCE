@@ -216,6 +216,7 @@ export default function BotSettingsPage() {
     totalPages: 1,
   });
   const [importTotal, setImportTotal] = useState<number | null>(null);
+  const [importSessionCount, setImportSessionCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [showSetup, setShowSetup] = useState(false);
@@ -242,13 +243,16 @@ export default function BotSettingsPage() {
       const [botRes, importRes] = await Promise.all([
         apiClient.get<{ data: BotStatus }>('/bot/status'),
         apiClient
-          .get<{ meta: { total: number } }>('/invoices', { params: { provider: 'manual', pageSize: 1 } })
+          .get<{ data: { session_count: number; total_invoices: number } }>('/import/stats')
           .catch(() => null),
       ]);
 
       const botData = botRes.data.data;
       setStatus(botData);
-      if (importRes) setImportTotal(importRes.data.meta?.total ?? 0);
+      if (importRes) {
+        setImportTotal(importRes.data.data?.total_invoices ?? 0);
+        setImportSessionCount(importRes.data.data?.session_count ?? 0);
+      }
     } catch {
       // Keep page shell visible even when background status fetch fails.
     } finally {
@@ -878,7 +882,7 @@ export default function BotSettingsPage() {
             <p className="text-xs font-semibold uppercase tracking-[0.16em] text-amber-600">Import thủ công</p>
             <h2 className="mt-2 text-2xl font-semibold text-slate-950">Tách riêng luồng nhập file</h2>
             <p className="mt-3 max-w-2xl text-sm leading-6 text-slate-500">
-              Dùng khi cần nạp XML hoặc ZIP lấy trực tiếp từ GDT mà không phụ thuộc vào lịch BOT. Luồng này được gom tách riêng để thao tác rõ ràng hơn.
+              Tải lên file XML/ZIP xuất từ cổng hoadondientu.gdt.gov.vn để nhập hóa đơn ngay lập tức, không cần chờ lịch đồng bộ tự động.
             </p>
           </div>
 
@@ -889,7 +893,7 @@ export default function BotSettingsPage() {
                 <p className="mt-3 text-4xl font-semibold text-slate-950">
                   {(importTotal ?? 0).toLocaleString('vi-VN')}
                 </p>
-                <p className="mt-2 text-sm text-amber-900/70">Số hóa đơn đã nhập thủ công vào hệ thống.</p>
+                <p className="mt-2 text-sm text-amber-900/70">{importSessionCount !== null ? `${importSessionCount.toLocaleString('vi-VN')} phiên import` : 'Đang tải...'}</p>
               </div>
 
               <div className="space-y-4 rounded-2xl border border-white/70 bg-white/70 p-4">

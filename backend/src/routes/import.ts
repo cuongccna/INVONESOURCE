@@ -801,7 +801,7 @@ router.post(
             }
             // Mark original invoice as replaced/adjusted when this invoice references it
             if (row.tc_hdon != null && row.khhd_cl_quan && row.so_hd_cl_quan) {
-              const newStatus = row.tc_hdon === 1 ? 'replaced' : 'adjusted';
+              const newStatus = row.tc_hdon === 1 ? 'replaced_original' : 'adjusted_original';
               await pool.query(
                 `UPDATE invoices SET status = $1, updated_at = NOW()
                  WHERE company_id = $2
@@ -849,7 +849,7 @@ router.post(
             }
             // Mark original invoice as replaced/adjusted when this invoice references it
             if (row.tc_hdon != null && row.khhd_cl_quan && row.so_hd_cl_quan) {
-              const newStatus = row.tc_hdon === 1 ? 'replaced' : 'adjusted';
+              const newStatus = row.tc_hdon === 1 ? 'replaced_original' : 'adjusted_original';
               await pool.query(
                 `UPDATE invoices SET status = $1, updated_at = NOW()
                  WHERE company_id = $2
@@ -1012,7 +1012,7 @@ router.post(
             }
             // Mark original invoice as replaced/adjusted when this invoice references it
             if (row.tc_hdon != null && row.khhd_cl_quan && row.so_hd_cl_quan) {
-              const newStatus = row.tc_hdon === 1 ? 'replaced' : 'adjusted';
+              const newStatus = row.tc_hdon === 1 ? 'replaced_original' : 'adjusted_original';
               await pool.query(
                 `UPDATE invoices SET status = $1, updated_at = NOW()
                  WHERE company_id = $2
@@ -1059,7 +1059,7 @@ router.post(
             }
             // Mark original invoice as replaced/adjusted when this invoice references it
             if (row.tc_hdon != null && row.khhd_cl_quan && row.so_hd_cl_quan) {
-              const newStatus = row.tc_hdon === 1 ? 'replaced' : 'adjusted';
+              const newStatus = row.tc_hdon === 1 ? 'replaced_original' : 'adjusted_original';
               await pool.query(
                 `UPDATE invoices SET status = $1, updated_at = NOW()
                  WHERE company_id = $2
@@ -1114,6 +1114,24 @@ router.post(
     }
   }
 );
+
+// ── GET /api/import/stats ─────────────────────────────────────────────────────
+router.get('/stats', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId;
+    const row = await pool.query(
+      `SELECT COUNT(*) AS session_count, COALESCE(SUM(success_count), 0) AS total_invoices
+       FROM import_sessions WHERE company_id = $1`,
+      [companyId]
+    );
+    sendSuccess(res, {
+      session_count: Number(row.rows[0].session_count),
+      total_invoices: Number(row.rows[0].total_invoices),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
 
 // ── GET /api/import/sessions ──────────────────────────────────────────────────
 router.get(

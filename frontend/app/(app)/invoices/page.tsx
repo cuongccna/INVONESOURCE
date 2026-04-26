@@ -362,7 +362,7 @@ export default function InvoicesPage() {
           { v: 'replaced',          label: '↺ HĐ thay thế',      cls: 'bg-yellow-50 text-yellow-700 border-yellow-200', activeCls: 'bg-yellow-500 text-white border-yellow-500' },
           { v: 'replaced_original', label: '🔄 Bị thay thế',     cls: 'bg-orange-50 text-orange-700 border-orange-200', activeCls: 'bg-orange-600 text-white border-orange-600' },
           { v: 'adjusted',          label: '✏ HĐ điều chỉnh',    cls: 'bg-blue-50 text-blue-700 border-blue-200',      activeCls: 'bg-blue-600 text-white border-blue-600' },
-          { v: 'invalid',           label: '⚠ Không hợp lệ',    cls: 'bg-orange-50 text-orange-700 border-orange-200', activeCls: 'bg-orange-600 text-white border-orange-600' },
+          { v: 'adjusted_original',  label: '📝 HĐ bị điều chỉnh', cls: 'bg-purple-50 text-purple-700 border-purple-200',  activeCls: 'bg-purple-600 text-white border-purple-600' },
         ] as const).map(opt => (
           <button key={opt.v}
             onClick={() => { setStatusFilter(statusFilter === opt.v ? '' : opt.v); setSelectedIds([]); }}

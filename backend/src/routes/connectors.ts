@@ -209,38 +209,48 @@ router.post(
   }
 );
 
-// GET /api/connectors/sync-logs — paginated sync history
+// GET /api/connectors/sync-logs — paginated sync history (connector + GDT bot runs)
 router.get('/sync-logs', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const page = Math.max(1, Number(req.query.page ?? 1));
     const pageSize = Math.min(50, Math.max(1, Number(req.query.pageSize ?? 20)));
     const provider = req.query.provider as string | undefined;
     const offset = (page - 1) * pageSize;
+    const companyId = req.user!.companyId;
 
-    const providerFilter = provider ? 'AND provider = $2' : '';
-    const countParams: unknown[] = provider
-      ? [req.user!.companyId, provider]
-      : [req.user!.companyId];
-    const dataParams: unknown[] = provider
-      ? [req.user!.companyId, provider, pageSize, offset]
-      : [req.user!.companyId, pageSize, offset];
-    const limitParam = provider ? 3 : 2;
-    const offsetParam = provider ? 4 : 3;
+    // Build UNION of gdt_bot_runs + sync_logs so companies using GDT bot also see history
+    const providerFilterBot  = provider && provider !== 'gdt_bot' ? 'AND 1=0' : '';
+    const providerFilterConn = provider && provider !== 'gdt_bot' ? `AND provider = '${provider.replace(/'/g, "''")}'` : '';
+
+    const unionSql = `
+      SELECT
+        id::text, 'gdt_bot' AS provider, started_at,
+        finished_at,
+        COALESCE(output_count, 0) + COALESCE(input_count, 0) AS records_fetched,
+        COALESCE(output_count, 0) + COALESCE(input_count, 0) AS records_created,
+        0 AS records_updated,
+        CASE WHEN status IN ('failed','error') THEN 1 ELSE 0 END AS errors_count,
+        error_detail
+      FROM gdt_bot_runs
+      WHERE company_id = $1 ${providerFilterBot}
+
+      UNION ALL
+
+      SELECT
+        id::text, provider, started_at,
+        finished_at,
+        COALESCE(records_fetched, 0), COALESCE(records_created, 0),
+        COALESCE(records_updated, 0), COALESCE(errors_count, 0),
+        error_detail
+      FROM sync_logs
+      WHERE company_id = $1 ${providerFilterConn}
+    `;
 
     const [countResult, dataResult] = await Promise.all([
+      pool.query(`SELECT COUNT(*) FROM (${unionSql}) AS combined`, [companyId]),
       pool.query(
-        `SELECT COUNT(*) FROM sync_logs WHERE company_id = $1 ${providerFilter}`,
-        countParams
-      ),
-      pool.query(
-        `SELECT id, provider, started_at, finished_at,
-                records_fetched, records_created, records_updated,
-                errors_count, error_detail
-         FROM sync_logs
-         WHERE company_id = $1 ${providerFilter}
-         ORDER BY started_at DESC
-         LIMIT $${limitParam} OFFSET $${offsetParam}`,
-        dataParams
+        `SELECT * FROM (${unionSql}) AS combined ORDER BY started_at DESC LIMIT $2 OFFSET $3`,
+        [companyId, pageSize, offset]
       ),
     ]);
 

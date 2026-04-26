@@ -32,6 +32,7 @@ export interface CompanyInfo {
 }
 
 const GDT_LOOKUP_URL = 'http://tracuunnt.gdt.gov.vn/tcnnt/mstdn.jsp';
+const DKKD_URL = 'https://dangkyquamang.dkkd.gov.vn/inf/Forms/Searches/EnterpriseInfo.aspx?h=2114';
 const SCRAPE_HEADERS = {
   'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   'Referer':         'http://tracuunnt.gdt.gov.vn/',
@@ -117,6 +118,59 @@ export class CompanyVerificationService {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`[CompanyVerify] GDT lookup failed for ${taxCode}: ${msg} — falling back to masothue`);
       return this.lookupFromMasothue(taxCode);
+    }
+  }
+
+  /**
+   * Cross-check via DKKD (dangkyquamang.dkkd.gov.vn) — Bộ KH&ĐT business registry.
+   * Returns 'active' | 'dissolved' | 'suspended' | 'not_found' | null (on any error).
+   * Uses ASP.NET WebForms pattern: GET page → extract VIEWSTATE → POST with taxCode.
+   */
+  async lookupFromDkkd(taxCode: string): Promise<'active' | 'dissolved' | 'suspended' | 'not_found' | null> {
+    try {
+      const initRes = await axios.get<string>(DKKD_URL, {
+        headers: { 'User-Agent': SCRAPE_HEADERS['User-Agent'], Accept: 'text/html' },
+        timeout: 15_000,
+      });
+      const $init = cheerio.load(initRes.data);
+      const viewstate       = $init('input[name="__VIEWSTATE"]').val() as string | undefined;
+      const eventvalidation = $init('input[name="__EVENTVALIDATION"]').val() as string | undefined;
+      if (!viewstate) return null; // page structure not as expected
+
+      const formData = new URLSearchParams({
+        __VIEWSTATE:       viewstate,
+        __EVENTVALIDATION: eventvalidation ?? '',
+        'ctl00$ContentPlaceHolder1$txtMST': taxCode,
+        'ctl00$ContentPlaceHolder1$btnSearch': 'Tìm kiếm',
+      });
+      const searchRes = await axios.post<string>(DKKD_URL, formData.toString(), {
+        headers: {
+          'Content-Type':  'application/x-www-form-urlencoded',
+          'User-Agent':    SCRAPE_HEADERS['User-Agent'],
+          'Referer':       DKKD_URL,
+        },
+        timeout: 15_000,
+      });
+      const $r = cheerio.load(searchRes.data);
+      const pageText = $r.text().toLowerCase();
+
+      if (pageText.includes('không tìm thấy') || pageText.includes('không có kết quả')) {
+        return 'not_found';
+      }
+      // Status typically shown in a table cell — look for status keywords
+      if (pageText.includes('đã giải thể') || pageText.includes('chấm dứt hoạt động')) {
+        return 'dissolved';
+      }
+      if (pageText.includes('tạm ngừng') || pageText.includes('tạm dừng')) {
+        return 'suspended';
+      }
+      if (pageText.includes('đang hoạt động') || pageText.includes('hoạt động bình thường')) {
+        return 'active';
+      }
+      // If we got a response with company data but couldn't parse status
+      return null;
+    } catch {
+      return null; // network error or unexpected page structure — skip silently
     }
   }
 
