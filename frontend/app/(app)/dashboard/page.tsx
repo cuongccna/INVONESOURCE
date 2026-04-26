@@ -348,6 +348,7 @@ export default function DashboardPage() {
           deadlines={calendarDeadlines}
           year={periodYear}
           currentMonth={periodMonth}
+          taxLabel={isHousehold ? 'Thuế khoán' : 'GTGT'}
           title={isHousehold ? 'Lịch Thuế Khoán' : 'Lịch Thuế GTGT'}
         />
       )}

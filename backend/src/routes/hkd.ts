@@ -156,26 +156,41 @@ router.get('/dashboard/kpi', async (req: Request, res: Response) => {
   else                                   monBai = 1_000_000;
 
   // Tax deadlines for HKD — monthly + quarterly
-  const now2 = new Date();
-  const daysUntil = (d: Date) => Math.ceil((d.getTime() - now2.getTime()) / 86_400_000);
+  // daysUntil uses Vietnam UTC+7 wall-clock to avoid off-by-one at night.
+  const VN_OFFSET_MS = 7 * 60 * 60 * 1_000;
+  const todayVN = Math.floor((Date.now() + VN_OFFSET_MS) / 86_400_000);
+  const daysUntil = (d: Date) => {
+    const dueVN = Math.floor((d.getTime() + VN_OFFSET_MS) / 86_400_000);
+    return dueVN - todayVN;
+  };
   const monthlyDeadlines = Array.from({ length: 12 }, (_, i) => {
     const m = i + 1;
     const dueMonth = m === 12 ? 1 : m + 1;
     const dueYear  = m === 12 ? year + 1 : year;
+    const due = new Date(dueYear, dueMonth - 1, 20);
     return {
       label: `Nộp thuế khoán T${m}/${year}`,
-      due: new Date(dueYear, dueMonth - 1, 20).toISOString().split('T')[0],
-      days_left: daysUntil(new Date(dueYear, dueMonth - 1, 20)),
+      due: due.toISOString().split('T')[0],
+      days_left: daysUntil(due),
       type: 'hkd_monthly',
     };
   });
+  // Quarterly: last day of first month of next quarter
+  // Q1→30/04, Q2→31/07, Q3→31/10, Q4→31/01 next year (Điều 44 Luật 38/2019/QH14)
+  const QUARTER_DUE: Record<number, { month: number; day: number }> = {
+    1: { month: 4,  day: 30 },
+    2: { month: 7,  day: 31 },
+    3: { month: 10, day: 31 },
+    4: { month: 1,  day: 31 },
+  };
   const quarterlyDeadlines = [1, 2, 3, 4].map((q) => {
-    const dueMonth = q * 3 + 1 > 12 ? 1 : q * 3 + 1;
-    const dueYear  = q === 4 ? year + 1 : year;
+    const { month: dueMonth, day: dueDay } = QUARTER_DUE[q]!;
+    const dueYear = q === 4 ? year + 1 : year;
+    const due = new Date(dueYear, dueMonth - 1, dueDay);
     return {
       label: `Nộp thuế khoán Q${q}/${year}`,
-      due: new Date(dueYear, dueMonth - 1, 20).toISOString().split('T')[0],
-      days_left: daysUntil(new Date(dueYear, dueMonth - 1, 20)),
+      due: due.toISOString().split('T')[0],
+      days_left: daysUntil(due),
       type: 'hkd_quarterly',
     };
   });
