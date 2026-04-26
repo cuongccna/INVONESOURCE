@@ -116,7 +116,8 @@ router.get('/dashboard/kpi', async (req: Request, res: Response) => {
   if (!isHousehold) throw new AppError('Endpoint chỉ dành cho hộ kinh doanh', 400, 'VALIDATION');
 
   const startDate = `${year}-${String(monthFrom).padStart(2, '0')}-01`;
-  const endDate   = new Date(year, monthTo, 0).toISOString().split('T')[0];
+  // Use Date.UTC to get last day of monthTo — avoids off-by-1 when server is in UTC+7.
+  const endDate = new Date(Date.UTC(year, monthTo, 0)).toISOString().split('T')[0];
 
   const [outputRes, inputRes] = await Promise.all([
     pool.query<{ total: string; count: string }>(

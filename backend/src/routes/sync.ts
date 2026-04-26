@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { Queue } from 'bullmq';
 import Redis from 'ioredis';
 import rateLimit from 'express-rate-limit';
+import { randomBytes } from 'crypto';
 import { pool } from '../db/pool';
 import { env } from '../config/env';
 import { authenticate, requireRole } from '../middleware/auth';

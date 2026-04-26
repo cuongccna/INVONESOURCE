@@ -231,19 +231,19 @@ export default function DashboardPage() {
       .catch(() => setGhostSummary(null));
   }, [activeCompanyId]);
 
-  /* ── Chart data ── */
+  /* ── Chart data — stored as raw VND (not pre-divided) so tooltip is exact ── */
   const vatChartData = chart?.vatTrend.map((r) => ({
     name: `T${r.period_month}/${String(r.period_year).slice(2)}`,
-    'Đầu Ra': Math.round(Number(r.output_vat) / 1_000_000),
-    'Đầu Vào': Math.round(Number(r.input_vat) / 1_000_000),
-    'Phải Nộp': Math.round(Number(r.payable_vat) / 1_000_000),
+    'Đầu Ra': Number(r.output_vat),
+    'Đầu Vào': Number(r.input_vat),
+    'Phải Nộp': Number(r.payable_vat),
   })) ?? [];
 
   const plChartData = chart?.invoiceTrend.map((r) => ({
     name: `T${r.month}/${String(r.year).slice(2)}`,
-    'Doanh Thu': Math.round(Number(r.output_total) / 1_000_000),
-    'Chi Phí': Math.round(Number(r.input_total) / 1_000_000),
-    'Lãi Gộp': Math.round((Number(r.output_total) - Number(r.input_total)) / 1_000_000),
+    'Doanh Thu': Number(r.output_total),
+    'Chi Phí': Number(r.input_total),
+    'Lãi Gộp': Number(r.output_total) - Number(r.input_total),
   })) ?? [];
 
   /* VAT quarterly grouping */
@@ -254,9 +254,9 @@ export default function DashboardPage() {
       const q = Math.ceil(r.period_month / 3);
       const key = `Q${q}/${String(r.period_year).slice(2)}`;
       if (!qMap[key]) qMap[key] = { name: key, 'Đầu Ra': 0, 'Đầu Vào': 0, 'Phải Nộp': 0 };
-      qMap[key]['Đầu Ra']   += Math.round(Number(r.output_vat)  / 1_000_000);
-      qMap[key]['Đầu Vào']  += Math.round(Number(r.input_vat)   / 1_000_000);
-      qMap[key]['Phải Nộp'] += Math.round(Number(r.payable_vat) / 1_000_000);
+      qMap[key]['Đầu Ra']   += Number(r.output_vat);
+      qMap[key]['Đầu Vào']  += Number(r.input_vat);
+      qMap[key]['Phải Nộp'] += Number(r.payable_vat);
     });
     return Object.values(qMap);
   })();
@@ -295,9 +295,17 @@ export default function DashboardPage() {
   const periodDeadline = (() => {
     if (vatViewMode === 'yearly') return `31/3/${periodYear + 1}`;
     if (vatViewMode === 'quarterly') {
+      // Điều 44 – Luật 38/2019/QH14: last day of first month of next quarter
       const q = quarterOf(periodMonth);
-      const dm = q * 3 + 1;
-      return dm > 12 ? `20/1/${periodYear + 1}` : `20/${dm}/${periodYear}`;
+      const QUARTER_DEADLINES: Record<number, { day: number; month: number }> = {
+        1: { day: 30, month: 4 },  // Q1 → 30/04
+        2: { day: 31, month: 7 },  // Q2 → 31/07
+        3: { day: 31, month: 10 }, // Q3 → 31/10
+        4: { day: 31, month: 1 },  // Q4 → 31/01 next year
+      };
+      const { day, month } = QUARTER_DEADLINES[q]!;
+      const y = q === 4 ? periodYear + 1 : periodYear;
+      return `${day}/${month}/${y}`;
     }
     const nextM = periodMonth === 12 ? 1 : periodMonth + 1;
     const nextY = periodMonth === 12 ? periodYear + 1 : periodYear;
@@ -521,8 +529,8 @@ export default function DashboardPage() {
                 <ComposedChart data={plChartFiltered} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
                   <XAxis dataKey="name" tick={{ fontSize: 10 }} />
-                  <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v * 1_000_000)} />
-                  <Tooltip formatter={(val: number) => formatVNDFull(Number(val) * 1_000_000)} />
+                  <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v)} />
+                  <Tooltip formatter={(val: number) => formatVNDFull(Number(val))} />
                   <Legend wrapperStyle={{ fontSize: 11 }} />
                   <Bar dataKey="Doanh Thu" fill="#3b82f6" radius={[3, 3, 0, 0]} maxBarSize={18} />
                   <Bar dataKey="Chi Phí" fill="#f87171" radius={[3, 3, 0, 0]} maxBarSize={18} />
@@ -570,8 +578,8 @@ export default function DashboardPage() {
               <BarChart data={vatChartData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
                 <XAxis dataKey="name" tick={{ fontSize: 10 }} />
-                <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v * 1_000_000)} />
-                <Tooltip formatter={(val: number) => formatVNDFull(Number(val) * 1_000_000)} />
+                <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v)} />
+                <Tooltip formatter={(val: number) => formatVNDFull(Number(val))} />
                 <Legend wrapperStyle={{ fontSize: 11 }} />
                 <Bar dataKey="Đầu Ra" fill="#3b82f6" radius={[3, 3, 0, 0]} maxBarSize={18} />
                 <Bar dataKey="Đầu Vào" fill="#10b981" radius={[3, 3, 0, 0]} maxBarSize={18} />
@@ -590,8 +598,8 @@ export default function DashboardPage() {
               <ComposedChart data={plChartFiltered} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
                 <XAxis dataKey="name" tick={{ fontSize: 10 }} />
-                <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v * 1_000_000)} />
-                <Tooltip formatter={(val: number) => formatVNDFull(Number(val) * 1_000_000)} />
+                <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v)} />
+                <Tooltip formatter={(val: number) => formatVNDFull(Number(val))} />
                 <Legend wrapperStyle={{ fontSize: 11 }} />
                 <Bar dataKey="Doanh Thu" fill="#3b82f6" radius={[3, 3, 0, 0]} maxBarSize={18} />
                 <Bar dataKey="Chi Phí" fill="#f87171" radius={[3, 3, 0, 0]} maxBarSize={18} />
@@ -610,8 +618,8 @@ export default function DashboardPage() {
             <BarChart data={activeVatData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
               <XAxis dataKey="name" tick={{ fontSize: 10 }} />
-              <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v * 1_000_000)} />
-              <Tooltip formatter={(val: number) => formatVNDFull(Number(val) * 1_000_000)} />
+              <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v)} />
+              <Tooltip formatter={(val: number) => formatVNDFull(Number(val))} />
               <Legend wrapperStyle={{ fontSize: 11 }} />
               <Bar dataKey="Đầu Ra" fill="#3b82f6" radius={[3, 3, 0, 0]} maxBarSize={22} />
               <Bar dataKey="Đầu Vào" fill="#10b981" radius={[3, 3, 0, 0]} maxBarSize={22} />
@@ -736,18 +744,22 @@ export default function DashboardPage() {
 
       {/* ── VAT Forecast (DN only) ── */}
       {!isHousehold && forecast && forecast.periods_used > 0 && (() => {
-        const now2 = new Date();
-        const deadlineDay = 20;
-        const nextMonth = new Date(now2.getFullYear(), now2.getMonth() + 1, deadlineDay);
-        const daysToDeadline = Math.ceil((nextMonth.getTime() - now2.getTime()) / 86_400_000);
+        // Use the same periodDeadline already computed for the selected Tháng/Quý/Năm mode
+        // so "Hạn nộp kỳ này" always matches the KPI card badge.
+        const VN_OFFSET_MS = 7 * 60 * 60 * 1_000;
+        const [ddStr, mmStr, yyyyStr] = periodDeadline.split('/');
+        const deadlineUTC = new Date(Date.UTC(Number(yyyyStr), Number(mmStr) - 1, Number(ddStr)));
+        const todayVN = Math.floor((Date.now() + VN_OFFSET_MS) / 86_400_000);
+        const dueVN   = Math.floor((deadlineUTC.getTime() + VN_OFFSET_MS) / 86_400_000);
+        const daysToDeadline = dueVN - todayVN;
         const currentPayable = kpi?.vat ? Number(kpi.vat.payable_vat) : 0;
         return (
           <div className="bg-white rounded-xl shadow-sm p-4 space-y-4">
-            <h2 className="text-sm font-semibold text-gray-700">📈 Dự Báo Thuế GTGT Tháng Sau</h2>
+            <h2 className="text-sm font-semibold text-gray-700">📈 Dự Báo Thuế GTGT Kỳ Sau</h2>
             <div className="space-y-2">
               {[
-                { label: 'Tháng này (tt)', val: currentPayable, color: 'bg-blue-400' },
-                { label: 'Dự báo tháng sau', val: forecast.net_forecast, color: 'bg-amber-400' },
+                { label: 'Kỳ này (tạm tính)', val: currentPayable, color: 'bg-blue-400' },
+                { label: 'Dự báo kỳ sau', val: forecast.net_forecast, color: 'bg-amber-400' },
               ].map((row) => {
                 const max = Math.max(currentPayable, forecast.net_forecast, 1);
                 return (
@@ -769,8 +781,8 @@ export default function DashboardPage() {
                 <div className="flex items-center justify-between text-sm">
                   <span className="text-gray-600">Hạn nộp kỳ này</span>
                   <span className={`font-semibold ${daysToDeadline <= 5 ? 'text-red-600' : daysToDeadline <= 10 ? 'text-amber-600' : 'text-gray-800'}`}>
-                    Ngày 20/{now2.getMonth() + 2 > 12 ? `01/${now2.getFullYear()+1}` : `${now2.getMonth() + 2}/${now2.getFullYear()}`}
-                    &nbsp;({daysToDeadline > 0 ? `còn ${daysToDeadline} ngày` : 'Đã quá hạn'})
+                    Ngày {periodDeadline}
+                    &nbsp;({daysToDeadline > 0 ? `còn ${daysToDeadline} ngày` : daysToDeadline === 0 ? 'Hôm nay!' : 'Đã quá hạn'})
                   </span>
                 </div>
                 <div className="flex items-center justify-between text-sm">

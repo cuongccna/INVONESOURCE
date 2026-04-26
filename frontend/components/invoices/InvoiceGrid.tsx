@@ -67,11 +67,12 @@ interface Props {
 }
 
 const STATUS_LABELS: Record<string, { label: string; color: string }> = {
-  valid:            { label: 'Hợp lệ',      color: 'bg-green-100 text-green-700' },
-  cancelled:        { label: 'Đã hủy',      color: 'bg-red-100 text-red-700' },
-  replaced:         { label: 'Thay thế',    color: 'bg-yellow-100 text-yellow-700' },
-  replaced_original:{ label: 'Bị thay thế', color: 'bg-orange-100 text-orange-700' },
-  adjusted:         { label: 'Điều chỉnh',  color: 'bg-blue-100 text-blue-700' },
+  valid:             { label: 'Hợp lệ',       color: 'bg-green-100 text-green-700' },
+  cancelled:         { label: 'Đã hủy',       color: 'bg-red-100 text-red-700' },
+  replaced:          { label: 'Thay thế',     color: 'bg-yellow-100 text-yellow-700' },
+  replaced_original: { label: 'Bị thay thế',  color: 'bg-orange-100 text-orange-700' },
+  adjusted:          { label: 'Điều chỉnh',   color: 'bg-blue-100 text-blue-700' },
+  adjusted_original: { label: 'Bị điều chỉnh', color: 'bg-purple-100 text-purple-700' },
 };
 
 const PAGE_SIZES = [15, 30, 50, 100];
@@ -269,6 +270,7 @@ export default function InvoiceGrid({
                 <th className="px-3 py-3 text-left text-xs font-semibold text-gray-500 hidden sm:table-cell">Ngày lập</th>
                 <th className="px-3 py-3 text-left text-xs font-semibold text-gray-500">Tên {partyLabel}</th>
                 <th className="px-3 py-3 text-right text-xs font-semibold text-gray-500 hidden xl:table-cell">Tiền hàng</th>
+                <th className="px-3 py-3 text-right text-xs font-semibold text-gray-500 hidden sm:table-cell">Tổng tiền</th>
                 <th className="px-3 py-3 text-right text-xs font-semibold text-gray-500">Thuế VAT</th>
                 {/* Status column hidden — status is conveyed by row color + left border */}
                 <th className="w-10 px-2 py-3" />
@@ -349,6 +351,9 @@ export default function InvoiceGrid({
                       </td>
                       <td className="px-3 py-3 text-right text-gray-700 tabular-nums text-xs hidden xl:table-cell" onClick={() => handleRowClick(inv)}>
                         {fmtVND(inv.subtotal)}
+                      </td>
+                      <td className="px-3 py-3 text-right font-medium text-gray-900 tabular-nums text-xs hidden sm:table-cell" onClick={() => handleRowClick(inv)}>
+                        {fmtVND(inv.total_amount)}
                       </td>
                       <td className="px-3 py-3 text-right text-gray-700 tabular-nums text-xs" onClick={() => handleRowClick(inv)}>
                         {fmtVND(inv.vat_amount)}

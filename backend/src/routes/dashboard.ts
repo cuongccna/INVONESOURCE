@@ -17,9 +17,11 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
     const year      = req.query['year']       ? parseInt(String(req.query['year']),       10) : now.getFullYear();
     const monthFrom = req.query['month_from'] ? parseInt(String(req.query['month_from']), 10) : month;
     const monthTo   = req.query['month_to']   ? parseInt(String(req.query['month_to']),   10) : month;
-    // Convert to date range for flexible monthly/quarterly/yearly filtering
-    const periodStart = new Date(year, monthFrom - 1, 1);
-    const periodEnd   = new Date(year, monthTo, 1); // exclusive upper bound (first day of month AFTER range)
+    // Convert to date range for flexible monthly/quarterly/yearly filtering.
+    // Use Date.UTC() to anchor to UTC midnight regardless of server TZ — avoids
+    // the off-by-7h bug when the server runs in Asia/Ho_Chi_Minh (UTC+7).
+    const periodStart = new Date(Date.UTC(year, monthFrom - 1, 1));
+    const periodEnd   = new Date(Date.UTC(year, monthTo, 1)); // exclusive upper bound
 
     // Previous period for carry_forward query
     const prevMonth = monthFrom === 1 ? 12 : monthFrom - 1;
@@ -204,15 +206,18 @@ router.get('/charts', async (req: Request, res: Response, next: NextFunction) =>
     const endMonth = req.query['month'] ? parseInt(String(req.query['month']), 10) : now.getMonth() + 1;
     const endYear  = req.query['year']  ? parseInt(String(req.query['year']),  10) : now.getFullYear();
 
-    // Compute start of the 12-month window (11 months before the given period)
-    const endDate  = new Date(endYear, endMonth - 1, 1); // first day of endMonth
-    const startDate = new Date(endYear, endMonth - 1 - 11, 1); // 11 months back
+    // Compute start of the 12-month window (11 months before the given period).
+    // Use Date.UTC() to anchor to UTC midnight — avoids off-by-7h when server is UTC+7.
+    const endDate   = new Date(Date.UTC(endYear, endMonth - 1, 1));
+    const startDate = new Date(Date.UTC(endYear, endMonth - 1 - 11, 1));
+    const upperBound = new Date(Date.UTC(endYear, endMonth, 1));
 
-    // Calculate VAT trend directly from invoices grouped by month
+    // Group by VN month (AT TIME ZONE) so an invoice timestamped 2026-01-31T17:00Z
+    // (= 2026-02-01 00:00 VN) is correctly counted in February, not January.
     const result = await pool.query(
       `SELECT
-         EXTRACT(MONTH FROM invoice_date)::int AS period_month,
-         EXTRACT(YEAR  FROM invoice_date)::int AS period_year,
+         EXTRACT(MONTH FROM invoice_date AT TIME ZONE 'Asia/Ho_Chi_Minh')::int AS period_month,
+         EXTRACT(YEAR  FROM invoice_date AT TIME ZONE 'Asia/Ho_Chi_Minh')::int AS period_year,
          COALESCE(SUM(vat_amount) FILTER (WHERE direction = 'output' AND status != 'cancelled'), 0) AS output_vat,
          COALESCE(SUM(vat_amount) FILTER (WHERE direction = 'input'  AND status != 'cancelled'), 0) AS input_vat,
          GREATEST(0,
@@ -226,14 +231,14 @@ router.get('/charts', async (req: Request, res: Response, next: NextFunction) =>
          AND deleted_at IS NULL
        GROUP BY period_month, period_year
        ORDER BY period_year ASC, period_month ASC`,
-      [companyId, startDate.toISOString(), new Date(endYear, endMonth, 1).toISOString()]
+      [companyId, startDate.toISOString(), upperBound.toISOString()]
     );
 
     // Invoice count trend — 12 months ending at the given period
     const countTrend = await pool.query(
       `SELECT
-         EXTRACT(MONTH FROM invoice_date)::int as month,
-         EXTRACT(YEAR FROM invoice_date)::int as year,
+         EXTRACT(MONTH FROM invoice_date AT TIME ZONE 'Asia/Ho_Chi_Minh')::int as month,
+         EXTRACT(YEAR  FROM invoice_date AT TIME ZONE 'Asia/Ho_Chi_Minh')::int as year,
          COUNT(*) FILTER (WHERE direction = 'output') as output_count,
          COUNT(*) FILTER (WHERE direction = 'input') as input_count,
          SUM(total_amount) FILTER (WHERE direction = 'output') as output_total,
@@ -245,7 +250,7 @@ router.get('/charts', async (req: Request, res: Response, next: NextFunction) =>
          AND deleted_at IS NULL
        GROUP BY 1, 2
        ORDER BY 2 ASC, 1 ASC`,
-      [companyId, startDate.toISOString(), new Date(endYear, endMonth, 1).toISOString()]
+      [companyId, startDate.toISOString(), upperBound.toISOString()]
     );
 
     sendSuccess(res, {
