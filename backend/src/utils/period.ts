@@ -31,7 +31,8 @@ export function resolvePeriod(query: ParsedQs): ResolvedPeriod {
     const startMonth = (quarter - 1) * 3 + 1;
     const endMonth = quarter * 3;
     const start = `${year}-${String(startMonth).padStart(2, '0')}-01`;
-    const end = new Date(year, endMonth, 0).toISOString().split('T')[0]!;
+    // Use Date.UTC to avoid off-by-one on UTC+7 servers (local midnight ≠ UTC midnight)
+    const end = new Date(Date.UTC(year, endMonth, 0)).toISOString().split('T')[0]!;
     return { start, end, year, month: startMonth, quarter, periodType: 'quarterly' };
   }
 
@@ -49,6 +50,7 @@ export function resolvePeriod(query: ParsedQs): ResolvedPeriod {
   // monthly (default)
   const month = Math.min(12, Math.max(1, parseInt(query['month'] as string) || new Date().getMonth() + 1));
   const start = `${year}-${String(month).padStart(2, '0')}-01`;
-  const end = new Date(year, month, 0).toISOString().split('T')[0]!;
+  // Use Date.UTC to avoid off-by-one on UTC+7 servers (local midnight ≠ UTC midnight)
+  const end = new Date(Date.UTC(year, month, 0)).toISOString().split('T')[0]!;
   return { start, end, year, month, quarter: 0, periodType: 'monthly' };
 }

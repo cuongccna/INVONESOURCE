@@ -1590,10 +1590,13 @@ async function _batchUpsertInvoices(
     invNums.push(inv.invoice_number ?? null);
     serials.push(inv.serial_number ?? null);
     dates.push(inv.invoice_date ?? null);
-    // Keep GDT's own status for the invoice itself. tc_hdon indicates the TYPE (replacement/
-    // adjustment), not the invoice's validity. The ORIGINAL invoice's status ('replaced_original',
-    // 'adjusted') comes from GDT's ttxly mapping in gdt-config.ts statusMap.
-    statuses.push(inv.status ?? 'valid');
+    // GDT list API returns tthai=1 (valid) for replacement/adjustment invoices.
+    // Derive the correct status from tc_hdon so filters work correctly.
+    const derivedStatus =
+      inv.tc_hdon === 1 ? 'replaced' :
+      inv.tc_hdon === 2 ? 'adjusted' :
+      (inv.status ?? 'valid');
+    statuses.push(derivedStatus);
     sellerNames.push(inv.seller_name ?? null);
     sellerTaxes.push(inv.seller_tax_code ?? '');
     buyerNames.push(inv.buyer_name ?? null);
@@ -1656,7 +1659,12 @@ async function _batchUpsertInvoices(
   const updateAndReturnSql =
     ` DO UPDATE SET
        direction             = EXCLUDED.direction,
-       status                = EXCLUDED.status,
+       status                = CASE
+         WHEN EXCLUDED.tc_hdon = 1 THEN 'replaced'::invoice_status
+         WHEN EXCLUDED.tc_hdon = 2 THEN 'adjusted'::invoice_status
+         WHEN invoices.status IN ('replaced_original', 'adjusted_original', 'cancelled') THEN invoices.status
+         ELSE EXCLUDED.status
+       END,
        invoice_date          = EXCLUDED.invoice_date,
        serial_number         = COALESCE(EXCLUDED.serial_number, invoices.serial_number),
        seller_name           = EXCLUDED.seller_name,
@@ -1765,8 +1773,10 @@ async function _batchUpsertInvoices(
     const khhdArr:      string[]           = [];
     const soHdArr:      string[]           = [];
     for (const inv of replacements) {
-      // Mark the ORIGINAL invoice as 'replaced_original' (not 'replaced' — that belongs to the new invoice)
-      newStatuses.push(inv.tc_hdon === 1 ? 'replaced_original' : 'adjusted');
+      // Mark the ORIGINAL invoice with the correct status:
+      // tc_hdon=1 → original becomes 'replaced_original'
+      // tc_hdon=2 → original becomes 'adjusted_original' (NOT 'adjusted' — that belongs to the new invoice)
+      newStatuses.push(inv.tc_hdon === 1 ? 'replaced_original' : 'adjusted_original');
       cids.push(companyId);
       khhdArr.push(inv.khhd_cl_quan!);
       soHdArr.push(inv.so_hd_cl_quan!);
@@ -1778,7 +1788,7 @@ async function _batchUpsertInvoices(
        WHERE invoices.company_id    = t.cid
          AND invoices.serial_number = t.khhd
          AND invoices.invoice_number = t.so_hd
-         AND invoices.status NOT IN ('cancelled', 'replaced_original')`,
+         AND invoices.status NOT IN ('cancelled', 'replaced_original', 'adjusted_original')`,
       [newStatuses, cids, khhdArr, soHdArr]
     ).catch(err => logger.warn('[SyncWorker] mark-original batch failed', { err }));
   }
@@ -1824,7 +1834,12 @@ async function _upsertInvoice(
       $16,$17,$18,$19,$20,$21,$22,NOW())
      ON CONFLICT (company_id, provider, invoice_number, COALESCE(seller_tax_code, ''), COALESCE(serial_number, '')) DO UPDATE SET
        direction       = EXCLUDED.direction,
-       status          = EXCLUDED.status,
+       status          = CASE
+         WHEN EXCLUDED.tc_hdon = 1 THEN 'replaced'::invoice_status
+         WHEN EXCLUDED.tc_hdon = 2 THEN 'adjusted'::invoice_status
+         WHEN invoices.status IN ('replaced_original', 'adjusted_original', 'cancelled') THEN invoices.status
+         ELSE EXCLUDED.status
+       END,
        invoice_date    = EXCLUDED.invoice_date,
        serial_number   = COALESCE(EXCLUDED.serial_number, invoices.serial_number),
        seller_name     = EXCLUDED.seller_name,
@@ -1848,7 +1863,7 @@ async function _upsertInvoice(
       uuidv4(), companyId,
       inv.invoice_number, inv.serial_number ?? null,
       inv.invoice_date, direction,
-      inv.status ?? 'valid',
+      inv.tc_hdon === 1 ? 'replaced' : inv.tc_hdon === 2 ? 'adjusted' : (inv.status ?? 'valid'),
       inv.seller_name, inv.seller_tax_code,
       inv.buyer_name, inv.buyer_tax_code,
       computedSubtotal, inv.total_amount, inv.vat_amount, inv.vat_rate,
@@ -1858,17 +1873,17 @@ async function _upsertInvoice(
   );
   const invoiceDbId = res.rows[0].id as string;
 
-  // Mark original invoice as replaced/adjusted when this one references it
-  // tc_hdon=1 (replacement): original becomes 'replaced_original' (NOT 'replaced' — that is the new invoice)
-  // tc_hdon=2 (adjustment): original becomes 'adjusted'
+  // Mark original invoice with the correct status:
+  // tc_hdon=1 (replacement): original becomes 'replaced_original'
+  // tc_hdon=2 (adjustment): original becomes 'adjusted_original' (NOT 'adjusted' — that is the new invoice)
   if ((inv.tc_hdon === 1 || inv.tc_hdon === 2) && inv.khhd_cl_quan && inv.so_hd_cl_quan) {
-    const newStatus = inv.tc_hdon === 1 ? 'replaced_original' : 'adjusted';
+    const newStatus = inv.tc_hdon === 1 ? 'replaced_original' : 'adjusted_original';
     await pool.query(
       `UPDATE invoices SET status = $1, updated_at = NOW()
        WHERE company_id    = $2
          AND serial_number  = $3
          AND invoice_number = $4
-         AND status NOT IN ('cancelled', 'replaced_original')`,
+         AND status NOT IN ('cancelled', 'replaced_original', 'adjusted_original')`,
       [newStatus, companyId, inv.khhd_cl_quan, inv.so_hd_cl_quan]
     ).catch(err => logger.warn('[SyncWorker] mark-original single failed', { err }));
   }

@@ -683,9 +683,9 @@ function mapInvoice(
   const { ttxlyFilter, isSco, fields, statusMap: recipeStatusMap, xmlAvailableTtxly: recipeXmlSet } = opts;
   const r = row as Record<string, unknown>;
 
-  // tthai = trạng thái hóa đơn (1=valid, 3=cancelled, 5=replaced, 6=adjusted)
-  // ttxly = trạng thái xử lý by GDT (5=accepted) — NOT the invoice status
-  const statusCode = num(pick(r, ...(fields?.status ?? ['tthai', 'ttxly', 'tthdon', 'trangThai', 'status']))) ?? 1;
+  // tthai = trạng thái hóa đơn (1=valid, 3=cancelled, 4=replaced_original, 5=replaced, 6=adjusted)
+  // ttxly = trạng thái xử lý GDT (5=co_ma, 6=khong_ma, 8=MTT) — completely different semantics, must NOT be used here
+  const statusCode = num(pick(r, ...(fields?.status ?? ['tthai', 'tthdon', 'trangThai', 'status']))) ?? 1;
   const status: RawInvoice['status'] =
     (recipeStatusMap?.[String(statusCode)] as RawInvoice['status'] | undefined)
     ?? STATUS_MAP[statusCode]

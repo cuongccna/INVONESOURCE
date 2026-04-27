@@ -100,6 +100,7 @@ export interface LineItem {
 const STATUS_MAP: Record<number, RawInvoice['status']> = {
   1: 'valid',
   3: 'cancelled',
+  4: 'replaced_original',  // original invoice superseded by a replacement
   5: 'replaced',
   6: 'adjusted',
 };
