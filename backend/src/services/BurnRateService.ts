@@ -49,6 +49,8 @@ export class BurnRateService {
          WHERE i.company_id = $1
            AND i.direction = 'output'
            AND i.status != 'cancelled'
+           AND i.buyer_tax_code IS NOT NULL
+           AND BTRIM(i.buyer_tax_code) <> ''
            AND ili.item_name IS NOT NULL
        ),
        intervals AS (
@@ -86,6 +88,10 @@ export class BurnRateService {
 
     // Upsert predictions
     for (const r of rows) {
+      if (!r.buyer_tax_code?.trim()) {
+        continue;
+      }
+
       const avgInterval = Number(r.avg_interval);
       const dataPoints = Number(r.data_points);
       const lastDate = new Date(r.last_date);

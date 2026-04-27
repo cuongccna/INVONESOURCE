@@ -57,6 +57,7 @@ export default function HkdDeclarationsPage() {
   const [calcQuarter, setCalcQuarter] = useState<number>(() => Math.ceil((new Date().getMonth() + 1) / 3));
   const [calcYear, setCalcYear] = useState(currentYear);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [completingId, setCompletingId] = useState<string | null>(null);
 
   const { activeCompany, loading: companyLoading } = useCompany();
   const router = useRouter();
@@ -118,6 +119,20 @@ export default function HkdDeclarationsPage() {
       toast.error('Lỗi xóa tờ khai.');
     } finally {
       setDeletingId(null);
+    }
+  };
+
+  const markReady = async (decl: HkdDeclaration) => {
+    setCompletingId(decl.id);
+    try {
+      const res = await apiClient.patch<{ data: HkdDeclaration }>(`/hkd/declarations/${decl.id}/status`, { status: 'ready' });
+      const nextDecl = res.data.data;
+      setDeclarations((prev) => prev.map((item) => (item.id === decl.id ? nextDecl : item)));
+      toast.success(`Đã chuyển Quý ${decl.period_quarter}/${decl.period_year} sang Hoàn thiện`);
+    } catch {
+      toast.error('Không thể xác nhận hoàn thiện tờ khai HKD.');
+    } finally {
+      setCompletingId(null);
     }
   };
 
@@ -213,6 +228,15 @@ export default function HkdDeclarationsPage() {
                     </p>
                   </div>
                   <div className="flex items-center gap-2">
+                    {decl.submission_status === 'draft' && (
+                      <button
+                        onClick={() => void markReady(decl)}
+                        disabled={completingId === decl.id}
+                        className="px-3 py-1 rounded-lg text-xs font-semibold bg-primary-50 text-primary-700 hover:bg-primary-100 disabled:opacity-50"
+                      >
+                        {completingId === decl.id ? 'Đang xác nhận...' : 'Xác nhận'}
+                      </button>
+                    )}
                     <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${statusInfo.color}`}>
                       {statusInfo.label}
                     </span>

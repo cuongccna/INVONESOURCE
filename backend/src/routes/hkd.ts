@@ -10,9 +10,11 @@ import { pool } from '../db/pool';
 import { sendSuccess } from '../utils/response';
 import { AppError } from '../utils/AppError';
 import ExcelJS from 'exceljs';
-import puppeteer from 'puppeteer';
 import { HkdDeclarationEngine, INDUSTRY_GROUP_RATES } from '../services/HkdDeclarationEngine';
 import { HkdHtkkXmlGenerator } from '../services/HkdHtkkXmlGenerator';
+import { HkdPdfExporter } from '../services/HkdPdfExporter';
+import { buildDashboardBucketKey, buildTrailingDashboardBuckets } from '../utils/dashboardBuckets';
+import { resolvePeriod } from '../utils/period';
 
 const router = Router();
 router.use(authenticate);
@@ -90,11 +92,9 @@ if (!comp) throw new AppError('Company not found', 404, 'NOT_FOUND');
 // GET /api/hkd/dashboard/kpi — HKD-specific dashboard KPIs for current period
 router.get('/dashboard/kpi', async (req: Request, res: Response) => {
   const companyId = req.user!.companyId!;
-  const now = new Date();
-  const month     = parseInt(req.query.month      as string) || now.getMonth() + 1;
-  const year      = parseInt(req.query.year       as string) || now.getFullYear();
-  const monthFrom = parseInt(req.query.month_from as string) || month;
-  const monthTo   = parseInt(req.query.month_to   as string) || month;
+  const resolved = resolvePeriod(req.query);
+  const month = resolved.month;
+  const year = resolved.year;
   if (month < 1 || month > 12) throw new AppError('month must be 1-12', 400, 'VALIDATION');
 
   // Guard: household only
@@ -115,9 +115,8 @@ router.get('/dashboard/kpi', async (req: Request, res: Response) => {
   const isHousehold = comp.company_type === 'household' || ['HKD', 'HND', 'CA_NHAN'].includes(comp.business_type);
   if (!isHousehold) throw new AppError('Endpoint chỉ dành cho hộ kinh doanh', 400, 'VALIDATION');
 
-  const startDate = `${year}-${String(monthFrom).padStart(2, '0')}-01`;
-  // Use Date.UTC to get last day of monthTo — avoids off-by-1 when server is in UTC+7.
-  const endDate = new Date(Date.UTC(year, monthTo, 0)).toISOString().split('T')[0];
+  const startDate = resolved.start;
+  const endDate = resolved.end;
 
   const [outputRes, inputRes] = await Promise.all([
     pool.query<{ total: string; count: string }>(
@@ -199,7 +198,7 @@ router.get('/dashboard/kpi', async (req: Request, res: Response) => {
     .sort((a, b) => a.days_left - b.days_left);
 
   sendSuccess(res, {
-    period: { month, monthFrom, monthTo, year },
+    period: { month, quarter: resolved.quarter, periodType: resolved.periodType, year },
     revenue,
     input_purchases: inputTotal,
     input_invoice_count: Number(inputRes.rows[0]?.count    ?? 0),
@@ -213,6 +212,120 @@ router.get('/dashboard/kpi', async (req: Request, res: Response) => {
     vat_rate_hkd:    vatRate,
     tax_regime:      comp.tax_regime,
     tax_deadlines:   taxDeadlines,
+  });
+});
+
+// GET /api/hkd/dashboard/charts — household revenue / purchase / profit trend
+router.get('/dashboard/charts', async (req: Request, res: Response) => {
+  const companyId = req.user!.companyId!;
+  const resolved = resolvePeriod(req.query);
+  const buckets = buildTrailingDashboardBuckets(resolved.periodType, {
+    year: resolved.year,
+    month: resolved.month,
+    quarter: resolved.quarter,
+  });
+  const windowStart = buckets[0]!.startDate;
+  const windowEndExclusive = buckets[buckets.length - 1]!.endExclusiveDate;
+
+  let result;
+
+  if (resolved.periodType === 'quarterly') {
+    result = await pool.query<{
+      period_year: number;
+      period_quarter: number;
+      output_total: string;
+      input_total: string;
+    }>(
+      `SELECT
+         EXTRACT(YEAR FROM invoice_date)::int AS period_year,
+         EXTRACT(QUARTER FROM invoice_date)::int AS period_quarter,
+         COALESCE(SUM(total_amount) FILTER (WHERE direction = 'output' AND status = 'valid'), 0) AS output_total,
+         COALESCE(SUM(total_amount) FILTER (WHERE direction = 'input' AND status = 'valid'), 0) AS input_total
+       FROM invoices
+       WHERE company_id = $1
+         AND invoice_date >= $2
+         AND invoice_date < $3
+         AND deleted_at IS NULL
+       GROUP BY period_year, period_quarter
+       ORDER BY period_year ASC, period_quarter ASC`,
+      [companyId, windowStart, windowEndExclusive],
+    );
+  } else if (resolved.periodType === 'yearly') {
+    result = await pool.query<{
+      period_year: number;
+      output_total: string;
+      input_total: string;
+    }>(
+      `SELECT
+         EXTRACT(YEAR FROM invoice_date)::int AS period_year,
+         COALESCE(SUM(total_amount) FILTER (WHERE direction = 'output' AND status = 'valid'), 0) AS output_total,
+         COALESCE(SUM(total_amount) FILTER (WHERE direction = 'input' AND status = 'valid'), 0) AS input_total
+       FROM invoices
+       WHERE company_id = $1
+         AND invoice_date >= $2
+         AND invoice_date < $3
+         AND deleted_at IS NULL
+       GROUP BY period_year
+       ORDER BY period_year ASC`,
+      [companyId, windowStart, windowEndExclusive],
+    );
+  } else {
+    result = await pool.query<{
+      period_year: number;
+      period_month: number;
+      output_total: string;
+      input_total: string;
+    }>(
+      `SELECT
+         EXTRACT(YEAR FROM invoice_date)::int AS period_year,
+         EXTRACT(MONTH FROM invoice_date)::int AS period_month,
+         COALESCE(SUM(total_amount) FILTER (WHERE direction = 'output' AND status = 'valid'), 0) AS output_total,
+         COALESCE(SUM(total_amount) FILTER (WHERE direction = 'input' AND status = 'valid'), 0) AS input_total
+       FROM invoices
+       WHERE company_id = $1
+         AND invoice_date >= $2
+         AND invoice_date < $3
+         AND deleted_at IS NULL
+       GROUP BY period_year, period_month
+       ORDER BY period_year ASC, period_month ASC`,
+      [companyId, windowStart, windowEndExclusive],
+    );
+  }
+
+  const pointMap = new Map(
+    result.rows.map((row) => {
+      const bucketMonth = 'period_month' in row
+        ? Number((row as { period_month: number }).period_month)
+        : 1;
+      const bucketQuarter = 'period_quarter' in row
+        ? Number((row as { period_quarter: number }).period_quarter)
+        : 1;
+      const key = buildDashboardBucketKey(
+        resolved.periodType,
+        row.period_year,
+        bucketMonth,
+        bucketQuarter,
+      );
+
+      return [key, row] as const;
+    }),
+  );
+
+  sendSuccess(res, {
+    periodType: resolved.periodType,
+    invoiceTrend: buckets.map((bucket) => {
+      const row = pointMap.get(bucket.key);
+      const outputTotal = Number(row?.output_total ?? 0);
+      const inputTotal = Number(row?.input_total ?? 0);
+
+      return {
+        key: bucket.key,
+        label: bucket.label,
+        output_total: outputTotal,
+        input_total: inputTotal,
+        gross_profit: outputTotal - inputTotal,
+      };
+    }),
   });
 });
 
@@ -490,55 +603,12 @@ router.get('/declarations/:id/export', requireRole('OWNER', 'ADMIN', 'ACCOUNTANT
     return;
   }
 
-  // PDF via Puppeteer
-  const html = `<!DOCTYPE html>
-<html lang="vi">
-<head>
-<meta charset="UTF-8"/>
-<style>
-  body { font-family: Arial, sans-serif; font-size: 13px; padding: 24px; }
-  h2 { text-align: center; margin-bottom: 4px; }
-  .sub { text-align: center; color: #555; margin-bottom: 4px; }
-  table { width: 100%; border-collapse: collapse; margin-top: 16px; }
-  th, td { border: 1px solid #aaa; padding: 6px 10px; }
-  th { background: #d9ead3; text-align: center; }
-  td.num { text-align: right; }
-  .total-row td { font-weight: bold; color: #cc0000; }
-</style>
-</head>
-<body>
-<h2>TỜ KHAI THUẾ HỘ KINH DOANH / CNKD (TT40/2021)</h2>
-<p class="sub">${d.company_name} — MST: ${d.tax_code}</p>
-<p class="sub">Kỳ: Quý ${d.period_quarter}/${d.period_year} (Tháng ${m1}–${m3}/${d.period_year})</p>
-<table>
-  <thead>
-    <tr><th>Chỉ tiêu</th><th>Tháng ${m1}</th><th>Tháng ${m2}</th><th>Tháng ${m3}</th><th>Tổng quý</th></tr>
-  </thead>
-  <tbody>
-    <tr><td>Doanh thu chịu thuế GTGT</td><td class="num">${fmtVND(d.revenue_m1)}</td><td class="num">${fmtVND(d.revenue_m2)}</td><td class="num">${fmtVND(d.revenue_m3)}</td><td class="num">${fmtVND(d.revenue_total)}</td></tr>
-    <tr><td>Thuế GTGT khoán (${d.vat_rate}%)</td><td class="num">${fmtVND(d.vat_m1)}</td><td class="num">${fmtVND(d.vat_m2)}</td><td class="num">${fmtVND(d.vat_m3)}</td><td class="num">${fmtVND(d.vat_total)}</td></tr>
-    <tr><td>Doanh thu chịu thuế TNCN</td><td class="num">${fmtVND(d.revenue_m1)}</td><td class="num">${fmtVND(d.revenue_m2)}</td><td class="num">${fmtVND(d.revenue_m3)}</td><td class="num">${fmtVND(d.revenue_total)}</td></tr>
-    <tr><td>Thuế TNCN (${d.pit_rate ?? 0.5}%)</td><td class="num">${fmtVND(d.pit_m1)}</td><td class="num">${fmtVND(d.pit_m2)}</td><td class="num">${fmtVND(d.pit_m3)}</td><td class="num">${fmtVND(d.pit_total)}</td></tr>
-    <tr class="total-row"><td colspan="4">TỔNG PHẢI NỘP</td><td class="num">${fmtVND(d.total_payable)}</td></tr>
-  </tbody>
-</table>
-</body>
-</html>`;
-
-  const chromiumPath = process.env.CHROMIUM_PATH;
-  const browser = await puppeteer.launch({
-    headless: true,
-    executablePath: chromiumPath || undefined,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  });
-  const page = await browser.newPage();
-  await page.setContent(html, { waitUntil: 'networkidle0' });
-  const pdfBuffer = await page.pdf({ format: 'A4', margin: { top: '16mm', bottom: '16mm', left: '16mm', right: '16mm' } });
-  await browser.close();
+  const exporter = new HkdPdfExporter();
+  const pdfBuffer = await exporter.generate(d);
 
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `attachment; filename="TT40_Q${d.period_quarter}_${d.period_year}.pdf"`);
-  res.send(Buffer.from(pdfBuffer));
+  res.send(pdfBuffer);
 });
 
 export default router;

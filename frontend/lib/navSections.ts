@@ -114,3 +114,19 @@ export const VISIBLE_DRAWER_SECTIONS = [
 ];
 
 export const VISIBLE_DRAWER_HREFS = VISIBLE_DRAWER_SECTIONS.flatMap((s) => s.items.map((i) => i.href));
+
+// ── HKD-only section (shown only when activeCompany is household) ──────────
+export const HKD_REPORT_SECTION = {
+  title: '🏪 Sổ Sách HKD',
+  items: [
+    { href: '/reports/hkd/s1a', label: 'S1a – Chi tiết doanh thu' },
+    { href: '/reports/hkd/s2a', label: 'S2a – Doanh thu (GTGT+TNCN)' },
+    { href: '/reports/hkd/s2b', label: 'S2b – Doanh thu (GTGT)' },
+    { href: '/reports/hkd/s2c', label: 'S2c – Doanh thu & Chi phí' },
+    { href: '/reports/hkd/s2d', label: 'S2d – Vật liệu, hàng hóa' },
+    { href: '/reports/hkd/s2e', label: 'S2e – Chi tiết tiền' },
+    { href: '/reports/hkd/s3a', label: 'S3a – Nghĩa vụ thuế khác' },
+  ],
+};
+
+export const HKD_REPORT_HREFS = HKD_REPORT_SECTION.items.map((i) => i.href);

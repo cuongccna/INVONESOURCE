@@ -7,7 +7,7 @@ import { useCompany } from '../contexts/CompanyContext';
 import { useView } from '../contexts/ViewContext';
 import NotificationPanel from './NotificationPanel';
 import apiClient from '../lib/apiClient';
-import { DRAWER_HREFS, VISIBLE_DRAWER_SECTIONS, VISIBLE_DRAWER_HREFS } from '../lib/navSections';
+import { DRAWER_HREFS, VISIBLE_DRAWER_SECTIONS, VISIBLE_DRAWER_HREFS, HKD_REPORT_SECTION, HKD_REPORT_HREFS } from '../lib/navSections';
 import { useAuth } from '../contexts/AuthContext';
 
 interface UnreadCount {
@@ -20,6 +20,10 @@ export default function Header() {
   const { user } = useAuth();
   const router = useRouter();
   const pathname = usePathname();
+
+  const isHousehold = activeCompany?.company_type === 'household';
+  const visibleSections = isHousehold ? [...VISIBLE_DRAWER_SECTIONS, HKD_REPORT_SECTION] : VISIBLE_DRAWER_SECTIONS;
+  const visibleDrawerHrefs = isHousehold ? [...VISIBLE_DRAWER_HREFS, ...HKD_REPORT_HREFS] : VISIBLE_DRAWER_HREFS;
   const [showSwitcher, setShowSwitcher] = useState(false);
   const [showNotif, setShowNotif] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -256,7 +260,7 @@ export default function Header() {
             <button
               onClick={() => setShowMore((v) => !v)}
               className={`flex items-center gap-1 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
-                !!pathname && VISIBLE_DRAWER_HREFS.some((h) => pathname.startsWith(h))
+                !!pathname && visibleDrawerHrefs.some((h) => pathname.startsWith(h))
                   ? 'bg-primary-50 text-primary-700'
                   : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
               }`}
@@ -268,7 +272,7 @@ export default function Header() {
             </button>
             {showMore && (
               <div className="absolute top-full left-0 mt-1 w-60 bg-white rounded-xl shadow-lg border border-gray-100 py-2 z-50">
-                {VISIBLE_DRAWER_SECTIONS.map((section) => (
+                {visibleSections.map((section) => (
                   <div key={section.title}>
                     <p className="px-3 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-400">{section.title}</p>
                     {section.items.map((item) => {

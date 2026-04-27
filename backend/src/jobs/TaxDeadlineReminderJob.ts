@@ -1,5 +1,5 @@
 /**
- * TaxDeadlineReminderJob — BullMQ worker that fires daily at 08:00 Vietnam time (01:00 UTC).
+ * TaxDeadlineReminderJob — BullMQ worker that fires daily at 08:00 Vietnam time.
  *
  * The job calls checkTaxDeadlines() which:
  *  - Finds all active companies
@@ -16,9 +16,9 @@ import { checkTaxDeadlines } from '../services/NotificationService';
 const QUEUE_NAME = 'tax-deadline-reminders';
 const JOB_NAME = 'daily-deadline-check';
 
-// UTC cron for 08:00 ICT (UTC+7) = 01:00 UTC
-// Format: second minute hour day month weekday
-const CRON_UTC_01 = '0 1 * * *';
+const VIETNAM_TIMEZONE = 'Asia/Ho_Chi_Minh';
+// 08:00 Vietnam time
+const CRON_VN_08 = '0 8 * * *';
 
 export const deadlineReminderQueue = new Queue(QUEUE_NAME, {
   connection: { url: env.REDIS_URL },
@@ -60,10 +60,10 @@ export async function scheduleTaxDeadlineReminder(): Promise<void> {
     JOB_NAME,
     {},
     {
-      repeat: { pattern: CRON_UTC_01, tz: 'UTC' },
+      repeat: { pattern: CRON_VN_08, tz: VIETNAM_TIMEZONE },
       jobId: JOB_NAME,
     }
   );
 
-  console.info('[TaxDeadlineJob] Scheduled — daily at 08:00 ICT (01:00 UTC)');
+  console.info('[TaxDeadlineJob] Scheduled — daily at 08:00 Asia/Ho_Chi_Minh (UTC+7)');
 }

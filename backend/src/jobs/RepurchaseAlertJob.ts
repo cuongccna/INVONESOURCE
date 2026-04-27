@@ -7,8 +7,9 @@ import { telegramService } from '../services/TelegramNotificationService';
 const QUEUE_NAME = 'repurchase-alerts';
 const JOB_NAME = 'daily-repurchase-alerts';
 
-// 07:00 ICT = 00:00 UTC
-const CRON_UTC_00 = '0 0 * * *';
+const VIETNAM_TIMEZONE = 'Asia/Ho_Chi_Minh';
+// 07:00 Vietnam time
+const CRON_VN_07 = '0 7 * * *';
 
 const burnRateService = new BurnRateService();
 
@@ -111,10 +112,10 @@ export async function scheduleRepurchaseAlertJob(): Promise<void> {
     JOB_NAME,
     {},
     {
-      repeat: { pattern: CRON_UTC_00, tz: 'UTC' },
+      repeat: { pattern: CRON_VN_07, tz: VIETNAM_TIMEZONE },
       jobId: JOB_NAME,
     },
   );
 
-  console.info('[RepurchaseAlertJob] Scheduled - daily at 07:00 ICT (00:00 UTC)');
+  console.info('[RepurchaseAlertJob] Scheduled - daily at 07:00 Asia/Ho_Chi_Minh (UTC+7)');
 }

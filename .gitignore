@@ -94,3 +94,4 @@ prompts_bot_refactor_FINAL.md
 .claude/settings.local.json
 backend/tools/fix-sse-token.js
 backend/tools/fix-sync-sse-auth.js
+backend/hkd_test_output.pdf

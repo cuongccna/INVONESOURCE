@@ -1,6 +1,6 @@
 /**
  * QuotaResetJob — resets monthly invoice quota for all active/trial subscriptions
- * Runs: 1st of every month at 00:00 UTC (= 07:00 ICT)
+ * Runs: 1st of every month at 07:00 Vietnam time.
  */
 import { Queue, Worker } from 'bullmq';
 import { env } from '../config/env';
@@ -9,8 +9,9 @@ import { quotaService } from '../services/QuotaService';
 const QUEUE_NAME = 'quota-reset';
 const JOB_NAME   = 'monthly-quota-reset';
 
-// 00:00 UTC on the 1st of every month
-const CRON = '0 0 1 * *';
+const VIETNAM_TIMEZONE = 'Asia/Ho_Chi_Minh';
+// 07:00 Vietnam time on the 1st of every month
+const CRON = '0 7 1 * *';
 
 export const quotaResetQueue = new Queue(QUEUE_NAME, {
   connection: { url: env.REDIS_URL },
@@ -48,8 +49,8 @@ export async function scheduleQuotaReset(): Promise<void> {
   await quotaResetQueue.add(
     JOB_NAME,
     {},
-    { repeat: { pattern: CRON, tz: 'UTC' } },
+    { repeat: { pattern: CRON, tz: VIETNAM_TIMEZONE } },
   );
 
-  console.info('[QuotaResetJob] Cron scheduled (0 0 1 * * UTC)');
+  console.info('[QuotaResetJob] Scheduled - monthly at 07:00 Asia/Ho_Chi_Minh (UTC+7)');
 }

@@ -3,31 +3,181 @@ import { pool } from '../db/pool';
 import { authenticate } from '../middleware/auth';
 import { requireCompany } from '../middleware/company';
 import { sendSuccess } from '../utils/response';
+import { buildDashboardBucketKey, buildTrailingDashboardBuckets } from '../utils/dashboardBuckets';
+import { resolvePeriod, type PeriodType } from '../utils/period';
 
 const router = Router();
 router.use(authenticate);
 router.use(requireCompany);
 
+const VIETNAM_TIMEZONE = 'Asia/Ho_Chi_Minh';
+
+function _notReplacedClause(alias: string): string {
+  return `AND NOT EXISTS (
+       SELECT 1 FROM invoices _r
+       WHERE _r.tc_hdon = 1
+         AND _r.deleted_at IS NULL
+         AND _r.company_id = ${alias}.company_id
+         AND TRIM(COALESCE(_r.khhd_cl_quan,  '')) = TRIM(COALESCE(${alias}.serial_number,  ''))
+         AND TRIM(COALESCE(_r.so_hd_cl_quan, '')) = TRIM(COALESCE(${alias}.invoice_number, ''))
+         AND COALESCE(_r.seller_tax_code, '') = COALESCE(${alias}.seller_tax_code, '')
+     )`;
+}
+
+function _validOutputVatCondition(alias: string): string {
+  return `${alias}.direction = 'output'
+               AND ${alias}.status IN ('valid', 'replaced', 'adjusted')
+               ${_notReplacedClause(alias)}`;
+}
+
+function _deductibleInputVatCondition(alias: string): string {
+  return `${alias}.direction = 'input'
+               AND ${alias}.status IN ('valid', 'replaced', 'adjusted')
+               AND (${alias}.non_deductible = false OR ${alias}.non_deductible IS NULL)
+               AND (
+                 (${alias}.invoice_group = 5 AND ${alias}.gdt_validated = true)
+                 OR (${alias}.invoice_group IN (6, 8))
+                 OR (${alias}.invoice_group IS NULL AND ${alias}.gdt_validated = true)
+               )
+               AND (
+                 ${alias}.total_amount <= 20000000
+                 OR ${alias}.payment_method IS NULL
+                 OR LOWER(${alias}.payment_method) <> 'cash'
+               )
+               ${_notReplacedClause(alias)}`;
+}
+
+async function getCarryForwardInfo(
+  companyId: string,
+  periodType: PeriodType,
+  month: number,
+  quarter: number,
+  year: number,
+): Promise<{ amount: number; label: string }> {
+  if (periodType === 'monthly') {
+    let prevMonth = month - 1;
+    let prevYear = year;
+    if (prevMonth === 0) {
+      prevMonth = 12;
+      prevYear -= 1;
+    }
+
+    const { rows } = await pool.query<{ amount: string }>(
+      `SELECT COALESCE(ct43_carry_forward_vat, 0) AS amount
+       FROM tax_declarations
+       WHERE company_id = $1
+         AND period_month = $2
+         AND period_year = $3
+         AND form_type = '01/GTGT'
+         AND period_type = 'monthly'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [companyId, prevMonth, prevYear],
+    );
+
+    return {
+      amount: Number(rows[0]?.amount ?? 0),
+      label: `T${prevMonth}/${String(prevYear).slice(-2)}`,
+    };
+  }
+
+  if (periodType === 'quarterly') {
+    let prevQuarter = quarter - 1;
+    let prevYear = year;
+    if (prevQuarter === 0) {
+      prevQuarter = 4;
+      prevYear -= 1;
+    }
+
+    const quarterly = await pool.query<{ amount: string }>(
+      `SELECT COALESCE(ct43_carry_forward_vat, 0) AS amount
+       FROM tax_declarations
+       WHERE company_id = $1
+         AND period_month = $2
+         AND period_year = $3
+         AND form_type = '01/GTGT'
+         AND period_type = 'quarterly'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [companyId, prevQuarter, prevYear],
+    );
+
+    if (quarterly.rows.length > 0) {
+      return {
+        amount: Number(quarterly.rows[0].amount ?? 0),
+        label: `Q${prevQuarter}/${String(prevYear).slice(-2)}`,
+      };
+    }
+
+    const fallbackMonth = prevQuarter * 3;
+    const monthly = await pool.query<{ amount: string }>(
+      `SELECT COALESCE(ct43_carry_forward_vat, 0) AS amount
+       FROM tax_declarations
+       WHERE company_id = $1
+         AND period_month = $2
+         AND period_year = $3
+         AND form_type = '01/GTGT'
+         AND period_type = 'monthly'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [companyId, fallbackMonth, prevYear],
+    );
+
+    return {
+      amount: Number(monthly.rows[0]?.amount ?? 0),
+      label: `Q${prevQuarter}/${String(prevYear).slice(-2)}`,
+    };
+  }
+
+  const prevYear = year - 1;
+  const quarterly = await pool.query<{ amount: string }>(
+    `SELECT COALESCE(ct43_carry_forward_vat, 0) AS amount
+     FROM tax_declarations
+     WHERE company_id = $1
+       AND period_month = 4
+       AND period_year = $2
+       AND form_type = '01/GTGT'
+       AND period_type = 'quarterly'
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [companyId, prevYear],
+  );
+
+  if (quarterly.rows.length > 0) {
+    return {
+      amount: Number(quarterly.rows[0].amount ?? 0),
+      label: `Năm ${prevYear}`,
+    };
+  }
+
+  const monthly = await pool.query<{ amount: string }>(
+    `SELECT COALESCE(ct43_carry_forward_vat, 0) AS amount
+     FROM tax_declarations
+     WHERE company_id = $1
+       AND period_month = 12
+       AND period_year = $2
+       AND form_type = '01/GTGT'
+       AND period_type = 'monthly'
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [companyId, prevYear],
+  );
+
+  return {
+    amount: Number(monthly.rows[0]?.amount ?? 0),
+    label: `Năm ${prevYear}`,
+  };
+}
+
 // GET /api/dashboard/kpi - key performance indicators for current period
 router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const companyId = req.user!.companyId;
-    const now = new Date();
-    const month     = req.query['month']      ? parseInt(String(req.query['month']),      10) : now.getMonth() + 1;
-    const year      = req.query['year']       ? parseInt(String(req.query['year']),       10) : now.getFullYear();
-    const monthFrom = req.query['month_from'] ? parseInt(String(req.query['month_from']), 10) : month;
-    const monthTo   = req.query['month_to']   ? parseInt(String(req.query['month_to']),   10) : month;
-    // Convert to date range for flexible monthly/quarterly/yearly filtering.
-    // Use Date.UTC() to anchor to UTC midnight regardless of server TZ — avoids
-    // the off-by-7h bug when the server runs in Asia/Ho_Chi_Minh (UTC+7).
-    const periodStart = new Date(Date.UTC(year, monthFrom - 1, 1));
-    const periodEnd   = new Date(Date.UTC(year, monthTo, 1)); // exclusive upper bound
-
-    // Previous period for carry_forward query
-    const prevMonth = monthFrom === 1 ? 12 : monthFrom - 1;
-    const prevYear  = monthFrom === 1 ? year - 1 : year;
-
-    const [invoiceStats, vatStats, syncStats, ytdStats, riskStats, deductibleRes, carryForwardRes] = await Promise.all([
+    const companyId = req.user?.companyId;
+    if (!companyId) {
+      throw new Error('Missing companyId in dashboard KPI route');
+    }
+    const resolved = resolvePeriod(req.query);
+    const [invoiceStats, vatStats, syncStats, ytdStats, riskStats, carryForwardInfo] = await Promise.all([
       pool.query<{
         total: string; output_count: string; input_count: string;
         invalid_count: string; unvalidated_count: string; input_above_20m_count: string;
@@ -41,26 +191,29 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
            COUNT(*) FILTER (WHERE direction = 'input' AND total_amount > 20000000) as input_above_20m_count
          FROM invoices
          WHERE company_id = $1
-           AND invoice_date >= $2
-           AND invoice_date <  $3
+           AND invoice_date BETWEEN $2 AND $3
            AND deleted_at IS NULL`,
-        [companyId, periodStart.toISOString(), periodEnd.toISOString()]
+        [companyId, resolved.start, resolved.end]
       ),
-      // Calculate VAT directly from invoices (not from vat_reconciliations which requires manual trigger)
-      pool.query(
+      pool.query<{
+        output_vat: string;
+        input_vat: string;
+        deductible_vat: string;
+        payable_vat: string;
+      }>(
         `SELECT
-           COALESCE(SUM(vat_amount) FILTER (WHERE direction = 'output' AND status != 'cancelled'), 0) AS output_vat,
-           COALESCE(SUM(vat_amount) FILTER (WHERE direction = 'input'  AND status != 'cancelled'), 0) AS input_vat,
+           COALESCE(SUM(i.vat_amount) FILTER (WHERE i.direction = 'input' AND i.status NOT IN ('cancelled', 'replaced_original')), 0) AS input_vat,
+           COALESCE(SUM(i.vat_amount) FILTER (WHERE ${_validOutputVatCondition('i')}), 0) AS output_vat,
+           COALESCE(SUM(i.vat_amount) FILTER (WHERE ${_deductibleInputVatCondition('i')}), 0) AS deductible_vat,
            GREATEST(0,
-             COALESCE(SUM(vat_amount) FILTER (WHERE direction = 'output' AND status != 'cancelled'), 0) -
-             COALESCE(SUM(vat_amount) FILTER (WHERE direction = 'input'  AND status != 'cancelled'), 0)
+             COALESCE(SUM(i.vat_amount) FILTER (WHERE ${_validOutputVatCondition('i')}), 0) -
+             COALESCE(SUM(i.vat_amount) FILTER (WHERE ${_deductibleInputVatCondition('i')}), 0)
            ) AS payable_vat
-         FROM invoices
-         WHERE company_id = $1
-           AND invoice_date >= $2
-           AND invoice_date <  $3
-           AND deleted_at IS NULL`,
-        [companyId, periodStart.toISOString(), periodEnd.toISOString()]
+         FROM invoices i
+         WHERE i.company_id = $1
+           AND i.invoice_date BETWEEN $2 AND $3
+           AND i.deleted_at IS NULL`,
+        [companyId, resolved.start, resolved.end]
       ),
       pool.query(
         `SELECT provider, errors_count, error_detail, started_at
@@ -77,7 +230,7 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
          WHERE company_id = $1
            AND EXTRACT(YEAR FROM invoice_date) = $2
            AND deleted_at IS NULL`,
-        [companyId, year]
+        [companyId, resolved.year]
       ),
       // Risk score from unacknowledged flags
       pool.query<{ critical: string; high: string; medium: string }>(
@@ -89,27 +242,7 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
          WHERE company_id = $1 AND is_acknowledged = false`,
         [companyId]
       ).catch(() => ({ rows: [{ critical: '0', high: '0', medium: '0' }] })),
-      // Deductible input VAT (tạm tính): input VAT excluding cash payments >20M
-      pool.query<{ deductible_vat: string }>(
-        `SELECT COALESCE(SUM(vat_amount), 0) AS deductible_vat
-         FROM invoices
-         WHERE company_id = $1
-           AND invoice_date >= $2
-           AND invoice_date <  $3
-           AND direction = 'input'
-           AND status != 'cancelled'
-           AND deleted_at IS NULL
-           AND NOT (total_amount > 20000000 AND payment_method = 'cash')`,
-        [companyId, periodStart.toISOString(), periodEnd.toISOString()]
-      ),
-      // Carry-forward VAT from previous period (CT43 → becomes CT24 this period)
-      pool.query<{ carry_forward_vat: string }>(
-        `SELECT COALESCE(ct43_carry_forward_vat, 0) AS carry_forward_vat
-         FROM tax_declarations
-         WHERE company_id = $1 AND period_month = $2 AND period_year = $3
-         ORDER BY created_at DESC LIMIT 1`,
-        [companyId, prevMonth, prevYear]
-      ).catch(() => ({ rows: [{ carry_forward_vat: '0' }] })),
+      getCarryForwardInfo(companyId, resolved.periodType, resolved.month, resolved.quarter, resolved.year),
     ]);
 
     // CIT estimate: YTD gross profit × 20%
@@ -118,10 +251,6 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
     const ytdCost    = Number(ytd?.ytd_cost    ?? 0);
     const ytdProfit  = ytdRevenue - ytdCost;
     const citEstimate = Math.max(0, ytdProfit * 0.20);
-
-    // Deductible VAT & carry-forward
-    const deductibleVat  = Number(deductibleRes.rows[0]?.deductible_vat ?? 0);
-    const carryForwardVat = Number(carryForwardRes.rows[0]?.carry_forward_vat ?? 0);
 
     // Risk score: weighted, capped at 100
     const riskRow = riskStats.rows[0] ?? { critical: '0', high: '0', medium: '0' };
@@ -142,10 +271,10 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
     const monthlyDeadlines = Array.from({ length: 12 }, (_, i) => {
       const m = i + 1; // invoice month 1-12
       const dueMonth = m === 12 ? 1 : m + 1;
-      const dueYear  = m === 12 ? year + 1 : year;
+      const dueYear  = m === 12 ? resolved.year + 1 : resolved.year;
       const due = new Date(dueYear, dueMonth - 1, 20);
       return {
-        label: `Nộp GTGT T${m}/${year}`,
+        label: `Nộp GTGT T${m}/${resolved.year}`,
         due: due.toISOString().split('T')[0],
         days_left: daysUntil(due),
         type: 'gtgt_monthly',
@@ -161,10 +290,10 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
     };
     const quarterlyDeadlines = [1, 2, 3, 4].map((q) => {
       const { month: dueMonth, day: dueDay } = QUARTER_DUE[q]!;
-      const dueYear = q === 4 ? year + 1 : year;
+      const dueYear = q === 4 ? resolved.year + 1 : resolved.year;
       const due = new Date(dueYear, dueMonth - 1, dueDay);
       return {
-        label: `Nộp GTGT Q${q}/${year}`,
+        label: `Nộp GTGT Q${q}/${resolved.year}`,
         due: due.toISOString().split('T')[0],
         days_left: daysUntil(due),
         type: 'gtgt_quarterly',
@@ -172,25 +301,31 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
     });
     const taxDeadlines = [...monthlyDeadlines, ...quarterlyDeadlines,
       {
-        label: `Quyết toán TNDN ${year}`,
-        due: `${year + 1}-03-31`,
-        days_left: daysUntil(new Date(year + 1, 2, 31)),
+        label: `Quyết toán TNDN ${resolved.year}`,
+        due: `${resolved.year + 1}-03-31`,
+        days_left: daysUntil(new Date(resolved.year + 1, 2, 31)),
         type: 'cit_annual',
       },
     ].sort((a, b) => a.days_left - b.days_left);
 
-    const vatRow = vatStats.rows[0] ?? { output_vat: '0', input_vat: '0', payable_vat: '0' };
+    const vatRow = vatStats.rows[0] ?? { output_vat: '0', input_vat: '0', deductible_vat: '0', payable_vat: '0' };
     sendSuccess(res, {
-      period: { month, monthFrom, monthTo, year },
+      period: {
+        month: resolved.month,
+        quarter: resolved.quarter,
+        periodType: resolved.periodType,
+        year: resolved.year,
+      },
       invoices: invoiceStats.rows[0],
-      vat: { ...vatRow, deductible_vat: String(deductibleVat) },
+      vat: vatRow,
       recentSyncs: syncStats.rows,
       cit_estimate: citEstimate,
       ytd_revenue: ytdRevenue,
       ytd_cost: ytdCost,
       ytd_profit: ytdProfit,
       risk_score: riskScore,
-      carry_forward_vat: carryForwardVat,
+      carry_forward_vat: carryForwardInfo.amount,
+      carry_forward_source_label: carryForwardInfo.label,
       tax_deadlines: taxDeadlines,
     });
   } catch (err) {
@@ -202,60 +337,265 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
 router.get('/charts', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const companyId = req.user!.companyId;
-    const now = new Date();
-    const endMonth = req.query['month'] ? parseInt(String(req.query['month']), 10) : now.getMonth() + 1;
-    const endYear  = req.query['year']  ? parseInt(String(req.query['year']),  10) : now.getFullYear();
+    const resolved = resolvePeriod(req.query);
+    const buckets = buildTrailingDashboardBuckets(resolved.periodType, {
+      year: resolved.year,
+      month: resolved.month,
+      quarter: resolved.quarter,
+    });
+    const windowStart = buckets[0]!.startDate;
+    const windowEndExclusive = buckets[buckets.length - 1]!.endExclusiveDate;
 
-    // Compute start of the 12-month window (11 months before the given period).
-    // Use Date.UTC() to anchor to UTC midnight — avoids off-by-7h when server is UTC+7.
-    const endDate   = new Date(Date.UTC(endYear, endMonth - 1, 1));
-    const startDate = new Date(Date.UTC(endYear, endMonth - 1 - 11, 1));
-    const upperBound = new Date(Date.UTC(endYear, endMonth, 1));
+    let vatResult;
+    let countTrend;
 
-    // Group by VN month (AT TIME ZONE) so an invoice timestamped 2026-01-31T17:00Z
-    // (= 2026-02-01 00:00 VN) is correctly counted in February, not January.
-    const result = await pool.query(
-      `SELECT
-         EXTRACT(MONTH FROM invoice_date AT TIME ZONE 'Asia/Ho_Chi_Minh')::int AS period_month,
-         EXTRACT(YEAR  FROM invoice_date AT TIME ZONE 'Asia/Ho_Chi_Minh')::int AS period_year,
-         COALESCE(SUM(vat_amount) FILTER (WHERE direction = 'output' AND status != 'cancelled'), 0) AS output_vat,
-         COALESCE(SUM(vat_amount) FILTER (WHERE direction = 'input'  AND status != 'cancelled'), 0) AS input_vat,
-         GREATEST(0,
-           COALESCE(SUM(vat_amount) FILTER (WHERE direction = 'output' AND status != 'cancelled'), 0) -
-           COALESCE(SUM(vat_amount) FILTER (WHERE direction = 'input'  AND status != 'cancelled'), 0)
-         ) AS payable_vat
-       FROM invoices
-       WHERE company_id = $1
-         AND invoice_date >= $2
-         AND invoice_date <  $3
-         AND deleted_at IS NULL
-       GROUP BY period_month, period_year
-       ORDER BY period_year ASC, period_month ASC`,
-      [companyId, startDate.toISOString(), upperBound.toISOString()]
+    if (resolved.periodType === 'quarterly') {
+      vatResult = await pool.query<{
+        period_year: number;
+        period_quarter: number;
+        output_vat: string;
+        input_vat: string;
+      }>(
+        `SELECT
+           EXTRACT(YEAR FROM invoice_date AT TIME ZONE '${VIETNAM_TIMEZONE}')::int AS period_year,
+           EXTRACT(QUARTER FROM invoice_date AT TIME ZONE '${VIETNAM_TIMEZONE}')::int AS period_quarter,
+           COALESCE(SUM(vat_amount) FILTER (
+             WHERE direction = 'output'
+               AND status IN ('valid', 'replaced', 'adjusted')
+               ${_notReplacedClause('invoices')}
+           ), 0) AS output_vat,
+           COALESCE(SUM(vat_amount) FILTER (
+             WHERE direction = 'input'
+               AND status IN ('valid', 'replaced', 'adjusted')
+               AND (non_deductible = false OR non_deductible IS NULL)
+               AND (
+                 (invoice_group = 5 AND gdt_validated = true)
+                 OR (invoice_group IN (6, 8))
+                 OR (invoice_group IS NULL AND gdt_validated = true)
+               )
+               AND (
+                 total_amount <= 20000000
+                 OR payment_method IS NULL
+                 OR LOWER(payment_method) <> 'cash'
+               )
+               ${_notReplacedClause('invoices')}
+           ), 0) AS input_vat
+         FROM invoices
+         WHERE company_id = $1
+           AND invoice_date >= $2
+           AND invoice_date < $3
+           AND deleted_at IS NULL
+         GROUP BY period_year, period_quarter
+         ORDER BY period_year ASC, period_quarter ASC`,
+        [companyId, windowStart, windowEndExclusive],
+      );
+
+      countTrend = await pool.query<{
+        period_year: number;
+        period_quarter: number;
+        output_total: string;
+        input_total: string;
+      }>(
+        `SELECT
+           EXTRACT(YEAR FROM invoice_date AT TIME ZONE '${VIETNAM_TIMEZONE}')::int AS period_year,
+           EXTRACT(QUARTER FROM invoice_date AT TIME ZONE '${VIETNAM_TIMEZONE}')::int AS period_quarter,
+           COALESCE(SUM(total_amount) FILTER (WHERE direction = 'output' AND status != 'cancelled'), 0) AS output_total,
+           COALESCE(SUM(total_amount) FILTER (WHERE direction = 'input' AND status != 'cancelled'), 0) AS input_total
+         FROM invoices
+         WHERE company_id = $1
+           AND invoice_date >= $2
+           AND invoice_date < $3
+           AND deleted_at IS NULL
+         GROUP BY period_year, period_quarter
+         ORDER BY period_year ASC, period_quarter ASC`,
+        [companyId, windowStart, windowEndExclusive],
+      );
+    } else if (resolved.periodType === 'yearly') {
+      vatResult = await pool.query<{
+        period_year: number;
+        output_vat: string;
+        input_vat: string;
+      }>(
+        `SELECT
+           EXTRACT(YEAR FROM invoice_date AT TIME ZONE '${VIETNAM_TIMEZONE}')::int AS period_year,
+           COALESCE(SUM(vat_amount) FILTER (
+             WHERE direction = 'output'
+               AND status IN ('valid', 'replaced', 'adjusted')
+               ${_notReplacedClause('invoices')}
+           ), 0) AS output_vat,
+           COALESCE(SUM(vat_amount) FILTER (
+             WHERE direction = 'input'
+               AND status IN ('valid', 'replaced', 'adjusted')
+               AND (non_deductible = false OR non_deductible IS NULL)
+               AND (
+                 (invoice_group = 5 AND gdt_validated = true)
+                 OR (invoice_group IN (6, 8))
+                 OR (invoice_group IS NULL AND gdt_validated = true)
+               )
+               AND (
+                 total_amount <= 20000000
+                 OR payment_method IS NULL
+                 OR LOWER(payment_method) <> 'cash'
+               )
+               ${_notReplacedClause('invoices')}
+           ), 0) AS input_vat
+         FROM invoices
+         WHERE company_id = $1
+           AND invoice_date >= $2
+           AND invoice_date < $3
+           AND deleted_at IS NULL
+         GROUP BY period_year
+         ORDER BY period_year ASC`,
+        [companyId, windowStart, windowEndExclusive],
+      );
+
+      countTrend = await pool.query<{
+        period_year: number;
+        output_total: string;
+        input_total: string;
+      }>(
+        `SELECT
+           EXTRACT(YEAR FROM invoice_date AT TIME ZONE '${VIETNAM_TIMEZONE}')::int AS period_year,
+           COALESCE(SUM(total_amount) FILTER (WHERE direction = 'output' AND status != 'cancelled'), 0) AS output_total,
+           COALESCE(SUM(total_amount) FILTER (WHERE direction = 'input' AND status != 'cancelled'), 0) AS input_total
+         FROM invoices
+         WHERE company_id = $1
+           AND invoice_date >= $2
+           AND invoice_date < $3
+           AND deleted_at IS NULL
+         GROUP BY period_year
+         ORDER BY period_year ASC`,
+        [companyId, windowStart, windowEndExclusive],
+      );
+    } else {
+      vatResult = await pool.query<{
+        period_year: number;
+        period_month: number;
+        output_vat: string;
+        input_vat: string;
+      }>(
+        `SELECT
+           EXTRACT(MONTH FROM invoice_date AT TIME ZONE '${VIETNAM_TIMEZONE}')::int AS period_month,
+           EXTRACT(YEAR  FROM invoice_date AT TIME ZONE '${VIETNAM_TIMEZONE}')::int AS period_year,
+           COALESCE(SUM(vat_amount) FILTER (
+             WHERE direction = 'output'
+               AND status IN ('valid', 'replaced', 'adjusted')
+               ${_notReplacedClause('invoices')}
+           ), 0) AS output_vat,
+           COALESCE(SUM(vat_amount) FILTER (
+             WHERE direction = 'input'
+               AND status IN ('valid', 'replaced', 'adjusted')
+               AND (non_deductible = false OR non_deductible IS NULL)
+               AND (
+                 (invoice_group = 5 AND gdt_validated = true)
+                 OR (invoice_group IN (6, 8))
+                 OR (invoice_group IS NULL AND gdt_validated = true)
+               )
+               AND (
+                 total_amount <= 20000000
+                 OR payment_method IS NULL
+                 OR LOWER(payment_method) <> 'cash'
+               )
+               ${_notReplacedClause('invoices')}
+           ), 0) AS input_vat
+         FROM invoices
+         WHERE company_id = $1
+           AND invoice_date >= $2
+           AND invoice_date < $3
+           AND deleted_at IS NULL
+         GROUP BY period_month, period_year
+         ORDER BY period_year ASC, period_month ASC`,
+        [companyId, windowStart, windowEndExclusive],
+      );
+
+      countTrend = await pool.query<{
+        period_year: number;
+        period_month: number;
+        output_total: string;
+        input_total: string;
+      }>(
+        `SELECT
+           EXTRACT(MONTH FROM invoice_date AT TIME ZONE '${VIETNAM_TIMEZONE}')::int AS period_month,
+           EXTRACT(YEAR  FROM invoice_date AT TIME ZONE '${VIETNAM_TIMEZONE}')::int AS period_year,
+           COALESCE(SUM(total_amount) FILTER (WHERE direction = 'output' AND status != 'cancelled'), 0) AS output_total,
+           COALESCE(SUM(total_amount) FILTER (WHERE direction = 'input' AND status != 'cancelled'), 0) AS input_total
+         FROM invoices
+         WHERE company_id = $1
+           AND invoice_date >= $2
+           AND invoice_date <  $3
+           AND deleted_at IS NULL
+         GROUP BY period_month, period_year
+         ORDER BY period_year ASC, period_month ASC`,
+        [companyId, windowStart, windowEndExclusive],
+      );
+    }
+
+    const vatMap = new Map(
+      vatResult.rows.map((row) => {
+        const bucketMonth = 'period_month' in row
+          ? Number((row as { period_month: number }).period_month)
+          : 1;
+        const bucketQuarter = 'period_quarter' in row
+          ? Number((row as { period_quarter: number }).period_quarter)
+          : 1;
+        const key = buildDashboardBucketKey(
+          resolved.periodType,
+          row.period_year,
+          bucketMonth,
+          bucketQuarter,
+        );
+
+        return [key, row] as const;
+      }),
     );
 
-    // Invoice count trend — 12 months ending at the given period
-    const countTrend = await pool.query(
-      `SELECT
-         EXTRACT(MONTH FROM invoice_date AT TIME ZONE 'Asia/Ho_Chi_Minh')::int as month,
-         EXTRACT(YEAR  FROM invoice_date AT TIME ZONE 'Asia/Ho_Chi_Minh')::int as year,
-         COUNT(*) FILTER (WHERE direction = 'output') as output_count,
-         COUNT(*) FILTER (WHERE direction = 'input') as input_count,
-         SUM(total_amount) FILTER (WHERE direction = 'output') as output_total,
-         SUM(total_amount) FILTER (WHERE direction = 'input') as input_total
-       FROM invoices
-       WHERE company_id = $1
-         AND invoice_date >= $2
-         AND invoice_date <  $3
-         AND deleted_at IS NULL
-       GROUP BY 1, 2
-       ORDER BY 2 ASC, 1 ASC`,
-      [companyId, startDate.toISOString(), upperBound.toISOString()]
+    const invoiceMap = new Map(
+      countTrend.rows.map((row) => {
+        const bucketMonth = 'period_month' in row
+          ? Number((row as { period_month: number }).period_month)
+          : 1;
+        const bucketQuarter = 'period_quarter' in row
+          ? Number((row as { period_quarter: number }).period_quarter)
+          : 1;
+        const key = buildDashboardBucketKey(
+          resolved.periodType,
+          row.period_year,
+          bucketMonth,
+          bucketQuarter,
+        );
+
+        return [key, row] as const;
+      }),
     );
 
     sendSuccess(res, {
-      vatTrend: result.rows,
-      invoiceTrend: countTrend.rows,
+      periodType: resolved.periodType,
+      vatTrend: buckets.map((bucket) => {
+        const row = vatMap.get(bucket.key);
+        const outputVat = Number(row?.output_vat ?? 0);
+        const inputVat = Number(row?.input_vat ?? 0);
+
+        return {
+          key: bucket.key,
+          label: bucket.label,
+          output_vat: outputVat,
+          input_vat: inputVat,
+          payable_vat: Math.max(0, outputVat - inputVat),
+        };
+      }),
+      invoiceTrend: buckets.map((bucket) => {
+        const row = invoiceMap.get(bucket.key);
+        const outputTotal = Number(row?.output_total ?? 0);
+        const inputTotal = Number(row?.input_total ?? 0);
+
+        return {
+          key: bucket.key,
+          label: bucket.label,
+          output_total: outputTotal,
+          input_total: inputTotal,
+          gross_profit: outputTotal - inputTotal,
+        };
+      }),
     });
   } catch (err) {
     next(err);

@@ -4,13 +4,19 @@ import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { useView } from '../contexts/ViewContext';
-import { VISIBLE_DRAWER_SECTIONS, VISIBLE_DRAWER_HREFS, DRAWER_HREFS } from '../lib/navSections';
+import { useCompany } from '../contexts/CompanyContext';
+import { VISIBLE_DRAWER_SECTIONS, VISIBLE_DRAWER_HREFS, DRAWER_HREFS, HKD_REPORT_SECTION, HKD_REPORT_HREFS } from '../lib/navSections';
 
 export default function BottomNav() {
   const pathname = usePathname();
   const router = useRouter();
   const { mode, orgId } = useView();
+  const { activeCompany } = useCompany();
   const [drawerOpen, setDrawerOpen] = useState(false);
+
+  const isHousehold = activeCompany?.company_type === 'household';
+  const visibleSections = isHousehold ? [...VISIBLE_DRAWER_SECTIONS, HKD_REPORT_SECTION] : VISIBLE_DRAWER_SECTIONS;
+  const visibleDrawerHrefs = isHousehold ? [...VISIBLE_DRAWER_HREFS, ...HKD_REPORT_HREFS] : VISIBLE_DRAWER_HREFS;
 
   // Close drawer on route change
   useEffect(() => {
@@ -23,7 +29,7 @@ export default function BottomNav() {
       ? `/group/${orgId}`
       : '/dashboard';
 
-  const isDrawerActive = !!pathname && VISIBLE_DRAWER_HREFS.some((h) => pathname.startsWith(h));
+  const isDrawerActive = !!pathname && visibleDrawerHrefs.some((h) => pathname.startsWith(h));
 
   const mainItems = [
     {
@@ -84,7 +90,7 @@ export default function BottomNav() {
         </div>
 
         <div className="p-4 space-y-4 pb-6">
-          {VISIBLE_DRAWER_SECTIONS.map((section) => (
+          {visibleSections.map((section) => (
             <div key={section.title}>
               <p className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">
                 {section.title}

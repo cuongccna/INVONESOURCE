@@ -16,7 +16,7 @@ interface TaxDeadline {
 }
 
 interface KpiData {
-  period: { month: number; year: number };
+  period: { month: number; quarter?: number; periodType?: 'monthly' | 'quarterly' | 'yearly'; year: number };
   invoices: {
     total: string; output_count: string; input_count: string;
     invalid_count: string; unvalidated_count: string; input_above_20m_count?: string;
@@ -31,11 +31,12 @@ interface KpiData {
   ytd_profit?: number;
   risk_score?: number;
   carry_forward_vat?: number;
+  carry_forward_source_label?: string;
   tax_deadlines?: TaxDeadline[];
 }
 
 interface HkdKpiData {
-  period: { month: number; monthFrom?: number; monthTo?: number; year: number };
+  period: { month: number; quarter?: number; periodType?: 'monthly' | 'quarterly' | 'yearly'; year: number };
   revenue: number;
   input_purchases: number;
   input_invoice_count: number;
@@ -52,8 +53,14 @@ interface HkdKpiData {
 }
 
 interface ChartData {
-  vatTrend: Array<{ period_month: number; period_year: number; output_vat: string; input_vat: string; payable_vat: string }>;
-  invoiceTrend: Array<{ month: number; year: number; output_count: string; input_count: string; output_total: string; input_total: string }>;
+  periodType: 'monthly' | 'quarterly' | 'yearly';
+  vatTrend: Array<{ key: string; label: string; output_vat: number; input_vat: number; payable_vat: number }>;
+  invoiceTrend: Array<{ key: string; label: string; output_total: number; input_total: number; gross_profit: number }>;
+}
+
+interface HkdChartData {
+  periodType: 'monthly' | 'quarterly' | 'yearly';
+  invoiceTrend: Array<{ key: string; label: string; output_total: number; input_total: number; gross_profit: number }>;
 }
 
 interface VatForecast {
@@ -62,6 +69,8 @@ interface VatForecast {
   forecast_payable: number;
   carry_forward: number;
   net_forecast: number;
+  display_amount: number;
+  direction: 'payable' | 'deductible';
   periods_used: number;
   confidence_note: string;
 }
@@ -128,6 +137,7 @@ export default function DashboardPage() {
   const isHousehold = activeCompany?.company_type === 'household';
   const [kpi, setKpi] = useState<KpiData | null>(null);
   const [chart, setChart] = useState<ChartData | null>(null);
+  const [hkdChart, setHkdChart] = useState<HkdChartData | null>(null);
   const [forecast, setForecast] = useState<VatForecast | null>(null);
   const [ghostSummary, setGhostSummary] = useState<GhostSummary | null>(null);
   const [loading, setLoading] = useState(true);
@@ -141,6 +151,17 @@ export default function DashboardPage() {
 
   const quarterOf     = (m: number) => Math.ceil(m / 3);
   const quarterStart  = (q: number) => (q - 1) * 3 + 1;
+
+  const buildPeriodQuery = useCallback((mode: 'monthly' | 'quarterly' | 'yearly', month: number, year: number) => {
+    const params = new URLSearchParams({ periodType: mode, year: String(year) });
+    if (mode === 'monthly') {
+      params.set('month', String(month));
+    }
+    if (mode === 'quarterly') {
+      params.set('quarter', String(Math.ceil(month / 3)));
+    }
+    return params.toString();
+  }, []);
 
   const handleVatViewMode = (mode: 'monthly' | 'quarterly' | 'yearly') => {
     setVatViewMode(mode);
@@ -172,16 +193,17 @@ export default function DashboardPage() {
     }
   };
 
-  const load = useCallback(async (month = periodMonth, year = periodYear, mode = vatViewMode) => {
-    const qOf2 = (m: number) => Math.ceil(m / 3);
-    const qStart2 = (q: number) => (q - 1) * 3 + 1;
-    const mFrom = mode === 'yearly' ? 1 : mode === 'quarterly' ? qStart2(qOf2(month)) : month;
-    const mTo   = mode === 'yearly' ? 12 : mode === 'quarterly' ? qStart2(qOf2(month)) + 2 : month;
+  const loadEnterprise = useCallback(async (month = periodMonth, year = periodYear, mode = vatViewMode) => {
+    if (isHousehold) {
+      return;
+    }
+
+    const query = buildPeriodQuery(mode, month, year);
     try {
       const [kpiRes, chartRes, forecastRes] = await Promise.all([
-        apiClient.get<{ data: KpiData }>(`/dashboard/kpi?month_from=${mFrom}&month_to=${mTo}&year=${year}`),
-        apiClient.get<{ data: ChartData }>(`/dashboard/charts?month=${month}&year=${year}`),
-        apiClient.get<{ data: VatForecast }>('/forecast/vat').catch(() => ({ data: { data: null } })),
+        apiClient.get<{ data: KpiData }>(`/dashboard/kpi?${query}`),
+        apiClient.get<{ data: ChartData }>(`/dashboard/charts?${query}`),
+        apiClient.get<{ data: VatForecast }>(`/forecast/vat?${query}`).catch(() => ({ data: { data: null } })),
       ]);
       setKpi(kpiRes.data.data);
       setChart(chartRes.data.data);
@@ -191,93 +213,78 @@ export default function DashboardPage() {
     } finally {
       setLoading(false);
     }
-  }, [periodMonth, periodYear, vatViewMode]);
-
-  useEffect(() => { void load(); }, [load, activeCompanyId]);
-
-  useEffect(() => {
-    setLoading(true);
-    void load(periodMonth, periodYear, vatViewMode);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [periodMonth, periodYear, vatViewMode]);
+  }, [buildPeriodQuery, isHousehold, periodMonth, periodYear, vatViewMode]);
 
   const loadHkd = useCallback(async (month = periodMonth, year = periodYear, mode = vatViewMode) => {
     if (!isHousehold) return;
-    const qOf2 = (m: number) => Math.ceil(m / 3);
-    const qStart2 = (q: number) => (q - 1) * 3 + 1;
-    const mFrom = mode === 'yearly' ? 1 : mode === 'quarterly' ? qStart2(qOf2(month)) : month;
-    const mTo   = mode === 'yearly' ? 12 : mode === 'quarterly' ? qStart2(qOf2(month)) + 2 : month;
+    const query = buildPeriodQuery(mode, month, year);
     try {
-      const res = await apiClient.get<{ data: HkdKpiData }>(
-        `/hkd/dashboard/kpi?month=${month}&month_from=${mFrom}&month_to=${mTo}&year=${year}`
-      );
-      setHkdKpi(res.data.data);
+      const [kpiRes, chartRes] = await Promise.all([
+        apiClient.get<{ data: HkdKpiData }>(`/hkd/dashboard/kpi?${query}`),
+        apiClient.get<{ data: HkdChartData }>(`/hkd/dashboard/charts?${query}`),
+      ]);
+      setHkdKpi(kpiRes.data.data);
+      setHkdChart(chartRes.data.data);
     } catch {
       // silent
+    } finally {
+      setLoading(false);
     }
-  }, [isHousehold, periodMonth, periodYear, vatViewMode]);
-
-  useEffect(() => { void loadHkd(); }, [loadHkd, activeCompanyId]);
+  }, [buildPeriodQuery, isHousehold, periodMonth, periodYear, vatViewMode]);
 
   useEffect(() => {
-    void loadHkd(periodMonth, periodYear, vatViewMode);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isHousehold, periodMonth, periodYear, vatViewMode]);
+    setLoading(true);
+    if (isHousehold) {
+      setKpi(null);
+      setChart(null);
+      setForecast(null);
+      void loadHkd(periodMonth, periodYear, vatViewMode);
+      return;
+    }
+
+    setHkdKpi(null);
+    setHkdChart(null);
+    void loadEnterprise(periodMonth, periodYear, vatViewMode);
+  }, [activeCompanyId, isHousehold, loadEnterprise, loadHkd, periodMonth, periodYear, vatViewMode]);
 
   useEffect(() => {
+    if (isHousehold) {
+      setGhostSummary(null);
+      return;
+    }
+
     apiClient
       .get<{ data: GhostSummary }>('/audit/ghost-companies/summary')
       .then((res) => setGhostSummary(res.data.data))
       .catch(() => setGhostSummary(null));
-  }, [activeCompanyId]);
+  }, [activeCompanyId, isHousehold]);
 
   /* ── Chart data — stored as raw VND (not pre-divided) so tooltip is exact ── */
   const vatChartData = chart?.vatTrend.map((r) => ({
-    name: `T${r.period_month}/${String(r.period_year).slice(2)}`,
-    'Đầu Ra': Number(r.output_vat),
-    'Đầu Vào': Number(r.input_vat),
-    'Phải Nộp': Number(r.payable_vat),
+    name: r.label,
+    'Đầu Ra': r.output_vat,
+    'Đầu Vào': r.input_vat,
+    'Phải Nộp': r.payable_vat,
   })) ?? [];
 
-  const plChartData = chart?.invoiceTrend.map((r) => ({
-    name: `T${r.month}/${String(r.year).slice(2)}`,
-    'Doanh Thu': Number(r.output_total),
-    'Chi Phí': Number(r.input_total),
-    'Lãi Gộp': Number(r.output_total) - Number(r.input_total),
+  const smePlChartData = chart?.invoiceTrend.map((r) => ({
+    name: r.label,
+    'Doanh Thu': r.output_total,
+    'Chi Phí': r.input_total,
+    'Lãi Gộp': r.gross_profit,
   })) ?? [];
 
-  /* VAT quarterly grouping */
-  const vatQuarterlyData = (() => {
-    if (!chart?.vatTrend.length) return [] as typeof vatChartData;
-    const qMap: Record<string, { name: string; 'Đầu Ra': number; 'Đầu Vào': number; 'Phải Nộp': number }> = {};
-    chart.vatTrend.forEach((r) => {
-      const q = Math.ceil(r.period_month / 3);
-      const key = `Q${q}/${String(r.period_year).slice(2)}`;
-      if (!qMap[key]) qMap[key] = { name: key, 'Đầu Ra': 0, 'Đầu Vào': 0, 'Phải Nộp': 0 };
-      qMap[key]['Đầu Ra']   += Number(r.output_vat);
-      qMap[key]['Đầu Vào']  += Number(r.input_vat);
-      qMap[key]['Phải Nộp'] += Number(r.payable_vat);
-    });
-    return Object.values(qMap);
-  })();
+  const hkdPlChartData = hkdChart?.invoiceTrend.map((r) => ({
+    name: r.label,
+    'Doanh Thu': r.output_total,
+    'Chi Phí': r.input_total,
+    'Lãi Gộp': r.gross_profit,
+  })) ?? [];
 
-  /* Filter chart data to selected period */
-  const filteredVatMonthly = vatViewMode === 'monthly'
-    ? vatChartData.filter(d => d.name === `T${periodMonth}/${String(periodYear).slice(2)}`)
-    : vatViewMode === 'quarterly'
-    ? vatQuarterlyData.filter(d => d.name === `Q${quarterOf(periodMonth)}/${String(periodYear).slice(2)}`)
-    : vatChartData.filter(d => d.name.endsWith(`/${String(periodYear).slice(2)}`));
-
-  /* Always show at least the full chart for context */
-  const activeVatData = vatViewMode === 'yearly'
-    ? vatChartData.filter(d => d.name.endsWith(`/${String(periodYear).slice(2)}`))
-    : vatViewMode === 'quarterly'
-    ? vatQuarterlyData
-    : vatChartData;
-
-  const plChartFiltered = vatViewMode === 'yearly'
-    ? plChartData.filter(d => d.name.endsWith(`/${String(periodYear).slice(2)}`))
-    : plChartData;
+  const chartWindowSize = vatViewMode === 'yearly' ? 2 : 1;
+  const visibleVatChartData = vatChartData.slice(-chartWindowSize);
+  const visibleSmePlChartData = smePlChartData.slice(-chartWindowSize);
+  const visibleHkdPlChartData = hkdPlChartData.slice(-chartWindowSize);
 
   if (loading) {
     return (
@@ -327,9 +334,25 @@ export default function DashboardPage() {
   };
 
   /* Prev period label for carry forward */
-  const prevMonth = periodMonth === 1 ? 12 : periodMonth - 1;
-  const prevYear  = periodMonth === 1 ? periodYear - 1 : periodYear;
-  const prevLabel = `T${prevMonth}/${prevYear}`;
+  const prevLabel = (() => {
+    if (vatViewMode === 'yearly') {
+      return `Năm ${periodYear - 1}`;
+    }
+
+    if (vatViewMode === 'quarterly') {
+      let prevQuarter = quarterOf(periodMonth) - 1;
+      let prevYear = periodYear;
+      if (prevQuarter === 0) {
+        prevQuarter = 4;
+        prevYear -= 1;
+      }
+      return `Q${prevQuarter}/${String(prevYear).slice(-2)}`;
+    }
+
+    const prevMonth = periodMonth === 1 ? 12 : periodMonth - 1;
+    const prevYear = periodMonth === 1 ? periodYear - 1 : periodYear;
+    return `T${prevMonth}/${String(prevYear).slice(-2)}`;
+  })();
 
   /* Tax deadlines for calendar */
   const calendarDeadlines = kpi?.tax_deadlines ?? hkdKpi?.tax_deadlines ?? [];
@@ -342,7 +365,7 @@ export default function DashboardPage() {
           <h1 className="text-2xl font-bold text-gray-900">Tổng Quan</h1>
         </div>
         <button
-          onClick={() => void (isHousehold ? loadHkd() : load())}
+          onClick={() => void (isHousehold ? loadHkd() : loadEnterprise())}
           className="text-xs text-gray-400 hover:text-gray-700"
           title="Làm mới"
         >
@@ -439,7 +462,7 @@ export default function DashboardPage() {
               ? `${compact(kpi.carry_forward_vat)} ₫`
               : '—'}
             sub={kpi.carry_forward_vat && kpi.carry_forward_vat > 0
-              ? `CT43 từ ${prevLabel}`
+              ? `CT43 từ ${kpi.carry_forward_source_label ?? prevLabel}`
               : 'Chưa có tờ khai kỳ trước'}
             color="text-green-600"
             badge="Kỳ trước"
@@ -450,7 +473,7 @@ export default function DashboardPage() {
             value={kpi.vat?.deductible_vat != null
               ? `${compact(kpi.vat.deductible_vat)} ₫`
               : '—'}
-            sub="Đầu vào hợp lệ (trừ TM >20Tr)"
+            sub="Đầu vào đủ điều kiện khấu trừ theo 01/GTGT"
             color="text-blue-600"
             badge="Tạm tính"
             badgeColor="bg-orange-50 text-orange-500"
@@ -522,11 +545,11 @@ export default function DashboardPage() {
       {/* ── HKD: Revenue chart + Profit ── */}
       {isHousehold && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          {plChartFiltered.length > 0 && (
+          {visibleHkdPlChartData.length > 0 && (
             <div className="bg-white rounded-xl shadow-sm p-4">
               <h2 className="text-sm font-semibold text-gray-700 mb-3">📊 Doanh Thu / Chi Phí / Lãi Gộp</h2>
               <ResponsiveContainer width="100%" height={200}>
-                <ComposedChart data={plChartFiltered} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
+                <ComposedChart data={visibleHkdPlChartData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
                   <XAxis dataKey="name" tick={{ fontSize: 10 }} />
                   <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v)} />
@@ -571,11 +594,11 @@ export default function DashboardPage() {
       {/* ── DN Charts grid ── */}
       {!isHousehold && <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {/* VAT Trend */}
-        {vatChartData.length > 0 && (
+        {visibleVatChartData.length > 0 && (
           <div className="bg-white rounded-xl shadow-sm p-4">
             <h2 className="text-sm font-semibold text-gray-700 mb-3">Biến Động Thuế GTGT</h2>
             <ResponsiveContainer width="100%" height={200}>
-              <BarChart data={vatChartData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
+              <BarChart data={visibleVatChartData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
                 <XAxis dataKey="name" tick={{ fontSize: 10 }} />
                 <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v)} />
@@ -590,12 +613,12 @@ export default function DashboardPage() {
         )}
 
         {/* P&L chart */}
-        {plChartFiltered.length > 0 && (
+        {visibleSmePlChartData.length > 0 && (
           <div className="bg-white rounded-xl shadow-sm p-4">
             <h2 className="text-sm font-semibold text-gray-700 mb-1">📊 Lãi / Lỗ Tạm Thời</h2>
             <p className="text-xs text-gray-400 mb-3">Doanh thu bán ra − chi phí mua vào (chưa trừ thuế, lương, khấu hao)</p>
             <ResponsiveContainer width="100%" height={200}>
-              <ComposedChart data={plChartFiltered} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
+              <ComposedChart data={visibleSmePlChartData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
                 <XAxis dataKey="name" tick={{ fontSize: 10 }} />
                 <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v)} />
@@ -611,11 +634,11 @@ export default function DashboardPage() {
       </div>}
 
       {/* ── VAT Payable Chart (DN only) — 1 bộ chọn duy nhất ở period nav bar ── */}
-      {!isHousehold && activeVatData.length > 0 && (
+      {!isHousehold && visibleVatChartData.length > 0 && (
         <div className="bg-white rounded-xl shadow-sm p-4">
           <h2 className="text-sm font-semibold text-gray-700 mb-3">💰 Thuế GTGT Phải Nộp</h2>
           <ResponsiveContainer width="100%" height={200}>
-            <BarChart data={activeVatData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
+            <BarChart data={visibleVatChartData} margin={{ top: 0, right: 4, left: 0, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
               <XAxis dataKey="name" tick={{ fontSize: 10 }} />
               <YAxis tick={{ fontSize: 10 }} width={52} tickFormatter={(v: number) => formatVNDShort(v)} />
@@ -753,15 +776,19 @@ export default function DashboardPage() {
         const dueVN   = Math.floor((deadlineUTC.getTime() + VN_OFFSET_MS) / 86_400_000);
         const daysToDeadline = dueVN - todayVN;
         const currentPayable = kpi?.vat ? Number(kpi.vat.payable_vat) : 0;
+        const forecastAmount = Math.abs(forecast.display_amount ?? forecast.net_forecast);
+        const forecastSummaryLabel = forecast.direction === 'payable' ? 'Dự kiến phải nộp' : 'Dự kiến được khấu trừ';
+        const forecastSummaryColor = forecast.direction === 'payable' ? 'text-amber-700' : 'text-green-700';
+        const forecastBarColor = forecast.direction === 'payable' ? 'bg-amber-400' : 'bg-green-400';
         return (
           <div className="bg-white rounded-xl shadow-sm p-4 space-y-4">
             <h2 className="text-sm font-semibold text-gray-700">📈 Dự Báo Thuế GTGT Kỳ Sau</h2>
             <div className="space-y-2">
               {[
                 { label: 'Kỳ này (tạm tính)', val: currentPayable, color: 'bg-blue-400' },
-                { label: 'Dự báo kỳ sau', val: forecast.net_forecast, color: 'bg-amber-400' },
+                { label: 'Dự báo kỳ sau', val: forecastAmount, color: forecastBarColor },
               ].map((row) => {
-                const max = Math.max(currentPayable, forecast.net_forecast, 1);
+                const max = Math.max(currentPayable, forecastAmount, 1);
                 return (
                   <div key={row.label} className="flex items-center gap-3">
                     <span className="text-xs text-gray-500 w-36 shrink-0">{row.label}</span>
@@ -786,8 +813,8 @@ export default function DashboardPage() {
                   </span>
                 </div>
                 <div className="flex items-center justify-between text-sm">
-                  <span className="text-gray-600">Dự kiến phải nộp</span>
-                  <span className="font-semibold text-amber-700">{compact(forecast.net_forecast)}₫</span>
+                  <span className="text-gray-600">{forecastSummaryLabel}</span>
+                  <span className={`font-semibold ${forecastSummaryColor}`}>{compact(forecastAmount)}₫</span>
                 </div>
                 {forecast.carry_forward > 0 && (
                   <div className="flex items-center justify-between text-sm">

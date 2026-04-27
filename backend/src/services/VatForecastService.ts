@@ -1,4 +1,6 @@
 import { pool } from '../db/pool';
+import { buildTrailingDashboardBuckets } from '../utils/dashboardBuckets';
+import type { PeriodType } from '../utils/period';
 
 export interface VatForecast {
   forecast_output_vat: number;
@@ -6,58 +8,25 @@ export interface VatForecast {
   forecast_payable: number;
   carry_forward: number;
   net_forecast: number;
+  display_amount: number;
+  direction: 'payable' | 'deductible';
   periods_used: number;
   confidence_note: string;
 }
 
 export class VatForecastService {
-  async forecastNextPeriod(companyId: string): Promise<VatForecast> {
+  async forecastNextPeriod(
+    companyId: string,
+    options?: { periodType?: PeriodType; year?: number; month?: number; quarter?: number },
+  ): Promise<VatForecast> {
     const now = new Date();
-    // Build last 3 period (month, year) pairs going backwards from current month
-    const periods: [number, number][] = [];
-    for (let i = 1; i <= 3; i++) {
-      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-      periods.push([d.getMonth() + 1, d.getFullYear()]);
-    }
-
-    // Fetch ct40a (output VAT), deductible input VAT, and ct43 (carry-forward) for each period
-    const { rows } = await pool.query<{
-      period_month: number;
-      period_year: number;
-      ct40a: string;
-      deductible_input: string;
-      ct43: string;
-    }>(
-      `SELECT
-         period_month,
-         period_year,
-         COALESCE(output_vat, 0)::numeric                               AS ct40a,
-         COALESCE(input_vat, 0)::numeric                                AS deductible_input,
-         COALESCE(GREATEST(0, input_vat - output_vat), 0)::numeric      AS ct43
-       FROM vat_reconciliations
-       WHERE company_id = $1
-         AND (period_month, period_year) IN (
-           ($2,$3), ($4,$5), ($6,$7)
-         )
-       ORDER BY period_year DESC, period_month DESC`,
-      [
-        companyId,
-        periods[0][0], periods[0][1],
-        periods[1][0], periods[1][1],
-        periods[2][0], periods[2][1],
-      ],
-    );
-
+    const periodType = options?.periodType ?? 'monthly';
+    const year = options?.year ?? now.getFullYear();
+    const month = options?.month ?? now.getMonth() + 1;
+    const quarter = options?.quarter ?? Math.ceil(month / 3);
     const weights = [0.5, 0.3, 0.2];
-    // Map rows to matched period slots (rows may be < 3 if data is missing)
-    const periodMap = new Map<string, { ct40a: number; deductible_input: number; ct43: number }>();
-    for (const r of rows) {
-      periodMap.set(`${r.period_month}-${r.period_year}`, {
-        ct40a: Number(r.ct40a),
-        deductible_input: Number(r.deductible_input),
-        ct43: Number(r.ct43),
-      });
-    }
+    const historyBuckets = buildTrailingDashboardBuckets(periodType, { year, month, quarter }, 3);
+    const newestFirstBuckets = [...historyBuckets].reverse();
 
     let weightedOutput = 0;
     let weightedInput = 0;
@@ -65,16 +34,114 @@ export class VatForecastService {
     let periodsUsed = 0;
     let carryForward = 0;
 
-    for (let i = 0; i < 3; i++) {
-      const key = `${periods[i][0]}-${periods[i][1]}`;
-      const p = periodMap.get(key);
-      if (p) {
-        weightedOutput += p.ct40a * weights[i];
-        weightedInput += p.deductible_input * weights[i];
-        totalWeight += weights[i];
-        periodsUsed++;
-        // carry-forward taken from most recent available
-        if (i === 0) carryForward = p.ct43;
+    if (periodType === 'yearly') {
+      const targetYears = historyBuckets.map((bucket) => bucket.year);
+      const { rows } = await pool.query<{
+        period_month: number;
+        period_year: number;
+        period_type: 'monthly' | 'quarterly';
+        ct40a: string;
+        deductible_input: string;
+        ct43: string;
+      }>(
+        `SELECT
+           period_month,
+           period_year,
+           period_type,
+           COALESCE(ct40a_total_output_vat, 0)::numeric AS ct40a,
+           COALESCE(ct23_deductible_input_vat, 0)::numeric AS deductible_input,
+           COALESCE(ct43_carry_forward_vat, 0)::numeric AS ct43
+         FROM tax_declarations
+         WHERE company_id = $1
+           AND form_type = '01/GTGT'
+           AND period_year = ANY($2::int[])
+           AND period_type IN ('monthly', 'quarterly')`,
+        [companyId, targetYears],
+      );
+
+      for (let index = 0; index < newestFirstBuckets.length; index++) {
+        const bucket = newestFirstBuckets[index]!;
+        const yearRows = rows.filter((row) => row.period_year === bucket.year);
+        const sourceRows = yearRows.some((row) => row.period_type === 'quarterly')
+          ? yearRows.filter((row) => row.period_type === 'quarterly')
+          : yearRows.filter((row) => row.period_type === 'monthly');
+
+        if (sourceRows.length === 0) {
+          continue;
+        }
+
+        const output = sourceRows.reduce((sum, row) => sum + Number(row.ct40a), 0);
+        const input = sourceRows.reduce((sum, row) => sum + Number(row.deductible_input), 0);
+
+        weightedOutput += output * weights[index]!;
+        weightedInput += input * weights[index]!;
+        totalWeight += weights[index]!;
+        periodsUsed += 1;
+
+        if (index === 0) {
+          const carryForwardRow = sourceRows.some((row) => row.period_type === 'quarterly')
+            ? sourceRows.find((row) => row.period_type === 'quarterly' && row.period_month === 4)
+            : sourceRows.find((row) => row.period_type === 'monthly' && row.period_month === 12);
+
+          carryForward = Number(carryForwardRow?.ct43 ?? 0);
+        }
+      }
+    } else {
+      const targetYears = [...new Set(historyBuckets.map((bucket) => bucket.year))];
+      const targetKeys = new Set(historyBuckets.map((bucket) => bucket.key));
+      const { rows } = await pool.query<{
+        period_month: number;
+        period_year: number;
+        ct40a: string;
+        deductible_input: string;
+        ct43: string;
+      }>(
+        `SELECT
+           period_month,
+           period_year,
+           COALESCE(ct40a_total_output_vat, 0)::numeric AS ct40a,
+           COALESCE(ct23_deductible_input_vat, 0)::numeric AS deductible_input,
+           COALESCE(ct43_carry_forward_vat, 0)::numeric AS ct43
+         FROM tax_declarations
+         WHERE company_id = $1
+           AND form_type = '01/GTGT'
+           AND period_type = $2
+           AND period_year = ANY($3::int[])`,
+        [companyId, periodType, targetYears],
+      );
+
+      const periodMap = new Map<string, { ct40a: number; deductible_input: number; ct43: number }>();
+      for (const row of rows) {
+        const key = periodType === 'monthly'
+          ? `${row.period_year}-${String(row.period_month).padStart(2, '0')}`
+          : `${row.period_year}-Q${row.period_month}`;
+
+        if (!targetKeys.has(key)) {
+          continue;
+        }
+
+        periodMap.set(key, {
+          ct40a: Number(row.ct40a),
+          deductible_input: Number(row.deductible_input),
+          ct43: Number(row.ct43),
+        });
+      }
+
+      for (let index = 0; index < newestFirstBuckets.length; index++) {
+        const bucket = newestFirstBuckets[index]!;
+        const point = periodMap.get(bucket.key);
+        if (!point) {
+          continue;
+        }
+
+        weightedOutput += point.ct40a * weights[index]!;
+        weightedInput += point.deductible_input * weights[index]!;
+        totalWeight += weights[index]!;
+        periodsUsed += 1;
+
+        if (index === 0) {
+          carryForward = point.ct43;
+        }
       }
     }
 
@@ -85,16 +152,17 @@ export class VatForecastService {
         forecast_payable: 0,
         carry_forward: 0,
         net_forecast: 0,
+        display_amount: 0,
+        direction: 'deductible',
         periods_used: 0,
         confidence_note: 'Dự báo dựa trên 3 kỳ gần nhất. Độ chính xác cao hơn khi dữ liệu đầy đủ.',
       };
     }
 
-    // Normalise if fewer than 3 periods (avoid bias)
     const forecastOutput = totalWeight > 0 ? weightedOutput / totalWeight : 0;
     const forecastInput = totalWeight > 0 ? weightedInput / totalWeight : 0;
     const forecastPayable = Math.max(0, forecastOutput - forecastInput);
-    const netForecast = Math.max(0, forecastPayable - carryForward);
+    const netForecast = forecastOutput - forecastInput - carryForward;
 
     return {
       forecast_output_vat: Math.round(forecastOutput),
@@ -102,6 +170,8 @@ export class VatForecastService {
       forecast_payable: Math.round(forecastPayable),
       carry_forward: Math.round(carryForward),
       net_forecast: Math.round(netForecast),
+      display_amount: Math.round(Math.abs(netForecast)),
+      direction: netForecast > 0 ? 'payable' : 'deductible',
       periods_used: periodsUsed,
       confidence_note: 'Dự báo dựa trên 3 kỳ gần nhất. Độ chính xác cao hơn khi dữ liệu đầy đủ.',
     };
