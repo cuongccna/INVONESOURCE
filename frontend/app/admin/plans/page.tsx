@@ -71,11 +71,21 @@ export default function AdminPlansPage() {
   const [form, setForm]         = useState<FormState>(BLANK);
   const [saving, setSaving]     = useState(false);
   const [err, setErr]           = useState('');
+  const [loading, setLoading]   = useState(true);
+  const [loadErr, setLoadErr]   = useState('');
 
   const load = useCallback(() => {
+    setLoading(true);
+    setLoadErr('');
     apiClient.get<{ data: Plan[] }>('/admin/plans')
-      .then(r => setPlans(r.data.data))
-      .catch(console.error);
+      .then(r => setPlans(r.data.data ?? []))
+      .catch((e: unknown) => {
+        const msg = (e as { response?: { data?: { error?: { message?: string } } } })
+          ?.response?.data?.error?.message
+          ?? (e instanceof Error ? e.message : 'Không thể tải danh sách gói dịch vụ');
+        setLoadErr(msg);
+      })
+      .finally(() => setLoading(false));
   }, []);
 
   useEffect(() => { load(); }, [load]);
@@ -173,6 +183,21 @@ export default function AdminPlansPage() {
         </div>
       )}
 
+      {/* Load error banner */}
+      {loadErr && (
+        <div className="bg-red-50 border border-red-200 rounded-xl px-4 py-3 flex items-center justify-between">
+          <p className="text-sm text-red-700">
+            <span className="font-semibold">Lỗi tải dữ liệu:</span> {loadErr}
+          </p>
+          <button
+            onClick={load}
+            className="ml-4 text-sm text-red-600 underline hover:text-red-800 shrink-0"
+          >
+            Thử lại
+          </button>
+        </div>
+      )}
+
       {/* Table */}
       <div className="bg-white rounded-xl border border-gray-200 overflow-x-auto">
         <table className="w-full text-sm min-w-[600px]">
@@ -184,9 +209,23 @@ export default function AdminPlansPage() {
             </tr>
           </thead>
           <tbody>
-            {plans.map(p => (
-              <PlanRow key={p.id} plan={p} onToggle={toggleActive} onEdit={openEdit} />
-            ))}
+            {loading ? (
+              <tr>
+                <td colSpan={6} className="px-4 py-8 text-center text-gray-400 text-sm">
+                  Đang tải…
+                </td>
+              </tr>
+            ) : plans.length === 0 && !loadErr ? (
+              <tr>
+                <td colSpan={6} className="px-4 py-8 text-center text-gray-400 text-sm">
+                  Chưa có gói nào. Nhấn &quot;+ Tạo gói mới&quot; để bắt đầu.
+                </td>
+              </tr>
+            ) : (
+              plans.map(p => (
+                <PlanRow key={p.id} plan={p} onToggle={toggleActive} onEdit={openEdit} />
+              ))
+            )}
           </tbody>
         </table>
       </div>

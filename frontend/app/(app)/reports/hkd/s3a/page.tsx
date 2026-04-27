@@ -5,7 +5,9 @@ import { useRouter } from 'next/navigation';
 import { useCompany } from '../../../../../contexts/CompanyContext';
 import { downloadExcel } from '../../../../../lib/downloadExcel';
 
+type PeriodType = 'month' | 'quarter';
 const YEARS    = Array.from({ length: 5 }, (_, i) => new Date().getFullYear() - i);
+const MONTHS   = Array.from({ length: 12 }, (_, i) => i + 1);
 const QUARTERS = [1, 2, 3, 4];
 
 // S3a is a manual-entry ledger for other tax types (import/export duties,
@@ -13,17 +15,19 @@ const QUARTERS = [1, 2, 3, 4];
 // The form is generated blank for manual completion per TT152/2025 Mẫu S3a-HKD.
 
 const TAX_TYPES = [
-  { key: 'xnk',   label: 'Thuế xuất nhập khẩu',          col: 7 },
-  { key: 'ttdb',  label: 'Thuế tiêu thụ đặc biệt',       col: 7 },
-  { key: 'bvmt',  label: 'Thuế bảo vệ môi trường',        col: 10 },
-  { key: 'tn',    label: 'Thuế tài nguyên',               col: 11 },
-  { key: 'dat',   label: 'Thuế sử dụng đất phi nông nghiệp', col: 12 },
+  { key: 'xnk',   label: 'Thuế xuất nhập khẩu',                  col: 7 },
+  { key: 'ttdb',  label: 'Thuế tiêu thụ đặc biệt',               col: 7 },
+  { key: 'bvmt',  label: 'Thuế bảo vệ môi trường',                col: 10 },
+  { key: 'tn',    label: 'Thuế tài nguyên',                       col: 11 },
+  { key: 'dat',   label: 'Thuế sử dụng đất phi nông nghiệp',      col: 12 },
 ];
 
 export default function S3aPage() {
   const { activeCompany } = useCompany();
   const router = useRouter();
   const now = new Date();
+  const [periodType, setPeriodType] = useState<PeriodType>('month');
+  const [month, setMonth]     = useState(() => now.getMonth() + 1);
   const [quarter, setQuarter] = useState(() => Math.ceil((now.getMonth() + 1) / 3));
   const [year, setYear]       = useState(() => now.getFullYear());
 
@@ -31,8 +35,16 @@ export default function S3aPage() {
     if (activeCompany && activeCompany.company_type !== 'household') router.replace('/dashboard');
   }, [activeCompany, router]);
 
-  const sm = (quarter - 1) * 3 + 1;
-  const em = sm + 2;
+  const periodLabelStr = periodType === 'month'
+    ? `Tháng ${month}/${year}`
+    : `Quý ${quarter}/${year}`;
+
+  const fileTag = periodType === 'month' ? `T${month}_${year}` : `Q${quarter}_${year}`;
+
+  const handleExcel = () => {
+    const qs = periodType === 'month' ? `month=${month}&year=${year}` : `quarter=${quarter}&year=${year}`;
+    downloadExcel(`/hkd-reports/s3a/excel?${qs}`, `S3a-HKD_${fileTag}.xlsx`);
+  };
 
   return (
     <div className="max-w-7xl mx-auto px-4 py-6 space-y-4">
@@ -41,10 +53,8 @@ export default function S3aPage() {
           <h1 className="text-lg font-bold text-gray-900">Mẫu số S3a-HKD</h1>
           <p className="text-sm text-gray-500">SỔ THEO DÕI NGHĨA VỤ THUẾ KHÁC</p>
         </div>
-        <button
-          onClick={() => downloadExcel(`/hkd-reports/s3a/excel?quarter=${quarter}&year=${year}`, `S3a-HKD_Q${quarter}_${year}.xlsx`)}
-          className="inline-flex items-center gap-1.5 px-3 py-2 bg-green-600 text-white text-sm rounded-lg hover:bg-green-700 transition-colors"
-        >
+        <button onClick={handleExcel}
+          className="inline-flex items-center gap-1.5 px-3 py-2 bg-green-600 text-white text-sm rounded-lg hover:bg-green-700 transition-colors">
           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
           </svg>
@@ -52,13 +62,29 @@ export default function S3aPage() {
         </button>
       </div>
 
-      <div className="flex flex-wrap gap-3 bg-gray-50 rounded-xl p-3">
-        <div className="flex items-center gap-2">
-          <label className="text-sm text-gray-600 font-medium">Quý</label>
-          <select value={quarter} onChange={(e) => setQuarter(Number(e.target.value))} className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm">
-            {QUARTERS.map((q) => <option key={q} value={q}>Quý {q}</option>)}
-          </select>
+      {/* Period selector */}
+      <div className="flex flex-wrap gap-3 items-center bg-gray-50 rounded-xl p-3">
+        <div className="flex rounded-lg border border-gray-300 overflow-hidden text-sm">
+          <button onClick={() => setPeriodType('month')}
+            className={`px-3 py-1.5 ${periodType === 'month' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}>Tháng</button>
+          <button onClick={() => setPeriodType('quarter')}
+            className={`px-3 py-1.5 ${periodType === 'quarter' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}>Quý</button>
         </div>
+        {periodType === 'month' ? (
+          <div className="flex items-center gap-2">
+            <label className="text-sm text-gray-600 font-medium">Tháng</label>
+            <select value={month} onChange={(e) => setMonth(Number(e.target.value))} className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm">
+              {MONTHS.map((m) => <option key={m} value={m}>Tháng {m}</option>)}
+            </select>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2">
+            <label className="text-sm text-gray-600 font-medium">Quý</label>
+            <select value={quarter} onChange={(e) => setQuarter(Number(e.target.value))} className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm">
+              {QUARTERS.map((q) => <option key={q} value={q}>Quý {q}</option>)}
+            </select>
+          </div>
+        )}
         <div className="flex items-center gap-2">
           <label className="text-sm text-gray-600 font-medium">Năm</label>
           <select value={year} onChange={(e) => setYear(Number(e.target.value))} className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm">
@@ -89,9 +115,7 @@ export default function S3aPage() {
               <p className="text-xs text-gray-500">MST: {activeCompany.tax_code}</p>
             </>
           )}
-          <p className="text-xs text-gray-500 mt-0.5">
-            Kỳ kê khai: Quý {quarter}/{year} (T{sm}/{year} – T{em}/{year})
-          </p>
+          <p className="text-xs text-gray-500 mt-0.5">Kỳ kê khai: {periodLabelStr}</p>
         </div>
 
         <div className="overflow-x-auto">

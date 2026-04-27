@@ -9,7 +9,7 @@ import { downloadExcel } from '../../../../../lib/downloadExcel';
 interface S2Row { invoice_number: string; invoice_date: string; description: string; amount: number; }
 interface S2bData {
   company: { name: string; tax_code: string; address: string | null };
-  period: { quarter: number; year: number; start_month: number; end_month: number };
+  period: { quarter?: number; month?: number; year: number };
   industry_group: number;
   vat_rate: number;
   industry_label: string;
@@ -18,13 +18,21 @@ interface S2bData {
   vat_total: number;
 }
 
+type PeriodType = 'month' | 'quarter';
 const YEARS    = Array.from({ length: 5 }, (_, i) => new Date().getFullYear() - i);
+const MONTHS   = Array.from({ length: 12 }, (_, i) => i + 1);
 const QUARTERS = [1, 2, 3, 4];
+
+function periodLabel(p: { quarter?: number; month?: number; year: number }) {
+  return p.quarter ? `Quý ${p.quarter}/${p.year}` : `Tháng ${p.month}/${p.year}`;
+}
 
 export default function S2bPage() {
   const { activeCompany } = useCompany();
   const router = useRouter();
   const now = new Date();
+  const [periodType, setPeriodType] = useState<PeriodType>('month');
+  const [month, setMonth]     = useState(() => now.getMonth() + 1);
   const [quarter, setQuarter] = useState(() => Math.ceil((now.getMonth() + 1) / 3));
   const [year, setYear]       = useState(() => now.getFullYear());
   const [data, setData]       = useState<S2bData | null>(null);
@@ -35,18 +43,26 @@ export default function S2bPage() {
     if (activeCompany && activeCompany.company_type !== 'household') router.replace('/dashboard');
   }, [activeCompany, router]);
 
+  const fileTag = periodType === 'month' ? `T${month}_${year}` : `Q${quarter}_${year}`;
+
   const fetchData = useCallback(async () => {
     setLoading(true); setError(null);
     try {
-      const res = await api.get('/hkd-reports/s2b', { params: { quarter, year } });
+      const params = periodType === 'month' ? { month, year } : { quarter, year };
+      const res = await api.get('/hkd-reports/s2b', { params });
       setData(res.data.data);
     } catch (e: unknown) { setError(e instanceof Error ? e.message : 'Lỗi tải dữ liệu'); }
     finally { setLoading(false); }
-  }, [quarter, year]);
+  }, [periodType, month, quarter, year]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
   const fmt = (n: number) => n.toLocaleString('vi-VN');
+
+  const handleExcel = () => {
+    const qs = periodType === 'month' ? `month=${month}&year=${year}` : `quarter=${quarter}&year=${year}`;
+    downloadExcel(`/hkd-reports/s2b/excel?${qs}`, `S2b-HKD_${fileTag}.xlsx`);
+  };
 
   return (
     <div className="max-w-5xl mx-auto px-4 py-6 space-y-4">
@@ -55,10 +71,8 @@ export default function S2bPage() {
           <h1 className="text-lg font-bold text-gray-900">Mẫu số S2b-HKD</h1>
           <p className="text-sm text-gray-500">SỔ DOANH THU BÁN HÀNG HÓA, DỊCH VỤ (GTGT)</p>
         </div>
-        <button
-          onClick={() => downloadExcel(`/hkd-reports/s2b/excel?quarter=${quarter}&year=${year}`, `S2b-HKD_Q${quarter}_${year}.xlsx`)}
-          className="inline-flex items-center gap-1.5 px-3 py-2 bg-green-600 text-white text-sm rounded-lg hover:bg-green-700 transition-colors"
-        >
+        <button onClick={handleExcel}
+          className="inline-flex items-center gap-1.5 px-3 py-2 bg-green-600 text-white text-sm rounded-lg hover:bg-green-700 transition-colors">
           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
           </svg>
@@ -66,20 +80,36 @@ export default function S2bPage() {
         </button>
       </div>
 
-      <div className="flex flex-wrap gap-3 bg-gray-50 rounded-xl p-3">
-        <div className="flex items-center gap-2">
-          <label className="text-sm text-gray-600 font-medium">Quý</label>
-          <select value={quarter} onChange={(e) => setQuarter(Number(e.target.value))} className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm">
-            {QUARTERS.map((q) => <option key={q} value={q}>Quý {q}</option>)}
-          </select>
+      {/* Period selector */}
+      <div className="flex flex-wrap gap-3 items-center bg-gray-50 rounded-xl p-3">
+        <div className="flex rounded-lg border border-gray-300 overflow-hidden text-sm">
+          <button onClick={() => setPeriodType('month')}
+            className={`px-3 py-1.5 ${periodType === 'month' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}>Tháng</button>
+          <button onClick={() => setPeriodType('quarter')}
+            className={`px-3 py-1.5 ${periodType === 'quarter' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}>Quý</button>
         </div>
+        {periodType === 'month' ? (
+          <div className="flex items-center gap-2">
+            <label className="text-sm text-gray-600 font-medium">Tháng</label>
+            <select value={month} onChange={(e) => setMonth(Number(e.target.value))} className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm">
+              {MONTHS.map((m) => <option key={m} value={m}>Tháng {m}</option>)}
+            </select>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2">
+            <label className="text-sm text-gray-600 font-medium">Quý</label>
+            <select value={quarter} onChange={(e) => setQuarter(Number(e.target.value))} className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm">
+              {QUARTERS.map((q) => <option key={q} value={q}>Quý {q}</option>)}
+            </select>
+          </div>
+        )}
         <div className="flex items-center gap-2">
           <label className="text-sm text-gray-600 font-medium">Năm</label>
           <select value={year} onChange={(e) => setYear(Number(e.target.value))} className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm">
             {YEARS.map((y) => <option key={y} value={y}>{y}</option>)}
           </select>
         </div>
-        <button onClick={fetchData} className="px-3 py-1.5 bg-primary-600 text-white text-sm rounded-lg hover:bg-primary-700 transition-colors">Xem</button>
+        <button onClick={fetchData} className="px-3 py-1.5 bg-indigo-600 text-white text-sm rounded-lg hover:bg-indigo-700 transition-colors">Xem</button>
       </div>
 
       {error && <div className="p-3 bg-red-50 text-red-700 rounded-lg text-sm">{error}</div>}
@@ -89,12 +119,8 @@ export default function S2bPage() {
           <div className="px-4 py-3 border-b border-gray-100 bg-gray-50">
             <p className="font-semibold text-sm">{data.company.name}</p>
             <p className="text-xs text-gray-500">MST: {data.company.tax_code} | {data.company.address}</p>
-            <p className="text-xs text-gray-500 mt-0.5">
-              Kỳ kê khai: Quý {data.period.quarter}/{data.period.year}&nbsp;
-              (T{data.period.start_month}/{data.period.year} – T{data.period.end_month}/{data.period.year})
-            </p>
+            <p className="text-xs text-gray-500 mt-0.5">Kỳ kê khai: {periodLabel(data.period)}</p>
           </div>
-
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="bg-blue-50">

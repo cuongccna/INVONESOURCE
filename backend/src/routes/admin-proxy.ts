@@ -5,6 +5,11 @@
  * All routes require: authenticate → requireAdmin
  *
  * Mounted at: /api/admin/proxies
+ *
+ * Many-to-many model (since migration 048):
+ *   proxy_user_assignments_v2 (proxy_id, user_id) — one IP can be assigned to
+ *   multiple users; one user can hold multiple IPs.
+ *   The bot enforces "only assigned IPs" per user.
  */
 import { Router, Request, Response, NextFunction } from 'express';
 import * as net from 'net';
@@ -53,14 +58,28 @@ router.get('/dashboard', async (_req: Request, res: Response, next: NextFunction
   try {
     const counts = await pool.query(`
       SELECT
-        COUNT(*)                                          FILTER (WHERE status = 'active')      AS active,
-        COUNT(*)                                          FILTER (WHERE status = 'blocked')     AS blocked,
-        COUNT(*)                                          FILTER (WHERE status = 'quarantine')  AS quarantine,
-        COUNT(*)                                          FILTER (WHERE assigned_user_id IS NOT NULL AND status = 'active') AS assigned,
-        COUNT(*)                                          FILTER (WHERE assigned_user_id IS NULL AND status = 'active')     AS available,
-        COUNT(*)                                                                                AS total,
-        COUNT(*)                                          FILTER (WHERE expires_at IS NOT NULL AND expires_at < NOW())      AS expired
-      FROM static_proxies
+        COUNT(*)  FILTER (WHERE p.status = 'active')     AS active,
+        COUNT(*)  FILTER (WHERE p.status = 'blocked')    AS blocked,
+        COUNT(*)  FILTER (WHERE p.status = 'quarantine') AS quarantine,
+        COUNT(*)                                          AS total,
+        COUNT(*)  FILTER (WHERE p.expires_at IS NOT NULL AND p.expires_at < NOW()) AS expired
+      FROM static_proxies p
+    `);
+
+    // Count assigned proxies (those with at least one user in the junction table)
+    const assignedCount = await pool.query(`
+      SELECT COUNT(DISTINCT proxy_id)::int AS assigned
+      FROM proxy_user_assignments_v2
+    `);
+
+    // Count available proxies (active + not in junction table at all)
+    const availableCount = await pool.query(`
+      SELECT COUNT(*)::int AS available
+      FROM static_proxies p
+      WHERE p.status = 'active'
+        AND NOT EXISTS (
+          SELECT 1 FROM proxy_user_assignments_v2 pua WHERE pua.proxy_id = p.id
+        )
     `);
 
     const row = counts.rows[0];
@@ -69,8 +88,8 @@ router.get('/dashboard', async (_req: Request, res: Response, next: NextFunction
       active:     parseInt(row.active, 10),
       blocked:    parseInt(row.blocked, 10),
       quarantine: parseInt(row.quarantine, 10),
-      assigned:   parseInt(row.assigned, 10),
-      available:  parseInt(row.available, 10),
+      assigned:   assignedCount.rows[0]!.assigned,
+      available:  availableCount.rows[0]!.available,
       expired:    parseInt(row.expired, 10),
     });
   } catch (err) { next(err); }
@@ -83,10 +102,21 @@ router.get('/', async (_req: Request, res: Response, next: NextFunction) => {
     const result = await pool.query(`
       SELECT
         p.*,
-        u.email  AS assigned_user_email,
-        u.full_name AS assigned_user_name
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'user_id',  u.id,
+              'email',    u.email,
+              'name',     u.full_name,
+              'assigned_at', pua.assigned_at
+            )
+          ) FILTER (WHERE u.id IS NOT NULL),
+          '[]'::json
+        ) AS assigned_users
       FROM static_proxies p
-      LEFT JOIN users u ON p.assigned_user_id = u.id
+      LEFT JOIN proxy_user_assignments_v2 pua ON pua.proxy_id = p.id
+      LEFT JOIN users u ON u.id = pua.user_id
+      GROUP BY p.id
       ORDER BY p.created_at DESC
     `);
     sendSuccess(res, result.rows);
@@ -104,7 +134,7 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
        RETURNING *`,
       [data.host, data.port, data.protocol, data.username, data.password, data.label, data.country, data.expires_at ?? null],
     );
-    sendSuccess(res, result.rows[0], undefined, 201);
+    sendSuccess(res, { ...result.rows[0], assigned_users: [] }, undefined, 201);
   } catch (err) {
     if (err instanceof z.ZodError) return next(new ValidationError(err.errors.map(e => e.message).join(', ')));
     next(err);
@@ -124,7 +154,7 @@ router.post('/bulk', async (req: Request, res: Response, next: NextFunction) => 
          RETURNING *`,
         [data.host, data.port, data.protocol, data.username, data.password, data.label, data.country, data.expires_at ?? null],
       );
-      created.push(result.rows[0]);
+      created.push({ ...result.rows[0], assigned_users: [] });
     }
     sendSuccess(res, { created: created.length, proxies: created }, undefined, 201);
   } catch (err) {
@@ -178,7 +208,9 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction) =>
   } catch (err) { next(err); }
 });
 
-// ── Assign Proxy to User ─────────────────────────────────────────────────────
+// ── Assign Proxy to User ──────────────────────────────────────────────────────
+// Many-to-many: a proxy can be assigned to multiple users simultaneously.
+// No auto-release of existing assignments.
 
 router.post('/:id/assign', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -188,23 +220,20 @@ router.post('/:id/assign', async (req: Request, res: Response, next: NextFunctio
       reason:     z.string().max(500).optional(),
     }).parse(req.body);
 
-    // Release any existing proxy for this user first
+    // Verify the proxy exists and is active
+    const proxyCheck = await pool.query(
+      `SELECT id FROM static_proxies WHERE id = $1 AND status = 'active'`,
+      [req.params.id],
+    );
+    if (proxyCheck.rowCount === 0) throw new NotFoundError('Proxy not found or not active');
+
+    // Insert into junction table (idempotent — ON CONFLICT DO NOTHING)
     await pool.query(
-      `UPDATE static_proxies
-       SET assigned_user_id = NULL, assigned_at = NULL
-       WHERE assigned_user_id = $1`,
-      [user_id],
+      `INSERT INTO proxy_user_assignments_v2 (proxy_id, user_id, assigned_by)
+       VALUES ($1, $2, $3)
+       ON CONFLICT DO NOTHING`,
+      [req.params.id, user_id, req.user?.userId ?? null],
     );
-
-    const result = await pool.query(
-      `UPDATE static_proxies
-       SET assigned_user_id = $1, assigned_at = NOW()
-       WHERE id = $2 AND status = 'active'
-       RETURNING *`,
-      [user_id, req.params.id],
-    );
-
-    if (result.rowCount === 0) throw new NotFoundError('Proxy not found or not active');
 
     // Audit log
     await pool.query(
@@ -213,47 +242,112 @@ router.post('/:id/assign', async (req: Request, res: Response, next: NextFunctio
       [req.params.id, user_id, company_id ?? null, reason ?? null],
     );
 
-    sendSuccess(res, result.rows[0]);
+    // Return the updated proxy with all assigned users
+    const updated = await pool.query(`
+      SELECT
+        p.*,
+        COALESCE(
+          json_agg(json_build_object('user_id', u.id, 'email', u.email, 'name', u.full_name, 'assigned_at', pua.assigned_at))
+          FILTER (WHERE u.id IS NOT NULL),
+          '[]'::json
+        ) AS assigned_users
+      FROM static_proxies p
+      LEFT JOIN proxy_user_assignments_v2 pua ON pua.proxy_id = p.id
+      LEFT JOIN users u ON u.id = pua.user_id
+      WHERE p.id = $1
+      GROUP BY p.id
+    `, [req.params.id]);
+
+    sendSuccess(res, updated.rows[0]);
   } catch (err) {
     if (err instanceof z.ZodError) return next(new ValidationError(err.errors.map(e => e.message).join(', ')));
     next(err);
   }
 });
 
-// ── Release Proxy from User ───────────────────────────────────────────────────
+// ── Release Proxy from a specific User ───────────────────────────────────────
+// user_id is required — admin must specify which user to release.
+// To release all users, call this once per user or use /release-all.
 
 router.post('/:id/release', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { user_id, reason } = z.object({
+      user_id: z.string().uuid(),
+      reason:  z.string().max(500).optional(),
+    }).parse(req.body);
+
+    // Verify proxy exists
+    const proxyCheck = await pool.query(`SELECT id FROM static_proxies WHERE id = $1`, [req.params.id]);
+    if (proxyCheck.rowCount === 0) throw new NotFoundError('Proxy not found');
+
+    // Remove the specific assignment
+    const del = await pool.query(
+      `DELETE FROM proxy_user_assignments_v2 WHERE proxy_id = $1 AND user_id = $2`,
+      [req.params.id, user_id],
+    );
+
+    // Audit log (only if there was actually an assignment)
+    if ((del.rowCount ?? 0) > 0) {
+      await pool.query(
+        `INSERT INTO proxy_assignments (proxy_id, user_id, action, reason)
+         VALUES ($1, $2, 'release', $3)`,
+        [req.params.id, user_id, reason ?? null],
+      );
+    }
+
+    // Return the updated proxy with remaining assigned users
+    const updated = await pool.query(`
+      SELECT
+        p.*,
+        COALESCE(
+          json_agg(json_build_object('user_id', u.id, 'email', u.email, 'name', u.full_name, 'assigned_at', pua.assigned_at))
+          FILTER (WHERE u.id IS NOT NULL),
+          '[]'::json
+        ) AS assigned_users
+      FROM static_proxies p
+      LEFT JOIN proxy_user_assignments_v2 pua ON pua.proxy_id = p.id
+      LEFT JOIN users u ON u.id = pua.user_id
+      WHERE p.id = $1
+      GROUP BY p.id
+    `, [req.params.id]);
+
+    sendSuccess(res, updated.rows[0]);
+  } catch (err) {
+    if (err instanceof z.ZodError) return next(new ValidationError(err.errors.map(e => e.message).join(', ')));
+    next(err);
+  }
+});
+
+// ── Release Proxy from ALL Users ─────────────────────────────────────────────
+
+router.post('/:id/release-all', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { reason } = z.object({
       reason: z.string().max(500).optional(),
     }).parse(req.body);
 
-    const proxy = await pool.query(
-      `SELECT assigned_user_id FROM static_proxies WHERE id = $1`,
-      [req.params.id],
-    );
-    if (proxy.rowCount === 0) throw new NotFoundError('Proxy not found');
+    const proxyCheck = await pool.query(`SELECT id FROM static_proxies WHERE id = $1`, [req.params.id]);
+    if (proxyCheck.rowCount === 0) throw new NotFoundError('Proxy not found');
 
-    const userId = proxy.rows[0].assigned_user_id;
-
-    const result = await pool.query(
-      `UPDATE static_proxies
-       SET assigned_user_id = NULL, assigned_at = NULL
-       WHERE id = $1
-       RETURNING *`,
+    // Get all users currently assigned
+    const assignments = await pool.query(
+      `SELECT user_id FROM proxy_user_assignments_v2 WHERE proxy_id = $1`,
       [req.params.id],
     );
 
-    // Audit log
-    if (userId) {
+    // Remove all assignments
+    await pool.query(`DELETE FROM proxy_user_assignments_v2 WHERE proxy_id = $1`, [req.params.id]);
+
+    // Audit log for each user
+    for (const row of assignments.rows as { user_id: string }[]) {
       await pool.query(
         `INSERT INTO proxy_assignments (proxy_id, user_id, action, reason)
          VALUES ($1, $2, 'release', $3)`,
-        [req.params.id, userId, reason ?? null],
+        [req.params.id, row.user_id, reason ?? 'Admin release-all'],
       );
     }
 
-    sendSuccess(res, result.rows[0]);
+    sendSuccess(res, { released: assignments.rowCount ?? 0 });
   } catch (err) {
     if (err instanceof z.ZodError) return next(new ValidationError(err.errors.map(e => e.message).join(', ')));
     next(err);

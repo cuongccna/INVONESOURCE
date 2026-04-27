@@ -5,6 +5,13 @@ import apiClient from '../../../lib/apiClient';
 
 /* ── Types ──────────────────────────────────────────────────────────────────── */
 
+interface AssignedUser {
+  user_id:     string;
+  email:       string;
+  name:        string | null;
+  assigned_at: string;
+}
+
 interface Proxy {
   id: string;
   host: string;
@@ -15,10 +22,7 @@ interface Proxy {
   label: string | null;
   country: string;
   status: 'active' | 'blocked' | 'quarantine';
-  assigned_user_id: string | null;
-  assigned_user_email: string | null;
-  assigned_user_name: string | null;
-  assigned_at: string | null;
+  assigned_users: AssignedUser[];   // many-to-many (migration 048)
   blocked_reason: string | null;
   blocked_at: string | null;
   last_health_check: string | null;
@@ -63,7 +67,6 @@ const STATUS_BADGE: Record<string, string> = {
 
 const VN_TZ = 'Asia/Ho_Chi_Minh';
 
-/** Format UTC ISO string → Vietnamese datetime string (UTC+7) */
 function fmtDate(d: string | null): string {
   if (!d) return '—';
   return new Date(d).toLocaleString('vi-VN', {
@@ -73,15 +76,9 @@ function fmtDate(d: string | null): string {
   });
 }
 
-/**
- * Convert UTC ISO string → value suitable for <input type="datetime-local">
- * datetime-local expects "YYYY-MM-DDTHH:mm" in LOCAL time (no timezone suffix).
- * Using Date methods gives us the browser's local time, but we force UTC+7 explicitly.
- */
 function toLocalInput(utcIso: string): string {
   if (!utcIso) return '';
   const d = new Date(utcIso);
-  // Shift to UTC+7
   const vnMs  = d.getTime() + 7 * 3_600_000;
   const vn    = new Date(vnMs);
   const yyyy  = vn.getUTCFullYear();
@@ -92,13 +89,8 @@ function toLocalInput(utcIso: string): string {
   return `${yyyy}-${mm}-${dd}T${HH}:${MM}`;
 }
 
-/**
- * Convert datetime-local value (UTC+7 local string) → UTC ISO string for storage.
- * e.g. "2026-04-20T00:00" (VN) → "2026-04-19T17:00:00.000Z" (UTC)
- */
 function fromLocalInput(localStr: string): string {
   if (!localStr) return '';
-  // Treat input as UTC+7 by subtracting 7h
   const asUtcMs = new Date(localStr).getTime() - 7 * 3_600_000;
   return new Date(asUtcMs).toISOString();
 }
@@ -124,24 +116,58 @@ function StatCard({ label, value, color }: { label: string; value: number; color
   );
 }
 
+/* ── Assigned Users badges ──────────────────────────────────────────────────── */
+
+function AssignedUsersBadges({
+  users,
+  onRelease,
+}: {
+  users: AssignedUser[];
+  onRelease: (userId: string, email: string) => void;
+}) {
+  if (users.length === 0) return <span className="text-xs text-gray-400">Chưa gán</span>;
+
+  return (
+    <div className="flex flex-col gap-1">
+      {users.map(u => (
+        <div key={u.user_id} className="flex items-center gap-1">
+          <span className="text-xs bg-indigo-50 text-indigo-700 border border-indigo-100 rounded px-1.5 py-0.5 max-w-[160px] truncate" title={u.email}>
+            {u.name ?? u.email}
+          </span>
+          <button
+            onClick={() => onRelease(u.user_id, u.email)}
+            className="text-xs text-orange-500 hover:text-orange-700 shrink-0"
+            title={`Gỡ ${u.email}`}
+          >
+            ✕
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /* ── Proxy Row ──────────────────────────────────────────────────────────────── */
 
 function ProxyRow({
   proxy,
   onHealthCheck,
-  onRelease,
+  onReleaseUser,
+  onReleaseAll,
   onDelete,
   onEdit,
   onAssign,
 }: {
   proxy: Proxy;
   onHealthCheck: (id: string) => void;
-  onRelease: (id: string) => void;
+  onReleaseUser: (proxyId: string, userId: string, email: string) => void;
+  onReleaseAll: (id: string) => void;
   onDelete: (id: string) => void;
   onEdit: (p: Proxy) => void;
   onAssign: (id: string) => void;
 }) {
   const [checking, setChecking] = useState(false);
+  const hasUsers = proxy.assigned_users.length > 0;
 
   return (
     <tr className={`border-t border-gray-100 transition-colors hover:bg-gray-50 ${proxy.status !== 'active' ? 'opacity-60' : ''}`}>
@@ -172,16 +198,12 @@ function ProxyRow({
         )}
       </td>
 
-      {/* Assigned To */}
-      <td className="px-4 py-3">
-        {proxy.assigned_user_email ? (
-          <div>
-            <p className="text-sm text-gray-700">{proxy.assigned_user_name ?? proxy.assigned_user_email}</p>
-            <p className="text-xs text-gray-400">{fmtDate(proxy.assigned_at)}</p>
-          </div>
-        ) : (
-          <span className="text-xs text-gray-400">Chưa gán</span>
-        )}
+      {/* Assigned To (many-to-many) */}
+      <td className="px-4 py-3 min-w-[180px]">
+        <AssignedUsersBadges
+          users={proxy.assigned_users}
+          onRelease={(userId, email) => onReleaseUser(proxy.id, userId, email)}
+        />
       </td>
 
       {/* Health */}
@@ -217,13 +239,12 @@ function ProxyRow({
           >
             {checking ? '...' : 'Check'}
           </button>
-          {proxy.assigned_user_id ? (
-            <button onClick={() => onRelease(proxy.id)} className="text-xs text-orange-600 hover:underline">
-              Gỡ gán
-            </button>
-          ) : (
-            <button onClick={() => onAssign(proxy.id)} className="text-xs text-green-600 hover:underline">
-              Gán
+          <button onClick={() => onAssign(proxy.id)} className="text-xs text-green-600 hover:underline">
+            + Gán
+          </button>
+          {hasUsers && (
+            <button onClick={() => onReleaseAll(proxy.id)} className="text-xs text-orange-600 hover:underline">
+              Gỡ tất cả
             </button>
           )}
           <button onClick={() => onEdit(proxy)} className="text-xs text-indigo-600 hover:underline">Sửa</button>
@@ -311,9 +332,23 @@ export default function AdminProxiesPage() {
     }
   }
 
-  async function handleRelease(id: string) {
+  async function handleReleaseUser(proxyId: string, userId: string, email: string) {
+    if (!confirm(`Gỡ gán ${email} khỏi proxy này?`)) return;
     try {
-      await apiClient.post(`/admin/proxies/${id}/release`, { reason: 'Admin manual release' });
+      await apiClient.post(`/admin/proxies/${proxyId}/release`, {
+        user_id: userId,
+        reason: 'Admin manual release',
+      });
+      load();
+    } catch (e) {
+      alert(errMsg(e));
+    }
+  }
+
+  async function handleReleaseAll(proxyId: string) {
+    if (!confirm('Gỡ gán TẤT CẢ user khỏi proxy này?')) return;
+    try {
+      await apiClient.post(`/admin/proxies/${proxyId}/release-all`, { reason: 'Admin release-all' });
       load();
     } catch (e) {
       alert(errMsg(e));
@@ -324,7 +359,6 @@ export default function AdminProxiesPage() {
     if (!assignEmail.trim()) return;
     setErr('');
     try {
-      // sendPaginated returns { data: T[], meta: {...} } — flat array, no .users wrapper
       const usersRes = await apiClient.get<{ data: { id: string; email: string; full_name: string }[] }>(
         '/admin/users',
         { params: { search: assignEmail.trim(), pageSize: 50 } },
@@ -352,7 +386,6 @@ export default function AdminProxiesPage() {
       host: p.host, port: p.port, protocol: p.protocol as FormState['protocol'],
       username: p.username ?? '', password: p.password ?? '',
       label: p.label ?? '', country: p.country,
-      // Keep raw UTC ISO — toLocalInput() converts for the input display
       expires_at: p.expires_at ?? '',
     });
     setShowAdd(true);
@@ -366,7 +399,9 @@ export default function AdminProxiesPage() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-xl font-bold text-gray-800">Static Proxy Pool</h1>
-          <p className="text-sm text-gray-500 mt-1">Quản lý proxy tĩnh cho manual sync</p>
+          <p className="text-sm text-gray-500 mt-1">
+            Quản lý proxy tĩnh — 1 IP có thể gán cho nhiều user
+          </p>
         </div>
         <button
           onClick={() => { setShowAdd(true); setEditProxy(null); setForm(BLANK); setErr(''); }}
@@ -495,14 +530,21 @@ export default function AdminProxiesPage() {
 
       {/* Assign Modal */}
       {assignModal && (
-        <div className="bg-white border border-blue-200 rounded-xl p-6 space-y-4">
-          <h2 className="text-sm font-semibold text-gray-700">Gán Proxy cho User</h2>
+        <div className="bg-white border border-blue-200 rounded-xl p-6 space-y-3">
+          <h2 className="text-sm font-semibold text-gray-700">
+            Gán thêm User vào Proxy
+          </h2>
+          <p className="text-xs text-gray-400">
+            Nhập email user cần gán. IP này có thể được gán cho nhiều user đồng thời.
+          </p>
           <div className="flex gap-2">
             <input
               value={assignEmail}
               onChange={e => setAssignEmail(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && handleAssign(assignModal)}
               className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm"
-              placeholder="Email người dùng"
+              placeholder="user@example.com"
+              autoFocus
             />
             <button
               onClick={() => handleAssign(assignModal)}
@@ -542,7 +584,8 @@ export default function AdminProxiesPage() {
                 key={p.id}
                 proxy={p}
                 onHealthCheck={handleHealthCheck}
-                onRelease={handleRelease}
+                onReleaseUser={handleReleaseUser}
+                onReleaseAll={handleReleaseAll}
                 onDelete={handleDelete}
                 onEdit={startEdit}
                 onAssign={id => { setAssignModal(id); setErr(''); }}

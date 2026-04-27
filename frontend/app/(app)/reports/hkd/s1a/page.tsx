@@ -9,45 +9,54 @@ import { downloadExcel } from '../../../../../lib/downloadExcel';
 interface S1aRow { invoice_date: string; description: string; amount: number; }
 interface S1aData {
   company: { name: string; tax_code: string; address: string | null };
-  period: { quarter: number; year: number; start_month: number; end_month: number };
+  period: { quarter?: number; month?: number; year: number };
   rows: S1aRow[];
   total_amount: number;
 }
 
-const YEARS  = Array.from({ length: 5 }, (_, i) => new Date().getFullYear() - i);
+type PeriodType = 'month' | 'quarter';
+const YEARS    = Array.from({ length: 5 }, (_, i) => new Date().getFullYear() - i);
+const MONTHS   = Array.from({ length: 12 }, (_, i) => i + 1);
 const QUARTERS = [1, 2, 3, 4];
+
+function periodLabel(p: { quarter?: number; month?: number; year: number }) {
+  return p.quarter ? `Quý ${p.quarter}/${p.year}` : `Tháng ${p.month}/${p.year}`;
+}
 
 export default function S1aPage() {
   const { activeCompany } = useCompany();
   const router = useRouter();
   const now = new Date();
+  const [periodType, setPeriodType] = useState<PeriodType>('month');
+  const [month, setMonth]     = useState(() => now.getMonth() + 1);
   const [quarter, setQuarter] = useState(() => Math.ceil((now.getMonth() + 1) / 3));
   const [year, setYear]       = useState(() => now.getFullYear());
   const [data, setData]       = useState<S1aData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError]     = useState<string | null>(null);
 
-  // Guard: redirect non-household companies
   useEffect(() => {
-    if (activeCompany && activeCompany.company_type !== 'household') {
-      router.replace('/dashboard');
-    }
+    if (activeCompany && activeCompany.company_type !== 'household') router.replace('/dashboard');
   }, [activeCompany, router]);
+
+  const apiParams = periodType === 'month' ? { month, year } : { quarter, year };
+  const fileTag   = periodType === 'month' ? `T${month}_${year}` : `Q${quarter}_${year}`;
 
   const fetchData = useCallback(async () => {
     setLoading(true); setError(null);
     try {
-      const res = await api.get('/hkd-reports/s1a', { params: { quarter, year } });
+      const params = periodType === 'month' ? { month, year } : { quarter, year };
+      const res = await api.get('/hkd-reports/s1a', { params });
       setData(res.data.data);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Lỗi tải dữ liệu');
     } finally { setLoading(false); }
-  }, [quarter, year]);
+  }, [periodType, month, quarter, year]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
   const handleExcel = () => {
-    downloadExcel(`/hkd-reports/s1a/excel?quarter=${quarter}&year=${year}`, `S1a-HKD_Q${quarter}_${year}.xlsx`);
+    downloadExcel(`/hkd-reports/s1a/excel?${new URLSearchParams(Object.fromEntries(Object.entries(apiParams).map(([k,v])=>[k,String(v)]))).toString()}`, `S1a-HKD_${fileTag}.xlsx`);
   };
 
   const fmt = (n: number) => n.toLocaleString('vi-VN');
@@ -72,30 +81,44 @@ export default function S1aPage() {
       </div>
 
       {/* Period selector */}
-      <div className="flex flex-wrap gap-3 bg-gray-50 rounded-xl p-3">
-        <div className="flex items-center gap-2">
-          <label className="text-sm text-gray-600 font-medium">Quý</label>
-          <select
-            value={quarter}
-            onChange={(e) => setQuarter(Number(e.target.value))}
-            className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm"
-          >
-            {QUARTERS.map((q) => <option key={q} value={q}>Quý {q}</option>)}
-          </select>
+      <div className="flex flex-wrap gap-3 items-center bg-gray-50 rounded-xl p-3">
+        {/* Toggle Tháng / Quý */}
+        <div className="flex rounded-lg border border-gray-300 overflow-hidden text-sm">
+          <button
+            onClick={() => setPeriodType('month')}
+            className={`px-3 py-1.5 ${periodType === 'month' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}
+          >Tháng</button>
+          <button
+            onClick={() => setPeriodType('quarter')}
+            className={`px-3 py-1.5 ${periodType === 'quarter' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}
+          >Quý</button>
         </div>
+
+        {periodType === 'month' ? (
+          <div className="flex items-center gap-2">
+            <label className="text-sm text-gray-600 font-medium">Tháng</label>
+            <select value={month} onChange={(e) => setMonth(Number(e.target.value))} className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm">
+              {MONTHS.map((m) => <option key={m} value={m}>Tháng {m}</option>)}
+            </select>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2">
+            <label className="text-sm text-gray-600 font-medium">Quý</label>
+            <select value={quarter} onChange={(e) => setQuarter(Number(e.target.value))} className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm">
+              {QUARTERS.map((q) => <option key={q} value={q}>Quý {q}</option>)}
+            </select>
+          </div>
+        )}
+
         <div className="flex items-center gap-2">
           <label className="text-sm text-gray-600 font-medium">Năm</label>
-          <select
-            value={year}
-            onChange={(e) => setYear(Number(e.target.value))}
-            className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm"
-          >
+          <select value={year} onChange={(e) => setYear(Number(e.target.value))} className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm">
             {YEARS.map((y) => <option key={y} value={y}>{y}</option>)}
           </select>
         </div>
         <button
           onClick={fetchData}
-          className="px-3 py-1.5 bg-primary-600 text-white text-sm rounded-lg hover:bg-primary-700 transition-colors"
+          className="px-3 py-1.5 bg-indigo-600 text-white text-sm rounded-lg hover:bg-indigo-700 transition-colors"
         >
           Xem
         </button>
@@ -109,10 +132,7 @@ export default function S1aPage() {
           <div className="px-4 py-3 border-b border-gray-100 bg-gray-50">
             <p className="font-semibold text-sm">{data.company.name}</p>
             <p className="text-xs text-gray-500">MST: {data.company.tax_code} | {data.company.address}</p>
-            <p className="text-xs text-gray-500 mt-0.5">
-              Kỳ kê khai: Quý {data.period.quarter}/{data.period.year}&nbsp;
-              (T{data.period.start_month}/{data.period.year} – T{data.period.end_month}/{data.period.year})
-            </p>
+            <p className="text-xs text-gray-500 mt-0.5">Kỳ kê khai: {periodLabel(data.period)}</p>
           </div>
 
           {/* Table */}
@@ -120,9 +140,9 @@ export default function S1aPage() {
             <table className="w-full text-sm">
               <thead className="bg-blue-50">
                 <tr>
-                  <th className="px-3 py-2 text-left border-b border-gray-200 text-xs font-semibold text-gray-700 w-32">Ngày tháng</th>
-                  <th className="px-3 py-2 text-left border-b border-gray-200 text-xs font-semibold text-gray-700">Giao dịch</th>
-                  <th className="px-3 py-2 text-right border-b border-gray-200 text-xs font-semibold text-gray-700 w-36">Số tiền (VNĐ)</th>
+                  <th className="px-3 py-2 text-left border-b border-gray-200 text-xs font-semibold text-gray-700 w-32">Ngày tháng ghi sổ</th>
+                  <th className="px-3 py-2 text-left border-b border-gray-200 text-xs font-semibold text-gray-700">Diễn giải (khách hàng / số HĐ)</th>
+                  <th className="px-3 py-2 text-right border-b border-gray-200 text-xs font-semibold text-gray-700 w-36">Doanh thu (VNĐ)</th>
                 </tr>
                 <tr className="bg-blue-50/60">
                   <th className="px-3 py-1 text-center border-b border-gray-200 text-xs text-gray-400 italic">A</th>
@@ -157,7 +177,6 @@ export default function S1aPage() {
         </div>
       )}
 
-      {/* Signature block */}
       {data && (
         <div className="flex justify-end mt-4">
           <div className="text-center text-sm text-gray-600 space-y-1">
