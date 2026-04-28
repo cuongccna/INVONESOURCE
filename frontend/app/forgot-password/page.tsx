@@ -8,7 +8,6 @@ export default function ForgotPasswordPage() {
   const [email, setEmail] = useState('');
   const [loading, setLoading] = useState(false);
   const [sent, setSent] = useState(false);
-  const [devToken, setDevToken] = useState<string | null>(null);
   const [error, setError] = useState('');
 
   const submit = async (e: React.FormEvent) => {
@@ -16,11 +15,8 @@ export default function ForgotPasswordPage() {
     setError('');
     setLoading(true);
     try {
-      const res = await apiClient.post<{ data: { resetToken?: string } }>('/auth/forgot-password', { email });
+      await apiClient.post('/auth/forgot-password', { email });
       setSent(true);
-      if (res.data.data?.resetToken) {
-        setDevToken(res.data.data.resetToken);
-      }
     } catch (err: unknown) {
       const msg =
         (err as { response?: { data?: { error?: { message?: string } } } })
@@ -43,23 +39,21 @@ export default function ForgotPasswordPage() {
         <div className="bg-white rounded-2xl shadow-sm p-6">
           {sent ? (
             <div className="text-center space-y-4">
-              <div className="text-4xl">✉️</div>
-              <h2 className="text-lg font-bold text-gray-900">Đã gửi!</h2>
-              <p className="text-sm text-gray-600">
-                Nếu email <strong>{email}</strong> tồn tại, bạn sẽ nhận được hướng dẫn đặt lại mật khẩu.
+              <div className="text-5xl">📬</div>
+              <h2 className="text-lg font-bold text-gray-900">Kiểm tra hộp thư của bạn!</h2>
+              <p className="text-sm text-gray-600 leading-relaxed">
+                Chúng tôi đã gửi liên kết đặt lại mật khẩu đến{' '}
+                <strong className="text-gray-800">{email}</strong>.
               </p>
 
-              {devToken && (
-                <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-3 text-left">
-                  <p className="text-xs font-semibold text-yellow-700 mb-1">🛠 Dev mode — token:</p>
-                  <Link
-                    href={`/reset-password?token=${devToken}`}
-                    className="text-xs text-blue-600 break-all underline"
-                  >
-                    /reset-password?token={devToken}
-                  </Link>
-                </div>
-              )}
+              <div className="bg-blue-50 border border-blue-100 rounded-xl p-4 text-left space-y-1">
+                <p className="text-xs font-semibold text-blue-700">Lưu ý:</p>
+                <ul className="text-xs text-blue-700 list-disc list-inside space-y-1">
+                  <li>Link có hiệu lực trong <strong>24 giờ</strong> kể từ bây giờ</li>
+                  <li>Kiểm tra thư mục <strong>Spam / Junk</strong> nếu không thấy</li>
+                  <li>Chỉ link mới nhất có hiệu lực nếu bạn gửi nhiều lần</li>
+                </ul>
+              </div>
 
               <Link href="/login" className="block text-sm text-primary-600 font-medium mt-2">
                 ← Quay lại đăng nhập

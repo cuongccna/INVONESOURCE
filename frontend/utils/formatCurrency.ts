@@ -54,12 +54,14 @@ export function formatVNDShort(amount: number | string | null | undefined): stri
 
 /**
  * Full unscaled display in tables (dot-separated, no abbreviation):
- *   1000000 → "1.000.000đ"
+ *   1000000 → "1.000.000đ"  |  -500000 → "-500.000đ"
  */
 export function formatVNDFull(amount: number | string | null | undefined): string {
   const n = Number(amount);
   if (!isFinite(n) || isNaN(n)) return '0đ';
-  return `${Math.round(n).toLocaleString('vi-VN')}đ`;
+  const abs = Math.round(Math.abs(n));
+  const sign = n < 0 ? '-' : '';
+  return `${sign}${abs.toLocaleString('vi-VN')}đ`;
 }
 
 /**
@@ -71,7 +73,7 @@ export function formatVNDCompact(amount: number | string | null | undefined): st
   const abs = Math.abs(n);
   const sign = n < 0 ? '-' : '';
 
-  if (abs >= 1_000_000_000_000) return `${sign}${(abs / 1_000_000_000_000).toFixed(1).replace(/\.0$/, '')} nghìn tỷ₫`;
+  if (abs >= 1_000_000_000_000) return `${sign}${(abs / 1_000_000_000_000).toFixed(1).replace(/\.0$/, '')} K tỷ₫`;
   if (abs >= 1_000_000_000)     return `${sign}${(abs / 1_000_000_000).toFixed(1).replace(/\.0$/, '')} tỷ₫`;
   if (abs >= 1_000_000)         return `${sign}${(abs / 1_000_000).toFixed(1).replace(/\.0$/, '')} Tr₫`;
   return `${sign}${Math.round(abs).toLocaleString('vi-VN')}₫`;

@@ -3,6 +3,7 @@ import './globals.css';
 import { ToastProvider } from '../components/ToastProvider';
 
 export const metadata: Metadata = {
+  metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL ?? process.env.NEXT_PUBLIC_API_URL?.replace('/api', '') ?? 'https://autopostvn.cloud'),
   title: 'INVONE - Hóa Đơn Điện Tử',
   description: 'Nền tảng quản lý hóa đơn điện tử và kê khai thuế GTGT',
   manifest: '/manifest.json',
@@ -11,6 +12,7 @@ export const metadata: Metadata = {
       { url: '/favicon-16x16.png', sizes: '16x16', type: 'image/png' },
       { url: '/favicon-32x32.png', sizes: '32x32', type: 'image/png' },
       { url: '/icons/icon-192x192.png', sizes: '192x192', type: 'image/png' },
+      { url: '/icons/icon-512x512.png', sizes: '512x512', type: 'image/png' },
     ],
     shortcut: '/favicon-32x32.png',
     apple: '/apple-touch-icon.png',
@@ -22,13 +24,21 @@ export const metadata: Metadata = {
     capable: true,
     statusBarStyle: 'black-translucent',
     title: 'INVONE',
+    startupImage: '/apple-touch-icon.png',
+  },
+  openGraph: {
+    title: 'INVONE - Hóa Đơn Điện Tử',
+    description: 'Nền tảng quản lý hóa đơn điện tử và kê khai thuế GTGT',
+    images: [{ url: '/og-image.png', width: 1200, height: 630 }],
+    locale: 'vi_VN',
+    type: 'website',
   },
 };
 
 export const viewport: Viewport = {
   width: 'device-width',
   initialScale: 1,
-  themeColor: '#1c4e60',
+  themeColor: '#0ea5ad',
   viewportFit: 'cover',
 };
 

@@ -92,7 +92,7 @@ const PROVIDER_LABELS: Record<string, string> = {
 /* ─── Formatters ──────────────────────────────────────────────────────────── */
 import { formatVNDShort, formatVNDFull, formatVNDCompact } from '../../../utils/formatCurrency';
 
-const compact = (n: number | string) => formatVNDCompact(n).replace(/\s*₫$/, '');
+const compact = (n: number | string) => formatVNDFull(n).replace(/đ$/, '');
 const full = (n: string | number) => Number(n).toLocaleString('vi-VN');
 function timeAgo(iso: string) {
   const diff = Math.floor((Date.now() - new Date(iso).getTime()) / 60_000);
@@ -109,6 +109,14 @@ function KCard({ label, value, sub, color = 'text-gray-900', badge, badgeColor, 
   badge?: string; badgeColor?: string;
   badge2?: string; badge2Color?: string;
 }) {
+  // Auto-scale font size so large numbers (up to hàng chục tỷ) always fit
+  // on 2-column mobile grid (~150px card width) without overflow.
+  const len = value.length;
+  const textSize =
+    len <= 6  ? 'text-2xl' :
+    len <= 9  ? 'text-xl'  :
+    len <= 13 ? 'text-lg'  :
+               'text-base';
   return (
     <div className="bg-white rounded-xl shadow-sm p-4">
       <div className="flex items-start justify-between mb-1 gap-1">
@@ -126,8 +134,8 @@ function KCard({ label, value, sub, color = 'text-gray-900', badge, badgeColor, 
           )}
         </div>
       </div>
-      <p className={`text-2xl font-bold ${color}`}>{value}</p>
-      {sub && <p className="text-xs text-gray-400 mt-0.5">{sub}</p>}
+      <p className={`${textSize} font-bold leading-tight ${color} break-words tabular-nums`}>{value}</p>
+      {sub && <p className="text-xs text-gray-400 mt-0.5 leading-snug">{sub}</p>}
     </div>
   );
 }

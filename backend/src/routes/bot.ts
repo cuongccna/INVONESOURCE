@@ -469,7 +469,7 @@ router.get(
       let proxyAssigned = true; // default: no enforcement when pool is empty
       if (poolHasProxies) {
         const assignedRes = await pool.query(
-          `SELECT id FROM static_proxies WHERE assigned_user_id = $1 AND status = 'active' LIMIT 1`,
+          `SELECT proxy_id FROM proxy_user_assignments_v2 WHERE user_id = $1 LIMIT 1`,
           [userId]
         );
         proxyAssigned = assignedRes.rowCount !== null && assignedRes.rowCount > 0;
@@ -526,7 +526,7 @@ router.post(
       );
       if (Number(poolCountRes.rows[0].cnt) > 0) {
         const proxyRow = await pool.query(
-          `SELECT id FROM static_proxies WHERE assigned_user_id = $1 AND status = 'active' LIMIT 1`,
+          `SELECT proxy_id FROM proxy_user_assignments_v2 WHERE user_id = $1 LIMIT 1`,
           [req.user!.userId]
         );
         if (proxyRow.rowCount === 0) {

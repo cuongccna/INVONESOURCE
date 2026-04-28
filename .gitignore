@@ -95,3 +95,7 @@ prompts_bot_refactor_FINAL.md
 backend/tools/fix-sse-token.js
 backend/tools/fix-sync-sse-auth.js
 backend/hkd_test_output.pdf
+.env.production.example
+.env.production.example
+.env.production.example
+repomix-output.xml

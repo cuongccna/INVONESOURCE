@@ -79,6 +79,10 @@ const envSchema = z.object({
   // Telegram bot — optional
   TELEGRAM_BOT_TOKEN: z.string().optional(),
 
+  // Resend email service — required for forgot-password email delivery
+  RESEND_API_KEY: z.string().optional(),
+  RESEND_FROM_EMAIL: z.string().email().optional().default('support@autopostvn.cloud'),
+
   // DB pool size — default 50 for production concurrency
   DB_POOL_MAX: z.string().default('50').transform(Number),
 });

@@ -1,0 +1,82 @@
+# Dependency directories
+node_modules/
+jspm_packages/
+web_modules/
+
+# Build artifacts and caches
+dist/
+build/
+.next/
+out/
+.cache/
+.npm/
+.eslintcache/
+.stylelintcache/
+*.tsbuildinfo
+
+# Environment and Secrets (Bảo mật & Tiết kiệm token)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+*.pfx
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Version Control
+.git/
+.svn/
+.hg/
+.gitignore
+.gitattributes
+
+# Package Manager Lock files (Cực kỳ tốn token, không cần gửi)
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+bun.lockb
+
+# Media and Assets (Hình ảnh, font không giúp ích cho logic code)
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.ico
+*.webp
+*.avif
+*.mp4
+*.webm
+*.pdf
+*.zip
+*.gz
+*.tar
+public/fonts/
+public/images/
+assets/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# Testing (Nếu bạn chỉ cần sửa logic, có thể tạm ẩn test để giảm 30-50% dung lượng)
+__tests__/
+test/
+tests/
+*.test.js
+*.spec.js
+coverage/
+
+# Documentation
+*.md
+LICENSE

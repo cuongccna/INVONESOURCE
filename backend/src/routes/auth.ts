@@ -9,6 +9,7 @@ import { env } from '../config/env';
 import { AuthError, ValidationError, NotFoundError } from '../utils/AppError';
 import { sendSuccess, sendError } from '../utils/response';
 import { authenticate, setActiveSession } from '../middleware/auth';
+import { EmailService } from '../services/EmailService';
 
 /** Lazy-loaded Redis for session reads (reuses auth middleware's export pattern) */
 let _sessionRedis: import('ioredis').default | null = null;
@@ -267,7 +268,7 @@ router.post('/forgot-password', async (req: Request, res: Response, next: NextFu
     const { email } = z.object({ email: z.string().email() }).parse(req.body);
 
     const userResult = await pool.query(
-      `SELECT id FROM users WHERE email = $1 AND is_active = true`,
+      `SELECT id, full_name, email FROM users WHERE email = $1 AND is_active = true`,
       [email]
     );
     // Always respond with success to avoid leaking user enumeration
@@ -276,10 +277,14 @@ router.post('/forgot-password', async (req: Request, res: Response, next: NextFu
       return;
     }
 
-    const userId = userResult.rows[0].id as string;
+    const { id: userId, full_name: fullName, email: userEmail } = userResult.rows[0] as {
+      id: string;
+      full_name: string;
+      email: string;
+    };
     const rawToken = uuidv4();
     const tokenHash = hashToken(rawToken);
-    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
 
     // Invalidate any existing unused tokens for this user
     await pool.query(
@@ -294,7 +299,13 @@ router.post('/forgot-password', async (req: Request, res: Response, next: NextFu
       [uuidv4(), userId, tokenHash, expiresAt]
     );
 
-    // In production: send email with reset link; in dev: return token directly
+    // Send reset email (non-blocking — failure is logged, not surfaced to client)
+    const resetUrl = `${env.FRONTEND_URL}/reset-password?token=${rawToken}`;
+    EmailService.sendPasswordResetEmail(userEmail, resetUrl, fullName).catch((emailErr: unknown) => {
+      console.error('[auth/forgot-password] Failed to send reset email:', emailErr);
+    });
+
+    // Dev mode: include raw token in response so developers can test without email
     const isDev = env.NODE_ENV !== 'production';
     sendSuccess(res, isDev ? { resetToken: rawToken } : null, 'Nếu email tồn tại, bạn sẽ nhận được hướng dẫn');
   } catch (err) {
