@@ -8,7 +8,7 @@
  *
  * Runs as a SEPARATE PM2 process — NOT imported by index.ts.
  * Concurrency: up to MAX_CONCURRENT_COMPANIES companies processed in parallel.
- * Per-company: up to BATCH_PER_COMPANY invoices at a time (sequential within company).
+ * Per-company: up to randomBatchSize() invoices at a time (3–7, randomized per cycle).
  *
  * Architecture:
  *   - Claim rows via UPDATE ... WHERE status = 'pending' AND attempts < max_attempts
@@ -45,11 +45,8 @@ const REDIS_URL = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
 const DB_POLL_MIN_MS = 4_000;
 const DB_POLL_MAX_MS = 8_000;
 
-/** Max invoices claimed per company per poll cycle. */
-const BATCH_PER_COMPANY = 5;
-
 /** Max parallel company workers per poll cycle. */
-const MAX_CONCURRENT_COMPANIES = 20;
+const MAX_CONCURRENT_COMPANIES = 3;
 
 /**
  * Jitter between consecutive GDT detail-API calls within one company batch.
@@ -65,6 +62,22 @@ const GDT_JITTER_MAX_MS = 15_000;
  */
 const COMPANY_STAGGER_MIN_MS = 0;
 const COMPANY_STAGGER_MAX_MS = 5_000;
+
+/**
+ * Idle poll interval — used when no companies have pending work.
+ * Longer than active interval so the worker backs off when there is nothing to do.
+ */
+const DB_POLL_IDLE_MIN_MS = 15_000;
+const DB_POLL_IDLE_MAX_MS = 45_000;
+
+/**
+ * Per-company circuit breaker: if a company accumulates CB_THRESHOLD consecutive
+ * HTTP 500 errors within CB_WINDOW_MS, skip it until CB_COOLDOWN_MS has elapsed.
+ * Prevents hammering GDT when a specific company's invoices trigger server errors.
+ */
+const CB_THRESHOLD   = 5;
+const CB_WINDOW_MS   = 10 * 60_000;   // errors counted within a 10-minute window
+const CB_COOLDOWN_MS = 15 * 60_000;   // pause company for 15 minutes after trip
 
 /** GDT JWT is valid for 30 min; refresh 5 min early = 25 min max age. */
 const JWT_MAX_AGE_MS = 25 * 60_000;
@@ -91,8 +104,11 @@ const _detailCache  = new GdtDetailCache(_redis);
 const _notifQueue   = new Queue('sync-notifications', {
   connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
 });let _hasInvoiceRawDetailColumn: boolean | null = null;
-let _skipInvoiceDetailSave = false;
 let _loggedInvoiceRawDetailWarning = false;
+
+// ── Per-company circuit breaker state (in-memory, resets on worker restart) ──
+interface CbState { count: number; windowStart: number; trippedAt: number | null }
+const _cb500 = new Map<string, CbState>();
 
 // ── Row type from invoice_detail_queue ───────────────────────────────────────
 interface DetailQueueRow {
@@ -237,9 +253,72 @@ async function staggerDelay(): Promise<void> {
   if (ms > 0) await new Promise<void>(resolve => setTimeout(resolve, ms));
 }
 
-/** Randomized DB poll interval (4–8s). Avoids fixed-heartbeat pattern on PostgreSQL. */
+/** Randomized DB poll interval when there IS work (4–8s). */
 function dbPollIntervalMs(): number {
   return jitterMs(DB_POLL_MIN_MS, DB_POLL_MAX_MS);
+}
+
+/** Randomized DB poll interval when idle — backs off to avoid empty polling. */
+function dbPollIdleIntervalMs(): number {
+  return jitterMs(DB_POLL_IDLE_MIN_MS, DB_POLL_IDLE_MAX_MS);
+}
+
+/**
+ * Returns a random batch size (3–7) per cycle so the "always 5" pattern
+ * does not appear in GDT server logs as a fingerprint.
+ */
+function randomBatchSize(): number {
+  return Math.floor(3 + Math.random() * 5); // 3, 4, 5, 6, or 7
+}
+
+/**
+ * Returns true if current VN time (UTC+7) is inside the no-crawl window (23:00–06:00).
+ * Mirrors the sleep policy enforced in sync.worker / auto-sync scheduler.
+ */
+function isWithinSleepWindow(): boolean {
+  const vnHour = new Date(Date.now() + 7 * 3_600_000).getUTCHours();
+  return vnHour >= 23 || vnHour < 6;
+}
+
+/**
+ * Record an HTTP 500 error for a company.
+ * Returns true if the circuit breaker just tripped (CB_THRESHOLD consecutive
+ * 500s within CB_WINDOW_MS). Once tripped, the company is blocked for CB_COOLDOWN_MS.
+ */
+function recordHttp500(companyId: string): boolean {
+  const now = Date.now();
+  let s = _cb500.get(companyId);
+  if (!s) {
+    s = { count: 0, windowStart: now, trippedAt: null };
+    _cb500.set(companyId, s);
+  }
+  // Reset window if last error was outside CB_WINDOW_MS
+  if (now - s.windowStart > CB_WINDOW_MS) {
+    s.count = 0;
+    s.windowStart = now;
+    s.trippedAt = null;
+  }
+  s.count++;
+  if (s.count >= CB_THRESHOLD && s.trippedAt === null) {
+    s.trippedAt = now;
+    return true; // just tripped
+  }
+  return false;
+}
+
+/**
+ * Returns true if this company's circuit breaker is currently open (cooling down).
+ * Automatically resets the breaker once the cooldown window has elapsed.
+ */
+function isCbOpen(companyId: string): boolean {
+  const s = _cb500.get(companyId);
+  if (!s || s.trippedAt === null) return false;
+  if (Date.now() - s.trippedAt >= CB_COOLDOWN_MS) {
+    // Cooldown elapsed — reset breaker
+    _cb500.delete(companyId);
+    return false;
+  }
+  return true;
 }
 
 // ── Bulk-insert line items (mirrors _bulkInsertLineItems in sync.worker.ts) ──
@@ -280,7 +359,7 @@ async function _bulkInsertLineItems(
 }
 
 // ── Claim a batch of rows for one company ─────────────────────────────────────
-async function claimBatch(companyId: string): Promise<DetailQueueRow[]> {
+async function claimBatch(companyId: string, batchSize: number): Promise<DetailQueueRow[]> {
   const res = await pool.query<DetailQueueRow>(
     `UPDATE invoice_detail_queue
      SET status = 'processing', attempts = attempts + 1, last_attempted_at = NOW()
@@ -290,7 +369,8 @@ async function claimBatch(companyId: string): Promise<DetailQueueRow[]> {
          AND (
            (status = 'pending')
            OR
-           (status = 'failed' AND attempts < max_attempts)
+           (status = 'failed' AND attempts < max_attempts
+             AND (next_retry_at IS NULL OR next_retry_at <= NOW()))
            OR
            -- Unstick rows that were left in 'processing' for > STUCK_PROCESSING_MIN minutes
            (status = 'processing' AND last_attempted_at < NOW() - ($3 || ' minutes')::INTERVAL)
@@ -303,7 +383,7 @@ async function claimBatch(companyId: string): Promise<DetailQueueRow[]> {
        id, invoice_id, company_id,
        nbmst, khhdon, shdon, is_sco,
        priority, attempts, max_attempts`,
-    [companyId, BATCH_PER_COMPANY, STUCK_PROCESSING_MIN],
+    [companyId, batchSize, STUCK_PROCESSING_MIN],
   );
   return res.rows;
 }
@@ -325,13 +405,16 @@ async function markSkipped(rowId: string, reason: string): Promise<void> {
     [rowId, reason],
   );
 }
-async function markFailed(rowId: string, error: string, attempts: number, maxAttempts: number): Promise<void> {
-  const finalStatus = attempts >= maxAttempts ? 'failed' : 'failed';
+async function markFailed(rowId: string, error: string, attempts: number): Promise<void> {
+  // Exponential backoff: attempts=1→5m, 2→15m, 3→45m, 4→135m, 5+→180m
+  const backoffMin = Math.min(5 * Math.pow(3, Math.max(attempts - 1, 0)), 180);
   await pool.query(
     `UPDATE invoice_detail_queue
-     SET status = $1, last_error = $2
-     WHERE id = $3`,
-    [finalStatus, error.slice(0, 500), rowId],
+     SET status = 'failed',
+         last_error = $2,
+         next_retry_at = NOW() + ($3 || ' minutes')::INTERVAL
+     WHERE id = $1`,
+    [rowId, error.slice(0, 500), backoffMin],
   );
 }
 
@@ -441,7 +524,7 @@ async function processRow(
   const paymentMethod = typeof detail.thtttoan === 'string' && detail.thtttoan.trim()
     ? detail.thtttoan.trim() : null;
 
-  if (!_skipInvoiceDetailSave && hasRawDetailColumn) {
+  if (hasRawDetailColumn) {
     try {
       await pool.query(
         `UPDATE invoices SET
@@ -524,7 +607,6 @@ async function processRow(
     } catch (saveErr) {
       const message = saveErr instanceof Error ? saveErr.message : String(saveErr);
       if (isMissingColumnError(message)) {
-        _skipInvoiceDetailSave = true;
         logInvoiceRawDetailWarningOnce(message);
       } else {
         logger.warn('[DetailWorker] raw_detail save failed (non-fatal — run migration 038)', {
@@ -581,6 +663,10 @@ async function processCompany(companyId: string): Promise<void> {
   const proxyUrl       = config.proxy_url ?? await proxyManager.nextForAutoSync(config.proxy_session_id);
   const proxySessionId = config.proxy_session_id;
 
+  if (!proxyUrl) {
+    logger.warn('[DetailWorker] No proxy available — crawling without proxy (risk of IP block)', { companyId });
+  }
+
   let token: string | null = null;
   try {
     token = await getToken(companyId, proxySessionId, proxyUrl, creds.username, creds.password);
@@ -602,10 +688,17 @@ async function processCompany(companyId: string): Promise<void> {
   const gdtApi = new GdtDirectApiService(proxyUrl ?? undefined, null, undefined, companyId, null, gdtRawCacheService);
   gdtApi.setToken(token);
 
+  // Skip if circuit breaker is still open from a previous burst of 500s
+  if (isCbOpen(companyId)) {
+    logger.info('[DetailWorker] Circuit breaker open — skipping company this cycle', { companyId });
+    return;
+  }
+
   // Stagger start — prevents N companies from hammering GDT simultaneously
   await staggerDelay();
 
-  const rows = await claimBatch(companyId);
+  const batchSize = randomBatchSize();
+  const rows = await claimBatch(companyId, batchSize);
   if (rows.length === 0) return;
 
   logger.info('[DetailWorker] Processing batch', { companyId, count: rows.length });
@@ -621,7 +714,7 @@ async function processCompany(companyId: string): Promise<void> {
       } else if (outcome === 'skipped') {
         await markSkipped(row.id, 'already_complete');
       } else {
-        await markFailed(row.id, 'process returned failed', row.attempts, row.max_attempts);
+        await markFailed(row.id, 'process returned failed', row.attempts);
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -630,12 +723,25 @@ async function processCompany(companyId: string): Promise<void> {
       // 401 = token expired — invalidate and stop this company's batch
       if (msg.includes('401') || msg.toLowerCase().includes('token expired') || msg.toLowerCase().includes('unauthorized')) {
         await _sessionCache.invalidate(companyId, proxySessionId).catch(() => {});
-        await markFailed(row.id, `token_expired: ${msg}`, row.attempts, row.max_attempts);
+        await markFailed(row.id, `token_expired: ${msg}`, row.attempts);
         logger.info('[DetailWorker] Token expired — stopping company batch', { companyId });
         break;
       }
 
-      await markFailed(row.id, msg, row.attempts, row.max_attempts);
+      // 500 = GDT server error — apply circuit breaker; stop batch if tripped
+      if (msg.includes('500') || msg.includes('status code 500')) {
+        await markFailed(row.id, msg, row.attempts);
+        const tripped = recordHttp500(companyId);
+        if (tripped) {
+          logger.warn('[DetailWorker] Circuit breaker tripped — pausing company for 15 min', {
+            companyId, threshold: CB_THRESHOLD,
+          });
+          break;
+        }
+        continue;
+      }
+
+      await markFailed(row.id, msg, row.attempts);
     }
   }
 }
@@ -652,14 +758,20 @@ async function processCompany(companyId: string): Promise<void> {
 async function getPendingCompanyIds(): Promise<string[]> {
   const res = await pool.query<{ company_id: string }>(
     `WITH pending AS (
-       SELECT company_id, MIN(enqueued_at) AS oldest_pending
-       FROM invoice_detail_queue
+       SELECT q.company_id, MIN(q.enqueued_at) AS oldest_pending
+       FROM invoice_detail_queue q
+       -- Only consider companies that have an active bot config.
+       -- This eliminates the "No active config" warn-every-cycle noise for
+       -- companies whose bot was deactivated but still have queued rows.
+       JOIN gdt_bot_configs g ON g.company_id = q.company_id AND g.is_active = true
        WHERE (
-         status = 'pending'
-         OR (status = 'failed' AND attempts < max_attempts)
-         OR (status = 'processing' AND last_attempted_at < NOW() - ($1 || ' minutes')::INTERVAL)
+         q.status = 'pending'
+         OR (q.status = 'failed' AND q.attempts < q.max_attempts
+               AND (q.next_retry_at IS NULL OR q.next_retry_at <= NOW()))
+         OR (q.status = 'processing'
+               AND q.last_attempted_at < NOW() - ($1 || ' minutes')::INTERVAL)
        )
-       GROUP BY company_id
+       GROUP BY q.company_id
      )
      SELECT DISTINCT ON (uc.user_id) p.company_id
      FROM pending p
@@ -717,16 +829,28 @@ async function cleanupOldQueueRows(): Promise<void> {
 
 async function pollLoop(): Promise<void> {
   logger.info('[DetailWorker] Poll loop started', {
-    dbPollRange: `${DB_POLL_MIN_MS}–${DB_POLL_MAX_MS}ms`,
-    gdtJitterRange: `${GDT_JITTER_MIN_MS}–${GDT_JITTER_MAX_MS}ms`,
-    BATCH_PER_COMPANY, MAX_CONCURRENT_COMPANIES,
+    dbPollActiveRange:  `${DB_POLL_MIN_MS}–${DB_POLL_MAX_MS}ms`,
+    dbPollIdleRange:    `${DB_POLL_IDLE_MIN_MS}–${DB_POLL_IDLE_MAX_MS}ms`,
+    gdtJitterRange:     `${GDT_JITTER_MIN_MS}–${GDT_JITTER_MAX_MS}ms`,
+    batchSizeRange:     '3–7 (random per cycle)',
+    MAX_CONCURRENT_COMPANIES,
   });
 
   while (_running) {
+    // ── Sleep window: 23:00–06:00 VN time — mirror sync.worker policy ────────
+    if (isWithinSleepWindow()) {
+      const vnHour = new Date(Date.now() + 7 * 3_600_000).getUTCHours();
+      logger.debug('[DetailWorker] Sleep window active — skipping cycle', { vnHour });
+      await new Promise<void>(resolve => setTimeout(resolve, 5 * 60_000));
+      continue;
+    }
+
+    let hadWork = false;
     try {
       const companyIds = await getPendingCompanyIds();
 
       if (companyIds.length > 0) {
+        hadWork = true;
         logger.info('[DetailWorker] Poll cycle', { companies: companyIds.length });
         // Process companies in parallel (each independently isolated)
         await Promise.allSettled(
@@ -752,8 +876,8 @@ async function pollLoop(): Promise<void> {
       void cleanupOldQueueRows(); // fire-and-forget — does not block poll loop
     }
 
-    // Wait before next poll — randomized to avoid fixed-heartbeat pattern
-    const waitMs = dbPollIntervalMs();
+    // Back off more when idle — avoids hammering DB when queue is empty
+    const waitMs = hadWork ? dbPollIntervalMs() : dbPollIdleIntervalMs();
     logger.debug('[DetailWorker] Next DB poll in', { waitMs });
     await new Promise<void>(resolve => setTimeout(resolve, waitMs));
   }
