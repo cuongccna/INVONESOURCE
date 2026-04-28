@@ -31,7 +31,7 @@ export default function ForgotPasswordPage() {
     <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
       <div className="w-full max-w-sm">
         <div className="text-center mb-8">
-          <div className="text-5xl mb-3">📄</div>
+          <img src="/icons/icon-72x72.png" alt="INVONE logo" className="w-16 h-16 mx-auto mb-3" />
           <h1 className="text-3xl font-bold text-gray-900">HĐĐT</h1>
           <p className="text-gray-500 mt-1">Đặt Lại Mật Khẩu</p>
         </div>
