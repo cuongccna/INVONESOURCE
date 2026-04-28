@@ -95,12 +95,11 @@ export class ReplacedFilterPlugin implements IInvoiceValidationPlugin {
 
     const now = new Date();
     for (const inv of invoices) {
-      // Fallback A: GDT flagged this invoice as superseded (replaced, not merely adjusted).
-      // - 'replaced' (ttxly=5): original was replaced → invalid, exclude.
-      // - 'replaced_original' (ttxly=4): same meaning, from migration 041.
-      // - 'adjusted' (ttxly=6): an adjustment invoice was issued, but the ORIGINAL is still
-      //   valid and must be included in the declaration (only the delta goes to ct37/ct38).
-      if (inv.status === 'replaced' || inv.status === 'replaced_original') {
+      // Fallback A: GDT flagged this invoice as the original that was superseded.
+      // - 'replaced_original' (ttxly=4): bản GỐC đã bị thay thế bởi HĐ mới → LOẠI.
+      // - 'replaced' (ttxly=5): HĐ THAY THẾ mới (tc_hdon=1) — hợp lệ, KHÔNG loại.
+      // - 'adjusted' (ttxly=6): HĐ điều chỉnh — bản gốc vẫn hợp lệ, KHÔNG loại ở đây.
+      if (inv.status === 'replaced_original') {
         results.set(inv.id, {
           invoice_id: inv.id,
           status: 'excluded',

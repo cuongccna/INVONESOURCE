@@ -460,8 +460,27 @@ function BulkActionBar({
   onRefresh: () => void;
 }) {
   const [modal, setModal] = useState<'item' | 'customer' | 'payment' | null>(null);
+  const [confirmHide, setConfirmHide] = useState(false);
+  const [hideReason, setHideReason] = useState<'duplicate' | 'invalid' | 'other'>('invalid');
+  const [hiding, setHiding] = useState(false);
   const n = selectedIds.length;
   const toast = useToast();
+
+  async function handleBulkHide() {
+    setHiding(true);
+    try {
+      const { default: apiClient } = await import('../../lib/apiClient');
+      await apiClient.delete('/invoices/bulk-delete', { data: { ids: selectedIds, reason: hideReason } });
+      toast.success(`Đã ẩn ${n} hóa đơn. Các hóa đơn này sẽ không tính vào tờ khai.`);
+      setConfirmHide(false);
+      onClear();
+      onRefresh();
+    } catch {
+      toast.error('Ẩn hóa đơn thất bại. Vui lòng thử lại.');
+    } finally {
+      setHiding(false);
+    }
+  }
 
   return (
     <>
@@ -471,40 +490,32 @@ function BulkActionBar({
         <button onClick={() => setModal('customer')} className="text-xs border border-primary-300 bg-white rounded-lg px-3 py-1.5 text-primary-700 hover:bg-primary-50">Gán mã KH/NCC</button>
         <button onClick={() => setModal('payment')}  className="text-xs border border-primary-300 bg-white rounded-lg px-3 py-1.5 text-primary-700 hover:bg-primary-50">Khai báo TT</button>
         <button
-          onClick={async () => {
-            try {
-              const { default: apiClient } = await import('../../lib/apiClient');
-              const res = await apiClient.get(`/invoices/download-xml?ids=${selectedIds.join(',')}`, { responseType: 'blob' });
-              const url = URL.createObjectURL(new Blob([res.data as BlobPart]));
-              const a = document.createElement('a'); a.href = url;
-              a.download = `HoaDon_XML_${new Date().toISOString().slice(0, 10)}.zip`;
-              a.click(); URL.revokeObjectURL(url);
-            } catch (err: unknown) {
-              // Try to read error message from blob response
-              const axiosErr = err as { response?: { data?: Blob; status?: number } };
-              if (axiosErr.response?.data instanceof Blob) {
-                try {
-                  const text = await axiosErr.response.data.text();
-                  const json = JSON.parse(text) as { error?: { code?: string; message?: string } };
-                  const code = json?.error?.code ?? '';
-                  const msg  = json?.error?.message ?? '';
-                  if (code === 'NO_XML_BOT_SOURCE') {
-                    toast.info('Hóa đơn từ GDT Bot không có file XML gốc lưu trữ. Vào Cài đặt → Kết nối Hóa Đơn và chạy "Backfill XML" để tải về từ GDT.');
-                    return;
-                  }
-                  if (code === 'NO_XML' || msg.includes('No invoices with XML') || msg.includes('chưa có file XML')) {
-                    toast.info('Các hóa đơn đã chọn chưa có dữ liệu XML. Chỉ HĐ đồng bộ từ GDT/Viettel mới có XML.');
-                    return;
-                  }
-                } catch { /* ignore parse errors */ }
-              }
-              toast.error('Tải XML thất bại. Vui lòng thử lại sau.');
-            }
-          }}
-          className="text-xs border border-primary-300 bg-white rounded-lg px-3 py-1.5 text-primary-700 hover:bg-primary-50"
-        >📥 Tải XML</button>
+          onClick={() => setConfirmHide(true)}
+          className="text-xs border border-orange-300 bg-white rounded-lg px-3 py-1.5 text-orange-700 hover:bg-orange-50"
+        >Ẩn hóa đơn</button>
         <button onClick={onClear} className="ml-auto text-xs text-gray-400 hover:text-gray-700">Hủy chọn</button>
       </div>
+
+      {confirmHide && (
+        <div className="flex items-center gap-3 bg-orange-50 border border-orange-200 rounded-xl px-4 py-3 flex-wrap text-sm">
+          <span className="text-orange-800 font-medium">Ẩn {n} hóa đơn khỏi tờ khai?</span>
+          <select
+            value={hideReason}
+            onChange={e => setHideReason(e.target.value as typeof hideReason)}
+            className="border border-orange-300 rounded-lg px-2 py-1 text-xs bg-white text-gray-700"
+          >
+            <option value="invalid">Không hợp lệ</option>
+            <option value="duplicate">Trùng lặp</option>
+            <option value="other">Lý do khác</option>
+          </select>
+          <button
+            onClick={handleBulkHide}
+            disabled={hiding}
+            className="text-xs bg-orange-600 text-white rounded-lg px-3 py-1.5 hover:bg-orange-700 disabled:opacity-50"
+          >{hiding ? 'Đang ẩn...' : 'Xác nhận ẩn'}</button>
+          <button onClick={() => setConfirmHide(false)} className="text-xs text-gray-500 hover:text-gray-700">Hủy</button>
+        </div>
+      )}
 
       {modal === 'item'     && <BulkItemCodeModal     ids={selectedIds} onClose={() => { setModal(null); onClear(); onRefresh(); }} />}
       {modal === 'customer' && <BulkCustomerCodeModal ids={selectedIds} onClose={() => { setModal(null); onClear(); onRefresh(); }} />}

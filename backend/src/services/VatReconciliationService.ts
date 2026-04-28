@@ -73,17 +73,17 @@ export class VatReconciliationService {
     year: number,
     validIds?: { inputIds?: string[]; outputIds?: string[] }
   ): Promise<VatSummary> {
-    // BUG FIX: Use direction-specific ID filters to prevent input-only IDs from being
-    // applied to output queries (which would zero out ct40a).
-    // Each query direction uses its own validated ID list independently.
-    const hasValidInput  = (validIds?.inputIds?.length  ?? 0) > 0;
-    const hasValidOutput = (validIds?.outputIds?.length ?? 0) > 0;
+    // Apply direction-specific ID filters independently.
+    // If validIds is provided (even with empty array), always apply the filter —
+    // empty array = no valid invoices → result is 0, not "all invoices".
+    const hasInputFilter  = validIds?.inputIds  !== undefined;
+    const hasOutputFilter = validIds?.outputIds !== undefined;
 
-    const inputIdFilter  = hasValidInput  ? `AND id = ANY($4::uuid[])` : '';
-    const outputIdFilter = hasValidOutput ? `AND id = ANY($4::uuid[])` : '';
+    const inputIdFilter  = hasInputFilter  ? `AND id = ANY($4::uuid[])` : '';
+    const outputIdFilter = hasOutputFilter ? `AND id = ANY($4::uuid[])` : '';
 
-    const inputBaseParams  = () => hasValidInput  ? [companyId, month, year, validIds!.inputIds]  : [companyId, month, year];
-    const outputBaseParams = () => hasValidOutput ? [companyId, month, year, validIds!.outputIds] : [companyId, month, year];
+    const inputBaseParams  = () => hasInputFilter  ? [companyId, month, year, validIds!.inputIds]  : [companyId, month, year];
+    const outputBaseParams = () => hasOutputFilter ? [companyId, month, year, validIds!.outputIds] : [companyId, month, year];
     // ============================================================
     // [22] Total input VAT — all received input invoices (excl. replaced_original)
     // ============================================================
@@ -213,7 +213,8 @@ export class VatReconciliationService {
        FROM invoices
        WHERE company_id = $1
          AND direction = 'output'
-         AND status IN ('replaced', 'adjusted')
+         AND status IN ('adjusted')
+         AND invoice_relation_type = 'adjustment'
          AND deleted_at IS NULL
          AND EXTRACT(MONTH FROM invoice_date) = $2
          AND EXTRACT(YEAR FROM invoice_date) = $3
@@ -346,14 +347,14 @@ export class VatReconciliationService {
     const m3 = m1 + 2;
     const months = [m1, m2, m3];
 
-    const hasValidInput  = (validIds?.inputIds?.length  ?? 0) > 0;
-    const hasValidOutput = (validIds?.outputIds?.length ?? 0) > 0;
+    const hasInputFilter  = validIds?.inputIds  !== undefined;
+    const hasOutputFilter = validIds?.outputIds !== undefined;
 
-    const inputIdFilter  = hasValidInput  ? `AND id = ANY($4::uuid[])` : '';
-    const outputIdFilter = hasValidOutput ? `AND id = ANY($4::uuid[])` : '';
+    const inputIdFilter  = hasInputFilter  ? `AND id = ANY($4::uuid[])` : '';
+    const outputIdFilter = hasOutputFilter ? `AND id = ANY($4::uuid[])` : '';
 
-    const inputBaseParams  = () => hasValidInput  ? [companyId, year, months, validIds!.inputIds]  : [companyId, year, months];
-    const outputBaseParams = () => hasValidOutput ? [companyId, year, months, validIds!.outputIds] : [companyId, year, months];
+    const inputBaseParams  = () => hasInputFilter  ? [companyId, year, months, validIds!.inputIds]  : [companyId, year, months];
+    const outputBaseParams = () => hasOutputFilter ? [companyId, year, months, validIds!.outputIds] : [companyId, year, months];
 
     const { rows: inputAll } = await pool.query<{ vat_rate: string; vat_sum: string; subtotal_sum: string }>(
       `SELECT vat_rate, SUM(vat_amount) AS vat_sum, SUM(subtotal) AS subtotal_sum
@@ -463,7 +464,8 @@ export class VatReconciliationService {
        FROM invoices
        WHERE company_id = $1
          AND direction = 'output'
-         AND status IN ('replaced', 'adjusted')
+         AND status IN ('adjusted')
+         AND invoice_relation_type = 'adjustment'
          AND deleted_at IS NULL
          AND EXTRACT(YEAR FROM invoice_date) = $2
          AND EXTRACT(MONTH FROM invoice_date) = ANY($3::int[])

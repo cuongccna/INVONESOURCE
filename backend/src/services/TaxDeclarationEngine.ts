@@ -132,9 +132,11 @@ export class TaxDeclarationEngine {
     const validInputIds  = invoices.filter(inv => inv.direction === 'input'  && validIdSet.has(inv.id)).map(inv => inv.id);
     const validOutputIds = invoices.filter(inv => inv.direction === 'output' && validIdSet.has(inv.id) && !crossPeriodSet.has(inv.id)).map(inv => inv.id);
 
-    // Step 1: Get VAT summary — restricted to validated invoice IDs by direction
+    // Step 1: Get VAT summary — always pass direction-specific ID lists so each direction
+    // is independently filtered. Passing an empty array correctly yields zero for that direction
+    // rather than falling back to "no filter" which would count all invoices.
     const vat = await this.vatService.calculatePeriod(companyId, month, year,
-      validInvoiceIds.length > 0 ? { inputIds: validInputIds, outputIds: validOutputIds } : undefined
+      { inputIds: validInputIds, outputIds: validOutputIds }
     );
 
     // Step 2: Get carry-forward from previous period [24]
