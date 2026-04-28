@@ -98,7 +98,7 @@ export default function Header() {
       : '/dashboard';
 
   return (
-    <header className="fixed top-0 left-0 right-0 z-40 bg-white border-b border-gray-100 shadow-sm">
+    <header className="fixed top-0 left-0 right-0 z-40 bg-white border-b border-gray-100 shadow-sm header-safe">
       <div className="max-w-2xl lg:max-w-5xl mx-auto flex items-center justify-between px-4 h-14">
         {/* Company Switcher */}
         <div ref={switcherRef} className="relative flex-1 min-w-0 mr-2">

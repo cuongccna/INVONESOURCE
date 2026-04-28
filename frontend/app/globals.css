@@ -34,3 +34,20 @@ body {
     padding-bottom: 0 !important;
   }
 }
+
+/* Mobile header safe area — clears iPhone notch / Dynamic Island / Android display cutout */
+.header-safe {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+/* Main content offset = header height (3.5rem / 56px) + status bar safe area */
+.pt-header-safe {
+  padding-top: calc(3.5rem + env(safe-area-inset-top, 0px));
+}
+
+/* Desktop: revert to plain 3.5rem (no system bar overlap) */
+@media (min-width: 1024px) {
+  .pt-header-safe {
+    padding-top: 3.5rem;
+  }
+}

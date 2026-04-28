@@ -134,7 +134,7 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
             <NoCompanyGuard />
             <NavigationHistoryTracker />
             <Header />
-            <main className="flex-1 pb-20 lg:pb-6 pt-14 safe-bottom">
+            <main className="flex-1 pb-20 lg:pb-6 pt-header-safe safe-bottom">
               <GlobalBackStrip />
               {children}
             </main>
