@@ -1148,6 +1148,11 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       const outDedupSetKey = `gdt:dedup:${companyId}:${yyyymm}:output`;
       let outPageIdx = 0;
 
+      // Phase 2 diagnostic counters — aggregated across ALL batches in this sync run
+      let _detailEnqueueAttempts = 0;
+      let _detailKeyMiss         = 0;  // invoiceId not found in resultMap (key mismatch)
+      let _detailEnqueueOk       = 0;  // rows successfully inserted/updated in queue
+
       for await (const pageBatch of runner.fetchOutputInvoicesStream(fromDate, toDate)) {
         // Dedup check: pipeline SISMEMBER for this page batch
         const batchOutKeys = pageBatch.map(inv =>
@@ -1185,14 +1190,32 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
             // detail.worker (separate PM2 process) picks them up and fetches
             // raw_detail + line_items asynchronously via the same GDT session.
             // Promise.allSettled: one enqueue failure never blocks the others.
+            let _sliceKeyMiss = 0;
             await Promise.allSettled(
               slice.map(({ inv }) => {
+                _detailEnqueueAttempts++;
                 const invoiceId = idMap.get(_invMapKey(inv)) ?? null;
-                if (!invoiceId) return Promise.resolve();
+                if (!invoiceId) { _detailKeyMiss++; _sliceKeyMiss++; return Promise.resolve(); }
                 // Priority 1 = manual (user waiting), 5 = auto background
-                return _enqueueForDetail(inv, invoiceId, companyId, isManual ? 1 : 5);
+                return _enqueueForDetail(inv, invoiceId, companyId, isManual ? 1 : 5)
+                  .then(() => { _detailEnqueueOk++; });
               })
             );
+            if (_sliceKeyMiss > 0) {
+              logger.warn('[SyncWorker] Phase2 output: invoiceId key-miss in resultMap', {
+                companyId, sliceSize: slice.length, keyMiss: _sliceKeyMiss,
+                sample: slice
+                  .filter(({ inv }) => !idMap.get(_invMapKey(inv)))
+                  .slice(0, 3)
+                  .map(({ inv }) => ({
+                    key: _invMapKey(inv),
+                    inv_num: inv.invoice_number,
+                    serial: inv.serial_number,
+                    seller: inv.seller_tax_code,
+                    date: inv.invoice_date,
+                  })),
+              });
+            }
           }
         }
 
@@ -1268,13 +1291,31 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
               .exec().catch(() => {});
 
             // Phase 2: enqueue detail fetch (same as output loop)
+            let _sliceKeyMissIn = 0;
             await Promise.allSettled(
               slice.map(({ inv }) => {
+                _detailEnqueueAttempts++;
                 const invoiceId = idMap.get(_invMapKey(inv)) ?? null;
-                if (!invoiceId) return Promise.resolve();
-                return _enqueueForDetail(inv, invoiceId, companyId, isManual ? 1 : 5);
+                if (!invoiceId) { _detailKeyMiss++; _sliceKeyMissIn++; return Promise.resolve(); }
+                return _enqueueForDetail(inv, invoiceId, companyId, isManual ? 1 : 5)
+                  .then(() => { _detailEnqueueOk++; });
               })
             );
+            if (_sliceKeyMissIn > 0) {
+              logger.warn('[SyncWorker] Phase2 input: invoiceId key-miss in resultMap', {
+                companyId, sliceSize: slice.length, keyMiss: _sliceKeyMissIn,
+                sample: slice
+                  .filter(({ inv }) => !idMap.get(_invMapKey(inv)))
+                  .slice(0, 3)
+                  .map(({ inv }) => ({
+                    key: _invMapKey(inv),
+                    inv_num: inv.invoice_number,
+                    serial: inv.serial_number,
+                    seller: inv.seller_tax_code,
+                    date: inv.invoice_date,
+                  })),
+              });
+            }
           }
         }
 
@@ -1313,6 +1354,15 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
       if (proxyUrl) proxyManager.markHealthy(proxyUrl);
 
+      // Phase 2 enqueue summary — emitted once per sync job for easy grep
+      logger.info('[SyncWorker] Phase2 detail-queue enqueue summary', {
+        companyId,
+        total:     _detailEnqueueAttempts,
+        keyMiss:   _detailKeyMiss,
+        enqueued:  _detailEnqueueOk,
+        // paramMiss (missing inv_num/serial/seller_tax_code) is logged inline in _enqueueForDetail
+      });
+
       // ── Count discrepancy check ────────────────────────────────────────────────
       // Compare what GDT said was available (outEst/inEst) vs what we actually fetched.
       // Discrepancy > 5% AND > 5 invoices → warn user so they can re-sync.
@@ -1333,13 +1383,17 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
         });
       }
 
-      // Đếm số HĐ đã enqueue detail trong 2h gần nhất cho company này
-      const detailQueuedRes = await pool.query<{ count: string }>(
-        `SELECT COUNT(*) AS count FROM invoice_detail_queue
-         WHERE company_id = $1 AND enqueued_at > NOW() - INTERVAL '2 hours'`,
+      // Đếm số HĐ đang chờ xử lý chi tiết (pending) cho company này
+      const detailQueuedRes = await pool.query<{ count: string; done_count: string }>(
+        `SELECT
+           COUNT(*) FILTER (WHERE status = 'pending' OR status = 'failed') AS count,
+           COUNT(*) FILTER (WHERE status = 'done') AS done_count
+         FROM invoice_detail_queue
+         WHERE company_id = $1`,
         [companyId],
-      ).catch(() => ({ rows: [{ count: '0' }] }));
-      const detailQueued = parseInt(detailQueuedRes.rows[0]?.count ?? '0', 10);
+      ).catch(() => ({ rows: [{ count: '0', done_count: '0' }] }));
+      const detailQueued  = parseInt(detailQueuedRes.rows[0]?.count      ?? '0', 10);
+      const detailDone    = parseInt(detailQueuedRes.rows[0]?.done_count  ?? '0', 10);
 
       // Final progress update — Phase 1 complete, Phase 2 starting in background
       const totalFetchedFinal = outputCount + inputCount;
@@ -1357,7 +1411,7 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
         gdtExpectedOutput,
         gdtExpectedInput,
         hasDiscrepancy,
-        statusMessage: `Đã tải ${totalFetchedFinal.toLocaleString('vi-VN')} hóa đơn (📤 ${outputCount.toLocaleString('vi-VN')} đầu ra, 📥 ${inputCount.toLocaleString('vi-VN')} đầu vào). Đang xử lý chi tiết ${detailQueued} HĐ trong nền...${discrepancyMsg}`,
+        statusMessage: `Đã tải ${totalFetchedFinal.toLocaleString('vi-VN')} hóa đơn (📤 ${outputCount.toLocaleString('vi-VN')} đầu ra, 📥 ${inputCount.toLocaleString('vi-VN')} đầu vào). Đang chờ lấy chi tiết: ${detailQueued} HĐ, đã xong: ${detailDone} HĐ.${discrepancyMsg}`,
       } as Record<string, unknown>);
 
       const durationMs = Date.now() - startedAt;
@@ -1912,7 +1966,15 @@ async function _enqueueForDetail(
   priority:  1 | 5 | 10 = 5,
 ): Promise<void> {
   // Need all 3 params to call GDT detail API
-  if (!inv.invoice_number || !inv.serial_number || !inv.seller_tax_code) return;
+  if (!inv.invoice_number || !inv.serial_number || !inv.seller_tax_code) {
+    logger.warn('[SyncWorker] _enqueueForDetail skipped — missing required params', {
+      invoiceId,
+      inv_num:    inv.invoice_number ?? '(null)',
+      serial:     inv.serial_number  ?? '(null)',
+      seller_mst: inv.seller_tax_code ?? '(null)',
+    });
+    return;
+  }
 
   try {
     await pool.query(
@@ -1928,7 +1990,14 @@ async function _enqueueForDetail(
              ELSE 'pending'
            END,
            -- Lower priority number (higher urgency) wins
-           priority = LEAST(invoice_detail_queue.priority, EXCLUDED.priority)`,
+           priority = LEAST(invoice_detail_queue.priority, EXCLUDED.priority),
+           -- Refresh enqueued_at only when status is being reset to pending,
+           -- so the queue age metric stays accurate for re-enqueued invoices
+           enqueued_at = CASE
+             WHEN invoice_detail_queue.status IN ('done','skipped')
+             THEN invoice_detail_queue.enqueued_at
+             ELSE NOW()
+           END`,
       [
         invoiceId,
         companyId,
