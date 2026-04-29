@@ -789,7 +789,30 @@ async function processCompany(companyId: string): Promise<void> {
       await deactivateCompanyBot(companyId, authErr.message, authErr.gdtErrorCode);
       return;
     }
-    throw authErr;
+    // ── Hard timeout or transient error from raceTimeout ──────────────────────
+    // When gdtApi.login() hangs (TCP blackhole, dead proxy, captcha timeout),
+    // raceTimeout fires and rejects BEFORE getToken()'s inner catch can call
+    // recordAuthFailure(). We must count it here instead — otherwise the
+    // failure counter never increments and the worker loops forever.
+    const msg = authErr instanceof Error ? authErr.message : String(authErr);
+    const failCount = recordAuthFailure(companyId);
+    logger.warn('[DetailWorker] getToken timed out or failed (raceTimeout)', {
+      companyId,
+      consecutiveFailures: failCount,
+      maxBeforeDeactivate: MAX_CONSECUTIVE_AUTH_FAILURES,
+      err: msg,
+    });
+    if (failCount >= MAX_CONSECUTIVE_AUTH_FAILURES) {
+      logger.error('[DetailWorker] Too many consecutive auth timeouts — deactivating bot to stop infinite loop', {
+        companyId, failCount,
+      });
+      await deactivateCompanyBot(
+        companyId,
+        `Xác thực GDT timeout ${failCount} lần liên tiếp (${msg.slice(0, 100)})`,
+        null,
+      );
+    }
+    return;
   }
 
   if (!token) {
