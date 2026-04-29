@@ -192,6 +192,21 @@ export class NotificationService {
     );
   }
 
+  /**
+   * Gửi thông báo khi bot bị dừng vì không có proxy khả dụng.
+   * Crawl GDT bắt buộc phải đi qua proxy — không có proxy là lỗi cấu hình nghiêm trọng.
+   * User cần kiểm tra Cài đặt > Bot > Proxy để thêm proxy hoặc kích hoạt lại.
+   */
+  async onBotNoProxy(companyId: string): Promise<void> {
+    await this.createAndPush(
+      companyId,
+      'BOT_AUTH_FAILURE',
+      '🚫 Bot GDT: Không có proxy — đã dừng',
+      'Bot tạm dừng vì không có proxy khả dụng. Crawl GDT bắt buộc phải qua proxy. Vui lòng kiểm tra cấu hình proxy.',
+      '/settings/bot'
+    );
+  }
+
   async onVatAnomaly(companyId: string, message: string): Promise<void> {
     await this.createAndPush(
       companyId,

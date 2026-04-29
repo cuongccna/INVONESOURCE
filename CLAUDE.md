@@ -324,3 +324,33 @@ GDT_CANARY_COMPANY_ID           — ID công ty dùng để health check
 - **Single-session enforcement** — Redis revoke session cũ khi đăng nhập mới
 - **Rate limiting** — GDT validation 1 req/2s (tuân thủ giới hạn GDT)
 - **Audit logging** — Toàn bộ hành động người dùng được ghi lại
+
+---
+
+## Quy tắc bắt buộc — Bot crawl GDT
+
+> **CẤM TUYỆT ĐỐI** sử dụng IP trực tiếp (direct connection) để crawl dữ liệu từ GDT portal (`hoadondientu.gdt.gov.vn`). Mọi request đến GDT bắt buộc phải đi qua proxy.
+
+### Proxy + Captcha là điều kiện tiên quyết
+
+| Điều kiện | Hành vi bắt buộc |
+|-----------|-----------------|
+| **Không có proxy** | Dừng ngay (HARD STOP), ghi log ERROR, gửi chuông thông báo cho user, KHÔNG crawl |
+| **Proxy không hoạt động** | Đánh dấu proxy failed, rotate sang proxy khác; nếu hết proxy → HARD STOP + notify |
+| **Captcha thiếu key / 2Captcha lỗi** | Bỏ qua cycle hiện tại, retry cycle tiếp theo |
+| **Tài khoản GDT bị từ chối (HTTP 400/401 non-captcha)** | Deactivate bot ngay lập tức (không retry), notify user |
+| **Tài khoản GDT bị từ chối nhiều lần liên tiếp** | Sau `MAX_CONSECUTIVE_AUTH_FAILURES` lần → deactivate + notify |
+
+### Quy tắc retry và tự bảo vệ tài khoản
+
+- **Sai credentials**: dừng ngay, KHÔNG retry (tránh GDT lock account)
+- **Lỗi mạng/proxy transient**: retry theo backoff, tối đa `MAX_CONSECUTIVE_AUTH_FAILURES` lần
+- **Timeout (TCP blackhole)**: bọc mọi `processCompany()` và `getToken()` bằng `raceTimeout()` — không để poll loop bị block
+- **Circuit breaker**: ngừng company khi có ≥ 5 HTTP 500 trong 10 phút
+
+### File thực thi quy tắc này
+
+- [`bot/src/detail.worker.ts`](bot/src/detail.worker.ts) — `processCompany()`: proxy guard ở đầu hàm
+- [`bot/src/sync.worker.ts`](bot/src/sync.worker.ts) — tương tự
+- [`bot/src/crawl.worker.ts`](bot/src/crawl.worker.ts) — tương tự
+- [`bot/src/proxy-manager.ts`](bot/src/proxy-manager.ts) — quản lý proxy pool

@@ -64,6 +64,16 @@ export const syncNotificationWorker = new Worker<SyncNotificationPayload>(
       return; // Do NOT run recalc or sync-complete notification
     }
 
+    // ── bot-no-proxy: không có proxy khả dụng — crawl GDT bị chặn theo chính sách ──
+    if (job.name === 'bot-no-proxy') {
+      await notificationService.onBotNoProxy(companyId);
+      console.error(
+        `[SyncNotificationWorker] 🚫 No proxy available for company ${companyId} — GDT crawl halted`,
+        errorMessage,
+      );
+      return;
+    }
+
     // ── Bước 1: Gửi push notification ──────────────────────────────────────────
     await notificationService.onSyncComplete(companyId, provider, count);
     console.log(`[SyncNotificationWorker] Notification sent: ${count} invoices from ${provider} for company ${companyId}`);

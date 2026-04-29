@@ -95,6 +95,87 @@ const CLEANUP_RETENTION_DAYS = 30;
 /** Run cleanup at most once every 24 hours. */
 const CLEANUP_INTERVAL_MS = 24 * 60 * 60_000;
 
+/**
+ * Per-company hard timeout for the entire processCompany() call.
+ *
+ * Root cause context: when no proxy is available, GdtDirectApiService makes a direct
+ * HTTPS connection to GDT. If GDT blackholes TCP SYN packets from the VPS IP, Node.js
+ * socket.setTimeout() never fires (it only applies to ESTABLISHED sockets). The OS
+ * SYN-retry mechanism keeps the socket in SYN_SENT state for up to 63–127 s per
+ * attempt, but then the login retries again — potentially stacking multiple hangs.
+ * Without this cap, one stuck company blocks the ENTIRE poll loop indefinitely.
+ *
+ * Covers worst-case: 3 login retries × ~200 s each ≈ 10 min, plus batch ≈ 5 min.
+ */
+const COMPANY_PROCESS_TIMEOUT_MS = 15 * 60_000; // 15 minutes
+
+/**
+ * Timeout specifically for the GDT login (getToken) step.
+ * Shorter than COMPANY_PROCESS_TIMEOUT_MS so we can log a clear "login timed out"
+ * message and skip token refresh, rather than burning the full company budget.
+ */
+const GET_TOKEN_TIMEOUT_MS = 8 * 60_000; // 8 minutes
+
+/**
+ * Race a promise against a hard deadline.
+ * The underlying promise is NOT cancelled (JS has no native cancellation), but the
+ * poll loop is unblocked. Stuck HTTP sockets eventually time out at the OS level.
+ */
+function raceTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(
+        () => reject(new Error(`[DetailWorker] Hard timeout (${Math.round(ms / 1000)}s): ${label}`)),
+        ms,
+      ),
+    ),
+  ]);
+}
+
+/**
+ * Consecutive GDT auth failure counter (in-memory, per company).
+ *
+ * Tracks how many times in a row getToken() has failed for a given company,
+ * regardless of error type (wrong password, locked account, quota exceeded,
+ * captcha exhausted, HTTP 403, proxy rejection, etc.).
+ *
+ * After MAX_CONSECUTIVE_AUTH_FAILURES consecutive failures the bot for that
+ * company is permanently deactivated and the user is notified. This prevents:
+ *   - Retrying indefinitely on a locked/suspended GDT account (which worsens the lock)
+ *   - Silent infinite loops draining 2Captcha balance
+ *   - Confusing "always processing, never done" states in the queue
+ *
+ * The counter resets to 0 on any successful authentication.
+ */
+const MAX_CONSECUTIVE_AUTH_FAILURES = 5;
+const _authFailureCount = new Map<string, number>();
+
+function recordAuthFailure(companyId: string): number {
+  const prev = _authFailureCount.get(companyId) ?? 0;
+  const next = prev + 1;
+  _authFailureCount.set(companyId, next);
+  return next;
+}
+
+function resetAuthFailure(companyId: string): void {
+  _authFailureCount.delete(companyId);
+}
+
+/** Helper: enqueue a 'bot-no-proxy' notification for the user's bell icon. */
+async function notifyNoProxy(companyId: string): Promise<void> {
+  try {
+    await _notifQueue.add('bot-no-proxy', {
+      companyId,
+      errorMessage: 'Không có proxy khả dụng. Crawl GDT bắt buộc phải đi qua proxy.',
+    }, { removeOnComplete: 100, removeOnFail: 50 });
+  } catch (err) {
+    logger.warn('[DetailWorker] Failed to enqueue no-proxy notification (non-fatal)', {
+      companyId, err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 // ── Singletons ────────────────────────────────────────────────────────────────
 const _redis        = new Redis(REDIS_URL, { maxRetriesPerRequest: 3, lazyConnect: true });
 const _sessionCache = new GdtSessionCache(_redis);
@@ -452,12 +533,13 @@ async function getToken(
     const freshToken = gdtApi.getToken();
     if (freshToken) {
       await _sessionCache.set(companyId, proxySessionId, freshToken);
+      resetAuthFailure(companyId); // ✅ Đăng nhập thành công — reset bộ đếm lỗi
       return freshToken;
     }
   } catch (err) {
-    // GdtAuthError = GDT explicitly rejected credentials (HTTP 400/401, non-captcha).
-    // This is the ONLY reliable signal — no string matching needed.
-    // Re-throw as AuthUnrecoverableError so processCompany() deactivates the bot.
+    // ── GdtAuthError: GDT từ chối credentials (HTTP 400/401, non-captcha) ────────
+    // Đây là tín hiệu dứt khoát — không cần string-match. Dừng ngay lập tức,
+    // KHÔNG retry để tránh GDT khóa tài khoản thêm.
     if (err instanceof GdtAuthError) {
       logger.error('[DetailWorker] GDT rejected credentials — STOP immediately (will not retry)', {
         companyId,
@@ -468,11 +550,27 @@ async function getToken(
       throw new AuthUnrecoverableError(err.message, err.gdtErrorCode);
     }
 
-    // Transient errors (network, proxy, captcha exhausted) — skip this cycle, retry next poll.
+    // ── Lỗi transient (mạng, proxy, captcha timeout, 403, quota) ─────────────────
+    // Ghi nhận vào bộ đếm. Sau MAX_CONSECUTIVE_AUTH_FAILURES lần thất bại liên
+    // tiếp → deactivate bot để tránh loop vô tận làm cạn 2Captcha balance.
     const msg = err instanceof Error ? err.message : String(err);
-    logger.warn('[DetailWorker] GDT login failed (transient — will retry next cycle)', {
-      companyId, err: msg,
+    const failCount = recordAuthFailure(companyId);
+    logger.warn('[DetailWorker] GDT login failed', {
+      companyId,
+      consecutiveFailures: failCount,
+      maxBeforeDeactivate: MAX_CONSECUTIVE_AUTH_FAILURES,
+      err: msg,
     });
+
+    if (failCount >= MAX_CONSECUTIVE_AUTH_FAILURES) {
+      logger.error('[DetailWorker] Too many consecutive auth failures — deactivating bot to protect account', {
+        companyId, failCount,
+      });
+      throw new AuthUnrecoverableError(
+        `Đăng nhập GDT thất bại ${failCount} lần liên tiếp (${msg.slice(0, 100)})`,
+        null,
+      );
+    }
   }
   return null;
 }
@@ -666,13 +764,24 @@ async function processCompany(companyId: string): Promise<void> {
   const proxyUrl       = config.proxy_url ?? await proxyManager.nextForAutoSync(config.proxy_session_id ?? config.company_id);
   const proxySessionId = config.proxy_session_id ?? config.company_id;
 
+  // ── PROXY GUARD — CẤM TUYỆT ĐỐI crawl GDT bằng IP trực tiếp ───────────────
+  // Mọi request đến GDT phải đi qua proxy. Không có proxy → dừng ngay,
+  // không crawl, gửi chuông thông báo cho user.
   if (!proxyUrl) {
-    logger.warn('[DetailWorker] No proxy available — crawling without proxy (risk of IP block)', { companyId });
+    logger.error('[DetailWorker] HARD STOP: No proxy available — direct IP crawling is FORBIDDEN by policy', {
+      companyId,
+    });
+    await notifyNoProxy(companyId);
+    return;
   }
 
   let token: string | null = null;
   try {
-    token = await getToken(companyId, proxySessionId, proxyUrl, creds.username, creds.password);
+    token = await raceTimeout(
+      getToken(companyId, proxySessionId, proxyUrl, creds.username, creds.password),
+      GET_TOKEN_TIMEOUT_MS,
+      `getToken(${companyId.slice(0, 8)})`,
+    );
   } catch (authErr) {
     if (authErr instanceof AuthUnrecoverableError) {
       // GDT rejected credentials (HTTP 400/401 non-captcha) — deactivate bot immediately.
@@ -865,7 +974,11 @@ async function pollLoop(): Promise<void> {
         // Process manual rows and then re-check sleep window on next iteration
         await Promise.allSettled(
           manualCompanyIds.map(companyId =>
-            processCompany(companyId).catch(err =>
+            raceTimeout(
+              processCompany(companyId),
+              COMPANY_PROCESS_TIMEOUT_MS,
+              `processCompany(${companyId.slice(0, 8)})`,
+            ).catch(err =>
               logger.warn('[DetailWorker] processCompany error (non-fatal)', {
                 companyId, err: err instanceof Error ? err.message : String(err),
               })
@@ -899,10 +1012,16 @@ async function pollLoop(): Promise<void> {
       if (companyIds.length > 0) {
         hadWork = true;
         logger.info('[DetailWorker] Poll cycle', { companies: companyIds.length });
-        // Process companies in parallel (each independently isolated)
+        // Process companies in parallel (each independently isolated).
+        // raceTimeout() guarantees the poll loop is never blocked longer than
+        // COMPANY_PROCESS_TIMEOUT_MS by a single stuck company (TCP blackhole, dead proxy, etc.)
         await Promise.allSettled(
           companyIds.map(companyId =>
-            processCompany(companyId).catch(err =>
+            raceTimeout(
+              processCompany(companyId),
+              COMPANY_PROCESS_TIMEOUT_MS,
+              `processCompany(${companyId.slice(0, 8)})`,
+            ).catch(err =>
               logger.warn('[DetailWorker] processCompany error (non-fatal)', {
                 companyId,
                 err: err instanceof Error ? err.message : String(err),
