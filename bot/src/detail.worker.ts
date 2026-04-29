@@ -624,7 +624,8 @@ async function processRow(
 interface CompanyConfig {
   company_id:     string;
   proxy_url:      string | null;
-  proxy_session_id: string;
+  /** NULL when sync.worker cleared the session after a proxy failure — use companyId as hash fallback. */
+  proxy_session_id: string | null;
   encrypted_credentials: string;
 }
 
@@ -660,8 +661,10 @@ async function processCompany(companyId: string): Promise<void> {
     return;
   }
 
-  const proxyUrl       = config.proxy_url ?? await proxyManager.nextForAutoSync(config.proxy_session_id);
-  const proxySessionId = config.proxy_session_id;
+  // proxy_session_id can be NULL if sync.worker cleared it after a proxy failure.
+  // Fall back to company_id so _hashToIndex gets a valid string (avoids crash on null.length).
+  const proxyUrl       = config.proxy_url ?? await proxyManager.nextForAutoSync(config.proxy_session_id ?? config.company_id);
+  const proxySessionId = config.proxy_session_id ?? config.company_id;
 
   if (!proxyUrl) {
     logger.warn('[DetailWorker] No proxy available — crawling without proxy (risk of IP block)', { companyId });
@@ -754,8 +757,12 @@ async function processCompany(companyId: string): Promise<void> {
  *   - User A's 3 companies are processed ONE AT A TIME (sequential), not in parallel.
  *   - Different users run concurrently (one company each).
  *   - A single company that is slow does NOT starve other users.
+ *
+ * @param manualOnly  When true, only consider rows with priority = 1 (user-triggered syncs).
+ *                    Used during the 23:00–06:00 sleep window so manual syncs are never blocked.
  */
-async function getPendingCompanyIds(): Promise<string[]> {
+async function getPendingCompanyIds(manualOnly = false): Promise<string[]> {
+  const priorityFilter = manualOnly ? 'AND q.priority = 1' : '';
   const res = await pool.query<{ company_id: string }>(
     `WITH pending AS (
        SELECT q.company_id, MIN(q.enqueued_at) AS oldest_pending
@@ -771,6 +778,7 @@ async function getPendingCompanyIds(): Promise<string[]> {
          OR (q.status = 'processing'
                AND q.last_attempted_at < NOW() - ($1 || ' minutes')::INTERVAL)
        )
+       ${priorityFilter}
        GROUP BY q.company_id
      )
      SELECT DISTINCT ON (uc.user_id) p.company_id
@@ -786,6 +794,8 @@ async function getPendingCompanyIds(): Promise<string[]> {
 let _running = true;
 /** Epoch ms of last completed cleanup run. 0 = never run. */
 let _lastCleanupAt = 0;
+/** Track sleep-window state to log entry/exit only once (avoids log spam every 5 min). */
+let _inSleepWindow = false;
 
 /**
  * Deletes old finished rows from invoice_detail_queue.
@@ -837,12 +847,49 @@ async function pollLoop(): Promise<void> {
   });
 
   while (_running) {
-    // ── Sleep window: 23:00–06:00 VN time — mirror sync.worker policy ────────
+    // ── Sleep window: 23:00–06:00 VN time (UTC+7) ───────────────────────────
+    // Auto-sync details are skipped to avoid hammering GDT at night.
+    // EXCEPTION: priority=1 rows (user-triggered manual syncs) are always processed
+    // immediately — users expect details after manually syncing, regardless of hour.
     if (isWithinSleepWindow()) {
       const vnHour = new Date(Date.now() + 7 * 3_600_000).getUTCHours();
-      logger.debug('[DetailWorker] Sleep window active — skipping cycle', { vnHour });
+
+      // Check for manual-priority rows before sleeping
+      const manualCompanyIds = await getPendingCompanyIds(true).catch(() => [] as string[]);
+      if (manualCompanyIds.length > 0) {
+        if (_inSleepWindow) {
+          logger.info('[DetailWorker] Sleep window active but processing manual-priority rows', {
+            vnHour, companies: manualCompanyIds.length,
+          });
+        }
+        // Process manual rows and then re-check sleep window on next iteration
+        await Promise.allSettled(
+          manualCompanyIds.map(companyId =>
+            processCompany(companyId).catch(err =>
+              logger.warn('[DetailWorker] processCompany error (non-fatal)', {
+                companyId, err: err instanceof Error ? err.message : String(err),
+              })
+            )
+          )
+        );
+        await new Promise<void>(resolve => setTimeout(resolve, dbPollIntervalMs()));
+        continue;
+      }
+
+      // No manual rows — enter sleep
+      if (!_inSleepWindow) {
+        logger.info('[DetailWorker] Entering sleep window (23:00–06:00 VN time) — auto details paused', { vnHour });
+        _inSleepWindow = true;
+      }
       await new Promise<void>(resolve => setTimeout(resolve, 5 * 60_000));
       continue;
+    }
+
+    // Exiting sleep window
+    if (_inSleepWindow) {
+      const vnHour = new Date(Date.now() + 7 * 3_600_000).getUTCHours();
+      logger.info('[DetailWorker] Exiting sleep window — resuming normal polling', { vnHour });
+      _inSleepWindow = false;
     }
 
     let hadWork = false;

@@ -123,6 +123,7 @@ async function cleanupDetailQueue(): Promise<void> {
     const res = await pool.query(
       `DELETE FROM invoice_detail_queue
        WHERE status IN ('done','skipped')
+         AND done_at IS NOT NULL
          AND done_at < NOW() - INTERVAL '7 days'`,
     );
     if ((res.rowCount ?? 0) > 0) {

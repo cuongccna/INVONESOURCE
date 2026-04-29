@@ -177,7 +177,7 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
       throw new Error('Missing companyId in dashboard KPI route');
     }
     const resolved = resolvePeriod(req.query);
-    const [invoiceStats, vatStats, syncStats, ytdStats, riskStats, carryForwardInfo] = await Promise.all([
+    const [invoiceStats, vatStats, syncStats, ytdStats, riskStats, carryForwardInfo, declLookup, reconLookup] = await Promise.all([
       pool.query<{
         total: string; output_count: string; input_count: string;
         invalid_count: string; unvalidated_count: string; input_above_20m_count: string;
@@ -243,6 +243,41 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
         [companyId]
       ).catch(() => ({ rows: [{ critical: '0', high: '0', medium: '0' }] })),
       getCarryForwardInfo(companyId, resolved.periodType, resolved.month, resolved.quarter, resolved.year),
+      // Lookup saved tax declaration for this period — when found, ct23/ct41 override tạm tính estimates.
+      // period_month stores month (1-12) for monthly, quarter number (1-4) for quarterly.
+      pool.query<{ ct23_deductible_input_vat: string; ct41_payable_vat: string; ct40a_total_output_vat: string }>(
+        `SELECT ct23_deductible_input_vat, ct41_payable_vat, ct40a_total_output_vat
+         FROM tax_declarations
+         WHERE company_id = $1
+           AND period_month = $2
+           AND period_year  = $3
+           AND form_type    = '01/GTGT'
+           AND period_type  = $4
+         ORDER BY updated_at DESC
+         LIMIT 1`,
+        [
+          companyId,
+          resolved.periodType === 'quarterly' ? resolved.quarter : resolved.month,
+          resolved.year,
+          resolved.periodType === 'yearly' ? 'monthly' : resolved.periodType, // yearly has no standard tờ khai
+        ]
+      ).catch(() => ({ rows: [] as { ct23_deductible_input_vat: string; ct41_payable_vat: string; ct40a_total_output_vat: string }[] })),
+      // Lookup vat_reconciliations — populated by VatReconciliationService each time TaxDeclarationEngine
+      // runs (even for preview). Used as authoritative ct23 source when no saved declaration exists.
+      pool.query<{ input_vat: string; output_vat: string }>(
+        `SELECT input_vat, output_vat
+         FROM vat_reconciliations
+         WHERE company_id = $1
+           AND period_month = $2
+           AND period_year  = $3
+         ORDER BY generated_at DESC
+         LIMIT 1`,
+        [
+          companyId,
+          resolved.periodType === 'quarterly' ? resolved.quarter : resolved.month,
+          resolved.year,
+        ]
+      ).catch(() => ({ rows: [] as { input_vat: string; output_vat: string }[] })),
     ]);
 
     // CIT estimate: YTD gross profit × 20%
@@ -308,7 +343,48 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
       },
     ].sort((a, b) => a.days_left - b.days_left);
 
-    const vatRow = vatStats.rows[0] ?? { output_vat: '0', input_vat: '0', deductible_vat: '0', payable_vat: '0' };
+    const rawVatRow = vatStats.rows[0] ?? { output_vat: '0', input_vat: '0', deductible_vat: '0', payable_vat: '0' };
+    const declRow   = declLookup.rows[0];
+    const reconRow  = reconLookup.rows[0];
+
+    // Priority for deductible VAT (ct23):
+    // 1) Saved tax declaration → ct23 from tax_declarations (most authoritative, via pipeline)
+    // 2) vat_reconciliations  → input_vat computed by VatReconciliationService (pipeline-filtered,
+    //    written on every TaxDeclarationEngine run incl. preview) — matches declaration page values
+    // 3) Raw SQL tạm tính     → _deductibleInputVatCondition without pipeline filter (approximate)
+    const vatRow = declRow
+      ? {
+          ...rawVatRow,
+          deductible_vat:       declRow.ct23_deductible_input_vat,
+          payable_vat:          declRow.ct41_payable_vat,
+          output_vat:           declRow.ct40a_total_output_vat,
+          vat_from_declaration: true,
+        }
+      : reconRow
+      ? {
+          ...rawVatRow,
+          deductible_vat: reconRow.input_vat,
+          output_vat:     reconRow.output_vat,
+          payable_vat: String(Math.max(
+            0,
+            Number(reconRow.output_vat) -
+            Number(reconRow.input_vat)  -
+            carryForwardInfo.amount,
+          )),
+          vat_from_declaration: false,
+        }
+      : {
+          ...rawVatRow,
+          // Tạm tính: fix payable_vat to include carry-forward [ct24] so it matches [41] formula
+          payable_vat: String(Math.max(
+            0,
+            Number(rawVatRow.output_vat) -
+            Number(rawVatRow.deductible_vat) -
+            carryForwardInfo.amount,
+          )),
+          vat_from_declaration: false,
+        };
+
     sendSuccess(res, {
       period: {
         month: resolved.month,

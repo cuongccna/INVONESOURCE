@@ -23,7 +23,7 @@ export class ProxyManager extends EventEmitter {
     this.proxies = raw;
     this.failed  = new Set();
     this.index   = 0;
-    logger.info(`[ProxyManager] Static pool — ${this.proxies.length} proxies loaded`);
+    logger.info(`[ProxyManager] Env PROXY_LIST — ${this.proxies.length} proxies (DB static pool loaded on demand)`);
   }
 
   next(): string | null {
@@ -150,7 +150,20 @@ export class ProxyManager extends EventEmitter {
 
   async nextForAutoSync(sessionSuffix: string): Promise<string | null> {
     try {
-      const dbUrls = await staticProxyPool.listActiveUrls();
+      let dbUrls = await staticProxyPool.listActiveUrls();
+
+      // Fallback: nếu DB pool trống, thử dùng env-based PROXY_LIST
+      if (dbUrls.length === 0 && this.proxies.length > 0) {
+        logger.warn('[ProxyManager] Auto sync: DB pool empty — falling back to env PROXY_LIST', {
+          envProxies: this.proxies.length,
+        });
+        dbUrls = this.proxies.filter(p => !this.failed.has(p));
+        if (dbUrls.length === 0) {
+          this.reset();
+          dbUrls = this.proxies;
+        }
+      }
+
       if (dbUrls.length === 0) {
         logger.warn('[ProxyManager] Auto sync: no active static proxies in DB pool', {
           sessionSuffix: sessionSuffix.slice(0, 8),

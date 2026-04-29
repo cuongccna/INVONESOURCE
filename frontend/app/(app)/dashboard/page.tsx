@@ -21,7 +21,7 @@ interface KpiData {
     total: string; output_count: string; input_count: string;
     invalid_count: string; unvalidated_count: string; input_above_20m_count?: string;
   };
-  vat: { output_vat: string; input_vat: string; payable_vat: string; deductible_vat?: string } | null;
+  vat: { output_vat: string; input_vat: string; payable_vat: string; deductible_vat?: string; vat_from_declaration?: boolean } | null;
   recentSyncs: Array<{
     provider: string; errors_count: number; started_at: string; error_detail: string | null;
   }>;
@@ -459,8 +459,8 @@ export default function DashboardPage() {
             value={kpi.vat ? `${compact(kpi.vat.payable_vat)} ₫` : '—'}
             sub={kpi.vat ? `ĐR ${compact(kpi.vat.output_vat)}₫ — ĐV ${compact(kpi.vat.input_vat)}₫` : ''}
             color={kpi.vat && Number(kpi.vat.payable_vat) > 0 ? 'text-red-600' : 'text-gray-400'}
-            badge="Tạm tính"
-            badgeColor="bg-orange-50 text-orange-500"
+            badge={kpi.vat?.vat_from_declaration ? 'Theo tờ khai' : 'Tạm tính'}
+            badgeColor={kpi.vat?.vat_from_declaration ? 'bg-blue-50 text-blue-600' : 'bg-orange-50 text-orange-500'}
             badge2={`Hạn ${periodDeadline}`}
             badge2Color="bg-red-50 text-red-500"
           />
@@ -481,10 +481,12 @@ export default function DashboardPage() {
             value={kpi.vat?.deductible_vat != null
               ? `${compact(kpi.vat.deductible_vat)} ₫`
               : '—'}
-            sub="Đầu vào đủ điều kiện khấu trừ theo 01/GTGT"
+            sub={kpi.vat?.vat_from_declaration
+              ? 'CT23 — từ tờ khai 01/GTGT đã tính'
+              : 'Đầu vào đủ điều kiện khấu trừ (tạm tính)'}
             color="text-blue-600"
-            badge="Tạm tính"
-            badgeColor="bg-orange-50 text-orange-500"
+            badge={kpi.vat?.vat_from_declaration ? 'Theo tờ khai' : 'Tạm tính'}
+            badgeColor={kpi.vat?.vat_from_declaration ? 'bg-blue-50 text-blue-600' : 'bg-orange-50 text-orange-500'}
           />
         </div>
         </>
