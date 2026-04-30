@@ -66,7 +66,7 @@ export class HkdPdfExporter {
       const doc = new PDFDocument({
         size: 'A4',
         margins: { top: 60, bottom: 40, left: 42, right: 36 },
-        info: { Title: 'Tờ khai thuế HKD/CNKD (TT40/2021)', Author: 'INVONE' },
+        info: { Title: 'Tờ khai thuế HKD/CNKD (TT40/2021)', Author: 'AUTOPOST VN' },
       });
 
       doc.registerFont('Reg', fontReg);
@@ -336,7 +336,7 @@ export class HkdPdfExporter {
       cy += 6;
       doc.font('Reg').fontSize(7.5).fillColor('#9CA3AF')
         .text(
-          `Xuất bởi INVONE  |  ${exportDate}  |  MST: ${declaration.tax_code ?? ''}  |  INVONE – HKD PDF Export`,
+          `Xuất bởi AUTOPOST VN  |  ${exportDate}  |  MST: ${declaration.tax_code ?? ''}  |  AUTOPOST VN – HKD PDF Export`,
           ML, cy, { width: UW, align: 'center' },
         );
 

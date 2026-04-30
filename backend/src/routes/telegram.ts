@@ -59,7 +59,7 @@ router.post('/test', async (req, res) => {
   }
   const ok = await telegramService.sendMessage(
     chat_id,
-    '✅ <b>Kết nối thành công!</b>\nBạn đã kết nối Telegram với hệ thống INVONE.\nCác thông báo sẽ được gửi qua đây.',
+    '✅ <b>Kết nối thành công!</b>\nBạn đã kết nối Telegram với hệ thống AUTOPOST VN.\nCác thông báo sẽ được gửi qua đây.',
   );
   sendSuccess(res, { sent: ok });
 });

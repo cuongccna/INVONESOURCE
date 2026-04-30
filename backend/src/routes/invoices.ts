@@ -197,7 +197,7 @@ router.get('/export', async (req: Request, res: Response, next: NextFunction) =>
 
     const ExcelJS = (await import('exceljs')).default;
     const wb = new ExcelJS.Workbook();
-    wb.creator = 'INVONE Platform';
+    wb.creator = 'AUTOPOST VN';
     const sh = wb.addWorksheet('Hóa Đơn');
 
     sh.columns = [

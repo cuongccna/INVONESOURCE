@@ -20,7 +20,7 @@ function buildPasswordResetHtml(fullName: string, resetUrl: string): string {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Đặt Lại Mật Khẩu — INVONE</title>
+  <title>Đặt Lại Mật Khẩu — AUTOPOST VN</title>
 </head>
 <body style="margin:0;padding:0;background-color:#f4f6f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
   <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f6f9;padding:40px 0;">
@@ -32,7 +32,7 @@ function buildPasswordResetHtml(fullName: string, resetUrl: string): string {
           <tr>
             <td style="background:linear-gradient(135deg,#1d4ed8 0%,#2563eb 100%);padding:36px 40px;text-align:center;">
               <div style="display:inline-block;background:rgba(255,255,255,0.15);border-radius:10px;padding:10px 20px;margin-bottom:12px;">
-                <span style="font-size:22px;font-weight:800;color:#ffffff;letter-spacing:1px;">📄 INVONE</span>
+                <span style="font-size:22px;font-weight:800;color:#ffffff;letter-spacing:1px;">📄 AUTOPOST VN</span>
               </div>
               <div style="color:rgba(255,255,255,0.85);font-size:13px;margin-top:4px;letter-spacing:0.5px;">
                 Nền tảng Quản lý Hóa Đơn Điện Tử
@@ -50,7 +50,7 @@ function buildPasswordResetHtml(fullName: string, resetUrl: string): string {
                 Xin chào <strong>${displayName}</strong>,
               </p>
               <p style="margin:0 0 24px;font-size:15px;color:#4b5563;line-height:1.6;">
-                Chúng tôi nhận được yêu cầu đặt lại mật khẩu cho tài khoản INVONE của bạn.
+                Chúng tôi nhận được yêu cầu đặt lại mật khẩu cho tài khoản AUTOPOST VN của bạn.
                 Nhấn vào nút bên dưới để tạo mật khẩu mới:
               </p>
 
@@ -96,11 +96,11 @@ function buildPasswordResetHtml(fullName: string, resetUrl: string): string {
           <tr>
             <td style="background:#f9fafb;border-top:1px solid #e5e7eb;padding:24px 40px;text-align:center;">
               <p style="margin:0 0 6px;font-size:12px;color:#9ca3af;">
-                Email này được gửi tự động từ hệ thống INVONE.
+                Email này được gửi tự động từ hệ thống AUTOPOST VN.
                 Vui lòng không trả lời email này.
               </p>
               <p style="margin:0;font-size:12px;color:#9ca3af;">
-                © ${new Date().getFullYear()} INVONE — Nền tảng Hóa Đơn Điện Tử Việt Nam
+                © ${new Date().getFullYear()} AUTOPOST VN — Nền tảng Hóa Đơn Điện Tử Việt Nam
               </p>
             </td>
           </tr>
@@ -119,9 +119,9 @@ export const EmailService = {
     const fromEmail = env.RESEND_FROM_EMAIL ?? 'support@autopostvn.cloud';
 
     const { error } = await client.emails.send({
-      from: `INVONE <${fromEmail}>`,
+      from: `AUTOPOST VN <${fromEmail}>`,
       to: [to],
-      subject: 'Đặt lại mật khẩu INVONE của bạn',
+      subject: 'Đặt lại mật khẩu AUTOPOST VN của bạn',
       html: buildPasswordResetHtml(fullName, resetUrl),
     });
 

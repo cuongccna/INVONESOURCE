@@ -4,7 +4,7 @@ import { ToastProvider } from '../components/ToastProvider';
 
 export const metadata: Metadata = {
   metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL ?? process.env.NEXT_PUBLIC_API_URL?.replace('/api', '') ?? 'https://autopostvn.cloud'),
-  title: 'INVONE - Hóa Đơn Điện Tử',
+  title: 'AUTOPOST VN - Hóa Đơn Điện Tử',
   description: 'Nền tảng quản lý hóa đơn điện tử và kê khai thuế GTGT',
   manifest: '/manifest.json',
   icons: {
@@ -23,12 +23,12 @@ export const metadata: Metadata = {
   appleWebApp: {
     capable: true,
     statusBarStyle: 'black-translucent',
-    title: 'INVONE',
+    title: 'AUTOPOST VN',
     startupImage: '/apple-touch-icon.png',
   },
   openGraph: {
-    title: 'INVONE - Hóa Đơn Điện Tử',
-    description: 'Nền tảng quản lý hóa đơn điện tử và kê khai thuế GTGT',
+    title: 'AUTOPOST VN - Hóa Đơn Điện Tử',
+    description: 'Nền tấm quản lý hóa đơn điện tử và kê khai thuế GTGT',
     images: [{ url: '/og-image.png', width: 1200, height: 630 }],
     locale: 'vi_VN',
     type: 'website',
