@@ -12,6 +12,8 @@ interface AssignedUser {
   assigned_at: string;
 }
 
+type GdtCheckStatus = 'reachable' | 'gdt_blocked' | 'proxy_error' | 'proxy_auth_fail';
+
 interface Proxy {
   id: string;
   host: string;
@@ -22,13 +24,17 @@ interface Proxy {
   label: string | null;
   country: string;
   status: 'active' | 'blocked' | 'quarantine';
-  assigned_users: AssignedUser[];   // many-to-many (migration 048)
+  assigned_users: AssignedUser[];
   blocked_reason: string | null;
   blocked_at: string | null;
   last_health_check: string | null;
   last_health_status: boolean | null;
   expires_at: string | null;
   created_at: string;
+  /* GDT check columns (migration 051) */
+  gdt_check_at:     string | null;
+  gdt_check_status: GdtCheckStatus | null;
+  gdt_check_ms:     number | null;
 }
 
 interface Dashboard {
@@ -39,6 +45,27 @@ interface Dashboard {
   assigned: number;
   available: number;
   expired: number;
+  /* GDT stats */
+  gdt_blocked:   number;
+  gdt_reachable: number;
+  gdt_checked:   number;
+}
+
+interface GdtBulkResult {
+  checked:         number;
+  reachable:       number;
+  gdt_blocked:     number;
+  proxy_error:     number;
+  proxy_auth_fail: number;
+  results: {
+    proxyId:   string;
+    host:      string;
+    port:      number;
+    label:     string | null;
+    status:    GdtCheckStatus;
+    latencyMs: number | null;
+    detail:    string | null;
+  }[];
 }
 
 interface FormState {
@@ -63,6 +90,17 @@ const STATUS_BADGE: Record<string, string> = {
   quarantine: 'bg-yellow-100 text-yellow-700',
 };
 
+/* ── GDT check status config ────────────────────────────────────────────────── */
+
+const GDT_STATUS_CONFIG: Record<GdtCheckStatus, {
+  icon: string; label: string; color: string; bg: string;
+}> = {
+  reachable:       { icon: '✅', label: 'GDT thông',      color: 'text-green-700', bg: 'bg-green-50 border-green-200' },
+  gdt_blocked:     { icon: '🔴', label: 'GDT chặn',       color: 'text-red-700',   bg: 'bg-red-50 border-red-200' },
+  proxy_error:     { icon: '⚠️', label: 'Lỗi proxy',      color: 'text-amber-700', bg: 'bg-amber-50 border-amber-200' },
+  proxy_auth_fail: { icon: '🔑', label: 'Sai xác thực',   color: 'text-orange-700',bg: 'bg-orange-50 border-orange-200' },
+};
+
 /* ── Helpers ────────────────────────────────────────────────────────────────── */
 
 const VN_TZ = 'Asia/Ho_Chi_Minh';
@@ -76,16 +114,25 @@ function fmtDate(d: string | null): string {
   });
 }
 
+function fmtDateShort(d: string | null): string {
+  if (!d) return '—';
+  return new Date(d).toLocaleString('vi-VN', {
+    timeZone: VN_TZ,
+    day: '2-digit', month: '2-digit',
+    hour: '2-digit', minute: '2-digit',
+  });
+}
+
 function toLocalInput(utcIso: string): string {
   if (!utcIso) return '';
-  const d = new Date(utcIso);
-  const vnMs  = d.getTime() + 7 * 3_600_000;
-  const vn    = new Date(vnMs);
-  const yyyy  = vn.getUTCFullYear();
-  const mm    = String(vn.getUTCMonth() + 1).padStart(2, '0');
-  const dd    = String(vn.getUTCDate()).padStart(2, '0');
-  const HH    = String(vn.getUTCHours()).padStart(2, '0');
-  const MM    = String(vn.getUTCMinutes()).padStart(2, '0');
+  const d    = new Date(utcIso);
+  const vnMs = d.getTime() + 7 * 3_600_000;
+  const vn   = new Date(vnMs);
+  const yyyy = vn.getUTCFullYear();
+  const mm   = String(vn.getUTCMonth() + 1).padStart(2, '0');
+  const dd   = String(vn.getUTCDate()).padStart(2, '0');
+  const HH   = String(vn.getUTCHours()).padStart(2, '0');
+  const MM   = String(vn.getUTCMinutes()).padStart(2, '0');
   return `${yyyy}-${mm}-${dd}T${HH}:${MM}`;
 }
 
@@ -107,11 +154,51 @@ function errMsg(e: unknown): string {
 
 /* ── Stats Card ─────────────────────────────────────────────────────────────── */
 
-function StatCard({ label, value, color }: { label: string; value: number; color: string }) {
+function StatCard({
+  label, value, color, title,
+}: {
+  label: string; value: number | string; color: string; title?: string;
+}) {
   return (
-    <div className={`rounded-xl border px-4 py-3 ${color}`}>
-      <p className="text-xs font-medium text-gray-500 uppercase">{label}</p>
+    <div className={`rounded-xl border px-4 py-3 ${color}`} title={title}>
+      <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">{label}</p>
       <p className="text-2xl font-bold mt-1">{value}</p>
+    </div>
+  );
+}
+
+/* ── GDT Status Badge ────────────────────────────────────────────────────────── */
+
+function GdtStatusBadge({
+  status, checkedAt, latencyMs, checking,
+}: {
+  status: GdtCheckStatus | null;
+  checkedAt: string | null;
+  latencyMs: number | null;
+  checking?: boolean;
+}) {
+  if (checking) {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs text-gray-500 animate-pulse">
+        <span className="w-3 h-3 border-2 border-gray-400 border-t-transparent rounded-full animate-spin inline-block" />
+        Đang kiểm tra...
+      </span>
+    );
+  }
+  if (!status || !checkedAt) {
+    return <span className="text-xs text-gray-400">Chưa kiểm tra</span>;
+  }
+  const cfg = GDT_STATUS_CONFIG[status];
+  return (
+    <div>
+      <span className={`inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full border ${cfg.bg} ${cfg.color}`}>
+        <span>{cfg.icon}</span>
+        <span>{cfg.label}</span>
+        {latencyMs != null && (
+          <span className="opacity-70">({latencyMs}ms)</span>
+        )}
+      </span>
+      <p className="text-[10px] text-gray-400 mt-0.5">{fmtDateShort(checkedAt)}</p>
     </div>
   );
 }
@@ -119,19 +206,20 @@ function StatCard({ label, value, color }: { label: string; value: number; color
 /* ── Assigned Users badges ──────────────────────────────────────────────────── */
 
 function AssignedUsersBadges({
-  users,
-  onRelease,
+  users, onRelease,
 }: {
   users: AssignedUser[];
   onRelease: (userId: string, email: string) => void;
 }) {
   if (users.length === 0) return <span className="text-xs text-gray-400">Chưa gán</span>;
-
   return (
     <div className="flex flex-col gap-1">
       {users.map(u => (
         <div key={u.user_id} className="flex items-center gap-1">
-          <span className="text-xs bg-indigo-50 text-indigo-700 border border-indigo-100 rounded px-1.5 py-0.5 max-w-[160px] truncate" title={u.email}>
+          <span
+            className="text-xs bg-indigo-50 text-indigo-700 border border-indigo-100 rounded px-1.5 py-0.5 max-w-[140px] truncate"
+            title={u.email}
+          >
             {u.name ?? u.email}
           </span>
           <button
@@ -150,27 +238,32 @@ function AssignedUsersBadges({
 /* ── Proxy Row ──────────────────────────────────────────────────────────────── */
 
 function ProxyRow({
-  proxy,
-  onHealthCheck,
-  onReleaseUser,
-  onReleaseAll,
-  onDelete,
-  onEdit,
-  onAssign,
+  proxy, checkingGdt,
+  onHealthCheck, onCheckGdt,
+  onReleaseUser, onReleaseAll, onDelete, onEdit, onAssign,
 }: {
   proxy: Proxy;
+  checkingGdt: boolean;
   onHealthCheck: (id: string) => void;
+  onCheckGdt:    (id: string) => void;
   onReleaseUser: (proxyId: string, userId: string, email: string) => void;
-  onReleaseAll: (id: string) => void;
-  onDelete: (id: string) => void;
-  onEdit: (p: Proxy) => void;
-  onAssign: (id: string) => void;
+  onReleaseAll:  (id: string) => void;
+  onDelete:      (id: string) => void;
+  onEdit:        (p: Proxy) => void;
+  onAssign:      (id: string) => void;
 }) {
-  const [checking, setChecking] = useState(false);
+  const [tcpChecking, setTcpChecking] = useState(false);
   const hasUsers = proxy.assigned_users.length > 0;
 
+  const rowHighlight =
+    proxy.gdt_check_status === 'gdt_blocked'
+      ? 'bg-red-50'
+      : proxy.status !== 'active'
+      ? 'opacity-60'
+      : '';
+
   return (
-    <tr className={`border-t border-gray-100 transition-colors hover:bg-gray-50 ${proxy.status !== 'active' ? 'opacity-60' : ''}`}>
+    <tr className={`border-t border-gray-100 transition-colors hover:bg-gray-50 ${rowHighlight}`}>
       {/* Host:Port */}
       <td className="px-4 py-3">
         <p className="font-mono text-sm text-gray-800">{proxy.host}:{proxy.port}</p>
@@ -186,35 +279,45 @@ function ProxyRow({
         <p className="text-xs text-gray-400 font-mono">{maskPass(proxy.password)}</p>
       </td>
 
-      {/* Status */}
+      {/* Status (DB status) */}
       <td className="px-4 py-3">
         <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${STATUS_BADGE[proxy.status]}`}>
           {proxy.status}
         </span>
         {proxy.blocked_reason && (
-          <p className="text-xs text-red-400 mt-1 max-w-[200px] truncate" title={proxy.blocked_reason}>
+          <p className="text-xs text-red-400 mt-1 max-w-[180px] truncate" title={proxy.blocked_reason}>
             {proxy.blocked_reason}
           </p>
         )}
       </td>
 
-      {/* Assigned To (many-to-many) */}
-      <td className="px-4 py-3 min-w-[180px]">
-        <AssignedUsersBadges
-          users={proxy.assigned_users}
-          onRelease={(userId, email) => onReleaseUser(proxy.id, userId, email)}
+      {/* GDT Check Status */}
+      <td className="px-4 py-3 min-w-[160px]">
+        <GdtStatusBadge
+          status={proxy.gdt_check_status}
+          checkedAt={proxy.gdt_check_at}
+          latencyMs={proxy.gdt_check_ms}
+          checking={checkingGdt}
         />
       </td>
 
-      {/* Health */}
+      {/* Assigned To */}
+      <td className="px-4 py-3 min-w-[160px]">
+        <AssignedUsersBadges
+          users={proxy.assigned_users}
+          onRelease={(uid, email) => onReleaseUser(proxy.id, uid, email)}
+        />
+      </td>
+
+      {/* TCP Health */}
       <td className="px-4 py-3">
         {proxy.last_health_check ? (
           <div className="flex items-center gap-1">
-            <span className={`w-2 h-2 rounded-full ${proxy.last_health_status ? 'bg-green-500' : 'bg-red-500'}`} />
-            <span className="text-xs text-gray-500">{fmtDate(proxy.last_health_check)}</span>
+            <span className={`w-2 h-2 rounded-full shrink-0 ${proxy.last_health_status ? 'bg-green-500' : 'bg-red-500'}`} />
+            <span className="text-xs text-gray-500">{fmtDateShort(proxy.last_health_check)}</span>
           </div>
         ) : (
-          <span className="text-xs text-gray-400">Chưa kiểm tra</span>
+          <span className="text-xs text-gray-400">—</span>
         )}
       </td>
 
@@ -233,18 +336,27 @@ function ProxyRow({
       <td className="px-4 py-3">
         <div className="flex flex-wrap gap-1">
           <button
-            onClick={async () => { setChecking(true); await onHealthCheck(proxy.id); setChecking(false); }}
-            disabled={checking}
+            onClick={async () => { setTcpChecking(true); await onHealthCheck(proxy.id); setTcpChecking(false); }}
+            disabled={tcpChecking}
             className="text-xs text-blue-600 hover:underline disabled:opacity-50"
+            title="TCP ping proxy server"
           >
-            {checking ? '...' : 'Check'}
+            {tcpChecking ? '...' : 'TCP'}
+          </button>
+          <button
+            onClick={() => onCheckGdt(proxy.id)}
+            disabled={checkingGdt}
+            className="text-xs text-violet-600 hover:underline disabled:opacity-50"
+            title="Kiểm tra GDT có bị chặn không"
+          >
+            {checkingGdt ? '...' : 'GDT?'}
           </button>
           <button onClick={() => onAssign(proxy.id)} className="text-xs text-green-600 hover:underline">
             + Gán
           </button>
           {hasUsers && (
             <button onClick={() => onReleaseAll(proxy.id)} className="text-xs text-orange-600 hover:underline">
-              Gỡ tất cả
+              Gỡ all
             </button>
           )}
           <button onClick={() => onEdit(proxy)} className="text-xs text-indigo-600 hover:underline">Sửa</button>
@@ -252,6 +364,119 @@ function ProxyRow({
         </div>
       </td>
     </tr>
+  );
+}
+
+/* ── GDT Bulk Result Panel ───────────────────────────────────────────────────── */
+
+function GdtResultPanel({
+  result, onClose,
+}: {
+  result: GdtBulkResult;
+  onClose: () => void;
+}) {
+  const blocked = result.results.filter(r => r.status === 'gdt_blocked');
+  const errors  = result.results.filter(r => r.status === 'proxy_error' || r.status === 'proxy_auth_fail');
+  const ok      = result.results.filter(r => r.status === 'reachable');
+
+  return (
+    <div className="bg-white border border-violet-200 rounded-xl p-5 space-y-4">
+      {/* Summary */}
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-semibold text-gray-700">
+          Kết quả kiểm tra GDT Block ({result.checked} proxy)
+        </h2>
+        <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-lg leading-none">✕</button>
+      </div>
+
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <div className="rounded-lg border border-green-200 bg-green-50 px-3 py-2 text-center">
+          <p className="text-xs text-gray-500">✅ GDT thông</p>
+          <p className="text-xl font-bold text-green-700">{result.reachable}</p>
+        </div>
+        <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-center">
+          <p className="text-xs text-gray-500">🔴 GDT chặn</p>
+          <p className="text-xl font-bold text-red-700">{result.gdt_blocked}</p>
+        </div>
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-center">
+          <p className="text-xs text-gray-500">⚠️ Lỗi proxy</p>
+          <p className="text-xl font-bold text-amber-700">{result.proxy_error}</p>
+        </div>
+        <div className="rounded-lg border border-orange-200 bg-orange-50 px-3 py-2 text-center">
+          <p className="text-xs text-gray-500">🔑 Sai xác thực</p>
+          <p className="text-xl font-bold text-orange-700">{result.proxy_auth_fail}</p>
+        </div>
+      </div>
+
+      {/* Blocked list — most important */}
+      {blocked.length > 0 && (
+        <div>
+          <p className="text-xs font-semibold text-red-700 mb-2">
+            🔴 {blocked.length} proxy bị GDT TCP-blackhole — cần thay thế hoặc xoay IP:
+          </p>
+          <div className="space-y-1">
+            {blocked.map(r => (
+              <div
+                key={r.proxyId}
+                className="flex items-center gap-2 bg-red-50 border border-red-100 rounded-lg px-3 py-1.5"
+              >
+                <span className="font-mono text-sm text-red-800 font-medium">{r.host}:{r.port}</span>
+                {r.label && <span className="text-xs text-red-500">({r.label})</span>}
+                <span className="text-xs text-red-400 ml-auto">Timeout — IP bị GDT block</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Proxy errors */}
+      {errors.length > 0 && (
+        <div>
+          <p className="text-xs font-semibold text-amber-700 mb-2">
+            ⚠️ {errors.length} proxy có vấn đề cấu hình (không liên quan GDT):
+          </p>
+          <div className="space-y-1">
+            {errors.map(r => {
+              const cfg = GDT_STATUS_CONFIG[r.status];
+              return (
+                <div
+                  key={r.proxyId}
+                  className="flex items-center gap-2 bg-amber-50 border border-amber-100 rounded-lg px-3 py-1.5"
+                >
+                  <span className="text-sm">{cfg.icon}</span>
+                  <span className="font-mono text-sm text-gray-700">{r.host}:{r.port}</span>
+                  {r.label && <span className="text-xs text-gray-400">({r.label})</span>}
+                  <span className="text-xs text-amber-600 ml-auto">{cfg.label}: {r.detail ?? ''}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Reachable — collapsed if no issues */}
+      {ok.length > 0 && blocked.length === 0 && errors.length === 0 && (
+        <p className="text-sm text-green-700">
+          ✅ Tất cả {ok.length} proxy đều kết nối được với GDT — không có IP nào bị chặn.
+        </p>
+      )}
+      {ok.length > 0 && (blocked.length > 0 || errors.length > 0) && (
+        <details className="text-xs text-gray-500">
+          <summary className="cursor-pointer hover:text-gray-700">
+            ✅ {ok.length} proxy thông với GDT (xem chi tiết)
+          </summary>
+          <div className="mt-2 space-y-1">
+            {ok.map(r => (
+              <div key={r.proxyId} className="flex items-center gap-2">
+                <span className="font-mono text-gray-600">{r.host}:{r.port}</span>
+                {r.label && <span className="text-gray-400">({r.label})</span>}
+                {r.latencyMs != null && <span className="text-green-600 ml-auto">{r.latencyMs}ms</span>}
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+    </div>
   );
 }
 
@@ -265,8 +490,13 @@ export default function AdminProxiesPage() {
   const [form, setForm]           = useState<FormState>(BLANK);
   const [saving, setSaving]       = useState(false);
   const [err, setErr]             = useState('');
-  const [assignModal, setAssignModal] = useState<string | null>(null); // proxy id
+  const [assignModal, setAssignModal] = useState<string | null>(null);
   const [assignEmail, setAssignEmail] = useState('');
+
+  /* GDT check state */
+  const [gdtChecking, setGdtChecking]   = useState(false);          // bulk check running
+  const [gdtCheckingId, setGdtCheckingId] = useState<string | null>(null); // single proxy
+  const [gdtResult, setGdtResult]       = useState<GdtBulkResult | null>(null);
 
   const load = useCallback(() => {
     apiClient.get<{ data: Proxy[] }>('/admin/proxies')
@@ -295,7 +525,6 @@ export default function AdminProxiesPage() {
         country:  form.country,
         expires_at: form.expires_at || undefined,
       };
-
       if (editProxy) {
         await apiClient.patch(`/admin/proxies/${editProxy.id}`, body);
       } else {
@@ -325,19 +554,51 @@ export default function AdminProxiesPage() {
   async function handleHealthCheck(id: string) {
     try {
       const r = await apiClient.post<{ data: { healthy: boolean } }>(`/admin/proxies/${id}/health-check`);
-      alert(r.data.data.healthy ? '✅ Proxy hoạt động tốt' : '❌ Proxy không kết nối được');
+      alert(r.data.data.healthy ? '✅ Proxy TCP hoạt động' : '❌ Proxy TCP không kết nối được');
       load();
     } catch (e) {
       alert(errMsg(e));
     }
   }
 
+  /* ── GDT check handlers ─────────────────────────────────────────────────── */
+
+  /** Kiểm tra toàn bộ proxy xem IP nào bị GDT chặn */
+  async function handleBulkGdtCheck() {
+    if (!confirm(`Chạy kiểm tra GDT block cho tất cả proxy đang active?\n\n⏱ Thời gian tối đa: ~15 giây`)) return;
+    setGdtChecking(true);
+    setGdtResult(null);
+    try {
+      const r = await apiClient.post<{ data: GdtBulkResult }>('/admin/proxies/check-gdt-block', {});
+      setGdtResult(r.data.data);
+      load(); // reload table to show updated gdt_check_status
+    } catch (e) {
+      alert(`Lỗi kiểm tra GDT: ${errMsg(e)}`);
+    } finally {
+      setGdtChecking(false);
+    }
+  }
+
+  /** Kiểm tra một proxy đơn lẻ */
+  async function handleSingleGdtCheck(proxyId: string) {
+    setGdtCheckingId(proxyId);
+    try {
+      await apiClient.post(`/admin/proxies/${proxyId}/check-gdt-block`, {});
+      load();
+    } catch (e) {
+      alert(`Lỗi kiểm tra GDT: ${errMsg(e)}`);
+    } finally {
+      setGdtCheckingId(null);
+    }
+  }
+
+  /* ── Assignment handlers ────────────────────────────────────────────────── */
+
   async function handleReleaseUser(proxyId: string, userId: string, email: string) {
     if (!confirm(`Gỡ gán ${email} khỏi proxy này?`)) return;
     try {
       await apiClient.post(`/admin/proxies/${proxyId}/release`, {
-        user_id: userId,
-        reason: 'Admin manual release',
+        user_id: userId, reason: 'Admin manual release',
       });
       load();
     } catch (e) {
@@ -367,10 +628,8 @@ export default function AdminProxiesPage() {
         (u: { email: string }) => u.email.toLowerCase() === assignEmail.trim().toLowerCase(),
       );
       if (!user) { setErr(`Không tìm thấy user "${assignEmail}"`); return; }
-
       await apiClient.post(`/admin/proxies/${proxyId}/assign`, {
-        user_id: user.id,
-        reason: 'Admin manual assign',
+        user_id: user.id, reason: 'Admin manual assign',
       });
       setAssignModal(null);
       setAssignEmail('');
@@ -391,37 +650,92 @@ export default function AdminProxiesPage() {
     setShowAdd(true);
   }
 
+  /* ── Derived stats ──────────────────────────────────────────────────────── */
+
+  const gdtBlockedCount = proxies.filter(p => p.gdt_check_status === 'gdt_blocked').length;
+
   /* ── Render ─────────────────────────────────────────────────────────────── */
 
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex items-start justify-between gap-4">
         <div>
           <h1 className="text-xl font-bold text-gray-800">Static Proxy Pool</h1>
           <p className="text-sm text-gray-500 mt-1">
             Quản lý proxy tĩnh — 1 IP có thể gán cho nhiều user
           </p>
         </div>
-        <button
-          onClick={() => { setShowAdd(true); setEditProxy(null); setForm(BLANK); setErr(''); }}
-          className="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 transition-colors"
-        >
-          + Thêm Proxy
-        </button>
+        <div className="flex gap-2 shrink-0">
+          {/* GDT Block Check — hero action */}
+          <button
+            onClick={handleBulkGdtCheck}
+            disabled={gdtChecking}
+            className={`px-4 py-2 text-sm font-medium rounded-lg transition-colors flex items-center gap-2
+              ${gdtChecking
+                ? 'bg-violet-100 text-violet-500 cursor-not-allowed'
+                : gdtBlockedCount > 0
+                ? 'bg-red-600 text-white hover:bg-red-700'
+                : 'bg-violet-600 text-white hover:bg-violet-700'
+              }`}
+            title="Kiểm tra proxy nào bị GDT TCP-blackhole"
+          >
+            {gdtChecking
+              ? <><span className="w-3 h-3 border-2 border-violet-400 border-t-transparent rounded-full animate-spin" /> Đang kiểm tra...</>
+              : <><span>🔍</span> Kiểm tra GDT Block{gdtBlockedCount > 0 ? ` (${gdtBlockedCount} bị chặn)` : ''}</>
+            }
+          </button>
+          <button
+            onClick={() => { setShowAdd(true); setEditProxy(null); setForm(BLANK); setErr(''); }}
+            className="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 transition-colors"
+          >
+            + Thêm Proxy
+          </button>
+        </div>
       </div>
 
       {/* Dashboard Stats */}
       {dashboard && (
-        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3">
-          <StatCard label="Tổng" value={dashboard.total} color="border-gray-200" />
-          <StatCard label="Hoạt động" value={dashboard.active} color="border-green-200 bg-green-50" />
-          <StatCard label="Khả dụng" value={dashboard.available} color="border-blue-200 bg-blue-50" />
-          <StatCard label="Đã gán" value={dashboard.assigned} color="border-indigo-200 bg-indigo-50" />
-          <StatCard label="Bị chặn" value={dashboard.blocked} color="border-red-200 bg-red-50" />
-          <StatCard label="Cách ly" value={dashboard.quarantine} color="border-yellow-200 bg-yellow-50" />
-          <StatCard label="Hết hạn" value={dashboard.expired} color="border-gray-300 bg-gray-50" />
+        <div className="space-y-2">
+          {/* Row 1: pool stats */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3">
+            <StatCard label="Tổng"       value={dashboard.total}     color="border-gray-200" />
+            <StatCard label="Hoạt động"  value={dashboard.active}    color="border-green-200 bg-green-50" />
+            <StatCard label="Khả dụng"   value={dashboard.available} color="border-blue-200 bg-blue-50" />
+            <StatCard label="Đã gán"     value={dashboard.assigned}  color="border-indigo-200 bg-indigo-50" />
+            <StatCard label="Bị chặn"    value={dashboard.blocked}   color="border-red-200 bg-red-50" />
+            <StatCard label="Cách ly"    value={dashboard.quarantine}color="border-yellow-200 bg-yellow-50" />
+            <StatCard label="Hết hạn"    value={dashboard.expired}   color="border-gray-300 bg-gray-50" />
+          </div>
+          {/* Row 2: GDT stats — only if at least one proxy has been checked */}
+          {dashboard.gdt_checked > 0 && (
+            <div className="grid grid-cols-3 gap-3">
+              <StatCard
+                label="GDT thông"
+                value={`${dashboard.gdt_reachable} / ${dashboard.gdt_checked}`}
+                color="border-green-300 bg-green-50"
+                title={`${dashboard.gdt_reachable} proxy kết nối được GDT`}
+              />
+              <StatCard
+                label="🔴 GDT chặn IP"
+                value={dashboard.gdt_blocked}
+                color={dashboard.gdt_blocked > 0 ? 'border-red-400 bg-red-50' : 'border-gray-200'}
+                title="Số proxy bị GDT TCP-blackhole (cần thay thế)"
+              />
+              <StatCard
+                label="Chưa kiểm tra"
+                value={dashboard.active - dashboard.gdt_checked}
+                color="border-gray-200"
+                title="Proxy active chưa từng chạy kiểm tra GDT"
+              />
+            </div>
+          )}
         </div>
+      )}
+
+      {/* GDT Bulk Result Panel */}
+      {gdtResult && (
+        <GdtResultPanel result={gdtResult} onClose={() => setGdtResult(null)} />
       )}
 
       {/* Add / Edit Form */}
@@ -507,9 +821,7 @@ export default function AdminProxiesPage() {
               />
             </div>
           </div>
-
           {err && <p className="text-sm text-red-500">{err}</p>}
-
           <div className="flex gap-2">
             <button
               onClick={handleSave}
@@ -531,12 +843,8 @@ export default function AdminProxiesPage() {
       {/* Assign Modal */}
       {assignModal && (
         <div className="bg-white border border-blue-200 rounded-xl p-6 space-y-3">
-          <h2 className="text-sm font-semibold text-gray-700">
-            Gán thêm User vào Proxy
-          </h2>
-          <p className="text-xs text-gray-400">
-            Nhập email user cần gán. IP này có thể được gán cho nhiều user đồng thời.
-          </p>
+          <h2 className="text-sm font-semibold text-gray-700">Gán thêm User vào Proxy</h2>
+          <p className="text-xs text-gray-400">IP có thể gán cho nhiều user đồng thời.</p>
           <div className="flex gap-2">
             <input
               value={assignEmail}
@@ -565,15 +873,32 @@ export default function AdminProxiesPage() {
 
       {/* Proxy Table */}
       <div className="bg-white rounded-xl border border-gray-200 overflow-x-auto">
-        <table className="w-full text-sm min-w-[1000px]">
+        {/* Legend */}
+        <div className="px-4 py-2.5 border-b border-gray-100 flex flex-wrap items-center gap-4 text-xs text-gray-500">
+          <span className="font-medium text-gray-600">GDT Block Check:</span>
+          {Object.entries(GDT_STATUS_CONFIG).map(([key, cfg]) => (
+            <span key={key} className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border ${cfg.bg} ${cfg.color}`}>
+              {cfg.icon} {cfg.label}
+            </span>
+          ))}
+          <span className="ml-auto text-gray-400 italic">
+            Nhấn &quot;GDT?&quot; trên từng proxy hoặc &quot;Kiểm tra GDT Block&quot; để quét toàn bộ
+          </span>
+        </div>
+
+        <table className="w-full text-sm min-w-[1100px]">
           <thead className="bg-gray-50 border-b border-gray-200">
             <tr>
               <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">Host:Port</th>
               <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">Protocol</th>
               <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">Auth</th>
               <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">Trạng thái</th>
+              <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">
+                GDT Block Check
+                <span className="normal-case font-normal text-gray-400 ml-1">(CONNECT tunnel)</span>
+              </th>
               <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">Gán cho</th>
-              <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">Health</th>
+              <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">TCP Health</th>
               <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">Hạn</th>
               <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">Thao tác</th>
             </tr>
@@ -583,7 +908,9 @@ export default function AdminProxiesPage() {
               <ProxyRow
                 key={p.id}
                 proxy={p}
+                checkingGdt={gdtChecking || gdtCheckingId === p.id}
                 onHealthCheck={handleHealthCheck}
+                onCheckGdt={handleSingleGdtCheck}
                 onReleaseUser={handleReleaseUser}
                 onReleaseAll={handleReleaseAll}
                 onDelete={handleDelete}
@@ -593,7 +920,7 @@ export default function AdminProxiesPage() {
             ))}
             {proxies.length === 0 && (
               <tr>
-                <td colSpan={8} className="px-4 py-8 text-center text-gray-400">
+                <td colSpan={9} className="px-4 py-8 text-center text-gray-400">
                   Chưa có proxy nào. Nhấn &quot;+ Thêm Proxy&quot; để bắt đầu.
                 </td>
               </tr>

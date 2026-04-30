@@ -71,13 +71,23 @@ const DB_POLL_IDLE_MIN_MS = 15_000;
 const DB_POLL_IDLE_MAX_MS = 45_000;
 
 /**
- * Per-company circuit breaker: if a company accumulates CB_THRESHOLD consecutive
- * HTTP 500 errors within CB_WINDOW_MS, skip it until CB_COOLDOWN_MS has elapsed.
+ * Per-company circuit breaker: if a company accumulates CB_THRESHOLD HTTP 500
+ * errors within CB_WINDOW_MS, skip it until CB_COOLDOWN_MS has elapsed.
  * Prevents hammering GDT when a specific company's invoices trigger server errors.
+ *
+ * Tuning rationale (updated based on live VPS log analysis):
+ *   - GDT HTTP 500 is typically a transient overload (bursty, especially 07:00–09:00 VN).
+ *     The old threshold of 5 within 10 minutes tripped too aggressively on normal GDT
+ *     morning slowness, causing the worker to pause companies unnecessarily for 15 minutes.
+ *   - Raised threshold to 12: tolerates up to 12 × 500s in a 15-min window (a realistic
+ *     burst during GDT peak hour) before deciding the problem is persistent enough to pause.
+ *   - Extended window to 15 min: aligns with GDT's typical overload episode duration.
+ *   - Reduced cooldown to 5 min: GDT recovers quickly from transient overloads; 15 min was
+ *     too conservative and left companies paused long after GDT had already recovered.
  */
-const CB_THRESHOLD   = 5;
-const CB_WINDOW_MS   = 10 * 60_000;   // errors counted within a 10-minute window
-const CB_COOLDOWN_MS = 15 * 60_000;   // pause company for 15 minutes after trip
+const CB_THRESHOLD   = 12;
+const CB_WINDOW_MS   = 15 * 60_000;   // count errors within a 15-minute window
+const CB_COOLDOWN_MS =  5 * 60_000;   // pause for only 5 minutes after trip
 
 /** GDT JWT is valid for 30 min; refresh 5 min early = 25 min max age. */
 const JWT_MAX_AGE_MS = 25 * 60_000;
@@ -614,6 +624,13 @@ async function getToken(
         const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as Record<string, unknown>;
         const iat = typeof parsed['iat'] === 'number' ? parsed['iat'] : 0;
         if (Date.now() - iat * 1000 < JWT_MAX_AGE_MS) {
+          // Cache hit = this JWT was created by a successful login (from this worker or
+          // sync.worker). The credentials were valid at issue time — safe to reset the
+          // consecutive auth-failure counter so stale errors don't trigger deactivation.
+          // Do NOT reset _proxyFailures here: cache hit doesn't prove the current proxy
+          // works for auth; proxy state is reset in processCompany() after getToken()
+          // returns (line below: resetProxyFailures).
+          resetAuthFailure(companyId);
           return cached;
         }
       }
@@ -1042,8 +1059,10 @@ async function processCompany(companyId: string, companyIndex = 0): Promise<void
         await markFailed(row.id, msg, row.attempts);
         const tripped = recordHttp500(companyId);
         if (tripped) {
-          logger.warn('[DetailWorker] Circuit breaker tripped — pausing company for 15 min', {
-            companyId, threshold: CB_THRESHOLD,
+          logger.warn('[DetailWorker] Circuit breaker tripped — pausing company for 5 min', {
+            companyId,
+            threshold:   CB_THRESHOLD,
+            cooldownMin: CB_COOLDOWN_MS / 60_000,
           });
           break;
         }
