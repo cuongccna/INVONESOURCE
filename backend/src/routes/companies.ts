@@ -378,14 +378,20 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction) =>
       await client.query('DELETE FROM import_temp_files WHERE company_id = $1', [companyId]);
       // bot_failed_jobs has nullable FK without ON DELETE CASCADE
       await client.query('DELETE FROM bot_failed_jobs   WHERE company_id = $1', [companyId]);
-      // audit_logs has company_id UUID REFERENCES companies(id) WITHOUT CASCADE (013_soft_delete.sql)
-      await client.query('DELETE FROM audit_logs        WHERE company_id = $1', [companyId]);
+      // Note: audit_logs is intentionally NOT deleted to preserve audit trail
 
       // ── Tables whose FK points at invoices.id without cascade ────────
       // (gdt_validation_queue has ON DELETE CASCADE from invoices per 002 migration,
       //  but we delete explicitly here to be safe before invoices is removed)
       await client.query(
         'DELETE FROM gdt_validation_queue WHERE invoice_id IN (SELECT id FROM invoices WHERE company_id = $1)',
+        [companyId]
+      );
+
+      // (invoice_detail_queue has ON DELETE CASCADE from invoices per 042 migration,
+      //  delete explicitly for safety)
+      await client.query(
+        'DELETE FROM invoice_detail_queue WHERE invoice_id IN (SELECT id FROM invoices WHERE company_id = $1)',
         [companyId]
       );
 
@@ -400,7 +406,15 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction) =>
       //   esg_estimates, insights_cache, repurchase_predictions, price_anomalies,
       //   audit_rule_configs, code_sequences, customer_catalog, supplier_catalog,
       //   missing_invoice_alerts, tax_rate_anomalies, company_risk_flags,
-      //   raw_invoice_data
+      //   raw_invoice_data, vendor_blacklist, hkd_declarations, hkd_line_items,
+      //   hkd_inventory_opening_balances, company_analytics, company_verification_docs,
+      //   sequential_numbering, cash_book_entries, inventory_movements,
+      //   profit_loss_statements, hkd_tax_statements, esg_estimates,
+      //   repurchase_predictions, insights_cache, price_anomalies,
+      //   audit_rule_configs, company_risk_flags, raw_invoice_data, vendor_blacklist,
+      //   payment_plan_assignments, telegram_chat_configs, hkd_declarations,
+      //   hkd_line_items, hkd_inventory_opening_balances
+      // Note: audit_logs is NOT cascaded - kept for audit trail
       await client.query('DELETE FROM companies WHERE id = $1', [companyId]);
 
       await client.query('COMMIT');

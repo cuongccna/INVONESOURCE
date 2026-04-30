@@ -99,3 +99,7 @@ backend/hkd_test_output.pdf
 .env.production.example
 .env.production.example
 repomix-output.xml
+COMPANY_DELETE_AUDIT.md
+COMPANY_DELETE_FLOWCHART.txt
+COMPANY_DELETE_SUMMARY.md
+scripts/sql/cleanup-company.sql
