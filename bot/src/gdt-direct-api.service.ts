@@ -29,7 +29,7 @@ import type { GdtRawCacheService } from './crawl-cache/GdtRawCacheService';
 import type { ProxyManager } from './proxy-manager';
 
 // ── Human-like browser simulation ───────────────────────────────────────────
-// Realistic Chrome User-Agents observed on Vietnamese ISPs (Viettel / VNPT / FPT).
+// Realistic Chrome/Edge/Firefox User-Agents observed on Vietnamese ISPs.
 // Rotated randomly per session so GDT doesn't see the same UA every 6 hours.
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -52,6 +52,69 @@ function randomUserAgentExcluding(last: string | null): string {
   const pool = last ? USER_AGENTS.filter(u => u !== last) : USER_AGENTS;
   const source = pool.length > 0 ? pool : USER_AGENTS;
   return source[Math.floor(Math.random() * source.length)]!;
+}
+
+/**
+ * Derive Client Hints headers that MATCH the selected User-Agent string.
+ *
+ * A mismatch (e.g. sec-ch-ua = Chrome/122 while UA string claims Firefox) is a
+ * reliable bot-detection signal. Real browsers always emit sec-ch-ua headers that
+ * are consistent with their UA string, and Firefox emits NO sec-ch-ua at all.
+ *
+ * Returns a partial headers object (may be empty for Firefox, where these headers
+ * should be omitted entirely).
+ */
+function deriveClientHints(ua: string): Record<string, string> {
+  // Firefox: does not send Client Hints at all
+  if (/Firefox\//.test(ua)) return {};
+
+  // Determine platform
+  let platform       = '"Windows"';
+  let platformVersion = '"15.0.0"'; // Win 10/11
+
+  if (/Macintosh/.test(ua)) {
+    platform        = '"macOS"';
+    platformVersion = '"10.15.7"';
+  } else if (/Windows NT 6\.1/.test(ua)) {
+    // Windows 7
+    platformVersion = '"7.0.0"';
+  }
+
+  // Determine browser brand + version from UA
+  const edgeMatch   = ua.match(/Edg\/(\d+)\.\d+/);
+  const chromeMatch = ua.match(/Chrome\/(\d+)\.\d+/);
+
+  if (edgeMatch) {
+    const v = edgeMatch[1]!;
+    return {
+      'sec-ch-ua':                  `"Chromium";v="${v}", "Not(A:Brand";v="24", "Microsoft Edge";v="${v}"`,
+      'sec-ch-ua-mobile':           '?0',
+      'sec-ch-ua-platform':         platform,
+      'sec-ch-ua-platform-version': platformVersion,
+      'sec-ch-ua-full-version-list': `"Chromium";v="${v}.0.0.0", "Not(A:Brand";v="24.0.0.0", "Microsoft Edge";v="${v}.0.0.0"`,
+    };
+  }
+
+  if (chromeMatch) {
+    const v = chromeMatch[1]!;
+    // Chrome 109 (last version for Windows 7) uses a different Not-A-Brand token
+    const notBrand = parseInt(v, 10) <= 109 ? '"Not_A Brand";v="99"' : '"Not(A:Brand";v="24"';
+    return {
+      'sec-ch-ua':                  `"Chromium";v="${v}", ${notBrand}, "Google Chrome";v="${v}"`,
+      'sec-ch-ua-mobile':           '?0',
+      'sec-ch-ua-platform':         platform,
+      'sec-ch-ua-platform-version': platformVersion,
+      'sec-ch-ua-full-version-list': `"Chromium";v="${v}.0.0.0", ${notBrand.replace(/";v="/, '.0.0.0";v="').replace(/"$/, '.0.0"')}, "Google Chrome";v="${v}.0.0.0"`,
+    };
+  }
+
+  // Unknown Chromium-based: return minimal hints
+  return {
+    'sec-ch-ua':                  '"Chromium";v="122", "Not(A:Brand";v="24"',
+    'sec-ch-ua-mobile':           '?0',
+    'sec-ch-ua-platform':         platform,
+    'sec-ch-ua-platform-version': platformVersion,
+  };
 }
 
 /**
@@ -852,23 +915,22 @@ export class GdtDirectApiService {
     const ua = randomUserAgentExcluding(lastUa);
     GdtDirectApiService._lastUaMap.set(companyKey, ua);
     this._lastUa = ua;
+    // Derive Client Hints that match the selected UA — a mismatch is a bot signal.
+    // Firefox emits no sec-ch-ua headers; Chrome/Edge headers must match version.
+    const clientHints = deriveClientHints(ua);
     const commonHeaders = {
-      'Accept':                    'application/json, text/plain, */*',
-      'Accept-Language':           'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
-      'Accept-Encoding':           'gzip, deflate, br',
-      'Cache-Control':             'no-cache',
-      'Pragma':                    'no-cache',
-      'User-Agent':                ua,
-      'Origin':                    'https://hoadondientu.gdt.gov.vn',
-      'Referer':                   'https://hoadondientu.gdt.gov.vn/',
-      'sec-ch-ua':                 '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-      'sec-ch-ua-mobile':          '?0',
-      'sec-ch-ua-platform':        '"Windows"',
-      'sec-ch-ua-platform-version': '"15.0.0"',
-      'sec-ch-ua-full-version-list': '"Chromium";v="122.0.6261.94", "Not(A:Brand";v="24.0.0.0", "Google Chrome";v="122.0.6261.94"',
-      'sec-fetch-site':            'same-origin',
-      'sec-fetch-mode':            'cors',
-      'sec-fetch-dest':            'empty',
+      'Accept':           'application/json, text/plain, */*',
+      'Accept-Language':  'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Accept-Encoding':  'gzip, deflate, br',
+      'Cache-Control':    'no-cache',
+      'Pragma':           'no-cache',
+      'User-Agent':       ua,
+      'Origin':           'https://hoadondientu.gdt.gov.vn',
+      'Referer':          'https://hoadondientu.gdt.gov.vn/',
+      ...clientHints,     // sec-ch-ua, sec-ch-ua-mobile, sec-ch-ua-platform, etc. (empty for Firefox)
+      'sec-fetch-site':   'same-origin',
+      'sec-fetch-mode':   'cors',
+      'sec-fetch-dest':   'empty',
     };
     this._commonHeaders = commonHeaders;
     this._currentProxyUrl = proxyUrl ?? null;

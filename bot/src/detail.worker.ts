@@ -201,6 +201,7 @@ interface ProxyFailureState {
 
 const _proxyFailures = new Map<string, ProxyFailureState>();
 
+/** Synchronous getter — requires state to already be in memory (call ensureProxyFailureState first). */
 function getProxyFailureState(companyId: string): ProxyFailureState {
   let s = _proxyFailures.get(companyId);
   if (!s) {
@@ -210,8 +211,44 @@ function getProxyFailureState(companyId: string): ProxyFailureState {
   return s;
 }
 
+/**
+ * Load proxy failure state for a company, pulling persisted excluded-proxy URLs
+ * from Redis on first access.  Call this ONCE at the start of processCompany();
+ * subsequent synchronous getProxyFailureState() calls will use the cached entry.
+ */
+async function ensureProxyFailureState(companyId: string): Promise<ProxyFailureState> {
+  let s = _proxyFailures.get(companyId);
+  if (!s) {
+    const redisKey  = `gdt:detail:excluded:${companyId}`;
+    const persisted = await _redis.smembers(redisKey);
+    s = {
+      excludedUrls:        new Set<string>(persisted),
+      consecutiveTimeouts: 0,
+      totalRotations:      0,
+    };
+    _proxyFailures.set(companyId, s);
+    if (persisted.length > 0) {
+      logger.info('[DetailWorker] Loaded persisted proxy exclusions from Redis', {
+        companyId: companyId.slice(0, 8),
+        excluded:  persisted.length,
+      });
+    }
+  }
+  return s;
+}
+
+/**
+ * Reset only the transient counters after a successful login.
+ * The excludedUrls Set is intentionally preserved — a proxy that was
+ * TCP-blackholed by GDT stays excluded for the rest of the Redis TTL (24h),
+ * even if subsequent logins on other proxies succeed.
+ */
 function resetProxyFailures(companyId: string): void {
-  _proxyFailures.delete(companyId);
+  const s = _proxyFailures.get(companyId);
+  if (!s) return;
+  s.consecutiveTimeouts = 0;
+  s.totalRotations      = 0;
+  // s.excludedUrls is intentionally NOT cleared here
 }
 
 /**
@@ -221,12 +258,15 @@ function resetProxyFailures(companyId: string): void {
  *   { rotate: true }     — threshold reached, exclude this proxy and try the next
  *   { notifyUser: true } — all proxy rotations exhausted, notify the user
  *   { wait: true }       — below threshold, just wait for next cycle
+ *
+ * When the threshold is reached the proxy URL is persisted to Redis so the
+ * exclusion survives a worker restart (TTL = 24 h).
  */
-function recordProxyTimeout(
+async function recordProxyTimeout(
   companyId: string,
   proxyUrl:  string,
-): { rotate: boolean; notifyUser: boolean } {
-  const s = getProxyFailureState(companyId);
+): Promise<{ rotate: boolean; notifyUser: boolean }> {
+  const s = getProxyFailureState(companyId); // state already in memory from ensureProxyFailureState()
   s.consecutiveTimeouts++;
 
   if (s.consecutiveTimeouts >= PROXY_TIMEOUT_THRESHOLD) {
@@ -235,10 +275,23 @@ function recordProxyTimeout(
     s.totalRotations++;
     s.consecutiveTimeouts = 0; // Reset for the next proxy
 
+    // Persist exclusion to Redis so it survives process restarts
+    try {
+      const redisKey = `gdt:detail:excluded:${companyId}`;
+      await _redis.sadd(redisKey, proxyUrl);
+      await _redis.expire(redisKey, 86_400); // 24 h TTL
+    } catch (redisErr) {
+      logger.warn('[DetailWorker] Failed to persist proxy exclusion to Redis (non-fatal)', {
+        companyId: companyId.slice(0, 8),
+        error: redisErr instanceof Error ? redisErr.message : String(redisErr),
+      });
+    }
+
     const notifyUser = s.totalRotations >= MAX_PROXY_ROTATIONS;
     if (notifyUser) {
       // All rotations exhausted — the entire pool appears blocked for this company.
-      // Reset state so the company can be retried if user adds new proxies later.
+      // Reset in-memory state so the company can be retried if user adds new proxies later.
+      // Redis TTL will naturally expire the per-proxy exclusions after 24 h.
       _proxyFailures.delete(companyId);
     }
 
@@ -246,6 +299,21 @@ function recordProxyTimeout(
   }
 
   return { rotate: false, notifyUser: false };
+}
+
+/**
+ * Remove a specific proxy URL from the exclusion list for a company.
+ * Called when an admin GDT-check confirms the proxy is 'reachable' again.
+ */
+async function clearExcludedProxy(companyId: string, proxyUrl: string): Promise<void> {
+  const s = _proxyFailures.get(companyId);
+  if (s) s.excludedUrls.delete(proxyUrl);
+  try {
+    const redisKey = `gdt:detail:excluded:${companyId}`;
+    await _redis.srem(redisKey, proxyUrl);
+  } catch {
+    // Non-fatal — in-memory exclusion is already cleared above
+  }
 }
 
 /** Helper: enqueue a 'bot-no-proxy' notification for the user's bell icon. */
@@ -888,7 +956,7 @@ async function processCompany(companyId: string, companyIndex = 0): Promise<void
   //
   // proxySessionId still comes from gdt_bot_configs so the GdtSessionCache key
   // matches what sync.worker stored — allowing token reuse across workers.
-  const proxyFailState = getProxyFailureState(companyId);
+  const proxyFailState = await ensureProxyFailureState(companyId);
   const proxyUrl       = await proxyManager.nextForDetailWorker(companyId, proxyFailState.excludedUrls);
   const proxySessionId = config.proxy_session_id ?? config.company_id;
 
@@ -946,7 +1014,7 @@ async function processCompany(companyId: string, companyIndex = 0): Promise<void
       // Record the timeout against this proxy for this company.
       // After PROXY_TIMEOUT_THRESHOLD consecutive timeouts on the same proxy,
       // exclude it and let nextForDetailWorker() pick the next one.
-      const { rotate, notifyUser } = recordProxyTimeout(companyId, proxyUrl);
+      const { rotate, notifyUser } = await recordProxyTimeout(companyId, proxyUrl);
 
       if (notifyUser) {
         // All MAX_PROXY_ROTATIONS rotations exhausted — the entire proxy pool
@@ -1006,8 +1074,11 @@ async function processCompany(companyId: string, companyIndex = 0): Promise<void
     return;
   }
 
-  // ── Login succeeded — reset all failure counters ─────────────────────────────
-  resetProxyFailures(companyId);   // clear excluded proxy list for this company
+  // ── Login succeeded — reset transient failure counters ──────────────────────
+  // NOTE: resetProxyFailures() only resets consecutiveTimeouts and totalRotations.
+  // excludedUrls is intentionally preserved so a GDT-blackholed proxy stays
+  // excluded even after a successful login on a different proxy.
+  resetProxyFailures(companyId);
   // resetAuthFailure() is already called inside getToken() on success
 
   const gdtApi = new GdtDirectApiService(proxyUrl, null, undefined, companyId, null, gdtRawCacheService);
