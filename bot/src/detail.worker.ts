@@ -1100,22 +1100,49 @@ async function processCompany(companyId: string, companyIndex = 0): Promise<void
 
   logger.info('[DetailWorker] Processing batch', { companyId, count: rows.length, proxyRotations: getProxyFailureState(companyId).totalRotations });
 
+  // Track consecutive NETWORK errors (socket hang up, ETIMEDOUT, TLS failures) in this batch.
+  // If the proxy is TCP-blackholed at the detail-API level (not the login level), every
+  // fetchInvoiceDetail() call hangs until timeout.  Without this counter we would keep retrying
+  // all rows until the 900s processCompany hard-timeout fires — wasting ~15 minutes per cycle.
+  // After ROW_NETWORK_TIMEOUT_THRESHOLD consecutive network errors we call recordProxyTimeout()
+  // to mark the proxy as failing and return early; the next poll cycle will pick a new proxy.
+  const ROW_NETWORK_TIMEOUT_THRESHOLD = 3;
+  let consecutiveRowNetworkErrors = 0;
+
   for (let i = 0; i < rows.length; i++) {
     if (i > 0) await jitterDelay(rows.length);
     const row = rows[i]!;
     try {
       const outcome = await processRow(row, gdtApi);
       if (outcome === 'done') {
+        consecutiveRowNetworkErrors = 0; // Reset on success
         await markDone(row.id);
         logger.debug('[DetailWorker] Row done', { invoiceId: row.invoice_id });
       } else if (outcome === 'skipped') {
+        consecutiveRowNetworkErrors = 0;
         await markSkipped(row.id, 'already_complete');
       } else {
         await markFailed(row.id, 'process returned failed', row.attempts);
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      logger.warn('[DetailWorker] Row error', { invoiceId: row.invoice_id, err: msg });
+
+      // Classify error: network/proxy failure vs GDT server error vs auth error
+      const isNetworkError = (
+        msg.includes('socket hang up')   ||
+        msg.includes('ETIMEDOUT')        ||
+        msg.includes('ECONNRESET')       ||
+        msg.includes('ECONNREFUSED')     ||
+        msg.includes('TLS')              ||
+        msg.includes('Client network socket disconnected')
+      );
+
+      logger.warn('[DetailWorker] Row error', {
+        invoiceId: row.invoice_id,
+        err:       msg,
+        isNetworkError,
+        consecutiveNetworkErrors: isNetworkError ? consecutiveRowNetworkErrors + 1 : consecutiveRowNetworkErrors,
+      });
 
       // 401 = token expired — invalidate and stop this company's batch
       if (msg.includes('401') || msg.toLowerCase().includes('token expired') || msg.toLowerCase().includes('unauthorized')) {
@@ -1127,6 +1154,7 @@ async function processCompany(companyId: string, companyIndex = 0): Promise<void
 
       // 500 = GDT server error — apply circuit breaker; stop batch if tripped
       if (msg.includes('500') || msg.includes('status code 500')) {
+        consecutiveRowNetworkErrors = 0; // HTTP 500 is a GDT server error, not a proxy issue
         await markFailed(row.id, msg, row.attempts);
         const tripped = recordHttp500(companyId);
         if (tripped) {
@@ -1136,6 +1164,26 @@ async function processCompany(companyId: string, companyIndex = 0): Promise<void
             cooldownMin: CB_COOLDOWN_MS / 60_000,
           });
           break;
+        }
+        continue;
+      }
+
+      // Network error — proxy may be TCP-blackholed at the detail-API level
+      if (isNetworkError) {
+        consecutiveRowNetworkErrors++;
+        await markFailed(row.id, msg, row.attempts);
+
+        if (consecutiveRowNetworkErrors >= ROW_NETWORK_TIMEOUT_THRESHOLD) {
+          // Proxy is blackholed for the detail endpoint — rotate immediately instead of
+          // waiting for the 900s processCompany hard-timeout to fire.
+          const { rotate, notifyUser } = await recordProxyTimeout(companyId, proxyUrl);
+          logger.warn('[DetailWorker] Proxy TCP-blackholed at detail-request level — rotating early', {
+            companyId,
+            proxy:                    proxyUrl.replace(/:([^@:]+)@/, ':****@'),
+            consecutiveNetworkErrors: consecutiveRowNetworkErrors,
+          });
+          if (notifyUser) await notifyNoProxy(companyId);
+          if (rotate) return; // Let next poll cycle pick a new proxy
         }
         continue;
       }

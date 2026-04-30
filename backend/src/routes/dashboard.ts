@@ -5,6 +5,7 @@ import { requireCompany } from '../middleware/company';
 import { sendSuccess } from '../utils/response';
 import { buildDashboardBucketKey, buildTrailingDashboardBuckets } from '../utils/dashboardBuckets';
 import { resolvePeriod, type PeriodType } from '../utils/period';
+import { VatReconciliationService } from '../services/VatReconciliationService';
 
 const router = Router();
 router.use(authenticate);
@@ -352,6 +353,10 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
     // 2) vat_reconciliations  → input_vat computed by VatReconciliationService (pipeline-filtered,
     //    written on every TaxDeclarationEngine run incl. preview) — matches declaration page values
     // 3) Raw SQL tạm tính     → _deductibleInputVatCondition without pipeline filter (approximate)
+    //    accuracy_level: 'declaration' | 'reconciliation' | 'estimate'
+    //    Frontend uses accuracy_level to show "Tạm tính" badge when raw SQL fallback is active.
+    const vatAccuracyLevel = declRow ? 'declaration' : reconRow ? 'reconciliation' : 'estimate';
+
     const vatRow = declRow
       ? {
           ...rawVatRow,
@@ -359,6 +364,7 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
           payable_vat:          declRow.ct41_payable_vat,
           output_vat:           declRow.ct40a_total_output_vat,
           vat_from_declaration: true,
+          accuracy_level:       vatAccuracyLevel,
         }
       : reconRow
       ? {
@@ -372,6 +378,7 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
             carryForwardInfo.amount,
           )),
           vat_from_declaration: false,
+          accuracy_level:       vatAccuracyLevel,
         }
       : {
           ...rawVatRow,
@@ -383,7 +390,18 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
             carryForwardInfo.amount,
           )),
           vat_from_declaration: false,
+          accuracy_level:       vatAccuracyLevel,
         };
+
+    // When tier-3 (raw SQL estimate) is active, trigger VatReconciliationService in the background.
+    // On the next dashboard load this period will hit tier-2 (more accurate) instead of raw SQL.
+    // Fire-and-forget — never block the response.
+    if (!declRow && !reconRow) {
+      const bgMonth = resolved.periodType === 'quarterly' ? resolved.quarter : resolved.month;
+      new VatReconciliationService()
+        .calculatePeriod(companyId, bgMonth, resolved.year)
+        .catch(() => { /* non-fatal — next load retries automatically */ });
+    }
 
     sendSuccess(res, {
       period: {

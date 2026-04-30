@@ -1365,21 +1365,32 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
 
       // ── Count discrepancy check ────────────────────────────────────────────────
       // Compare what GDT said was available (outEst/inEst) vs what we actually fetched.
-      // Discrepancy > 5% AND > 5 invoices → warn user so they can re-sync.
-      const gdtExpectedOutput = outEst >= 0 ? outEst : 0;
-      const gdtExpectedInput  = inEst  >= 0 ? inEst  : 0;
-      const discrepancyOut    = gdtExpectedOutput > 0 ? gdtExpectedOutput - outputCount : 0;
-      const discrepancyIn     = gdtExpectedInput  > 0 ? gdtExpectedInput  - inputCount  : 0;
-      const discrepancyOutPct = gdtExpectedOutput > 0 ? Math.round((discrepancyOut / gdtExpectedOutput) * 100) : 0;
-      const discrepancyInPct  = gdtExpectedInput  > 0 ? Math.round((discrepancyIn  / gdtExpectedInput)  * 100) : 0;
-      const hasDiscrepancy    = (discrepancyOut > 5 && discrepancyOutPct > 5)
-                             || (discrepancyIn  > 5 && discrepancyInPct  > 5);
+      //
+      // FIX: Use totalFetchedFromGdt = outputCount + inputCount + skippedCount so that:
+      //   (a) Re-sync false alarms are suppressed: all invoices already in Redis dedup →
+      //       skippedCount = N, outputCount + inputCount = 0, but totalFetchedFromGdt = N → no warn
+      //   (b) SCO false alarms are suppressed: SCO invoices go through dedup and add to
+      //       skippedCount/outputCount/inputCount but outEst/inEst only covers main endpoint.
+      //       If SCO > estimate, discrepancyTotal goes negative → no warn.
+      //   (c) Real gaps still warn: GDT says 100 but only 40 fetched through all paths →
+      //       discrepancyTotal = 60 (60%) → warn fires correctly.
+      const totalFetchedFromGdt = outputCount + inputCount + skippedCount;
+      const gdtExpectedTotal    = (outEst >= 0 ? outEst : 0) + (inEst >= 0 ? inEst : 0);
+      const gdtExpectedOutput   = outEst >= 0 ? outEst : 0;
+      const gdtExpectedInput    = inEst >= 0 ? inEst : 0;
+      const discrepancyTotal    = gdtExpectedTotal > 0 ? gdtExpectedTotal - totalFetchedFromGdt : 0;
+      const discrepancyTotalPct = gdtExpectedTotal > 0
+        ? Math.round((discrepancyTotal / gdtExpectedTotal) * 100)
+        : 0;
+      // Only fire when genuinely missing invoices (positive gap > 5 invoices AND > 5%)
+      const hasDiscrepancy = discrepancyTotal > 5 && discrepancyTotalPct > 5;
 
       if (hasDiscrepancy) {
         logger.warn('[SyncWorker] Count discrepancy detected — GDT reported more invoices than fetched', {
           companyId,
-          gdtExpectedOutput, outputCount, discrepancyOut, discrepancyOutPct,
-          gdtExpectedInput,  inputCount,  discrepancyIn,  discrepancyInPct,
+          gdtExpectedTotal,
+          totalFetchedFromGdt, outputCount, inputCount, skippedCount,
+          discrepancyTotal, discrepancyTotalPct,
         });
       }
 
@@ -1396,22 +1407,21 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       const detailDone    = parseInt(detailQueuedRes.rows[0]?.done_count  ?? '0', 10);
 
       // Final progress update — Phase 1 complete, Phase 2 starting in background
-      const totalFetchedFinal = outputCount + inputCount;
-      const totalEstFinal = (outEst >= 0 ? outEst : 0) + (inEst >= 0 ? inEst : 0);
+      // totalFetchedFromGdt already computed above (outputCount + inputCount + skippedCount)
       const discrepancyMsg = hasDiscrepancy
-        ? ` ⚠️ GDT có ${totalEstFinal.toLocaleString('vi-VN')} HĐ nhưng chỉ tải được ${totalFetchedFinal.toLocaleString('vi-VN')} — vui lòng đồng bộ lại.`
+        ? ` ⚠️ GDT có ${gdtExpectedTotal.toLocaleString('vi-VN')} HĐ nhưng chỉ tải được ${totalFetchedFromGdt.toLocaleString('vi-VN')} — vui lòng đồng bộ lại.`
         : '';
       await job.updateProgress({
         percent: 100,
-        invoicesFetched: totalFetchedFinal,
-        totalInvoicesExpected: totalEstFinal > 0 ? totalEstFinal : totalFetchedFinal,
+        invoicesFetched: totalFetchedFromGdt,
+        totalInvoicesExpected: gdtExpectedTotal > 0 ? gdtExpectedTotal : totalFetchedFromGdt,
         outputCount,
         inputCount,
+        skippedCount,
         detailQueued,
-        gdtExpectedOutput,
-        gdtExpectedInput,
+        gdtExpectedTotal,
         hasDiscrepancy,
-        statusMessage: `Đã tải ${totalFetchedFinal.toLocaleString('vi-VN')} hóa đơn (📤 ${outputCount.toLocaleString('vi-VN')} đầu ra, 📥 ${inputCount.toLocaleString('vi-VN')} đầu vào). Đang chờ lấy chi tiết: ${detailQueued} HĐ, đã xong: ${detailDone} HĐ.${discrepancyMsg}`,
+        statusMessage: `Đã tải ${totalFetchedFromGdt.toLocaleString('vi-VN')} hóa đơn (📤 ${outputCount.toLocaleString('vi-VN')} đầu ra, 📥 ${inputCount.toLocaleString('vi-VN')} đầu vào, ⏭️ ${skippedCount.toLocaleString('vi-VN')} đã có). Đang chờ lấy chi tiết: ${detailQueued} HĐ, đã xong: ${detailDone} HĐ.${discrepancyMsg}`,
       } as Record<string, unknown>);
 
       const durationMs = Date.now() - startedAt;
