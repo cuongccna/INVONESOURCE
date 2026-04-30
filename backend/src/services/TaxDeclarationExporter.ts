@@ -37,6 +37,7 @@ interface DeclRow {
 }
 
 interface InvoiceRow {
+  id: string;
   invoice_number: string;
   serial_number: string;
   invoice_date: string;
@@ -54,6 +55,18 @@ interface InvoiceRow {
   customer_code: string | null;
   payment_method: string | null;
   non_deductible: boolean | null;
+}
+
+interface LineItemRow {
+  invoice_id:  string;
+  line_number: number | null;
+  item_name:   string | null;
+  unit:        string | null;
+  quantity:    number | null;
+  unit_price:  number | null;
+  subtotal:    number | null;
+  vat_rate:    number | null;
+  vat_amount:  number | null;
 }
 
 interface CompanyRow {
@@ -100,25 +113,54 @@ export class TaxDeclarationExporter {
       ? quarterMonths(decl.period_month)
       : [decl.period_month];
 
-    const invoiceRes = await pool.query<InvoiceRow>(
-      `SELECT invoice_number, serial_number, invoice_date, direction, status,
-              seller_name, buyer_name, seller_tax_code, buyer_tax_code,
-              subtotal, total_amount, vat_amount, vat_rate,
-              item_code, customer_code, payment_method, non_deductible
-       FROM invoices
-       WHERE company_id = $1
-         AND EXTRACT(YEAR FROM invoice_date)::INT = $2
-         AND EXTRACT(MONTH FROM invoice_date)::INT = ANY($3)
-         AND status NOT IN ('cancelled', 'replaced', 'adjusted')
-       ORDER BY invoice_date ASC, invoice_number ASC`,
-      [companyId, decl.period_year, months],
-    );
+    const [invoiceRes, lineItemRes] = await Promise.all([
+      pool.query<InvoiceRow>(
+        `SELECT id, invoice_number, serial_number, invoice_date, direction, status,
+                seller_name, buyer_name, seller_tax_code, buyer_tax_code,
+                subtotal, total_amount, vat_amount, vat_rate,
+                item_code, customer_code, payment_method, non_deductible
+         FROM invoices
+         WHERE company_id = $1
+           AND EXTRACT(YEAR FROM invoice_date)::INT = $2
+           AND EXTRACT(MONTH FROM invoice_date)::INT = ANY($3)
+           AND status NOT IN ('cancelled', 'replaced', 'adjusted')
+         ORDER BY invoice_date ASC, invoice_number ASC`,
+        [companyId, decl.period_year, months],
+      ),
+      pool.query<LineItemRow>(
+        `SELECT ili.invoice_id,
+                ili.line_number,
+                ili.item_name,
+                ili.unit,
+                ili.quantity,
+                ili.unit_price,
+                ili.subtotal,
+                ili.vat_rate,
+                ili.vat_amount
+         FROM invoice_line_items ili
+         JOIN invoices i ON i.id = ili.invoice_id
+         WHERE i.company_id = $1
+           AND EXTRACT(YEAR FROM i.invoice_date)::INT = $2
+           AND EXTRACT(MONTH FROM i.invoice_date)::INT = ANY($3)
+           AND i.status NOT IN ('cancelled', 'replaced', 'adjusted')
+         ORDER BY ili.invoice_id, ili.line_number ASC NULLS LAST`,
+        [companyId, decl.period_year, months],
+      ),
+    ]);
 
-    return { decl, company, invoices: invoiceRes.rows };
+    // Build invoice_id → line items map for O(1) lookup in sheet/PDF builders
+    const lineItemsByInvoice = new Map<string, LineItemRow[]>();
+    for (const li of lineItemRes.rows) {
+      const arr = lineItemsByInvoice.get(li.invoice_id) ?? [];
+      arr.push(li);
+      lineItemsByInvoice.set(li.invoice_id, arr);
+    }
+
+    return { decl, company, invoices: invoiceRes.rows, lineItemsByInvoice };
   }
 
   async exportToExcel(declId: string, companyId: string): Promise<Buffer> {
-    const { decl, company, invoices } = await this.loadData(declId, companyId);
+    const { decl, company, invoices, lineItemsByInvoice } = await this.loadData(declId, companyId);
 
     const wb = new ExcelJS.Workbook();
     wb.creator  = 'INVONE Platform';
@@ -430,83 +472,129 @@ export class TaxDeclarationExporter {
       const partyName = direction === 'output' ? 'Người mua'     : 'Người bán';
       const partyTax  = direction === 'output' ? 'MST người mua' : 'MST người bán';
 
+      // Columns: added "Tên hàng hóa/DV" before "Tiền hàng" so each line item gets its own row
       const cols: Partial<ExcelJS.Column>[] = [
-        { header: 'STT',           key: 'stt',    width: 6  },
-        { header: 'Số HĐ',         key: 'inv_no', width: 16 },
-        { header: 'Ký hiệu',       key: 'serial', width: 14 },
-        { header: 'Ngày lập',      key: 'date',   width: 13 },
-        { header: partyName,       key: 'party',  width: 30 },
-        { header: partyTax,        key: 'tax',    width: 16 },
-        { header: 'Tiền hàng',     key: 'sub',    width: 16 },
-        { header: 'Thuế VAT',      key: 'vat',    width: 14 },
-        { header: 'Tổng tiền',     key: 'total',  width: 16 },
-        { header: 'TS%',           key: 'rate',   width: 6  },
-        { header: 'TT thanh toán', key: 'pay',    width: 14 },
-        { header: 'Mã KH/NCC',    key: 'cust',   width: 14 },
-        { header: 'Mã hàng',      key: 'item',   width: 14 },
-        { header: 'Trạng thái',   key: 'status', width: 12 },
+        { header: 'STT',              key: 'stt',      width: 6  },
+        { header: 'Số HĐ',            key: 'inv_no',   width: 16 },
+        { header: 'Ký hiệu',          key: 'serial',   width: 14 },
+        { header: 'Ngày lập',         key: 'date',     width: 13 },
+        { header: partyName,          key: 'party',    width: 30 },
+        { header: partyTax,           key: 'tax',      width: 16 },
+        { header: 'Tên hàng hóa/DV', key: 'itemname', width: 30 },  // line-item name
+        { header: 'Tiền hàng',        key: 'sub',      width: 16 },
+        { header: 'Thuế VAT',         key: 'vat',      width: 14 },
+        { header: 'Tổng tiền',        key: 'total',    width: 16 },
+        { header: 'TS%',              key: 'rate',     width: 6  },
+        { header: 'TT thanh toán',    key: 'pay',      width: 14 },
+        { header: 'Mã KH/NCC',       key: 'cust',     width: 14 },
+        { header: 'Mã hàng',         key: 'item',     width: 14 },
+        { header: 'Trạng thái',      key: 'status',   width: 12 },
       ];
       if (direction === 'input') {
         cols.push({ header: 'Đủ ĐK khấu trừ', key: 'deductible', width: 14 });
       }
       shInv.columns = cols;
 
+      const hdrColor = direction === 'output' ? 'FFE3F2FD' : 'FFE8F5E9';
       const hdr = shInv.getRow(1);
       hdr.font = { bold: true };
-      hdr.fill = {
-        type: 'pattern', pattern: 'solid',
-        fgColor: { argb: direction === 'output' ? 'FFE3F2FD' : 'FFE8F5E9' },
-      };
+      hdr.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: hdrColor } };
       hdr.eachCell(cell => { cell.border = BORDER_ALL; });
 
-      let idx = 0;
+      let dataRowCount = 0;  // track actual rows for SUM formula range
+
       for (const inv of rows) {
         if (inv.direction !== direction) continue;
-        idx++;
+
         const party = direction === 'output' ? inv.buyer_name     : inv.seller_name;
         const tax   = direction === 'output' ? inv.buyer_tax_code : inv.seller_tax_code;
-        const rowData: Record<string, unknown> = {
-          stt:    idx,
-          inv_no: inv.invoice_number,
-          serial: inv.serial_number,
-          date:   inv.invoice_date ? new Date(inv.invoice_date) : '',
-          party,
-          tax,
-          sub:    inv.subtotal ? Number(inv.subtotal) : '',
-          vat:    Number(inv.vat_amount),
-          total:  Number(inv.total_amount),
-          rate:   inv.vat_rate,
-          pay:    inv.payment_method ?? '',
-          cust:   inv.customer_code  ?? '',
-          item:   inv.item_code      ?? '',
-          status: inv.status,
-        };
-        if (direction === 'input') {
-          rowData['deductible'] = inv.non_deductible ? 'Không' : 'Có';
-        }
-        const r = shInv.addRow(rowData);
-        for (const c of ['sub', 'vat', 'total']) r.getCell(c).numFmt = NUM_FMT;
-        r.getCell('date').numFmt = 'DD/MM/YYYY';
-        if (direction === 'input' && inv.non_deductible) {
-          r.getCell('deductible').font = { color: { argb: 'FFCC0000' } };
+        const lineItems = lineItemsByInvoice.get(inv.id) ?? [];
+
+        if (lineItems.length > 0) {
+          // ── One row per line item; invoice meta repeated on every sub-row ──
+          lineItems.forEach((li, liIdx) => {
+            dataRowCount++;
+            const rowData: Record<string, unknown> = {
+              stt:      liIdx === 0 ? dataRowCount : '',   // STT only on first sub-row
+              inv_no:   inv.invoice_number,
+              serial:   inv.serial_number,
+              date:     inv.invoice_date ? new Date(inv.invoice_date) : '',
+              party,
+              tax,
+              itemname: li.item_name ?? '',
+              sub:      li.subtotal  != null ? Number(li.subtotal)   : '',
+              vat:      li.vat_amount != null ? Number(li.vat_amount) : '',
+              // Put invoice total on first sub-row only so SUM formula captures it once
+              total:    liIdx === 0 ? Number(inv.total_amount) : '',
+              rate:     li.vat_rate  != null ? li.vat_rate : '',
+              pay:      liIdx === 0 ? (inv.payment_method ?? '') : '',
+              cust:     liIdx === 0 ? (inv.customer_code  ?? '') : '',
+              item:     liIdx === 0 ? (inv.item_code      ?? '') : '',
+              status:   liIdx === 0 ? inv.status : '',
+            };
+            if (direction === 'input') {
+              rowData['deductible'] = liIdx === 0 ? (inv.non_deductible ? 'Không' : 'Có') : '';
+            }
+            const r = shInv.addRow(rowData);
+            for (const c of ['sub', 'vat', 'total']) r.getCell(c).numFmt = NUM_FMT;
+            r.getCell('date').numFmt = 'DD/MM/YYYY';
+            // Light grey background on continuation sub-rows to visually group them
+            if (liIdx > 0) {
+              r.eachCell(cell => {
+                cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF9F9F9' } };
+              });
+            }
+            if (direction === 'input' && liIdx === 0 && inv.non_deductible) {
+              r.getCell('deductible').font = { color: { argb: 'FFCC0000' } };
+            }
+          });
+        } else {
+          // ── No line items: one row with invoice-level totals (backward compat) ──
+          dataRowCount++;
+          const rowData: Record<string, unknown> = {
+            stt:      dataRowCount,
+            inv_no:   inv.invoice_number,
+            serial:   inv.serial_number,
+            date:     inv.invoice_date ? new Date(inv.invoice_date) : '',
+            party,
+            tax,
+            itemname: '',
+            sub:      inv.subtotal ? Number(inv.subtotal) : '',
+            vat:      Number(inv.vat_amount),
+            total:    Number(inv.total_amount),
+            rate:     inv.vat_rate,
+            pay:      inv.payment_method ?? '',
+            cust:     inv.customer_code  ?? '',
+            item:     inv.item_code      ?? '',
+            status:   inv.status,
+          };
+          if (direction === 'input') {
+            rowData['deductible'] = inv.non_deductible ? 'Không' : 'Có';
+          }
+          const r = shInv.addRow(rowData);
+          for (const c of ['sub', 'vat', 'total']) r.getCell(c).numFmt = NUM_FMT;
+          r.getCell('date').numFmt = 'DD/MM/YYYY';
+          if (direction === 'input' && inv.non_deductible) {
+            r.getCell('deductible').font = { color: { argb: 'FFCC0000' } };
+          }
         }
       }
 
-      if (idx === 0) {
+      if (dataRowCount === 0) {
         shInv.addRow({
           stt: '', inv_no: '(Không có hóa đơn trong kỳ)',
-          serial: '', date: '', party: '', tax: '', sub: '', vat: '',
+          serial: '', date: '', party: '', tax: '', itemname: '', sub: '', vat: '',
           total: '', rate: '', pay: '', cust: '', item: '', status: '',
         });
       }
 
-      // Totals row
+      // Totals row — sub/vat/total columns (H, I, J with new itemname col inserted)
       shInv.addRow({});
       const tr = shInv.addRow({
         stt:   'Tổng',
-        sub:   { formula: `SUM(G2:G${idx + 1})` },
-        vat:   { formula: `SUM(H2:H${idx + 1})` },
-        total: { formula: `SUM(I2:I${idx + 1})` },
+        sub:   { formula: `SUM(H2:H${dataRowCount + 1})` },
+        vat:   { formula: `SUM(I2:I${dataRowCount + 1})` },
+        total: { formula: `SUM(J2:J${dataRowCount + 1})` },
       });
       tr.font = { bold: true };
       for (const c of ['sub', 'vat', 'total']) tr.getCell(c).numFmt = NUM_FMT;
@@ -521,10 +609,26 @@ export class TaxDeclarationExporter {
   }
 
   async exportToPdf(declId: string, companyId: string): Promise<Buffer> {
-    const { decl, company, invoices } = await this.loadData(declId, companyId);
+    const { decl, company, invoices, lineItemsByInvoice } = await this.loadData(declId, companyId);
 
     const outputInvoices = invoices.filter(i => i.direction === 'output');
     const inputInvoices  = invoices.filter(i => i.direction === 'input');
+
+    // Build lists of invoices that have ANY line item at 8% VAT rate (NQ142/NQ204).
+    // An invoice with mixed rates (10%, 8%, 5%, 0%) is included if any item is at 8%.
+    // Fallback: invoice with no line items included if invoice-level vat_rate = 8.
+    const pluc8Output = outputInvoices.filter(inv => {
+      const items = lineItemsByInvoice.get(inv.id) ?? [];
+      return items.length > 0
+        ? items.some(li => li.vat_rate === 8)
+        : inv.vat_rate === 8;
+    });
+    const pluc8Input = inputInvoices.filter(inv => {
+      const items = lineItemsByInvoice.get(inv.id) ?? [];
+      return items.length > 0
+        ? items.some(li => li.vat_rate === 8)
+        : inv.vat_rate === 8;
+    });
 
     /* ── Computed values matching official 01/GTGT form ── */
     const v22   = Number(decl.ct24_carried_over_vat);  // [22] = kỳ trước chuyển sang
@@ -785,6 +889,127 @@ export class TaxDeclarationExporter {
     </tr>
   </tbody>
 </table>
+
+${(pluc8Output.length > 0 || pluc8Input.length > 0) ? `
+<!-- ═══ NQ142 ANNEX — 8% VAT ═══ -->
+<div class="page-break"></div>
+<h2 style="font-size:11pt;font-weight:bold;margin:8px 0 4px;">PHỤ LỤC NQ142 — HÀNG HÓA/DỊCH VỤ ĐƯỢC GIẢM THUẾ SUẤT XUỐNG 8%</h2>
+<p style="font-size:9pt;margin-bottom:6px;">Kỳ khai thuế: <b>${periodStr}</b> &nbsp;|&nbsp; MST: <b>${company?.tax_code ?? ''}</b><br/>
+<i style="font-size:8pt;">Danh sách các hóa đơn có ít nhất một mặt hàng/dịch vụ áp thuế suất 8% theo Nghị quyết 142/2024/QH15 và NQ204/2023/QH15.</i></p>
+${pluc8Output.length > 0 ? `
+<p style="font-weight:bold;font-size:10pt;margin:6px 0 3px;">I. HÀng hóa/dịch vụ BÁN RA chịu thuế 8% (${pluc8Output.length} hóa đơn)</p>
+<table class="inv-table">
+  <thead>
+    <tr>
+      <th width="24">#</th><th>Số HĐ</th><th>Ký hiệu</th><th>Ngày lập</th>
+      <th>Người mua</th><th>MST người mua</th>
+      <th>Tên hàng hóa/DV (8%)</th>
+      <th style="text-align:right">Tiền hàng</th><th style="text-align:right">Thuế GTGT 8%</th>
+    </tr>
+  </thead>
+  <tbody>
+    ${pluc8Output.slice(0, 300).map((inv, idx) => {
+      const items8 = (lineItemsByInvoice.get(inv.id) ?? []).filter(li => li.vat_rate === 8);
+      const invDate = new Date(inv.invoice_date).toLocaleDateString('vi-VN');
+      if (items8.length > 0) {
+        return items8.map((li, liIdx) => `<tr${liIdx > 0 ? ' style="background:#fafafa"' : ''}>
+          <td style="text-align:center">${liIdx === 0 ? idx + 1 : ''}</td>
+          <td>${liIdx === 0 ? inv.invoice_number : ''}</td>
+          <td>${liIdx === 0 ? inv.serial_number : ''}</td>
+          <td style="white-space:nowrap">${liIdx === 0 ? invDate : ''}</td>
+          <td>${liIdx === 0 ? (inv.buyer_name ?? '') : ''}</td>
+          <td>${liIdx === 0 ? (inv.buyer_tax_code ?? '') : ''}</td>
+          <td>${li.item_name ?? 'Hàng hóa/dịch vụ'}</td>
+          <td style="text-align:right">${vnd(Number(li.subtotal ?? 0))}</td>
+          <td style="text-align:right">${vnd(Number(li.vat_amount ?? 0))}</td>
+        </tr>`).join('');
+      }
+      // fallback: invoice has no line items but vat_rate = 8
+      return `<tr>
+        <td style="text-align:center">${idx + 1}</td>
+        <td>${inv.invoice_number}</td><td>${inv.serial_number}</td>
+        <td style="white-space:nowrap">${invDate}</td>
+        <td>${inv.buyer_name ?? ''}</td><td>${inv.buyer_tax_code ?? ''}</td>
+        <td>—</td>
+        <td style="text-align:right">${vnd(Number(inv.subtotal ?? 0))}</td>
+        <td style="text-align:right">${vnd(Number(inv.vat_amount ?? 0))}</td>
+      </tr>`;
+    }).join('')}
+    ${pluc8Output.length > 300 ? `<tr><td colspan="9" style="text-align:center;color:#888;padding:4px">… và ${(pluc8Output.length - 300).toLocaleString('vi-VN')} hóa đơn khác</td></tr>` : ''}
+    <tr style="font-weight:bold;background:#f5f5f5;">
+      <td colspan="7" style="text-align:right">Tổng cộng bán ra 8%</td>
+      <td style="text-align:right">${vnd(pluc8Output.reduce((s, inv) => {
+        const items8 = (lineItemsByInvoice.get(inv.id) ?? []).filter(li => li.vat_rate === 8);
+        return s + (items8.length > 0
+          ? items8.reduce((a, li) => a + Number(li.subtotal ?? 0), 0)
+          : Number(inv.subtotal ?? 0));
+      }, 0))}</td>
+      <td style="text-align:right">${vnd(pluc8Output.reduce((s, inv) => {
+        const items8 = (lineItemsByInvoice.get(inv.id) ?? []).filter(li => li.vat_rate === 8);
+        return s + (items8.length > 0
+          ? items8.reduce((a, li) => a + Number(li.vat_amount ?? 0), 0)
+          : Number(inv.vat_amount ?? 0));
+      }, 0))}</td>
+    </tr>
+  </tbody>
+</table>` : ''}
+${pluc8Input.length > 0 ? `
+<p style="font-weight:bold;font-size:10pt;margin:10px 0 3px;">II. Hàng hóa/dịch vụ MUA VÀO chịu thuế 8% (${pluc8Input.length} hóa đơn)</p>
+<table class="inv-table">
+  <thead>
+    <tr>
+      <th width="24">#</th><th>Số HĐ</th><th>Ký hiệu</th><th>Ngày lập</th>
+      <th>Người bán</th><th>MST người bán</th>
+      <th>Tên hàng hóa/DV (8%)</th>
+      <th style="text-align:right">Tiền hàng</th><th style="text-align:right">Thuế GTGT 8%</th>
+    </tr>
+  </thead>
+  <tbody>
+    ${pluc8Input.slice(0, 300).map((inv, idx) => {
+      const items8 = (lineItemsByInvoice.get(inv.id) ?? []).filter(li => li.vat_rate === 8);
+      const invDate = new Date(inv.invoice_date).toLocaleDateString('vi-VN');
+      if (items8.length > 0) {
+        return items8.map((li, liIdx) => `<tr${liIdx > 0 ? ' style="background:#fafafa"' : ''}>
+          <td style="text-align:center">${liIdx === 0 ? idx + 1 : ''}</td>
+          <td>${liIdx === 0 ? inv.invoice_number : ''}</td>
+          <td>${liIdx === 0 ? inv.serial_number : ''}</td>
+          <td style="white-space:nowrap">${liIdx === 0 ? invDate : ''}</td>
+          <td>${liIdx === 0 ? (inv.seller_name ?? '') : ''}</td>
+          <td>${liIdx === 0 ? (inv.seller_tax_code ?? '') : ''}</td>
+          <td>${li.item_name ?? 'Hàng hóa/dịch vụ'}</td>
+          <td style="text-align:right">${vnd(Number(li.subtotal ?? 0))}</td>
+          <td style="text-align:right">${vnd(Number(li.vat_amount ?? 0))}</td>
+        </tr>`).join('');
+      }
+      return `<tr>
+        <td style="text-align:center">${idx + 1}</td>
+        <td>${inv.invoice_number}</td><td>${inv.serial_number}</td>
+        <td style="white-space:nowrap">${invDate}</td>
+        <td>${inv.seller_name ?? ''}</td><td>${inv.seller_tax_code ?? ''}</td>
+        <td>—</td>
+        <td style="text-align:right">${vnd(Number(inv.subtotal ?? 0))}</td>
+        <td style="text-align:right">${vnd(Number(inv.vat_amount ?? 0))}</td>
+      </tr>`;
+    }).join('')}
+    ${pluc8Input.length > 300 ? `<tr><td colspan="9" style="text-align:center;color:#888;padding:4px">… và ${(pluc8Input.length - 300).toLocaleString('vi-VN')} hóa đơn khác</td></tr>` : ''}
+    <tr style="font-weight:bold;background:#f5f5f5;">
+      <td colspan="7" style="text-align:right">Tổng cộng mua vào 8%</td>
+      <td style="text-align:right">${vnd(pluc8Input.reduce((s, inv) => {
+        const items8 = (lineItemsByInvoice.get(inv.id) ?? []).filter(li => li.vat_rate === 8);
+        return s + (items8.length > 0
+          ? items8.reduce((a, li) => a + Number(li.subtotal ?? 0), 0)
+          : Number(inv.subtotal ?? 0));
+      }, 0))}</td>
+      <td style="text-align:right">${vnd(pluc8Input.reduce((s, inv) => {
+        const items8 = (lineItemsByInvoice.get(inv.id) ?? []).filter(li => li.vat_rate === 8);
+        return s + (items8.length > 0
+          ? items8.reduce((a, li) => a + Number(li.vat_amount ?? 0), 0)
+          : Number(inv.vat_amount ?? 0));
+      }, 0))}</td>
+    </tr>
+  </tbody>
+</table>` : ''}
+` : ''}
 
 <div class="footer">Xuất ngày: ${exportDateStr} — INVONE Platform &nbsp;|&nbsp; MST: ${company?.tax_code ?? ''} &nbsp;|&nbsp; Kỳ: ${periodStr}</div>
 </div>
