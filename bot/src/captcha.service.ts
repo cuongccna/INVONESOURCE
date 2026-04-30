@@ -77,10 +77,14 @@ export class CaptchaService {
 
   private async _poll(captchaId: string): Promise<{ text: string; captchaId: string }> {
     const deadline = Date.now() + TIMEOUT_MS;
-    await _sleep(10_000); // Initial wait — 2captcha needs ~10s to process
+    // Initial wait — 2captcha needs ~10s to process.
+    // Randomize 8–12s so the captcha→login timing is not machine-consistent
+    // (fixed 10s fingerprint allows GDT to detect bot by measuring submission latency).
+    await _sleep(8_000 + Math.floor(Math.random() * 4_000));
 
     while (Date.now() < deadline) {
-      await _sleep(POLL_MS);
+      // Poll interval 3–5s (was fixed 3s) — adds noise to the polling pattern
+      await _sleep(POLL_MS + Math.floor(Math.random() * 2_000));
       const res = await axios.get<{ status: number; request: string }>(`${API_URL}/res.php`, {
         params: { key: this._key, action: 'get', id: captchaId, json: 1 },
         timeout: 15_000,

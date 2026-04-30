@@ -17,6 +17,14 @@ export class ProxyManager extends EventEmitter {
 
   private tenantProxyMap = new Map<string, string>();
 
+  /**
+   * Per-company rotation index for the detail worker pool.
+   * Unlike auto-sync (sticky hash → same proxy every time), detail worker uses
+   * round-robin rotation within the non-excluded set so a blocked proxy is
+   * automatically skipped on the next cycle without any manual intervention.
+   */
+  private _detailProxyIndex = new Map<string, number>();
+
   constructor(proxyList?: string[]) {
     super();
     const raw = proxyList ?? (process.env['PROXY_LIST'] ?? '').split(',').map(s => s.trim()).filter(Boolean);
@@ -183,6 +191,74 @@ export class ProxyManager extends EventEmitter {
       logger.error('[ProxyManager] Auto sync: static pool error', {
         sessionSuffix: sessionSuffix.slice(0, 8),
         error: (err as Error).message,
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Select a proxy for the detail worker.
+   *
+   * Design differs from nextForAutoSync() (sync sticky-hash):
+   *   - Uses hash-within-available so each company picks a consistent proxy
+   *     from the non-excluded subset, but when a proxy is excluded (TCP blackhole),
+   *     the hash naturally maps to the next proxy in the shrunk set.
+   *   - excludedUrls: set of proxy URLs that have timed-out for THIS company.
+   *     They are excluded from selection so the worker rotates away from a
+   *     GDT-blocked IP without marking it globally failed (it may still work for
+   *     other companies / endpoints).
+   *   - Falls back to env PROXY_LIST if the DB pool is empty.
+   *   - Returns null only when ALL proxies are excluded or globally failed.
+   *
+   * @param companyId    — used to deterministically pick within the available set
+   * @param excludedUrls — proxies temporarily excluded for this company (TCP timeouts)
+   */
+  async nextForDetailWorker(
+    companyId: string,
+    excludedUrls?: ReadonlySet<string>,
+  ): Promise<string | null> {
+    try {
+      let allUrls = await staticProxyPool.listActiveUrls();
+
+      // Fallback: DB pool empty → try env PROXY_LIST
+      if (allUrls.length === 0 && this.proxies.length > 0) {
+        logger.warn('[ProxyManager] Detail worker: DB pool empty — falling back to env PROXY_LIST', {
+          companyId: companyId.slice(0, 8),
+          envProxies: this.proxies.length,
+        });
+        allUrls = this.proxies;
+      }
+
+      if (allUrls.length === 0) {
+        logger.warn('[ProxyManager] Detail worker: no proxies configured', {
+          companyId: companyId.slice(0, 8),
+        });
+        return null;
+      }
+
+      // Filter out globally-failed + per-company excluded proxies
+      const available = allUrls.filter(
+        url => !this.failed.has(url) && !(excludedUrls?.has(url) ?? false),
+      );
+
+      if (available.length === 0) {
+        logger.warn('[ProxyManager] Detail worker: all proxies excluded or failed for company', {
+          companyId:     companyId.slice(0, 8),
+          totalProxies:  allUrls.length,
+          excluded:      excludedUrls?.size ?? 0,
+          globalFailed:  this.failed.size,
+        });
+        return null;
+      }
+
+      // Hash-within-available: company gets a stable proxy from the current
+      // non-excluded set. When a proxy is excluded, the set shrinks and the
+      // hash maps to a different (next) proxy automatically.
+      return available[this._hashToIndex(companyId, available.length)] ?? null;
+    } catch (err) {
+      logger.error('[ProxyManager] Detail worker: proxy selection error', {
+        companyId: companyId.slice(0, 8),
+        error:     (err as Error).message,
       });
       return null;
     }

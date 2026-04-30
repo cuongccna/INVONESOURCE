@@ -162,6 +162,82 @@ function resetAuthFailure(companyId: string): void {
   _authFailureCount.delete(companyId);
 }
 
+/**
+ * Per-company proxy failure tracker — separate from credential auth failures.
+ *
+ * When getToken() times out (TCP SYN blackhole = GDT blocked the proxy IP),
+ * we must NOT count it as a credential failure. The account is still valid;
+ * the problem is the proxy IP is blocked. We track which proxy URLs have
+ * timed out N times and exclude them from future selection for this company.
+ *
+ * PROXY_TIMEOUT_THRESHOLD: consecutive TCP timeouts on the SAME proxy before
+ *   we exclude it and rotate to the next one.
+ *
+ * MAX_PROXY_ROTATIONS: if we've rotated through this many proxies without
+ *   ever getting a successful login, notify the user — the entire pool may
+ *   be blocked for this company.
+ */
+const PROXY_TIMEOUT_THRESHOLD = 3;
+const MAX_PROXY_ROTATIONS     = 5;
+
+interface ProxyFailureState {
+  /** Proxy URLs that have timed out ≥ PROXY_TIMEOUT_THRESHOLD times for this company */
+  excludedUrls: Set<string>;
+  /** Consecutive timeout count on the CURRENT proxy (resets on rotation or success) */
+  consecutiveTimeouts: number;
+  /** Total proxy rotations performed without a successful login */
+  totalRotations: number;
+}
+
+const _proxyFailures = new Map<string, ProxyFailureState>();
+
+function getProxyFailureState(companyId: string): ProxyFailureState {
+  let s = _proxyFailures.get(companyId);
+  if (!s) {
+    s = { excludedUrls: new Set(), consecutiveTimeouts: 0, totalRotations: 0 };
+    _proxyFailures.set(companyId, s);
+  }
+  return s;
+}
+
+function resetProxyFailures(companyId: string): void {
+  _proxyFailures.delete(companyId);
+}
+
+/**
+ * Record a proxy TCP timeout for a company.
+ *
+ * Returns an object describing what action should be taken:
+ *   { rotate: true }     — threshold reached, exclude this proxy and try the next
+ *   { notifyUser: true } — all proxy rotations exhausted, notify the user
+ *   { wait: true }       — below threshold, just wait for next cycle
+ */
+function recordProxyTimeout(
+  companyId: string,
+  proxyUrl:  string,
+): { rotate: boolean; notifyUser: boolean } {
+  const s = getProxyFailureState(companyId);
+  s.consecutiveTimeouts++;
+
+  if (s.consecutiveTimeouts >= PROXY_TIMEOUT_THRESHOLD) {
+    // Exclude this proxy for future selections for this company
+    s.excludedUrls.add(proxyUrl);
+    s.totalRotations++;
+    s.consecutiveTimeouts = 0; // Reset for the next proxy
+
+    const notifyUser = s.totalRotations >= MAX_PROXY_ROTATIONS;
+    if (notifyUser) {
+      // All rotations exhausted — the entire pool appears blocked for this company.
+      // Reset state so the company can be retried if user adds new proxies later.
+      _proxyFailures.delete(companyId);
+    }
+
+    return { rotate: true, notifyUser };
+  }
+
+  return { rotate: false, notifyUser: false };
+}
+
 /** Helper: enqueue a 'bot-no-proxy' notification for the user's bell icon. */
 async function notifyNoProxy(companyId: string): Promise<void> {
   try {
@@ -321,16 +397,37 @@ function jitterMs(min: number, max: number): number {
   return Math.floor(min + Math.random() * (max - min));
 }
 
-/** Delay between consecutive GDT detail-API calls (3–15s). */
-async function jitterDelay(): Promise<void> {
-  const ms = jitterMs(GDT_JITTER_MIN_MS, GDT_JITTER_MAX_MS);
-  logger.debug('[DetailWorker] GDT jitter delay', { ms });
+/**
+ * Delay between consecutive GDT detail-API calls.
+ *
+ * Adaptive: when the batch is large (≥5 invoices = queue was busy), use a shorter
+ * jitter range (3–8s) to improve throughput. When the batch is small (queue draining),
+ * use the full range (3–15s) to avoid appearing as a fixed-rate bot.
+ *
+ * @param batchSize  Number of rows claimed in this cycle (from claimBatch)
+ */
+async function jitterDelay(batchSize: number): Promise<void> {
+  const highLoad = batchSize >= 5;
+  const min = highLoad ? 3_000 : GDT_JITTER_MIN_MS;
+  const max = highLoad ? 8_000 : GDT_JITTER_MAX_MS;
+  const ms  = jitterMs(min, max);
+  logger.debug('[DetailWorker] GDT jitter delay', { ms, highLoad });
   await new Promise<void>(resolve => setTimeout(resolve, ms));
 }
 
-/** Stagger delay before a company batch starts (0–5s). Prevents GDT storm when N companies fire at once. */
-async function staggerDelay(): Promise<void> {
-  const ms = jitterMs(COMPANY_STAGGER_MIN_MS, COMPANY_STAGGER_MAX_MS);
+/**
+ * Stagger delay before a company batch starts.
+ *
+ * Index-aware: company[0] starts immediately, company[1] waits 3–5s,
+ * company[2] waits 6–10s. This ensures N companies never all hit the
+ * GDT auth endpoint within the same second, even when they all
+ * need to re-authenticate simultaneously (e.g., after JWT expiry).
+ *
+ * @param companyIndex  0-based position of this company in the current poll batch
+ */
+async function staggerDelay(companyIndex: number): Promise<void> {
+  if (companyIndex === 0) return; // First company starts immediately
+  const ms = companyIndex * jitterMs(3_000, 5_000);
   if (ms > 0) await new Promise<void>(resolve => setTimeout(resolve, ms));
 }
 
@@ -741,7 +838,11 @@ async function getCompanyConfig(companyId: string): Promise<CompanyConfig | null
 }
 
 // ── Process all pending rows for one company ──────────────────────────────────
-async function processCompany(companyId: string): Promise<void> {
+/**
+ * @param companyId    — target company
+ * @param companyIndex — 0-based position in the current poll batch (used for stagger delay)
+ */
+async function processCompany(companyId: string, companyIndex = 0): Promise<void> {
   const config = await getCompanyConfig(companyId);
   if (!config) {
     logger.warn('[DetailWorker] No active config for company — skipping', { companyId });
@@ -759,17 +860,29 @@ async function processCompany(companyId: string): Promise<void> {
     return;
   }
 
-  // proxy_session_id can be NULL if sync.worker cleared it after a proxy failure.
-  // Fall back to company_id so _hashToIndex gets a valid string (avoids crash on null.length).
-  const proxyUrl       = config.proxy_url ?? await proxyManager.nextForAutoSync(config.proxy_session_id ?? config.company_id);
+  // ── Detail-worker proxy selection ────────────────────────────────────────────
+  // Detail worker uses its OWN proxy pool rotation, independent of the proxy
+  // assigned to the sync worker (config.proxy_url). This allows:
+  //   a) Detail worker to use a different proxy from the sync worker, spreading
+  //      load and reducing per-IP request density at GDT.
+  //   b) When a proxy is TCP-blackholed by GDT, detail worker can rotate to the
+  //      next available proxy WITHOUT deactivating the bot (the account is fine,
+  //      only the proxy IP is blocked).
+  //
+  // proxySessionId still comes from gdt_bot_configs so the GdtSessionCache key
+  // matches what sync.worker stored — allowing token reuse across workers.
+  const proxyFailState = getProxyFailureState(companyId);
+  const proxyUrl       = await proxyManager.nextForDetailWorker(companyId, proxyFailState.excludedUrls);
   const proxySessionId = config.proxy_session_id ?? config.company_id;
 
   // ── PROXY GUARD — CẤM TUYỆT ĐỐI crawl GDT bằng IP trực tiếp ───────────────
-  // Mọi request đến GDT phải đi qua proxy. Không có proxy → dừng ngay,
-  // không crawl, gửi chuông thông báo cho user.
+  // Không có proxy khả dụng (DB pool trống VÀ PROXY_LIST trống, hoặc tất cả
+  // proxy bị excluded) → dừng ngay, không crawl, gửi chuông thông báo user.
   if (!proxyUrl) {
-    logger.error('[DetailWorker] HARD STOP: No proxy available — direct IP crawling is FORBIDDEN by policy', {
+    logger.error('[DetailWorker] HARD STOP: No proxy available for company — direct IP crawling is FORBIDDEN', {
       companyId,
+      excludedProxies:   proxyFailState.excludedUrls.size,
+      totalRotations:    proxyFailState.totalRotations,
     });
     await notifyNoProxy(companyId);
     return;
@@ -783,32 +896,88 @@ async function processCompany(companyId: string): Promise<void> {
       `getToken(${companyId.slice(0, 8)})`,
     );
   } catch (authErr) {
+    // ── GdtAuthError (HTTP 400/401): credentials rejected by GDT ─────────────
+    // This is a CREDENTIAL problem (wrong password, locked account, etc.),
+    // NOT a proxy problem. Deactivate the bot immediately — retrying would
+    // worsen the GDT account lockout.
     if (authErr instanceof AuthUnrecoverableError) {
-      // GDT rejected credentials (HTTP 400/401 non-captcha) — deactivate bot immediately.
-      // Also notifies the user via push notification.
       await deactivateCompanyBot(companyId, authErr.message, authErr.gdtErrorCode);
       return;
     }
-    // ── Hard timeout or transient error from raceTimeout ──────────────────────
-    // When gdtApi.login() hangs (TCP blackhole, dead proxy, captcha timeout),
-    // raceTimeout fires and rejects BEFORE getToken()'s inner catch can call
-    // recordAuthFailure(). We must count it here instead — otherwise the
-    // failure counter never increments and the worker loops forever.
+
     const msg = authErr instanceof Error ? authErr.message : String(authErr);
+
+    // ── Classify: is this a proxy/network timeout or a genuine auth error? ───
+    // TCP blackhole (GDT blocks the proxy IP): the raceTimeout fires before the
+    // HTTP layer sees anything — the error message will contain "Hard timeout",
+    // "ECONNREFUSED", "ETIMEDOUT", "socket hang up", or similar network strings.
+    //
+    // Genuine auth errors (wrong captcha answer, 2Captcha down, etc.) will show
+    // HTTP status codes or 2captcha error strings in the message.
+    const isNetworkTimeout = (
+      msg.includes('Hard timeout')     ||  // raceTimeout fired
+      msg.includes('ETIMEDOUT')        ||  // TCP connect timed out
+      msg.includes('ECONNREFUSED')     ||  // proxy port closed
+      msg.includes('ECONNRESET')       ||  // connection reset by proxy
+      msg.includes('socket hang up')   ||  // proxy dropped TCP mid-stream
+      msg.includes('TCP')              ||  // proxy-layer TCP error
+      msg.includes('TLS')                  // TLS handshake failure (proxy MiTM issue)
+    );
+
+    if (isNetworkTimeout) {
+      // ── Proxy issue — rotate, not deactivate ─────────────────────────────
+      // Record the timeout against this proxy for this company.
+      // After PROXY_TIMEOUT_THRESHOLD consecutive timeouts on the same proxy,
+      // exclude it and let nextForDetailWorker() pick the next one.
+      const { rotate, notifyUser } = recordProxyTimeout(companyId, proxyUrl);
+
+      if (notifyUser) {
+        // All MAX_PROXY_ROTATIONS rotations exhausted — the entire proxy pool
+        // appears blocked for this company. Notify the user to add new proxies.
+        logger.error('[DetailWorker] All proxies exhausted for company — notifying user to add proxies', {
+          companyId, totalRotations: MAX_PROXY_ROTATIONS,
+        });
+        await notifyNoProxy(companyId);
+      } else if (rotate) {
+        const state = getProxyFailureState(companyId);
+        logger.warn('[DetailWorker] Proxy TCP-blackholed by GDT — excluded, rotating to next proxy', {
+          companyId,
+          excludedProxy:    proxyUrl,
+          excludedCount:    state.excludedUrls.size,
+          totalRotations:   state.totalRotations,
+          remainingBefore:  MAX_PROXY_ROTATIONS - state.totalRotations,
+        });
+      } else {
+        const state = getProxyFailureState(companyId);
+        logger.warn('[DetailWorker] Proxy network timeout (below rotation threshold)', {
+          companyId,
+          consecutiveTimeouts: state.consecutiveTimeouts,
+          threshold:           PROXY_TIMEOUT_THRESHOLD,
+          proxy:               proxyUrl.replace(/:([^@:]+)@/, ':****@'),
+          err:                 msg,
+        });
+      }
+      // Do NOT count proxy timeouts as auth failures — account is still valid
+      return;
+    }
+
+    // ── Genuine auth error (captcha failure, 2Captcha quota, etc.) ───────────
+    // Count against the auth failure limit. After MAX_CONSECUTIVE_AUTH_FAILURES
+    // the bot is deactivated to prevent draining 2Captcha balance in a loop.
     const failCount = recordAuthFailure(companyId);
-    logger.warn('[DetailWorker] getToken timed out or failed (raceTimeout)', {
+    logger.warn('[DetailWorker] getToken auth error (non-network)', {
       companyId,
       consecutiveFailures: failCount,
       maxBeforeDeactivate: MAX_CONSECUTIVE_AUTH_FAILURES,
-      err: msg,
+      err:                 msg,
     });
     if (failCount >= MAX_CONSECUTIVE_AUTH_FAILURES) {
-      logger.error('[DetailWorker] Too many consecutive auth timeouts — deactivating bot to stop infinite loop', {
+      logger.error('[DetailWorker] Too many consecutive auth failures — deactivating bot', {
         companyId, failCount,
       });
       await deactivateCompanyBot(
         companyId,
-        `Xác thực GDT timeout ${failCount} lần liên tiếp (${msg.slice(0, 100)})`,
+        `Xác thực GDT thất bại ${failCount} lần liên tiếp (${msg.slice(0, 100)})`,
         null,
       );
     }
@@ -820,7 +989,11 @@ async function processCompany(companyId: string): Promise<void> {
     return;
   }
 
-  const gdtApi = new GdtDirectApiService(proxyUrl ?? undefined, null, undefined, companyId, null, gdtRawCacheService);
+  // ── Login succeeded — reset all failure counters ─────────────────────────────
+  resetProxyFailures(companyId);   // clear excluded proxy list for this company
+  // resetAuthFailure() is already called inside getToken() on success
+
+  const gdtApi = new GdtDirectApiService(proxyUrl, null, undefined, companyId, null, gdtRawCacheService);
   gdtApi.setToken(token);
 
   // Skip if circuit breaker is still open from a previous burst of 500s
@@ -829,17 +1002,18 @@ async function processCompany(companyId: string): Promise<void> {
     return;
   }
 
-  // Stagger start — prevents N companies from hammering GDT simultaneously
-  await staggerDelay();
+  // Stagger start — company[0] starts immediately; company[1] waits 3–5s; company[2] 6–10s.
+  // Prevents N companies all hitting the GDT detail API at the same second.
+  await staggerDelay(companyIndex);
 
   const batchSize = randomBatchSize();
   const rows = await claimBatch(companyId, batchSize);
   if (rows.length === 0) return;
 
-  logger.info('[DetailWorker] Processing batch', { companyId, count: rows.length });
+  logger.info('[DetailWorker] Processing batch', { companyId, count: rows.length, proxyRotations: getProxyFailureState(companyId).totalRotations });
 
   for (let i = 0; i < rows.length; i++) {
-    if (i > 0) await jitterDelay();
+    if (i > 0) await jitterDelay(rows.length);
     const row = rows[i]!;
     try {
       const outcome = await processRow(row, gdtApi);
@@ -996,9 +1170,9 @@ async function pollLoop(): Promise<void> {
         }
         // Process manual rows and then re-check sleep window on next iteration
         await Promise.allSettled(
-          manualCompanyIds.map(companyId =>
+          manualCompanyIds.map((companyId, idx) =>
             raceTimeout(
-              processCompany(companyId),
+              processCompany(companyId, idx),
               COMPANY_PROCESS_TIMEOUT_MS,
               `processCompany(${companyId.slice(0, 8)})`,
             ).catch(err =>
@@ -1039,9 +1213,9 @@ async function pollLoop(): Promise<void> {
         // raceTimeout() guarantees the poll loop is never blocked longer than
         // COMPANY_PROCESS_TIMEOUT_MS by a single stuck company (TCP blackhole, dead proxy, etc.)
         await Promise.allSettled(
-          companyIds.map(companyId =>
+          companyIds.map((companyId, idx) =>
             raceTimeout(
-              processCompany(companyId),
+              processCompany(companyId, idx),
               COMPANY_PROCESS_TIMEOUT_MS,
               `processCompany(${companyId.slice(0, 8)})`,
             ).catch(err =>
