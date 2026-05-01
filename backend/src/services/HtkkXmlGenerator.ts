@@ -300,7 +300,7 @@ async function _fetchDeductibleInputSubtotal(
      FROM invoices
      WHERE company_id = $1
        AND direction = 'input'
-       AND status = 'valid'
+       AND status IN ('valid', 'replaced', 'adjusted')
        AND (
          (invoice_group = 5 AND gdt_validated = true)
          OR (invoice_group IN (6, 8))
@@ -460,7 +460,7 @@ async function _fetchPluc8InputItems(
      JOIN invoices i ON i.id = ili.invoice_id
      WHERE i.company_id = $1
        AND i.direction = 'input'
-       AND i.status = 'valid'
+       AND i.status IN ('valid', 'replaced', 'adjusted')
        AND i.deleted_at IS NULL
        AND ili.deleted_at IS NULL
        AND ${_lineItemEightPercentClause('ili')}
@@ -489,7 +489,7 @@ async function _fetchPluc8InputItems(
      WHERE company_id = $1
        AND direction = 'input'
        AND ${_invoiceEightPercentClause('invoices')}
-       AND status = 'valid'
+       AND status IN ('valid', 'replaced', 'adjusted')
        AND deleted_at IS NULL
        AND ${_noLineItemsClause('invoices')}
        ${_notReplacedClause('invoices')}
@@ -542,7 +542,7 @@ async function _fetchPluc8OutputItems(
      JOIN invoices i ON i.id = ili.invoice_id
      WHERE i.company_id = $1
        AND i.direction = 'output'
-       AND i.status = 'valid'
+       AND i.status IN ('valid', 'replaced', 'adjusted')
        AND i.deleted_at IS NULL
        AND ili.deleted_at IS NULL
        AND ${_lineItemEightPercentClause('ili')}
@@ -563,7 +563,7 @@ async function _fetchPluc8OutputItems(
      WHERE company_id = $1
        AND direction = 'output'
        AND ${_invoiceEightPercentClause('invoices')}
-       AND status = 'valid'
+       AND status IN ('valid', 'replaced', 'adjusted')
        AND deleted_at IS NULL
        AND ${_noLineItemsClause('invoices')}
        ${_notReplacedClause('invoices')}
