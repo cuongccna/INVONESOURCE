@@ -414,7 +414,7 @@ async function _fetchPluc8InputItems(
   periodYear: number,
   quarterly: boolean,
 ): Promise<PlucInputRow[]> {
-  const pf = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'i.invoice_date', 3);
+  const pf = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'i.invoice_date', 2);
   const normalizedLineRateExpr = _normalizedPercentRateExpr('ili.vat_rate');
 
   // Thử lấy từ bảng line items trước
@@ -499,7 +499,7 @@ async function _fetchPluc8OutputItems(
   periodYear: number,
   quarterly: boolean,
 ): Promise<PlucOutputRow[]> {
-  const pf = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'i.invoice_date', 3);
+  const pf = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'i.invoice_date', 2);
 
   const { rows: lineRows } = await pool.query<{ name: string; subtotal: string }>(
     `SELECT
