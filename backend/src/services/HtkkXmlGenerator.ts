@@ -334,6 +334,51 @@ function _notReplacedClause(alias: string): string {
          AND COALESCE(_r.seller_tax_code, '') = COALESCE(${alias}.seller_tax_code, '')
      )`;
 }
+
+function _normalizedPercentRateExpr(rateExpr: string): string {
+  return `CASE
+            WHEN ${rateExpr} IS NULL THEN NULL
+            WHEN ABS(${rateExpr}) > 0 AND ABS(${rateExpr}) < 1 THEN ${rateExpr} * 100
+            ELSE ${rateExpr}
+          END`;
+}
+
+function _lineItemEightPercentClause(alias: string): string {
+  const normalizedRateExpr = _normalizedPercentRateExpr(`${alias}.vat_rate`);
+  return `(
+        ROUND((${normalizedRateExpr})::numeric, 2) = 8.00
+        OR TRIM(COALESCE(${alias}.vat_rate_label, '')) IN ('8', '8%')
+        OR (
+          (${alias}.vat_rate IS NULL OR ${alias}.vat_rate = 0)
+          AND ${alias}.subtotal > 0
+          AND ${alias}.vat_amount IS NOT NULL
+          AND ROUND(${alias}.vat_amount * 100.0 / ${alias}.subtotal, 2) = 8.00
+        )
+      )`;
+}
+
+function _invoiceEightPercentClause(alias: string): string {
+  const normalizedRateExpr = _normalizedPercentRateExpr(`${alias}.vat_rate`);
+  return `(
+        ROUND((${normalizedRateExpr})::numeric, 2) = 8.00
+        OR COALESCE(${alias}.tax_category, '') = '8'
+        OR (
+          (${alias}.vat_rate IS NULL OR ${alias}.vat_rate = 0)
+          AND ${alias}.subtotal > 0
+          AND ${alias}.vat_amount IS NOT NULL
+          AND ROUND(${alias}.vat_amount * 100.0 / ${alias}.subtotal, 2) = 8.00
+        )
+      )`;
+}
+
+function _noLineItemsClause(invoiceAlias: string): string {
+  return `NOT EXISTS (
+       SELECT 1
+       FROM invoice_line_items _li
+       WHERE _li.invoice_id = ${invoiceAlias}.id
+         AND _li.deleted_at IS NULL
+     )`;
+}
 /** Trả về điều kiện WHERE + params cho lọc kỳ kê khai theo ngày hoá đơn. */
 function _buildPeriodFilter(
   periodMonth: number,
@@ -369,6 +414,7 @@ async function _fetchPluc8InputItems(
   quarterly: boolean,
 ): Promise<PlucInputRow[]> {
   const pf = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'i.invoice_date', 3);
+  const normalizedLineRateExpr = _normalizedPercentRateExpr('ili.vat_rate');
 
   // Thử lấy từ bảng line items trước
   const { rows: lineRows } = await pool.query<{ name: string; subtotal: string; vat_amount: string }>(
@@ -379,7 +425,7 @@ async function _fetchPluc8InputItems(
          ROUND(SUM(
            CASE WHEN ili.vat_amount IS NOT NULL AND ili.vat_amount <> 0
                 THEN ili.vat_amount
-                ELSE ili.subtotal * ili.vat_rate / 100.0
+                ELSE ili.subtotal * (${normalizedLineRateExpr}) / 100.0
            END
          )), 0
        )::bigint AS vat_amount
@@ -389,12 +435,12 @@ async function _fetchPluc8InputItems(
        AND i.direction = 'input'
        AND i.status = 'valid'
        AND i.deleted_at IS NULL
-       AND ili.vat_rate = $2
+       AND ${_lineItemEightPercentClause('ili')}
        ${_notReplacedClause('i')}
        AND ${pf.clause}
      GROUP BY 1
      ORDER BY SUM(ili.subtotal) DESC`,
-    [companyId, 8, ...pf.params],
+    [companyId, ...pf.params],
   );
 
   if (lineRows.length > 0) {
@@ -405,8 +451,10 @@ async function _fetchPluc8InputItems(
     }));
   }
 
-  // Fallback: dùng invoice header, gom theo seller_name
+  // Fallback chỉ cho hóa đơn chưa có line items; nếu đã có line items thì phụ lục
+  // phải bám theo từng dòng hàng hóa/dịch vụ, không kéo cả header invoice vào.
   const pf2 = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'invoice_date', 2);
+  const normalizedInvoiceRateExpr = _normalizedPercentRateExpr('vat_rate');
   const { rows: invRows } = await pool.query<{ name: string; subtotal: string; vat_amount: string }>(
     `SELECT
        COALESCE(NULLIF(TRIM(seller_name), ''), 'Hàng hóa/dịch vụ tổng hợp') AS name,
@@ -415,23 +463,17 @@ async function _fetchPluc8InputItems(
          ROUND(SUM(
            CASE WHEN vat_amount IS NOT NULL AND vat_amount <> 0
                 THEN vat_amount
-                ELSE subtotal * vat_rate / 100.0
+                ELSE subtotal * (${normalizedInvoiceRateExpr}) / 100.0
            END
          )), 0
        )::bigint AS vat_amount
      FROM invoices
      WHERE company_id = $1
        AND direction = 'input'
-       AND (
-         vat_rate = 8
-         OR (
-           (vat_rate IS NULL OR vat_rate = 0)
-           AND subtotal > 0
-           AND ROUND(vat_amount * 100.0 / subtotal) = 8
-         )
-       )
+       AND ${_invoiceEightPercentClause('invoices')}
        AND status = 'valid'
        AND deleted_at IS NULL
+       AND ${_noLineItemsClause('invoices')}
        ${_notReplacedClause('invoices')}
        AND ${pf2.clause}
      GROUP BY 1
@@ -468,12 +510,12 @@ async function _fetchPluc8OutputItems(
        AND i.direction = 'output'
        AND i.status = 'valid'
        AND i.deleted_at IS NULL
-       AND ili.vat_rate = $2
+       AND ${_lineItemEightPercentClause('ili')}
        ${_notReplacedClause('i')}
        AND ${pf.clause}
      GROUP BY 1
      ORDER BY SUM(ili.subtotal) DESC`,
-    [companyId, 8, ...pf.params],
+    [companyId, ...pf.params],
   );
 
   const toOutputRow = (name: string, subtotal: number): PlucOutputRow => ({
@@ -486,7 +528,8 @@ async function _fetchPluc8OutputItems(
     return lineRows.map(r => toOutputRow(r.name, Math.round(n(r.subtotal))));
   }
 
-  // Fallback: gom theo buyer_name (hoặc tên generic nếu không có)
+  // Fallback chỉ cho hóa đơn chưa có line items; nếu đã có line items thì phụ lục
+  // phải bám theo từng dòng hàng hóa/dịch vụ, không kéo cả header invoice vào.
   const pf2 = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'invoice_date', 2);
   const { rows: invRows } = await pool.query<{ name: string; subtotal: string }>(
     `SELECT
@@ -495,16 +538,10 @@ async function _fetchPluc8OutputItems(
      FROM invoices
      WHERE company_id = $1
        AND direction = 'output'
-       AND (
-         vat_rate = 8
-         OR (
-           (vat_rate IS NULL OR vat_rate = 0)
-           AND subtotal > 0
-           AND ROUND(vat_amount * 100.0 / subtotal) = 8
-         )
-       )
+       AND ${_invoiceEightPercentClause('invoices')}
        AND status = 'valid'
        AND deleted_at IS NULL
+       AND ${_noLineItemsClause('invoices')}
        ${_notReplacedClause('invoices')}
        AND ${pf2.clause}
      GROUP BY 1
