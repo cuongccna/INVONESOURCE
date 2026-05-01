@@ -42,6 +42,17 @@ export const apiClient: AxiosInstance = axios.create({
   headers: { 'Content-Type': 'application/json' },
 });
 
+async function refreshAccessToken(): Promise<string> {
+  const res = await axios.post<{ data: { accessToken: string } }>(
+    `${API_URL}/api/auth/refresh`,
+    {},
+    { withCredentials: true }
+  );
+  const token = res.data.data.accessToken;
+  setAccessToken(token);
+  return token;
+}
+
 // Attach in-memory access token and active company on each request
 apiClient.interceptors.request.use((config) => {
   if (_accessToken) {
@@ -74,7 +85,7 @@ apiClient.interceptors.request.use((config) => {
 });
 
 // On 401 → try to refresh, then retry once
-let refreshing = false;
+let refreshPromise: Promise<string> | null = null;
 apiClient.interceptors.response.use(
   (res: AxiosResponse) => res,
   async (error) => {
@@ -95,24 +106,19 @@ apiClient.interceptors.response.use(
       return Promise.reject(error);
     }
 
-    if (error.response?.status === 401 && !original._retry && !refreshing) {
+    if (error.response?.status === 401 && original && !original._retry) {
       original._retry = true;
-      refreshing = true;
       try {
-        const res = await axios.post<{ data: { accessToken: string } }>(
-          `${API_URL}/api/auth/refresh`,
-          {},
-          { withCredentials: true }
-        );
-        const token = res.data.data.accessToken;
-        setAccessToken(token);
+        refreshPromise ??= refreshAccessToken().finally(() => {
+          refreshPromise = null;
+        });
+        const token = await refreshPromise;
+        original.headers = original.headers ?? {};
         original.headers.Authorization = `Bearer ${token}`;
         return apiClient(original);
       } catch {
         setAccessToken(null);
         window.location.href = '/login';
-      } finally {
-        refreshing = false;
       }
     }
     return Promise.reject(error);
