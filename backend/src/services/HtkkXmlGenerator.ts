@@ -80,15 +80,16 @@ export class HtkkXmlGenerator {
     const d = declaration;
 
     // Nhóm 10%: gộp hoá đơn 8% (giảm thuế theo NQ) vào nhóm 10% trong bảng kê
-    const xml_ct32_revenue = n(d.ct36_revenue_10pct) + n(d.ct34_revenue_8pct);
-    const xml_ct33_vat     = n(d.ct37_vat_10pct) + n(d.ct35_vat_8pct);
+    // Math.round() bắt buộc: HTKK schema 842 yêu cầu xs:integer, không chấp nhận decimal
+    const xml_ct32_revenue = Math.round(n(d.ct36_revenue_10pct) + n(d.ct34_revenue_8pct));
+    const xml_ct33_vat     = Math.round(n(d.ct37_vat_10pct) + n(d.ct35_vat_8pct));
 
     // ct27 = tổng doanh thu chịu thuế (5%+8%+10%), không bao gồm miễn thuế
-    const xml_ct27_taxable = n(d.ct32_revenue_5pct) + xml_ct32_revenue;
+    const xml_ct27_taxable = Math.round(n(d.ct32_revenue_5pct) + xml_ct32_revenue);
     // ct28 = tổng VAT đầu ra gộp
-    const xml_ct28_vat     = n(d.ct40a_total_output_vat);
+    const xml_ct28_vat     = Math.round(n(d.ct40a_total_output_vat));
     // ct35 (TongDThuVaThueGTGTHHDVBRa) = tổng VAT đầu ra gộp (trước điều chỉnh NQ142)
-    const xml_ct35_total   = n(d.ct40a_total_output_vat);
+    const xml_ct35_total   = Math.round(n(d.ct40a_total_output_vat));
 
     // ── 3b. Phụ lục NQ142 — chỉ lấy hoá đơn VAT = 8% ──────────────────────
     const [plucInputItems, plucOutputItems] = await Promise.all([
@@ -103,20 +104,20 @@ export class HtkkXmlGenerator {
 
     // ── FIX: [25] trong XML = CHỈ thuế đầu vào kỳ này (ct23_deductible_input_vat = form [24])
     // KHÔNG bao gồm [22] kết chuyển kỳ trước. ct25_total_deductible=[24]+[22] chỉ dùng nội bộ.
-    const xml_ct25 = n(d.ct23_deductible_input_vat);
+    const xml_ct25 = Math.round(n(d.ct23_deductible_input_vat));
     // [22] = kết chuyển từ kỳ trước
-    const xml_ct22 = n(d.ct24_carried_over_vat);
+    const xml_ct22 = Math.round(n(d.ct24_carried_over_vat));
 
     // [36] = [35] - [25] = Thuế GTGT phát sinh trong kỳ (chưa tính kết chuyển và điều chỉnh)
     const xml_ct36 = xml_ct35_total - xml_ct25;
 
     // [37] = prior-period adjustments that increase output VAT + manual override
-    const xml_ct37 = n(d.ct37_auto_decrease ?? 0) + n(d.ct37_adjustment_decrease ?? 0);
+    const xml_ct37 = Math.round(n(d.ct37_auto_decrease ?? 0) + n(d.ct37_adjustment_decrease ?? 0));
 
     // [38] = prior-period adjustments that reduce output VAT / increase deductible + manual override.
     // NQ142 invoices are already issued at 8% rate — their actual VAT is in [35] directly.
     // Do NOT include plucOutputSumReduction here: that would be a double-reduction.
-    const xml_ct38 = n(d.ct38_auto_increase ?? 0) + n(d.ct38_adjustment_increase ?? 0);
+    const xml_ct38 = Math.round(n(d.ct38_auto_increase ?? 0) + n(d.ct38_adjustment_increase ?? 0));
 
     // [40a] = MAX(0, [36] - [22] + [37] - [38])
     // FIX: dấu [22] phải là trừ (kết chuyển làm giảm số phải nộp)
@@ -124,7 +125,7 @@ export class HtkkXmlGenerator {
     // ct40a/ct40: phải nộp — chỉ > 0 khi đầu ra > đầu vào
     const xml_ct40a = Math.max(0, xml_ct40a_raw);
     // ct40b = bù trừ dự án đầu tư (nhập tay)
-    const xml_ct40b = n(d.ct40b_investment_vat ?? 0);
+    const xml_ct40b = Math.round(n(d.ct40b_investment_vat ?? 0));
     const xml_ct40  = Math.max(0, xml_ct40a - xml_ct40b);
     // ct41: còn được khấu trừ chưa hết — chỉ > 0 khi đầu vào > đầu ra
     const xml_ct41  = Math.max(0, -xml_ct40a_raw) + Math.max(0, xml_ct40b - xml_ct40a);
@@ -132,11 +133,11 @@ export class HtkkXmlGenerator {
     const xml_ct43  = xml_ct41;
 
     // [26] = doanh thu không chịu thuế (KCT). Dùng ct26_kct_revenue nếu có, fallback ct30.
-    const xml_ct26  = n(d.ct26_kct_revenue ?? d.ct30_exempt_revenue);
+    const xml_ct26  = Math.round(n(d.ct26_kct_revenue ?? d.ct30_exempt_revenue));
     // [29] = doanh thu thuế suất 0% (xuất khẩu)
-    const xml_ct29  = n(d.ct29_0pct_revenue ?? 0);
+    const xml_ct29  = Math.round(n(d.ct29_0pct_revenue ?? 0));
     // [32a] = doanh thu KKKNT
-    const xml_ct32a = n(d.ct32a_kkknt_revenue ?? 0);
+    const xml_ct32a = Math.round(n(d.ct32a_kkknt_revenue ?? 0));
     // [21] = không phát sinh (checkbox)
     const xml_ct21  = d.ct21_no_activity ? 'true' : 'false';
 
@@ -230,8 +231,8 @@ export class HtkkXmlGenerator {
             </HHDVBRaChiuThueGTGT>
             <ct29>${xml_ct29}</ct29>
             <HHDVBRaChiuTSuat5>
-                <ct30>${n(d.ct32_revenue_5pct)}</ct30>
-                <ct31>${n(d.ct33_vat_5pct)}</ct31>
+                <ct30>${Math.round(n(d.ct32_revenue_5pct))}</ct30>
+                <ct31>${Math.round(n(d.ct33_vat_5pct))}</ct31>
             </HHDVBRaChiuTSuat5>
             <HHDVBRaChiuTSuat10>
                 <ct32>${xml_ct32_revenue}</ct32>
@@ -239,7 +240,7 @@ export class HtkkXmlGenerator {
             </HHDVBRaChiuTSuat10>
             <ct32a>${xml_ct32a}</ct32a>
             <TongDThuVaThueGTGTHHDVBRa>
-                <ct34>${n(d.ct40_total_output_revenue)}</ct34>
+                <ct34>${Math.round(n(d.ct40_total_output_revenue))}</ct34>
                 <ct35>${xml_ct35_total}</ct35>
             </TongDThuVaThueGTGTHHDVBRa>
             <ct36>${xml_ct36}</ct36>
@@ -568,33 +569,39 @@ function _buildPlucXml(
 
   const ct9 = outputSumReduction - inputSumVat;
 
-  const inputRows = inputItems.map((item, i) => `\
-                    <BangKeTenHHDV ID="${i + 1}">
-                        <tenHHDVMuaVao>${escapeXml(item.name)}</tenHHDVMuaVao>
-                        <giaTriHHDVMuaVao>${item.subtotal}</giaTriHHDVMuaVao>
-                        <thueGTGTHHDV>${item.vatAmount}</thueGTGTHHDV>
-                    </BangKeTenHHDV>`).join('\n');
+  // Build sections as line arrays — avoids blank lines when items list is empty,
+  // ensuring HTKK XSD validation passes (no stray whitespace-only text nodes).
+  const inputLines = [
+    ...inputItems.map((item, i) =>
+      `                    <BangKeTenHHDV ID="${i + 1}">\n` +
+      `                        <tenHHDVMuaVao>${escapeXml(item.name)}</tenHHDVMuaVao>\n` +
+      `                        <giaTriHHDVMuaVao>${item.subtotal}</giaTriHHDVMuaVao>\n` +
+      `                        <thueGTGTHHDV>${item.vatAmount}</thueGTGTHHDV>\n` +
+      `                    </BangKeTenHHDV>`),
+    `                    <tongCongGiaTriHHDVMuaVao>${inputSumSubtotal}</tongCongGiaTriHHDVMuaVao>`,
+    `                    <tongCongThueGTGTHHDV>${inputSumVat}</tongCongThueGTGTHHDV>`,
+  ];
 
-  const outputRows = outputItems.map((item, i) => `\
-                    <BangKeTenHHDV ID="${i + 1}">
-                        <tenHHDV>${escapeXml(item.name)}</tenHHDV>
-                        <giaTriHHDV>${item.subtotal}</giaTriHHDV>
-                        <thueSuatTheoQuyDinh>10</thueSuatTheoQuyDinh>
-                        <thueSuatSauGiam>8</thueSuatSauGiam>
-                        <thueGTGTDuocGiam>${item.vatReduction}</thueGTGTDuocGiam>
-                    </BangKeTenHHDV>`).join('\n');
+  const outputLines = [
+    ...outputItems.map((item, i) =>
+      `                    <BangKeTenHHDV ID="${i + 1}">\n` +
+      `                        <tenHHDV>${escapeXml(item.name)}</tenHHDV>\n` +
+      `                        <giaTriHHDV>${item.subtotal}</giaTriHHDV>\n` +
+      `                        <thueSuatTheoQuyDinh>10</thueSuatTheoQuyDinh>\n` +
+      `                        <thueSuatSauGiam>8</thueSuatSauGiam>\n` +
+      `                        <thueGTGTDuocGiam>${item.vatReduction}</thueGTGTDuocGiam>\n` +
+      `                    </BangKeTenHHDV>`),
+    `                    <tongCongGiaTriHHDV>${outputSumSubtotal}</tongCongGiaTriHHDV>`,
+    `                    <tongCongThueGTGTDuocGiam>${outputSumReduction}</tongCongThueGTGTDuocGiam>`,
+  ];
 
   return `<PLuc>
             <PL_NQ142_GTGT>
                 <HH_DV_MuaVaoTrongKy>
-${inputRows}
-                    <tongCongGiaTriHHDVMuaVao>${inputSumSubtotal}</tongCongGiaTriHHDVMuaVao>
-                    <tongCongThueGTGTHHDV>${inputSumVat}</tongCongThueGTGTHHDV>
+${inputLines.join('\n')}
                 </HH_DV_MuaVaoTrongKy>
                 <HH_DV_BanRaTrongKy>
-${outputRows}
-                    <tongCongGiaTriHHDV>${outputSumSubtotal}</tongCongGiaTriHHDV>
-                    <tongCongThueGTGTDuocGiam>${outputSumReduction}</tongCongThueGTGTDuocGiam>
+${outputLines.join('\n')}
                 </HH_DV_BanRaTrongKy>
                 <ChenhLech>
                     <ct9>${ct9}</ct9>
