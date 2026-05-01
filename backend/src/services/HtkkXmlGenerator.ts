@@ -336,6 +336,24 @@ function _notReplacedClause(alias: string): string {
      )`;
 }
 
+/**
+ * Điều kiện NOT EXISTS để loại hóa đơn bị điều chỉnh (tc_hdon=3 của hóa đơn khác trỏ vào).
+ * Đảm bảo chỉ giữ lại hóa đơn điều chỉnh (tc_hdon=3), loại hóa đơn gốc đã bị điều chỉnh.
+ * Belt-and-suspenders bên cạnh status='adjusted' — xử lý trường hợp status chưa được cập nhật.
+ * @param alias tên alias của bảng invoices trong câu query chính
+ */
+function _notAdjustedClause(alias: string): string {
+  return `AND NOT EXISTS (
+       SELECT 1 FROM invoices _a
+       WHERE _a.tc_hdon = 3
+         AND _a.deleted_at IS NULL
+         AND _a.company_id = ${alias}.company_id
+         AND TRIM(COALESCE(_a.khhd_cl_quan,  '')) = TRIM(COALESCE(${alias}.serial_number,  ''))
+         AND TRIM(COALESCE(_a.so_hd_cl_quan, '')) = TRIM(COALESCE(${alias}.invoice_number, ''))
+         AND COALESCE(_a.seller_tax_code, '') = COALESCE(${alias}.seller_tax_code, '')
+     )`;
+}
+
 function _normalizedPercentRateExpr(rateExpr: string): string {
   return `CASE
             WHEN ${rateExpr} IS NULL THEN NULL
@@ -406,7 +424,13 @@ function _buildPeriodFilter(
 
 /**
  * Lấy các mặt hàng MUA VÀO với VAT = 8% (NQ142) trong kỳ.
- * Ưu tiên `invoice_line_items`; fallback về invoice header (seller_name).
+ *
+ * Luôn kết hợp cả hai nguồn (UNION logic):
+ *   Tier 1 — invoice_line_items: dòng hàng hóa có tsuat=8% từ hóa đơn ĐÃ có line items
+ *   Tier 2 — invoices header:    hóa đơn 8% CHƯA có line items (fallback, dùng seller_name)
+ *
+ * Bao gồm hóa đơn thay thế (tc_hdon=1) và hóa đơn điều chỉnh (tc_hdon=3).
+ * Loại trừ hóa đơn bị thay thế, bị điều chỉnh, và đã hủy qua status + safety clauses.
  */
 async function _fetchPluc8InputItems(
   companyId: string,
@@ -414,10 +438,12 @@ async function _fetchPluc8InputItems(
   periodYear: number,
   quarterly: boolean,
 ): Promise<PlucInputRow[]> {
-  const pf = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'i.invoice_date', 2);
-  const normalizedLineRateExpr = _normalizedPercentRateExpr('ili.vat_rate');
+  const pf  = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'i.invoice_date', 2);
+  const pf2 = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'invoice_date',   2);
+  const normalizedLineRateExpr    = _normalizedPercentRateExpr('ili.vat_rate');
+  const normalizedInvoiceRateExpr = _normalizedPercentRateExpr('vat_rate');
 
-  // Thử lấy từ bảng line items trước
+  // Tier 1: dòng hàng hóa 8% từ hóa đơn đã có line items
   const { rows: lineRows } = await pool.query<{ name: string; subtotal: string; vat_amount: string }>(
     `SELECT
        COALESCE(NULLIF(TRIM(ili.item_name), ''), 'Hàng hóa/dịch vụ tổng hợp') AS name,
@@ -436,26 +462,17 @@ async function _fetchPluc8InputItems(
        AND i.direction = 'input'
        AND i.status = 'valid'
        AND i.deleted_at IS NULL
+       AND ili.deleted_at IS NULL
        AND ${_lineItemEightPercentClause('ili')}
        ${_notReplacedClause('i')}
+       ${_notAdjustedClause('i')}
        AND ${pf.clause}
      GROUP BY 1
      ORDER BY SUM(ili.subtotal) DESC`,
     [companyId, ...pf.params],
   );
 
-  if (lineRows.length > 0) {
-    return lineRows.map(r => ({
-      name:      r.name,
-      subtotal:  Math.round(n(r.subtotal)),
-      vatAmount: Math.round(n(r.vat_amount)),
-    }));
-  }
-
-  // Fallback chỉ cho hóa đơn chưa có line items; nếu đã có line items thì phụ lục
-  // phải bám theo từng dòng hàng hóa/dịch vụ, không kéo cả header invoice vào.
-  const pf2 = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'invoice_date', 2);
-  const normalizedInvoiceRateExpr = _normalizedPercentRateExpr('vat_rate');
+  // Tier 2: hóa đơn 8% chưa có line items (fallback — dùng seller_name làm tên mặt hàng)
   const { rows: invRows } = await pool.query<{ name: string; subtotal: string; vat_amount: string }>(
     `SELECT
        COALESCE(NULLIF(TRIM(seller_name), ''), 'Hàng hóa/dịch vụ tổng hợp') AS name,
@@ -476,22 +493,36 @@ async function _fetchPluc8InputItems(
        AND deleted_at IS NULL
        AND ${_noLineItemsClause('invoices')}
        ${_notReplacedClause('invoices')}
+       ${_notAdjustedClause('invoices')}
        AND ${pf2.clause}
      GROUP BY 1
      ORDER BY SUM(subtotal) DESC`,
     [companyId, ...pf2.params],
   );
 
-  return invRows.map(r => ({
-    name:      r.name,
-    subtotal:  Math.round(n(r.subtotal)),
-    vatAmount: Math.round(n(r.vat_amount)),
-  }));
+  // Merge cả hai nguồn theo tên mặt hàng
+  const map = new Map<string, { subtotal: number; vatAmount: number }>();
+  for (const r of [...lineRows, ...invRows]) {
+    const prev = map.get(r.name) ?? { subtotal: 0, vatAmount: 0 };
+    map.set(r.name, {
+      subtotal:  prev.subtotal  + Math.round(n(r.subtotal)),
+      vatAmount: prev.vatAmount + Math.round(n(r.vat_amount)),
+    });
+  }
+  return Array.from(map.entries())
+    .map(([name, v]) => ({ name, subtotal: v.subtotal, vatAmount: v.vatAmount }))
+    .sort((a, b) => b.subtotal - a.subtotal);
 }
 
 /**
  * Lấy các mặt hàng BÁN RA với VAT = 8% (NQ142, giảm từ 10%) trong kỳ.
- * Ưu tiên `invoice_line_items`; fallback về invoice header (buyer_name).
+ *
+ * Luôn kết hợp cả hai nguồn (UNION logic):
+ *   Tier 1 — invoice_line_items: dòng hàng hóa có tsuat=8% từ hóa đơn ĐÃ có line items
+ *   Tier 2 — invoices header:    hóa đơn 8% CHƯA có line items (fallback, dùng buyer_name)
+ *
+ * Bao gồm hóa đơn thay thế (tc_hdon=1) và hóa đơn điều chỉnh (tc_hdon=3).
+ * Loại trừ hóa đơn bị thay thế, bị điều chỉnh, và đã hủy qua status + safety clauses.
  */
 async function _fetchPluc8OutputItems(
   companyId: string,
@@ -499,8 +530,10 @@ async function _fetchPluc8OutputItems(
   periodYear: number,
   quarterly: boolean,
 ): Promise<PlucOutputRow[]> {
-  const pf = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'i.invoice_date', 2);
+  const pf  = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'i.invoice_date', 2);
+  const pf2 = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'invoice_date',   2);
 
+  // Tier 1: dòng hàng hóa 8% từ hóa đơn đã có line items
   const { rows: lineRows } = await pool.query<{ name: string; subtotal: string }>(
     `SELECT
        COALESCE(NULLIF(TRIM(ili.item_name), ''), 'Hàng hóa/dịch vụ tổng hợp') AS name,
@@ -511,27 +544,17 @@ async function _fetchPluc8OutputItems(
        AND i.direction = 'output'
        AND i.status = 'valid'
        AND i.deleted_at IS NULL
+       AND ili.deleted_at IS NULL
        AND ${_lineItemEightPercentClause('ili')}
        ${_notReplacedClause('i')}
+       ${_notAdjustedClause('i')}
        AND ${pf.clause}
      GROUP BY 1
      ORDER BY SUM(ili.subtotal) DESC`,
     [companyId, ...pf.params],
   );
 
-  const toOutputRow = (name: string, subtotal: number): PlucOutputRow => ({
-    name,
-    subtotal,
-    vatReduction: Math.round(subtotal * 0.02),  // giảm 2% = (10% - 8%)
-  });
-
-  if (lineRows.length > 0) {
-    return lineRows.map(r => toOutputRow(r.name, Math.round(n(r.subtotal))));
-  }
-
-  // Fallback chỉ cho hóa đơn chưa có line items; nếu đã có line items thì phụ lục
-  // phải bám theo từng dòng hàng hóa/dịch vụ, không kéo cả header invoice vào.
-  const pf2 = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'invoice_date', 2);
+  // Tier 2: hóa đơn 8% chưa có line items (fallback — dùng buyer_name làm tên mặt hàng)
   const { rows: invRows } = await pool.query<{ name: string; subtotal: string }>(
     `SELECT
        COALESCE(NULLIF(TRIM(buyer_name), ''), 'Hàng hóa/dịch vụ tổng hợp') AS name,
@@ -544,13 +567,28 @@ async function _fetchPluc8OutputItems(
        AND deleted_at IS NULL
        AND ${_noLineItemsClause('invoices')}
        ${_notReplacedClause('invoices')}
+       ${_notAdjustedClause('invoices')}
        AND ${pf2.clause}
      GROUP BY 1
      ORDER BY SUM(subtotal) DESC`,
     [companyId, ...pf2.params],
   );
 
-  return invRows.map(r => toOutputRow(r.name, Math.round(n(r.subtotal))));
+  // giảm 2% = (10% - 8%)
+  const toOutputRow = (name: string, subtotal: number): PlucOutputRow => ({
+    name,
+    subtotal,
+    vatReduction: Math.round(subtotal * 0.02),
+  });
+
+  // Merge cả hai nguồn theo tên mặt hàng
+  const map = new Map<string, number>();
+  for (const r of [...lineRows, ...invRows]) {
+    map.set(r.name, (map.get(r.name) ?? 0) + Math.round(n(r.subtotal)));
+  }
+  return Array.from(map.entries())
+    .map(([name, subtotal]) => toOutputRow(name, subtotal))
+    .sort((a, b) => b.subtotal - a.subtotal);
 }
 
 /**

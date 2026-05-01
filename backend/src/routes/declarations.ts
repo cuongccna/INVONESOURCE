@@ -8,6 +8,7 @@ import { TaxDeclarationEngine } from '../services/TaxDeclarationEngine';
 import { HtkkXmlGenerator } from '../services/HtkkXmlGenerator';
 import { TVanSubmissionService } from '../services/TVanSubmissionService';
 import { TaxDeclarationExporter } from '../services/TaxDeclarationExporter';
+import { checkLineItemSync } from '../services/InvoiceSyncChecker';
 import { ValidationError, NotFoundError } from '../utils/AppError';
 import { sendSuccess, sendPaginated } from '../utils/response';
 import type { TaxDeclaration } from 'shared';
@@ -109,11 +110,14 @@ router.post(
         );
       }
       // Attach audit gate warnings (non-blocking — UI shows them as informational alerts)
-      const warnings = await engine.getCT23Warnings(
-        req.user!.companyId!, month, parsed.data.year
-      ).catch(() => null);
+      const isQuarterly = parsed.data.quarter !== undefined;
+      const periodMonthOrQuarter = parsed.data.quarter ?? parsed.data.month!;
+      const [ct23Warnings, syncWarning] = await Promise.all([
+        engine.getCT23Warnings(req.user!.companyId!, month, parsed.data.year).catch(() => null),
+        checkLineItemSync(req.user!.companyId!, periodMonthOrQuarter, parsed.data.year, isQuarterly).catch(() => null),
+      ]);
       console.log('[CALC-DEBUG] result:', { id: declaration.id, companyId: declaration.company_id, ct40a: declaration.ct40a_total_output_vat, ct23: declaration.ct23_deductible_input_vat, ct41: declaration.ct41_payable_vat, ct43: declaration.ct43_carry_forward_vat });
-      sendSuccess(res, { ...declaration, _warnings: warnings });
+      sendSuccess(res, { ...declaration, _warnings: ct23Warnings, _syncWarning: syncWarning });
     } catch (err) {
       next(err);
     }
@@ -287,7 +291,17 @@ router.get(
 
       const exporter = new TaxDeclarationExporter();
       const { period_month, period_year, period_type } = check.rows[0] as { period_month: number; period_year: number; period_type: string };
-      const periodTag = period_type === 'quarterly' ? `Q${period_month}` : `T${period_month < 10 ? '0' : ''}${period_month}`;
+      const isQuarterlyExport = period_type === 'quarterly';
+      const periodTag = isQuarterlyExport ? `Q${period_month}` : `T${period_month < 10 ? '0' : ''}${period_month}`;
+
+      // Cảnh báo hóa đơn chưa đồng bộ line items — trả về header để UI hiển thị toast
+      const syncWarning = await checkLineItemSync(
+        req.user!.companyId!, period_month, period_year, isQuarterlyExport,
+      ).catch(() => null);
+      if (syncWarning) {
+        res.setHeader('X-Sync-Warning', JSON.stringify(syncWarning));
+        res.setHeader('Access-Control-Expose-Headers', 'X-Sync-Warning');
+      }
 
       if (format === 'excel') {
         const buf = await exporter.exportToExcel(id, req.user!.companyId!);
@@ -327,6 +341,16 @@ router.get('/:id/xml', async (req: Request, res: Response, next: NextFunction) =
 
     const { period_month, period_year, period_type } = decl;
     const isQuarterly = period_type === 'quarterly';
+
+    // Cảnh báo hóa đơn chưa đồng bộ line items — trả về header để UI hiển thị toast
+    const syncWarning = await checkLineItemSync(
+      req.user!.companyId!, period_month as number, period_year as number, isQuarterly,
+    ).catch(() => null);
+    if (syncWarning) {
+      res.setHeader('X-Sync-Warning', JSON.stringify(syncWarning));
+      res.setHeader('Access-Control-Expose-Headers', 'X-Sync-Warning');
+    }
+
     const filename = isQuarterly
       ? `01GTGT_${period_year}_Q${period_month}.xml`
       : `01GTGT_${period_year}_${String(period_month).padStart(2, '0')}.xml`;

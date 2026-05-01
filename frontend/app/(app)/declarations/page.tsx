@@ -110,6 +110,19 @@ export default function DeclarationsPage() {
       const res = await apiClient.post<{ data: Declaration & { id: string } }>('/declarations/calculate', body);
       console.log('[CALC-DEBUG] response id:', res.data.data.id, '| ct40a:', (res.data.data as unknown as Record<string, unknown>).ct40a_total_output_vat);
       toast.success('Đã tính toán tờ khai thành công');
+
+      // Hiển thị cảnh báo nếu có hóa đơn chưa đồng bộ danh mục hàng hóa/dịch vụ
+      const syncWarn = (res.data.data as unknown as Record<string, unknown>)._syncWarning as
+        { totalCount: number; inputCount: number; outputCount: number; message: string } | undefined;
+      if (syncWarn?.totalCount) {
+        toast.show({
+          tone: 'warning',
+          title: `⚠️ ${syncWarn.totalCount} hóa đơn chưa đồng bộ line items`,
+          message: syncWarn.message,
+          duration: 9000,
+        });
+      }
+
       // Navigate to detail page so user immediately sees full calculated values
       router.push(`/declarations/${res.data.data.id}`);
     } catch (err: unknown) {
@@ -122,6 +135,23 @@ export default function DeclarationsPage() {
     }
   };
 
+  /** Parse cảnh báo sync từ response header X-Sync-Warning và hiển thị toast nếu có. */
+  const showSyncWarningFromHeader = (headers: Record<string, string>) => {
+    const raw = headers['x-sync-warning'];
+    if (!raw) return;
+    try {
+      const w = JSON.parse(raw) as { totalCount: number; message: string };
+      if (w?.totalCount) {
+        toast.show({
+          tone: 'warning',
+          title: `⚠️ ${w.totalCount} hóa đơn chưa đồng bộ line items`,
+          message: w.message,
+          duration: 9000,
+        });
+      }
+    } catch { /* header không phải JSON hợp lệ, bỏ qua */ }
+  };
+
   const downloadXml = async (id: string, month: number, year: number) => {
     try {
       const res = await apiClient.get(`/declarations/${id}/xml`, { responseType: 'blob' });
@@ -131,6 +161,7 @@ export default function DeclarationsPage() {
       a.download = `01GTGT_${year}_${String(month).padStart(2, '0')}.xml`;
       a.click();
       URL.revokeObjectURL(url);
+      showSyncWarningFromHeader(res.headers as Record<string, string>);
     } catch {
       toast.error('Lỗi tải XML. Vui lòng thử lại.');
     }
@@ -149,6 +180,7 @@ export default function DeclarationsPage() {
       a.download = `TK01GTGT_${year}_${String(month).padStart(2, '0')}.${ext}`;
       a.click();
       URL.revokeObjectURL(url);
+      showSyncWarningFromHeader(res.headers as Record<string, string>);
     } catch {
       toast.error(`Lỗi tải ${format === 'excel' ? 'Excel' : 'PDF'}. Vui lòng thử lại.`);
     }
