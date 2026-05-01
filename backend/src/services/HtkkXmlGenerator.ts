@@ -380,7 +380,7 @@ function _invoiceEightPercentClause(alias: string): string {
   const normalizedRateExpr = _normalizedPercentRateExpr(`${alias}.vat_rate`);
   return `(
         ROUND((${normalizedRateExpr})::numeric, 2) = 8.00
-        OR COALESCE(${alias}.tax_category, '') = '8'
+        OR COALESCE(${alias}.tax_category, '') IN ('8', '8%')
         OR (
           (${alias}.vat_rate IS NULL OR ${alias}.vat_rate = 0)
           AND ${alias}.subtotal > 0
