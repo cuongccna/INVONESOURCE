@@ -299,7 +299,7 @@ router.get(
         req.user!.companyId!, period_month, period_year, isQuarterlyExport,
       ).catch(() => null);
       if (syncWarning) {
-        res.setHeader('X-Sync-Warning', JSON.stringify(syncWarning));
+        res.setHeader('X-Sync-Warning', encodeURIComponent(JSON.stringify(syncWarning)));
         res.setHeader('Access-Control-Expose-Headers', 'X-Sync-Warning');
       }
 
@@ -332,9 +332,9 @@ router.get('/:id/xml', async (req: Request, res: Response, next: NextFunction) =
     const decl = result.rows[0];
     if (!decl) throw new NotFoundError('Declaration not found');
 
-    // Generate XML if not yet created
+    // Generate XML nếu chưa có hoặc client yêu cầu regenerate (?regenerate=true)
     let xml: string = decl.xml_content as string;
-    if (!xml) {
+    if (!xml || req.query['regenerate'] === 'true') {
       const generator = new HtkkXmlGenerator();
       xml = await generator.generate(decl as TaxDeclaration);
     }
@@ -347,7 +347,7 @@ router.get('/:id/xml', async (req: Request, res: Response, next: NextFunction) =
       req.user!.companyId!, period_month as number, period_year as number, isQuarterly,
     ).catch(() => null);
     if (syncWarning) {
-      res.setHeader('X-Sync-Warning', JSON.stringify(syncWarning));
+      res.setHeader('X-Sync-Warning', encodeURIComponent(JSON.stringify(syncWarning)));
       res.setHeader('Access-Control-Expose-Headers', 'X-Sync-Warning');
     }
 

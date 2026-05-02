@@ -617,17 +617,19 @@ export class TaxDeclarationExporter {
     // Build lists of invoices that have ANY line item at 8% VAT rate (NQ142/NQ204).
     // An invoice with mixed rates (10%, 8%, 5%, 0%) is included if any item is at 8%.
     // Fallback: invoice with no line items included if invoice-level vat_rate = 8.
+    // NUMERIC từ pg driver có thể trả về string "8.00" — dùng Number() để so sánh đúng
+    const is8Pct = (rate: number | string | null): boolean => Number(rate) === 8;
     const pluc8Output = outputInvoices.filter(inv => {
       const items = lineItemsByInvoice.get(inv.id) ?? [];
       return items.length > 0
-        ? items.some(li => li.vat_rate === 8)
-        : inv.vat_rate === 8;
+        ? items.some(li => is8Pct(li.vat_rate))
+        : is8Pct(inv.vat_rate);
     });
     const pluc8Input = inputInvoices.filter(inv => {
       const items = lineItemsByInvoice.get(inv.id) ?? [];
       return items.length > 0
-        ? items.some(li => li.vat_rate === 8)
-        : inv.vat_rate === 8;
+        ? items.some(li => is8Pct(li.vat_rate))
+        : is8Pct(inv.vat_rate);
     });
 
     /* ── Computed values matching official 01/GTGT form ── */
@@ -909,7 +911,7 @@ ${pluc8Output.length > 0 ? `
   </thead>
   <tbody>
     ${pluc8Output.slice(0, 300).map((inv, idx) => {
-      const items8 = (lineItemsByInvoice.get(inv.id) ?? []).filter(li => li.vat_rate === 8);
+      const items8 = (lineItemsByInvoice.get(inv.id) ?? []).filter(li => is8Pct(li.vat_rate));
       const invDate = new Date(inv.invoice_date).toLocaleDateString('vi-VN');
       if (items8.length > 0) {
         return items8.map((li, liIdx) => `<tr${liIdx > 0 ? ' style="background:#fafafa"' : ''}>
@@ -939,13 +941,13 @@ ${pluc8Output.length > 0 ? `
     <tr style="font-weight:bold;background:#f5f5f5;">
       <td colspan="7" style="text-align:right">Tổng cộng bán ra 8%</td>
       <td style="text-align:right">${vnd(pluc8Output.reduce((s, inv) => {
-        const items8 = (lineItemsByInvoice.get(inv.id) ?? []).filter(li => li.vat_rate === 8);
+        const items8 = (lineItemsByInvoice.get(inv.id) ?? []).filter(li => is8Pct(li.vat_rate));
         return s + (items8.length > 0
           ? items8.reduce((a, li) => a + Number(li.subtotal ?? 0), 0)
           : Number(inv.subtotal ?? 0));
       }, 0))}</td>
       <td style="text-align:right">${vnd(pluc8Output.reduce((s, inv) => {
-        const items8 = (lineItemsByInvoice.get(inv.id) ?? []).filter(li => li.vat_rate === 8);
+        const items8 = (lineItemsByInvoice.get(inv.id) ?? []).filter(li => is8Pct(li.vat_rate));
         return s + (items8.length > 0
           ? items8.reduce((a, li) => a + Number(li.vat_amount ?? 0), 0)
           : Number(inv.vat_amount ?? 0));
@@ -966,7 +968,7 @@ ${pluc8Input.length > 0 ? `
   </thead>
   <tbody>
     ${pluc8Input.slice(0, 300).map((inv, idx) => {
-      const items8 = (lineItemsByInvoice.get(inv.id) ?? []).filter(li => li.vat_rate === 8);
+      const items8 = (lineItemsByInvoice.get(inv.id) ?? []).filter(li => is8Pct(li.vat_rate));
       const invDate = new Date(inv.invoice_date).toLocaleDateString('vi-VN');
       if (items8.length > 0) {
         return items8.map((li, liIdx) => `<tr${liIdx > 0 ? ' style="background:#fafafa"' : ''}>
@@ -995,13 +997,13 @@ ${pluc8Input.length > 0 ? `
     <tr style="font-weight:bold;background:#f5f5f5;">
       <td colspan="7" style="text-align:right">Tổng cộng mua vào 8%</td>
       <td style="text-align:right">${vnd(pluc8Input.reduce((s, inv) => {
-        const items8 = (lineItemsByInvoice.get(inv.id) ?? []).filter(li => li.vat_rate === 8);
+        const items8 = (lineItemsByInvoice.get(inv.id) ?? []).filter(li => is8Pct(li.vat_rate));
         return s + (items8.length > 0
           ? items8.reduce((a, li) => a + Number(li.subtotal ?? 0), 0)
           : Number(inv.subtotal ?? 0));
       }, 0))}</td>
       <td style="text-align:right">${vnd(pluc8Input.reduce((s, inv) => {
-        const items8 = (lineItemsByInvoice.get(inv.id) ?? []).filter(li => li.vat_rate === 8);
+        const items8 = (lineItemsByInvoice.get(inv.id) ?? []).filter(li => is8Pct(li.vat_rate));
         return s + (items8.length > 0
           ? items8.reduce((a, li) => a + Number(li.vat_amount ?? 0), 0)
           : Number(inv.vat_amount ?? 0));

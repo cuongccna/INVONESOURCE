@@ -398,6 +398,21 @@ function _noLineItemsClause(invoiceAlias: string): string {
          AND _li.deleted_at IS NULL
      )`;
 }
+
+/**
+ * Điều kiện NOT EXISTS để tier-2 bắt hóa đơn có line items nhưng không có dòng nào là 8%.
+ * Nếu tất cả line items đều không khớp 8%, hóa đơn vẫn cần xuất hiện trong phụ lục
+ * dựa trên dữ liệu header (buyer_name / seller_name + subtotal).
+ */
+function _no8PctLineItemsClause(invoiceAlias: string): string {
+  return `NOT EXISTS (
+       SELECT 1
+       FROM invoice_line_items _li
+       WHERE _li.invoice_id = ${invoiceAlias}.id
+         AND _li.deleted_at IS NULL
+         AND ${_lineItemEightPercentClause('_li')}
+     )`;
+}
 /** Trả về điều kiện WHERE + params cho lọc kỳ kê khai theo ngày hoá đơn. */
 function _buildPeriodFilter(
   periodMonth: number,
@@ -443,36 +458,48 @@ async function _fetchPluc8InputItems(
   const normalizedLineRateExpr    = _normalizedPercentRateExpr('ili.vat_rate');
   const normalizedInvoiceRateExpr = _normalizedPercentRateExpr('vat_rate');
 
-  // Tier 1: dòng hàng hóa 8% từ hóa đơn đã có line items
+  // Tier 1: dòng hàng hóa 8% từ hóa đơn đã có line items.
+  // Dùng CTE với window function để fallback về i.subtotal / i.vat_amount khi
+  // line item có subtotal = 0 (phổ biến ở hóa đơn thay thế/điều chỉnh).
   const { rows: lineRows } = await pool.query<{ name: string; subtotal: string; vat_amount: string }>(
-    `SELECT
-       COALESCE(NULLIF(TRIM(ili.item_name), ''), 'Hàng hóa/dịch vụ tổng hợp') AS name,
-       COALESCE(ROUND(SUM(ili.subtotal)), 0)::bigint AS subtotal,
-       COALESCE(
-         ROUND(SUM(
-           CASE WHEN ili.vat_amount IS NOT NULL AND ili.vat_amount <> 0
-                THEN ili.vat_amount
-                ELSE ili.subtotal * (${normalizedLineRateExpr}) / 100.0
-           END
-         )), 0
-       )::bigint AS vat_amount
-     FROM invoice_line_items ili
-     JOIN invoices i ON i.id = ili.invoice_id
-     WHERE i.company_id = $1
-       AND i.direction = 'input'
-       AND i.status IN ('valid', 'replaced', 'adjusted')
-       AND i.deleted_at IS NULL
-       AND ili.deleted_at IS NULL
-       AND ${_lineItemEightPercentClause('ili')}
-       ${_notReplacedClause('i')}
-       ${_notAdjustedClause('i')}
-       AND ${pf.clause}
-     GROUP BY 1
-     ORDER BY SUM(ili.subtotal) DESC`,
+    `WITH _matched AS (
+       SELECT
+         COALESCE(NULLIF(TRIM(ili.item_name), ''), 'Hàng hóa/dịch vụ tổng hợp') AS name,
+         CASE WHEN ili.subtotal IS NOT NULL AND ili.subtotal <> 0
+              THEN ili.subtotal
+              ELSE i.subtotal / NULLIF(COUNT(*) OVER (PARTITION BY i.id), 0)
+         END AS eff_subtotal,
+         CASE WHEN ili.vat_amount IS NOT NULL AND ili.vat_amount <> 0
+              THEN ili.vat_amount
+              WHEN ili.subtotal IS NOT NULL AND ili.subtotal <> 0
+              THEN ili.subtotal * (${normalizedLineRateExpr}) / 100.0
+              ELSE i.vat_amount / NULLIF(COUNT(*) OVER (PARTITION BY i.id), 0)
+         END AS eff_vat_amount
+       FROM invoice_line_items ili
+       JOIN invoices i ON i.id = ili.invoice_id
+       WHERE i.company_id = $1
+         AND i.direction = 'input'
+         AND i.status IN ('valid', 'replaced', 'adjusted')
+         AND i.deleted_at IS NULL
+         AND ili.deleted_at IS NULL
+         AND ${_lineItemEightPercentClause('ili')}
+         ${_notReplacedClause('i')}
+         ${_notAdjustedClause('i')}
+         AND ${pf.clause}
+     )
+     SELECT
+       name,
+       COALESCE(ROUND(SUM(eff_subtotal)), 0)::bigint AS subtotal,
+       COALESCE(ROUND(SUM(eff_vat_amount)), 0)::bigint AS vat_amount
+     FROM _matched
+     GROUP BY name
+     ORDER BY SUM(eff_subtotal) DESC`,
     [companyId, ...pf.params],
   );
 
-  // Tier 2: hóa đơn 8% chưa có line items (fallback — dùng seller_name làm tên mặt hàng)
+  // Tier 2: hóa đơn 8% không có line items NÀO khớp 8% (fallback — dùng seller_name làm tên mặt hàng).
+  // Dùng _no8PctLineItemsClause thay vì _noLineItemsClause để bắt được hóa đơn có line items
+  // nhưng không có dòng nào ở mức 8% (line items lưu ở thuế suất khác hoặc thiếu dữ liệu).
   const { rows: invRows } = await pool.query<{ name: string; subtotal: string; vat_amount: string }>(
     `SELECT
        COALESCE(NULLIF(TRIM(seller_name), ''), 'Hàng hóa/dịch vụ tổng hợp') AS name,
@@ -491,7 +518,7 @@ async function _fetchPluc8InputItems(
        AND ${_invoiceEightPercentClause('invoices')}
        AND status IN ('valid', 'replaced', 'adjusted')
        AND deleted_at IS NULL
-       AND ${_noLineItemsClause('invoices')}
+       AND ${_no8PctLineItemsClause('invoices')}
        ${_notReplacedClause('invoices')}
        ${_notAdjustedClause('invoices')}
        AND ${pf2.clause}
@@ -533,28 +560,38 @@ async function _fetchPluc8OutputItems(
   const pf  = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'i.invoice_date', 2);
   const pf2 = _buildPeriodFilter(periodMonth, periodYear, quarterly, 'invoice_date',   2);
 
-  // Tier 1: dòng hàng hóa 8% từ hóa đơn đã có line items
+  // Tier 1: dòng hàng hóa 8% từ hóa đơn đã có line items.
+  // Dùng CTE với window function để fallback về i.subtotal khi line item subtotal = 0.
   const { rows: lineRows } = await pool.query<{ name: string; subtotal: string }>(
-    `SELECT
-       COALESCE(NULLIF(TRIM(ili.item_name), ''), 'Hàng hóa/dịch vụ tổng hợp') AS name,
-       COALESCE(ROUND(SUM(ili.subtotal)), 0)::bigint AS subtotal
-     FROM invoice_line_items ili
-     JOIN invoices i ON i.id = ili.invoice_id
-     WHERE i.company_id = $1
-       AND i.direction = 'output'
-       AND i.status IN ('valid', 'replaced', 'adjusted')
-       AND i.deleted_at IS NULL
-       AND ili.deleted_at IS NULL
-       AND ${_lineItemEightPercentClause('ili')}
-       ${_notReplacedClause('i')}
-       ${_notAdjustedClause('i')}
-       AND ${pf.clause}
-     GROUP BY 1
-     ORDER BY SUM(ili.subtotal) DESC`,
+    `WITH _matched AS (
+       SELECT
+         COALESCE(NULLIF(TRIM(ili.item_name), ''), 'Hàng hóa/dịch vụ tổng hợp') AS name,
+         CASE WHEN ili.subtotal IS NOT NULL AND ili.subtotal <> 0
+              THEN ili.subtotal
+              ELSE i.subtotal / NULLIF(COUNT(*) OVER (PARTITION BY i.id), 0)
+         END AS eff_subtotal
+       FROM invoice_line_items ili
+       JOIN invoices i ON i.id = ili.invoice_id
+       WHERE i.company_id = $1
+         AND i.direction = 'output'
+         AND i.status IN ('valid', 'replaced', 'adjusted')
+         AND i.deleted_at IS NULL
+         AND ili.deleted_at IS NULL
+         AND ${_lineItemEightPercentClause('ili')}
+         ${_notReplacedClause('i')}
+         ${_notAdjustedClause('i')}
+         AND ${pf.clause}
+     )
+     SELECT
+       name,
+       COALESCE(ROUND(SUM(eff_subtotal)), 0)::bigint AS subtotal
+     FROM _matched
+     GROUP BY name
+     ORDER BY SUM(eff_subtotal) DESC`,
     [companyId, ...pf.params],
   );
 
-  // Tier 2: hóa đơn 8% chưa có line items (fallback — dùng buyer_name làm tên mặt hàng)
+  // Tier 2: hóa đơn 8% không có line items NÀO khớp 8% (fallback — dùng buyer_name làm tên mặt hàng).
   const { rows: invRows } = await pool.query<{ name: string; subtotal: string }>(
     `SELECT
        COALESCE(NULLIF(TRIM(buyer_name), ''), 'Hàng hóa/dịch vụ tổng hợp') AS name,
@@ -565,7 +602,7 @@ async function _fetchPluc8OutputItems(
        AND ${_invoiceEightPercentClause('invoices')}
        AND status IN ('valid', 'replaced', 'adjusted')
        AND deleted_at IS NULL
-       AND ${_noLineItemsClause('invoices')}
+       AND ${_no8PctLineItemsClause('invoices')}
        ${_notReplacedClause('invoices')}
        ${_notAdjustedClause('invoices')}
        AND ${pf2.clause}

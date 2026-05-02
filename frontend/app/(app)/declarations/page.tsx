@@ -140,7 +140,7 @@ export default function DeclarationsPage() {
     const raw = headers['x-sync-warning'];
     if (!raw) return;
     try {
-      const w = JSON.parse(raw) as { totalCount: number; message: string };
+      const w = JSON.parse(decodeURIComponent(raw)) as { totalCount: number; message: string };
       if (w?.totalCount) {
         toast.show({
           tone: 'warning',
