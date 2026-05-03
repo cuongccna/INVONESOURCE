@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, Suspense } from 'react';
 import { useRouter, usePathname, useSearchParams } from 'next/navigation';
 import axios from 'axios';
 import { setAccessToken } from '../lib/apiClient';
@@ -135,7 +135,7 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
         <ViewProvider>
           <div className="min-h-screen bg-gray-50 flex flex-col">
             <NoCompanyGuard />
-            <NavigationHistoryTracker />
+            <Suspense fallback={null}><NavigationHistoryTracker /></Suspense>
             <Header />
             <main className="flex-1 pb-20 lg:pb-6 pt-header-safe safe-bottom">
               <GlobalBackStrip />

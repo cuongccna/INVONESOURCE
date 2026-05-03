@@ -1,5 +1,6 @@
 'use client';
 
+import { Suspense } from 'react';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { buildRouteKey, getPreviousRoute } from '../lib/navigationHistory';
 
@@ -9,7 +10,7 @@ interface BackButtonProps {
   className?: string;
 }
 
-export default function BackButton({
+function BackButtonInner({
   fallbackHref,
   label = 'Quay lại',
   className = '',
@@ -52,5 +53,13 @@ export default function BackButton({
       </svg>
       {label}
     </button>
+  );
+}
+
+export default function BackButton(props: BackButtonProps) {
+  return (
+    <Suspense fallback={null}>
+      <BackButtonInner {...props} />
+    </Suspense>
   );
 }

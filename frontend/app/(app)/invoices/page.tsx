@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback, useMemo } from 'react';
+import { useEffect, useState, useCallback, useMemo, Suspense } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import apiClient from '../../../lib/apiClient';
 import { useCompany } from '../../../contexts/CompanyContext';
@@ -33,7 +33,7 @@ const SCO_OPTS: { v: boolean | null; label: string }[] = [
   { v: true,  label: 'HĐ máy tính tiền' },
 ];
 
-export default function InvoicesPage() {
+function InvoicesClient() {
   const searchParams = useSearchParams();
   const importSessionId = searchParams.get('importSessionId');
   const toast = useToast();
@@ -554,5 +554,13 @@ export default function InvoicesPage() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function InvoicesPage() {
+  return (
+    <Suspense fallback={<div className="flex items-center justify-center h-64"><p className="text-gray-400 text-sm">Đang tải…</p></div>}>
+      <InvoicesClient />
+    </Suspense>
   );
 }

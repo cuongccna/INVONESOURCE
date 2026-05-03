@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, Suspense } from 'react';
 import { useRouter, usePathname, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import axios from 'axios';
@@ -19,6 +19,15 @@ const NAV_ITEMS = [
   { href: '/admin/indicator-configs',    label: 'Chỉ tiêu 01/GTGT', icon: '⚙️' },
   { href: '/admin/system-settings',      label: 'Cài đặt hệ thống', icon: '🛠️' },
 ];
+
+function AdminNavTracker({ pathname }: { pathname: string }) {
+  const searchParams = useSearchParams();
+  useEffect(() => {
+    const routeKey = buildRouteKey(pathname, searchParams);
+    pushNavigationEntry(routeKey);
+  }, [pathname, searchParams]);
+  return null;
+}
 
 function SidebarContent({ pathname, onClose }: { pathname: string; onClose?: () => void }) {
   return (
@@ -68,15 +77,8 @@ function SidebarContent({ pathname, onClose }: { pathname: string; onClose?: () 
 export default function AdminLayout({ children }: { children: React.ReactNode }) {
   const router   = useRouter();
   const pathname = usePathname();
-  const searchParams = useSearchParams();
   const [checking, setChecking]     = useState(true);
   const [mobileOpen, setMobileOpen] = useState(false);
-
-  // Track navigation for back button
-  useEffect(() => {
-    const routeKey = buildRouteKey(pathname, searchParams);
-    pushNavigationEntry(routeKey);
-  }, [pathname, searchParams]);
 
   useEffect(() => {
     axios
@@ -112,6 +114,7 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
 
   return (
     <div className="min-h-screen bg-gray-50">
+      <Suspense fallback={null}><AdminNavTracker pathname={pathname} /></Suspense>
       {/* ── Mobile top bar ──────────────────────────────────────────────── */}
       <header className="md:hidden fixed top-0 inset-x-0 z-30 bg-white border-b border-gray-200 flex items-center px-4 h-14 shadow-sm">
         <button
