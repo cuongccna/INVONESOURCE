@@ -202,11 +202,8 @@ export default function DeclarationsPage() {
 
   return (
     <div className="p-4 max-w-2xl lg:max-w-5xl mx-auto">
-      <div className="flex items-center justify-between mb-6">
-        <div>
-          <h1 className="text-2xl font-bold text-gray-900">Tờ Khai Thuế</h1>
-          <p className="text-sm text-gray-500 mt-1">01/GTGT — Kê khai thuế GTGT</p>
-        </div>
+      <div className="flex items-center justify-between mb-4">
+        <h1 className="text-2xl font-bold text-gray-900">Tờ Khai Thuế</h1>
         <button
           onClick={() => setShowCalcModal(true)}
           disabled={calculating}
@@ -216,7 +213,18 @@ export default function DeclarationsPage() {
         </button>
       </div>
 
-      {/* Form type is implied by active company; toggle removed */}
+      {/* Form type tabs */}
+      <div className="flex gap-1 bg-gray-100 rounded-lg p-1 mb-6 w-fit">
+        <span className="px-4 py-1.5 rounded-md bg-white shadow-sm text-sm font-medium text-gray-900">
+          01/GTGT
+        </span>
+        <Link
+          href="/declarations/pit"
+          className="px-4 py-1.5 rounded-md text-sm font-medium text-gray-500 hover:text-gray-700 hover:bg-white/60 transition-colors"
+        >
+          05/KK-TNCN
+        </Link>
+      </div>
 
       {isHkd ? (
         <div className="flex justify-center py-12">

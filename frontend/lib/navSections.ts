@@ -16,6 +16,7 @@ export const DRAWER_SECTIONS = [
       { href: '/reports/inventory', label: 'Xuất Nhập Tồn' },
       { href: '/reports/cash-book', label: 'Sổ Quỹ Tiền' },
       { href: '/declarations/hkd', label: 'Hộ kinh doanh (HKD)' },
+      { href: '/declarations/pit', label: 'Khấu trừ TNCN (05/KK-TNCN)' },
     ],
   },
   {
@@ -109,6 +110,7 @@ export const VISIBLE_DRAWER_SECTIONS = [
     title: '📒 Kế Toán',
     items: [
       { href: '/reports/sales-journal', label: 'Bảng kê bán ra / mua vào' },
+      { href: '/declarations/pit', label: 'Khấu trừ TNCN (05/KK-TNCN)' },
     ],
   },
 ];

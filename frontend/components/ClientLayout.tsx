@@ -75,7 +75,7 @@ function GlobalBackStrip() {
   ].some((p) => pathname === p || pathname.startsWith(`${p}/`));
 
   const hasRouteSpecificBack = !!pathname && (
-    pathname.startsWith('/declarations/')
+    (pathname.startsWith('/declarations/') && pathname !== '/declarations/pit' && pathname !== '/declarations/hkd')
     || pathname.startsWith('/reports/monthly/')
     || pathname.startsWith('/invoices/')
     || pathname.startsWith('/admin/users/')
