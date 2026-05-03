@@ -99,8 +99,11 @@ export class HtkkXmlGenerator {
 
     const plucInputSumSubtotal   = plucInputItems.reduce((s, r) => s + r.subtotal,     0);
     const plucInputSumVat        = plucInputItems.reduce((s, r) => s + r.vatAmount,    0);
-    const plucOutputSumSubtotal  = plucOutputItems.reduce((s, r) => s + r.subtotal,    0);
-    const plucOutputSumReduction = plucOutputItems.reduce((s, r) => s + r.vatReduction, 0);
+    // Dùng giá trị đã được Tax Engine tính chính xác từ declaration thay vì tự tổng từ query.
+    // Query phụ lục có thể bỏ sót một số hóa đơn 8% (e.g. line items không có vat_rate rõ ràng),
+    // dẫn đến tongCongGiaTriHHDV lệch với [32] trên tờ khai.
+    const plucOutputSumSubtotal  = Math.round(n(d.ct34_revenue_8pct));
+    const plucOutputSumReduction = Math.round(plucOutputSumSubtotal * 0.02);
 
     // ── FIX: [25] trong XML = CHỈ thuế đầu vào kỳ này (ct23_deductible_input_vat = form [24])
     // KHÔNG bao gồm [22] kết chuyển kỳ trước. ct25_total_deductible=[24]+[22] chỉ dùng nội bộ.
