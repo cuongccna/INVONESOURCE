@@ -530,8 +530,6 @@ async function _fetchPluc8InputItems(
   }
   return Array.from(map.entries())
     .map(([name, v]) => ({ name, subtotal: v.subtotal, vatAmount: v.vatAmount }))
-    // Loại mặt hàng không có giá trị tiền — cả subtotal lẫn VAT đều bằng 0
-    .filter(item => item.subtotal !== 0 || item.vatAmount !== 0)
     .sort((a, b) => b.subtotal - a.subtotal);
 }
 
@@ -610,8 +608,6 @@ async function _fetchPluc8OutputItems(
   }
   return Array.from(map.entries())
     .map(([name, subtotal]) => toOutputRow(name, subtotal))
-    // Loại mặt hàng không có giá trị tiền — subtotal = 0 thì vatReduction cũng = 0
-    .filter(item => item.subtotal !== 0)
     .sort((a, b) => b.subtotal - a.subtotal);
 }
 
@@ -633,8 +629,12 @@ function _buildPlucXml(
 
   // Build sections as line arrays — avoids blank lines when items list is empty,
   // ensuring HTKK XSD validation passes (no stray whitespace-only text nodes).
+  // Chỉ hiển thị dòng có giá trị tiền trong danh sách; tổng cộng vẫn tính đủ tất cả mặt hàng.
+  const visibleInputItems  = inputItems.filter(item => item.subtotal !== 0 || item.vatAmount !== 0);
+  const visibleOutputItems = outputItems.filter(item => item.subtotal !== 0);
+
   const inputLines = [
-    ...inputItems.map((item, i) =>
+    ...visibleInputItems.map((item, i) =>
       `                    <BangKeTenHHDV ID="${i + 1}">\n` +
       `                        <tenHHDVMuaVao>${escapeXml(item.name)}</tenHHDVMuaVao>\n` +
       `                        <giaTriHHDVMuaVao>${item.subtotal}</giaTriHHDVMuaVao>\n` +
@@ -645,7 +645,7 @@ function _buildPlucXml(
   ];
 
   const outputLines = [
-    ...outputItems.map((item, i) =>
+    ...visibleOutputItems.map((item, i) =>
       `                    <BangKeTenHHDV ID="${i + 1}">\n` +
       `                        <tenHHDV>${escapeXml(item.name)}</tenHHDV>\n` +
       `                        <giaTriHHDV>${item.subtotal}</giaTriHHDV>\n` +
