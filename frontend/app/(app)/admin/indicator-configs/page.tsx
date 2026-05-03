@@ -88,7 +88,7 @@ export default function IndicatorConfigsPage() {
   return (
     <div className="max-w-4xl mx-auto px-4 py-6 space-y-4">
       <div className="flex items-center gap-3">
-        <BackButton fallbackHref="/dashboard" />
+        <BackButton fallbackHref="/admin" />
         <div>
           <h1 className="text-xl font-bold text-gray-900">Cấu hình chỉ tiêu 01/GTGT</h1>
           <p className="text-xs text-gray-400">Chỉ OWNER mới chỉnh sửa được. Thay đổi áp dụng cho tất cả tờ khai.</p>

@@ -11,6 +11,7 @@
 
 import type { Redis } from 'ioredis';
 import { logger } from './logger';
+import { cfg } from './config/ConfigStore';
 
 export enum CircuitState {
   CLOSED    = 'CLOSED',
@@ -29,10 +30,12 @@ interface CircuitData {
 const KEY_PREFIX = 'cb:';
 const KEY_TTL    = 24 * 3600; // 24h auto-expire stale keys
 
+// DEFAULTS are read from ConfigStore at runtime so admin can tune without restart.
+// If ConfigStore is not yet initialized (e.g. unit tests), fallback values are used.
 const DEFAULTS = {
-  failureThreshold: 3,
-  cooldownMs:       2 * 60_000, // 2 minutes
-  halfOpenTimeout:  30_000,
+  get failureThreshold() { return cfg.number('connector.cb_failure_threshold', 3); },
+  get cooldownMs()       { return cfg.number('connector.cb_cooldown_ms', 2 * 60_000); },
+  get halfOpenTimeout()  { return 30_000; }, // not yet in system_settings, reserved for future
 };
 
 export class GdtCircuitBreaker {
@@ -246,7 +249,12 @@ export function isInvalidCredentials(error: unknown): boolean {
     message?: string;
   };
 
-  // HTTP 401
+  // GdtAuthError (custom class — not Axios): httpStatus 400 or 401, non-captcha.
+  // Captcha errors are caught & retried inside gdt-direct-api.service.ts and never reach here.
+  const gdtErr = error as { name?: string; httpStatus?: number };
+  if (gdtErr.name === 'GdtAuthError' && (gdtErr.httpStatus === 400 || gdtErr.httpStatus === 401)) return true;
+
+  // Axios error: HTTP 401
   if (axiosError.response?.status === 401) return true;
 
   // GDT-specific error message (Vietnamese)

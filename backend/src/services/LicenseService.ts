@@ -9,6 +9,7 @@
 import IORedis from 'ioredis';
 import { pool } from '../db/pool';
 import { env } from '../config/env';
+import { cfg } from '../config/ConfigStore';
 
 export interface LicenseTier {
   planId:       string;
@@ -22,10 +23,10 @@ export interface LicenseTier {
 
 export const FREE_TIER: LicenseTier = {
   planId:        'free',
-  syncPerHour:   3,
-  burstMax:      3,
-  invoiceQuota:  100,
-  maxCompanies:  1,
+  get syncPerHour()  { return cfg.number('license.free_tier_sync_per_hour', 3); },
+  get burstMax()     { return cfg.number('license.free_tier_burst_max', 3); },
+  get invoiceQuota() { return cfg.number('license.free_tier_monthly_quota', 100); },
+  get maxCompanies() { return cfg.number('license.free_tier_max_companies', 1); },
   canExportXml:  false,
   canUseAiAudit: false,
 };

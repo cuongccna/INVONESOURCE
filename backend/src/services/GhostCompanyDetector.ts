@@ -9,6 +9,7 @@
  */
 import { pool } from '../db/pool';
 import { companyVerificationService, CompanyInfo } from './CompanyVerificationService';
+import { cfg } from '../config/ConfigStore';
 
 export interface RiskFlag {
   code:        string;
@@ -118,7 +119,7 @@ export class GhostCompanyDetector {
     if (info.company_name && invList.length > 0) {
       const invName = invList[0]![nameCol] ?? '';
       const similarity = companyVerificationService.compareNames(invName, info.company_name);
-      if (invName && similarity < 0.4) {
+      if (invName && similarity < cfg.number('audit.ghost_name_similarity', 0.4)) {
         flags.push({
           code: 'NAME_MISMATCH',
           level: 'high',
@@ -132,8 +133,8 @@ export class GhostCompanyDetector {
     if (info.registered_date && partnerType === 'seller') {
       const monthsOld =
         (Date.now() - new Date(info.registered_date).getTime()) / (1000 * 60 * 60 * 24 * 30);
-      const bigInvs = invList.filter(i => parseFloat(i.total_amount) > 50_000_000);
-      if (monthsOld < 6 && bigInvs.length > 0) {
+      const bigInvs = invList.filter(i => parseFloat(i.total_amount) > cfg.number('audit.ghost_new_company_invoice_vnd', 50_000_000));
+      if (monthsOld < cfg.number('audit.ghost_new_company_months', 6) && bigInvs.length > 0) {
         flags.push({
           code: 'NEW_COMPANY_BIG_INV',
           level: 'high',
@@ -149,7 +150,7 @@ export class GhostCompanyDetector {
       const d = new Date(i.invoice_date).toISOString().slice(0, 10);
       byDate[d] = (byDate[d] ?? 0) + 1;
     });
-    const splitDays = Object.values(byDate).filter(count => count >= 3);
+    const splitDays = Object.values(byDate).filter(count => count >= cfg.number('audit.split_invoice_threshold', 3));
     if (splitDays.length > 0) {
       flags.push({
         code: 'SPLIT_INVOICE',

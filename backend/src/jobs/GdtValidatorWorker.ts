@@ -3,6 +3,7 @@ import { pool } from '../db/pool';
 import { env } from '../config/env';
 import { v4 as uuidv4 } from 'uuid';
 import axios from 'axios';
+import { cfg } from '../config/ConfigStore';
 
 export interface GdtValidateJobPayload {
   invoiceId: string;
@@ -118,7 +119,7 @@ export const gdtValidateWorker = new Worker<GdtValidateJobPayload>(
     concurrency: 1,   // strict rate limiting — 1 at a time
     limiter: {
       max: 1,
-      duration: 2000,
+      duration: cfg.number('gdt.validate_rate_ms', 2000),
     },
   }
 );

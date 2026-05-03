@@ -50,7 +50,7 @@
  * ═════════════════════════════════════════════════════════════════════════════
  */
 const { Client } = require('pg');
-require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
+require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env') });
 
 const DB_URL = process.env.DATABASE_URL;
 const TEST_TAG = 'TEST_DELETE_' + Date.now();

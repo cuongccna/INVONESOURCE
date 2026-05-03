@@ -22,6 +22,7 @@ import axios, { AxiosInstance } from 'axios';
 import { createTunnelAgent, createSocks5TunnelAgent } from './proxy-tunnel';
 import { CaptchaService } from './captcha.service';
 import { logger } from './logger';
+import { cfg } from './config/ConfigStore';
 import type { RawInvoice } from './parsers/GdtXmlParser';
 import type { CrawlerRecipe, RecipeFields } from './types/recipe.types';
 import { SyncCheckpoint } from './crawl-cache/SyncCheckpoint';
@@ -182,15 +183,15 @@ const GDT_API_HTTP  = 'http://hoadondientu.gdt.gov.vn:30000';
 const GDT_SCO_SOLD     = '/sco-query/invoices/sold';
 const GDT_SCO_PURCHASE = '/sco-query/invoices/purchase';
 const GDT_SCO_DETAIL   = '/sco-query/invoices/detail';
-const PAGE_SIZE = 50;
+const PAGE_SIZE = () => cfg.number('gdt.page_size', 50);
 
-// Retry config for transient errors
-const MAX_RETRIES   = 3;
-const RETRY_DELAY   = 3_000; // ms
-const REQUEST_TIMEOUT = 30_000;
+// Retry config for transient errors — live-configurable via /admin/system-settings
+const MAX_RETRIES     = () => cfg.number('gdt.max_retries', 3);
+const RETRY_DELAY     = () => cfg.number('gdt.retry_delay_ms', 3_000);
+const REQUEST_TIMEOUT = () => cfg.number('gdt.request_timeout_ms', 30_000);
 // Binary downloads (XML ZIP, XLSX) can be large and GDT server is slow to generate them.
 // Give generous room for slow responses over the proxy tunnel.
-const BINARY_TIMEOUT = 120_000; // 2 min — override with recipe.timing.binaryTimeoutMs
+const BINARY_TIMEOUT  = () => cfg.number('gdt.binary_timeout_ms', 120_000);
 
 // ── Peak period detection ─────────────────────────────────────────────────────
 // GDT traffic peaks during tax filing deadline (20th of each month).
@@ -206,21 +207,24 @@ const BINARY_TIMEOUT = 120_000; // 2 min — override with recipe.timing.binaryT
 export function getPeakTimeoutMultiplier(): number {
   const vnNow = new Date(Date.now() + 7 * 3_600_000); // UTC+7
   const day = vnNow.getUTCDate();
-  if (day >= 21 && day <= 25) return 6.0;
-  if (day >= 18 && day <= 20) return 4.0;
+  const peakStart  = cfg.number('gdt.peak_start_day', 18);
+  const peakEnd    = cfg.number('gdt.peak_end_day', 25);
+  const multiplier = cfg.number('gdt.peak_timeout_multiplier', 6.0);
+  if (day >= 21 && day <= peakEnd) return multiplier;
+  if (day >= peakStart && day <= 20) return 4.0;
   return 1.0;
 }
 
 /** Returns retry count adjusted for peak periods */
 export function getPeakMaxRetries(): number {
   const m = getPeakTimeoutMultiplier();
-  return m > 1 ? 5 : MAX_RETRIES; // 3 → 5 during peak
+  return m > 1 ? cfg.number('gdt.peak_max_retries', 5) : MAX_RETRIES(); // 3 → 5 during peak
 }
 
 /** Returns retry delay base (ms) adjusted for peak periods */
 export function getPeakRetryDelay(): number {
   const m = getPeakTimeoutMultiplier();
-  return m > 1 ? 8_000 : RETRY_DELAY; // 3s → 8s during peak
+  return m > 1 ? 8_000 : RETRY_DELAY(); // 3s → 8s during peak
 }
 
 // VĐ2: Per-endpoint timeouts — /sco-query/ endpoints are significantly slower than /query/
@@ -941,7 +945,7 @@ export class GdtDirectApiService {
       baseURL: httpAgent
         ? (this.recipe?.api.baseUrlHttp ?? GDT_API_HTTP)
         : (this.recipe?.api.baseUrl    ?? GDT_API_HTTPS),
-      timeout: REQUEST_TIMEOUT,
+      timeout: REQUEST_TIMEOUT(),
       headers: commonHeaders,
       paramsSerializer: serializeParams,  // BUG-1: raw FIQL values, encoded keys only
       ...(httpAgent ? { httpAgent } : {}),
@@ -954,7 +958,7 @@ export class GdtDirectApiService {
       const socks5Agent = createSocks5TunnelAgent({ proxyUrl: socks5ProxyUrl });
       this.binaryHttp = axios.create({
         baseURL:          this.recipe?.api.baseUrlHttp ?? GDT_API_HTTP,   // http:// so axios uses httpAgent (our SOCKS5 tunnel does TLS)
-        timeout:          BINARY_TIMEOUT,
+        timeout:          BINARY_TIMEOUT(),
         headers:          commonHeaders,
         paramsSerializer: serializeParams,  // BUG-1: raw FIQL values, encoded keys only
         httpAgent:        socks5Agent,
@@ -1001,8 +1005,8 @@ export class GdtDirectApiService {
         }
       }
       // Apply peak multiplier to default timeout too (for unmatched endpoints)
-      if (m > 1 && config.timeout === REQUEST_TIMEOUT) {
-        config.timeout = Math.round(REQUEST_TIMEOUT * m);
+      if (m > 1 && config.timeout === REQUEST_TIMEOUT()) {
+        config.timeout = Math.round(REQUEST_TIMEOUT() * m);
       }
       return config;
     });
@@ -1017,7 +1021,7 @@ export class GdtDirectApiService {
     this._currentProxyUrl = newProxyUrl;
     this.http = axios.create({
       baseURL:          this.recipe?.api.baseUrlHttp ?? GDT_API_HTTP,
-      timeout:          REQUEST_TIMEOUT,
+      timeout:          REQUEST_TIMEOUT(),
       headers:          this._commonHeaders,
       paramsSerializer: serializeParams,
       httpAgent,
@@ -1623,7 +1627,7 @@ export class GdtDirectApiService {
 
     const res = await this._getWithRetry<GdtPagedResponse>(
       scoPath,
-      { sort, size: PAGE_SIZE, page: 0, search },
+      { sort, size: PAGE_SIZE(), page: 0, search },
     );
 
     const rows = res.data.datas ?? res.data.data ?? [];
@@ -1689,7 +1693,7 @@ export class GdtDirectApiService {
       }
 
       const resolvedRows = Array.from(uniqueRows.values());
-      const isCompleteRange = reportedTotal <= resolvedRows.length || reportedTotal <= PAGE_SIZE;
+      const isCompleteRange = reportedTotal <= resolvedRows.length || reportedTotal <= PAGE_SIZE();
       if (isCompleteRange || minValue === maxValue) {
         for (const inv of resolvedRows) {
           const key = invoiceIdentityKey(inv);
@@ -1762,7 +1766,7 @@ export class GdtDirectApiService {
     overridePath?: string,
   ): AsyncGenerator<RawInvoice[]> {
     const chunks = await this._planRangeChunks(endpoint, fromDate, toDate, extraFilter, overridePath);
-    const pageSize = this.recipe?.api.pagination.pageSize ?? PAGE_SIZE;
+    const pageSize = this.recipe?.api.pagination.pageSize ?? PAGE_SIZE();
 
     for (let i = 0; i < chunks.length; i++) {
       const { from, to } = chunks[i]!;
@@ -2071,7 +2075,7 @@ export class GdtDirectApiService {
     if (!this.token) throw new Error('Not authenticated — call login() first');
 
     const direction: 'output' | 'input' = endpoint === 'sold' ? 'output' : 'input';
-    const pageSize    = this.recipe?.api.pagination.pageSize ?? PAGE_SIZE;
+    const pageSize    = this.recipe?.api.pagination.pageSize ?? PAGE_SIZE();
     const endpointPath = overridePath
       ?? (endpoint === 'sold'
         ? (this.recipe?.api.endpoints.sold     ?? '/query/invoices/sold')
@@ -2241,7 +2245,7 @@ export class GdtDirectApiService {
     if (!this.token) throw new Error('Not authenticated — call login() first');
 
     const direction: 'output' | 'input' = endpoint === 'sold' ? 'output' : 'input';
-    const pageSize    = this.recipe?.api.pagination.pageSize ?? PAGE_SIZE;
+    const pageSize    = this.recipe?.api.pagination.pageSize ?? PAGE_SIZE();
     const endpointPath = overridePath
       ?? (endpoint === 'sold'
         ? (this.recipe?.api.endpoints.sold     ?? '/query/invoices/sold')
@@ -2345,10 +2349,10 @@ export class GdtDirectApiService {
     await humanDelay(1_500, 3_000);
 
     // SCO sold: use _fetchScoByWeeks (weekly → daily fallback on truncation detection).
-    // Buffered then yielded in PAGE_SIZE batches so the caller sees the same interface.
+    // Buffered then yielded in PAGE_SIZE() batches so the caller sees the same interface.
     const scoSoldAll = await this._fetchScoByWeeks('sold', fromDate, toDate, scoPath);
-    for (let i = 0; i < scoSoldAll.length; i += PAGE_SIZE) {
-      yield scoSoldAll.slice(i, i + PAGE_SIZE);
+    for (let i = 0; i < scoSoldAll.length; i += PAGE_SIZE()) {
+      yield scoSoldAll.slice(i, i + PAGE_SIZE());
     }
   }
 
@@ -2382,8 +2386,8 @@ export class GdtDirectApiService {
 
     // SCO purchase: same buffered approach with truncation detection + daily fallback.
     const scoPurchaseAll = await this._fetchScoByWeeks('purchase', fromDate, toDate, scoPurchasePath);
-    for (let i = 0; i < scoPurchaseAll.length; i += PAGE_SIZE) {
-      yield scoPurchaseAll.slice(i, i + PAGE_SIZE);
+    for (let i = 0; i < scoPurchaseAll.length; i += PAGE_SIZE()) {
+      yield scoPurchaseAll.slice(i, i + PAGE_SIZE());
     }
   }
 
@@ -2416,6 +2420,21 @@ export class GdtDirectApiService {
             }
             throw new Error('GDT token expired — re-login required');
           }
+          // 429 Rate Limit: GDT throttles requests per source IP.
+          // Sleep 90-120 seconds in-place and retry (within existing retry budget).
+          // Throwing immediately causes BullMQ to re-queue the whole job, which retries
+          // after only 2-8 min — not enough for the GDT rate limit window to reset —
+          // and the re-queued job hits 429 again, creating a retry storm on the same IP.
+          if (status === 429) {
+            const waitMs = 90_000 + Math.floor(Math.random() * 30_000); // 90–120 s
+            logger.warn('[GdtDirect] HTTP 429 Rate Limit — sleeping before retry', { url, attempt, waitMs });
+            if (attempt < maxRetries - 1) {
+              await humanDelay(waitMs, waitMs + 5_000);
+              continue; // retry within the existing loop — does NOT re-queue the job
+            }
+            // Last attempt exhausted — fall through to 4xx handler so error is visible
+          }
+
           // Log body for 4xx to help diagnose field/format issues
           if (status >= 400 && status < 500) {
             const body = JSON.stringify(err.response?.data ?? '').slice(0, 300);
@@ -2495,9 +2514,9 @@ export class GdtDirectApiService {
     // Falls back to main HTTP CONNECT client if SOCKS5 not configured.
     const primaryClient = this.binaryHttp ?? this.http;
     const client = primaryClient;
-    const maxRetries   = this.recipe?.timing.maxRetries    ?? MAX_RETRIES;
-    const retryDelayMs = this.recipe?.timing.retryDelayMs  ?? RETRY_DELAY;
-    const binaryTimeout = this.recipe?.timing.binaryTimeoutMs ?? BINARY_TIMEOUT;
+    const maxRetries   = this.recipe?.timing.maxRetries    ?? MAX_RETRIES();
+    const retryDelayMs = this.recipe?.timing.retryDelayMs  ?? RETRY_DELAY();
+    const binaryTimeout = this.recipe?.timing.binaryTimeoutMs ?? BINARY_TIMEOUT();
     let lastErr: Error | null = null;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {

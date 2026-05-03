@@ -103,3 +103,9 @@ COMPANY_DELETE_AUDIT.md
 COMPANY_DELETE_FLOWCHART.txt
 COMPANY_DELETE_SUMMARY.md
 scripts/sql/cleanup-company.sql
+.claude/skills/gdt-bot-safety/SKILL.md
+.github/skills/gdt-bot-safety/SKILL.md
+.claude/settings.local.json
+.claude/settings.local.json
+scripts/js/test-company-delete.js
+scripts/js/test-company-delete.js

@@ -2,6 +2,7 @@ import webpush from 'web-push';
 import { pool } from '../db/pool';
 import { env } from '../config/env';
 import { v4 as uuidv4 } from 'uuid';
+import { cfg } from '../config/ConfigStore';
 
 // Configure VAPID
 webpush.setVapidDetails(
@@ -232,10 +233,12 @@ export async function checkTaxDeadlines(): Promise<void> {
   // Deadline is the 20th of the following month
   const deadlineMonth = currentMonth === 12 ? 1 : currentMonth + 1;
   const deadlineYear = currentMonth === 12 ? currentYear + 1 : currentYear;
-  const deadline = new Date(deadlineYear, deadlineMonth - 1, 20);
+  const deadline = new Date(deadlineYear, deadlineMonth - 1, cfg.number('tax.filing_deadline_day', 20));
   const daysLeft = Math.ceil((deadline.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
 
-  if (daysLeft !== 7 && daysLeft !== 2) return;
+  const remind1 = cfg.number('tax.remind_days_before_first', 7);
+  const remind2 = cfg.number('tax.remind_days_before_second', 2);
+  if (daysLeft !== remind1 && daysLeft !== remind2) return;
 
   const { rows: companies } = await pool.query('SELECT id FROM companies');
   for (const company of companies) {

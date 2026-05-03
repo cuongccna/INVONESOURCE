@@ -13,7 +13,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { randomBytes } from 'crypto';
 import { pool } from './db';
 import { decryptCredentials } from './encryption.service';
-import { proxyManager } from './proxy-manager';
+import { proxyManager, storeProxyAssignment } from './proxy-manager';
 import { GdtDirectApiService, GdtAuthError } from './gdt-direct-api.service';
 import type { GdtFetchProgressSnapshot } from './gdt-direct-api.service';
 import { GdtXmlParser } from './parsers/GdtXmlParser';
@@ -25,6 +25,7 @@ import { SyncCheckpoint }      from './crawl-cache/SyncCheckpoint';
 import { GdtDetailCache }      from './crawl-cache/GdtDetailCache';
 import { MstLookupCache }      from './crawl-cache/MstLookupCache';
 import { gdtRawCacheService }  from './crawl-cache/GdtRawCacheService';
+import { cfg } from './config/ConfigStore';
 
 const REDIS_URL    = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
 const CONCURRENCY  = parseInt(process.env['WORKER_CONCURRENCY'] ?? '2', 10);
@@ -45,8 +46,9 @@ export class GdtStructuralError extends Error {
 // ── BOT-ENT-03: Global Circuit Breaker constants ─────────────────────────────
 const CIRCUIT_BREAKER_ERRORS_KEY  = 'gdt:circuit_breaker:errors';
 const CIRCUIT_BREAKER_STATUS_KEY  = 'gdt:circuit_breaker:status';
-const CIRCUIT_BREAKER_TRIP_COUNT  = 20;   // trip after 20 structural errors in 1 hour
-const CIRCUIT_BREAKER_TTL_SEC     = 3600; // 1-hour window
+// Configurable via /admin/system-settings — live update via Redis Pub/Sub
+const CIRCUIT_BREAKER_TRIP_COUNT  = () => cfg.number('bot.global_cb_trip_count', 20);
+const CIRCUIT_BREAKER_TTL_SEC     = () => cfg.number('bot.global_cb_ttl_sec', 3600);
 
 // Queue for notifying backend to send push notifications after sync
 const _notifQueue = new Queue('sync-notifications', {
@@ -64,7 +66,7 @@ export const manualQueue = new Queue('gdt-sync-manual', {
   defaultJobOptions: {
     attempts:          5,
     // Exponential backoff: 5min→10min→20min between retries.
-    backoff:           { type: 'exponential', delay: 300_000 },
+    backoff:           { type: 'exponential', delay: cfg.number('bot.manual_queue_backoff_delay_ms', 300_000) },
     removeOnComplete:  200,
     removeOnFail:      100,
   },
@@ -131,7 +133,7 @@ export const autoQueue = new Queue('gdt-sync-auto', {
   connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
   defaultJobOptions: {
     attempts:          3,
-    backoff:           { type: 'exponential', delay: 120_000 },
+    backoff:           { type: 'exponential', delay: cfg.number('bot.auto_queue_backoff_delay_ms', 120_000) },
     removeOnComplete:  100,
     removeOnFail:      50,
   },
@@ -140,16 +142,16 @@ export const autoQueue = new Queue('gdt-sync-auto', {
 const _dlqQueue = new Queue('gdt-sync-dlq', {
   connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
 });
-const JITTER_EVERY = 10;
-const JITTER_MIN   = 1200;
-const JITTER_MAX   = 2500;
+const JITTER_EVERY = () => cfg.number('bot.jitter_every_n_invoices', 10);
+const JITTER_MIN   = () => cfg.number('bot.jitter_min_ms', 1200);
+const JITTER_MAX   = () => cfg.number('bot.jitter_max_ms', 2500);
 // Longer "read pause" — simulates user stopping to examine an invoice
-const READ_PAUSE_EVERY_MIN = 25;
-const READ_PAUSE_EVERY_MAX = 40;
-const READ_PAUSE_MIN = 3_000;
-const READ_PAUSE_MAX = 10_000;
+const READ_PAUSE_EVERY_MIN = () => cfg.number('bot.read_pause_every_min', 25);
+const READ_PAUSE_EVERY_MAX = () => cfg.number('bot.read_pause_every_max', 40);
+const READ_PAUSE_MIN = () => cfg.number('bot.read_pause_min_ms', 3000);
+const READ_PAUSE_MAX = () => cfg.number('bot.read_pause_max_ms', 10000);
 
-const FREE_TIER_MONTHLY_QUOTA = 100;
+const FREE_TIER_MONTHLY_QUOTA = () => cfg.number('license.free_tier_monthly_quota', 100);
 
 // ── VĐ4: Dynamic job timeout based on estimated invoice volume ────────────────
 const VOLUME_ESTIMATE_KEY_PREFIX = 'gdt:volume:';
@@ -236,9 +238,9 @@ async function _checkQuota(companyId: string): Promise<void> {
       [userId],
     );
     const used = parseInt(usedRes.rows[0]?.used ?? '0', 10);
-    if (used >= FREE_TIER_MONTHLY_QUOTA) {
+    if (used >= FREE_TIER_MONTHLY_QUOTA()) {
       throw new UnrecoverableError(
-        `[SyncWorker] Free tier quota exhausted (${used}/${FREE_TIER_MONTHLY_QUOTA} this month) ` +
+        `[SyncWorker] Free tier quota exhausted (${used}/${FREE_TIER_MONTHLY_QUOTA()} this month) ` +
         `for company ${companyId}. Upgrade to a paid plan.`,
       );
     }
@@ -365,7 +367,8 @@ async function checkCancellationRequested(companyId: string): Promise<boolean> {
 }
 
 function jitteredDelay(): Promise<void> {
-  const ms = JITTER_MIN + Math.random() * (JITTER_MAX - JITTER_MIN);
+  const min = JITTER_MIN();
+  const ms = min + Math.random() * (JITTER_MAX() - min);
   return new Promise(r => setTimeout(r, ms));
 }
 
@@ -382,17 +385,34 @@ function _maskProxyUrl(url: string): string {
   }
 }
 
+/** Extract host:port from a proxy URL for use as a Redis rate-limit key. */
+function _extractProxyHost(url: string): string {
+  try {
+    const u = new URL(url);
+    return u.host; // e.g. "14.224.225.129:23551"
+  } catch {
+    // Fallback: strip scheme + credentials
+    return url.replace(/^https?:\/\/([^@]*@)?/, '').split('/')[0] ?? 'unknown';
+  }
+}
+
+/**
+ * Max concurrent GDT sync sessions allowed per proxy IP.
+ * Reads live from ConfigStore — admin can adjust without restart.
+ */
+const MAX_CONCURRENT_PER_PROXY_IP = () => cfg.number('bot.max_concurrent_per_proxy_ip', 3);
+
 /** Occasional longer pause to simulate reading/examining an invoice */
-let _nextReadPause = READ_PAUSE_EVERY_MIN + Math.floor(Math.random() * (READ_PAUSE_EVERY_MAX - READ_PAUSE_EVERY_MIN));
+let _nextReadPause = READ_PAUSE_EVERY_MIN() + Math.floor(Math.random() * (READ_PAUSE_EVERY_MAX() - READ_PAUSE_EVERY_MIN()));
 function shouldReadPause(index: number): boolean {
   if (index > 0 && index % _nextReadPause === 0) {
-    _nextReadPause = READ_PAUSE_EVERY_MIN + Math.floor(Math.random() * (READ_PAUSE_EVERY_MAX - READ_PAUSE_EVERY_MIN));
+    _nextReadPause = READ_PAUSE_EVERY_MIN() + Math.floor(Math.random() * (READ_PAUSE_EVERY_MAX() - READ_PAUSE_EVERY_MIN()));
     return true;
   }
   return false;
 }
 function readPause(): Promise<void> {
-  const ms = READ_PAUSE_MIN + Math.random() * (READ_PAUSE_MAX - READ_PAUSE_MIN);
+  const ms = READ_PAUSE_MIN() + Math.random() * (READ_PAUSE_MAX() - READ_PAUSE_MIN());
   return new Promise(r => setTimeout(r, ms));
 }
 
@@ -472,9 +492,53 @@ export async function checkManualRateLimit(
   userId: string,
   plan:   string,
 ): Promise<RateLimitResult> {
-  void userId;
-  void plan;
-  return { allowed: true, tokensRemaining: -1 };
+  try {
+    // Admin override: bypass rate limit for specific users (set by admin API)
+    const hasOverride = await _lockRedis.exists(`ratelimit:override:${userId}`);
+    if (hasOverride) return { allowed: true, tokensRemaining: -1 };
+
+    const planConfig  = RATE_LIMIT_PLANS[plan] ?? RATE_LIMIT_PLANS[RATE_LIMIT_DEFAULT_PLAN]!;
+    const stateKey    = `ratelimit:manual:${userId}`;
+    const raw         = await _lockRedis.get(stateKey);
+    const now         = Date.now();
+
+    let state: RateLimitState;
+    if (raw) {
+      state = JSON.parse(raw) as RateLimitState;
+    } else {
+      state = { tokens: planConfig.burstMax, lastRefill: now, plan };
+    }
+
+    // Refill tokens based on time elapsed since last refill
+    const elapsedMs   = now - state.lastRefill;
+    const refillPerMs = planConfig.tokensPerHour / 3_600_000;
+    state.tokens      = Math.min(planConfig.burstMax, state.tokens + elapsedMs * refillPerMs);
+    state.lastRefill  = now;
+    state.plan        = plan;
+
+    if (state.tokens < 1) {
+      const msUntilToken = (1 - state.tokens) / refillPerMs;
+      return {
+        allowed:         false,
+        tokensRemaining: 0,
+        retryAfterMs:    Math.ceil(msUntilToken),
+        message:         `Rate limit exceeded. Thử lại sau ${Math.ceil(msUntilToken / 60_000)} phút.`,
+        suggestion:      `Gói ${plan} cho phép ${planConfig.tokensPerHour} lần sync thủ công/giờ.`,
+      };
+    }
+
+    state.tokens -= 1;
+    await _lockRedis.set(stateKey, JSON.stringify(state), 'EX', 86_400);
+
+    return { allowed: true, tokensRemaining: Math.floor(state.tokens) };
+  } catch (err) {
+    // Fail-open on Redis error — do not block user due to infra issue
+    logger.warn('[SyncWorker] checkManualRateLimit Redis error — allowing through', {
+      userId: userId.slice(0, 8),
+      error:  (err as Error).message,
+    });
+    return { allowed: true, tokensRemaining: -1 };
+  }
 }
 
 type EnqueueResult =
@@ -546,6 +610,26 @@ export async function enqueueSync(
         enrichedJobData.dynamicTimeoutMs = calculateJobTimeout(est);
       }
     } catch { /* non-fatal */ }
+    // Per-user sequential: if another company of same user is already active/queued,
+    // delay this job — promoteNextDelayedManualJobForUser will activate it when the current finishes.
+    if (type === 'manual' && userId) {
+      const userActiveKey = `bot:user:active:${userId}`;
+      const activeCompany = await _lockRedis.get(userActiveKey);
+      if (activeCompany && activeCompany !== companyId) {
+        const delayedJob   = await manualQueue.add('sync', enrichedJobData, { priority: 1, delay: 10 * 60_000 });
+        const delayedJobId = delayedJob.id ?? uuidv4();
+        await _lockRedis.set(`${BOT_PENDING_PREFIX}${companyId}`, delayedJobId, 'EX', 7200);
+        logger.info('[SyncWorker] Per-user sequential: delaying job — another company active for same user', {
+          userId:         userId.slice(0, 8),
+          activeCompany:  activeCompany.slice(0, 8),
+          pendingCompany: companyId.slice(0, 8),
+        });
+        return { status: 'enqueued', jobId: delayedJobId };
+      }
+      // Claim user active slot (NX) — released in manualWorker 'completed'/'failed' handler
+      await _lockRedis.set(userActiveKey, companyId, 'EX', 4 * 3600);
+    }
+
     const jobOptions = type === 'manual' ? { priority: 1 } : {};
     const addedJob = await queue.add('sync', enrichedJobData, jobOptions);
     const jobId = addedJob.id ?? uuidv4();
@@ -626,7 +710,7 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     const vnMin  = vnNow.getUTCMinutes();
     // Only block during 2:00–4:00 AM Vietnam time.
     // Sleep until 4:00 AM + up to 5 min jitter so jobs don't all pile up at once.
-    if (vnHour >= 2 && vnHour < 4) {
+    if (vnHour >= cfg.number('bot.no_crawl_hour_start', 2) && vnHour < cfg.number('bot.no_crawl_hour_end', 4)) {
       const msUntil4am = ((4 - vnHour) * 60 - vnMin) * 60_000;
       const delayMs    = msUntil4am + Math.floor(Math.random() * 5 * 60_000);
       logger.info('[SyncWorker] Off-hours delay (VN time)', { vnHour, vnMin, delayMs });
@@ -657,6 +741,12 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       logger.warn('[SyncWorker] Lock heartbeat thất bại (non-fatal)', { companyId, err: (e as Error).message });
     }
   }, 10 * 60 * 1000); // every 10 min
+
+  // Proxy-IP slot tracker — DECR'd in finally to release the slot when sync ends.
+  // Declared outside try{} so the finally block can reach it.
+  let proxySlotAcquired = false;
+  let _proxySlotKey: string | null = null;
+
   try {
 
     // ── 1. Load config ──────────────────────────────────────────────────────────
@@ -670,7 +760,7 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     if (cfgRes.rows.length === 0) {
       throw new UnrecoverableError(`[SyncWorker] No active config for company ${companyId}`);
     }
-    const cfg = cfgRes.rows[0] as {
+    const botCfg = cfgRes.rows[0] as {
       encrypted_credentials: string;
       has_otp: boolean;
       otp_method: string;
@@ -685,22 +775,22 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     // Manual sync: clear the auto-block so the user can force a re-run.
     // The block was set by _failRun after consecutive failures (captcha/proxy errors).
     // A manual action means the user knows what they're doing — honour the request.
-    if (isManual && cfg.blocked_until && new Date(cfg.blocked_until) > new Date()) {
-      logger.info('[SyncWorker] Manual sync — clearing auto-block', { companyId, was_blocked_until: cfg.blocked_until });
+    if (isManual && botCfg.blocked_until && new Date(botCfg.blocked_until) > new Date()) {
+      logger.info('[SyncWorker] Manual sync — clearing auto-block', { companyId, was_blocked_until: botCfg.blocked_until });
       await pool.query(
         `UPDATE gdt_bot_configs
          SET blocked_until = NULL, consecutive_failures = 0, updated_at = NOW()
          WHERE company_id = $1`,
         [companyId]
       );
-      cfg.blocked_until = null;
-      cfg.consecutive_failures = 0;
+      botCfg.blocked_until = null;
+      botCfg.consecutive_failures = 0;
     }
 
     // Check if blocked — skip _failRun (not a real failure, just a cooldown)
-    if (cfg.blocked_until && new Date(cfg.blocked_until) > new Date()) {
-      logger.warn('[SyncWorker] Company blocked until', { companyId, blocked_until: cfg.blocked_until });
-      throw new Error(`COOLDOWN_SKIP: Bot blocked until ${cfg.blocked_until}`);
+    if (botCfg.blocked_until && new Date(botCfg.blocked_until) > new Date()) {
+      logger.warn('[SyncWorker] Company blocked until', { companyId, blocked_until: botCfg.blocked_until });
+      throw new Error(`COOLDOWN_SKIP: Bot blocked until ${botCfg.blocked_until}`);
     }
 
     // ── 1b. Quota gate ─────────────────────────────────────────────────────────
@@ -712,9 +802,9 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     // Manual sync jobs bypass this cooldown — the user explicitly requested immediate sync.
     // Chained jobs (quarter sync month 2/3) also bypass — they reuse the cached session token,
     // so no new GDT login happens and there is no spam risk.
-    const MIN_LOGIN_INTERVAL_MS = 5 * 60 * 1000;
-    if (!isManual && !isChained && cfg.last_run_at) {
-      const elapsedMs = Date.now() - new Date(cfg.last_run_at).getTime();
+    const MIN_LOGIN_INTERVAL_MS = cfg.number('bot.min_login_interval_ms', 300_000);
+    if (!isManual && !isChained && botCfg.last_run_at) {
+      const elapsedMs = Date.now() - new Date(botCfg.last_run_at).getTime();
       if (elapsedMs < MIN_LOGIN_INTERVAL_MS) {
         const elapsedMin = Math.floor(elapsedMs / 60_000);
         const waitMin    = Math.ceil((MIN_LOGIN_INTERVAL_MS - elapsedMs) / 60_000);
@@ -733,7 +823,7 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     // ── 2. Decrypt credentials ──────────────────────────────────────────────────
     let creds: { username: string; password: string };
     try {
-      creds = decryptCredentials(cfg.encrypted_credentials);
+      creds = decryptCredentials(botCfg.encrypted_credentials);
     } catch (err) {
       // Credential decryption failure — deactivate permanently
       await pool.query(
@@ -747,7 +837,7 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     // Proxy selection:
     //   Manual sync → static pool, per-user sticky from DB
     //   Auto sync   → DB static pool, hash-keyed by proxy_session_id
-    let proxySessionId = cfg.proxy_session_id;
+    let proxySessionId = botCfg.proxy_session_id;
     if (!proxySessionId) {
       proxySessionId = randomBytes(8).toString('hex'); // 16-char hex, e.g. 'a3f9b2c1d4e5f678'
       await pool.query(
@@ -770,7 +860,7 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
         const maskedIp = proxyUrl ? _maskProxyUrl(proxyUrl) : 'none';
         logger.info('[SyncWorker] Proxy selected — MANUAL (static IP)', {
           companyId,
-          taxCode:      cfg.tax_code,
+          taxCode:      botCfg.tax_code,
           proxyIp:      maskedIp,
           userId:       triggerUserId.slice(0, 8) + '…',
           isManual:     true,
@@ -788,11 +878,16 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       const maskedIp = proxyUrl ? _maskProxyUrl(proxyUrl) : 'none';
       logger.info('[SyncWorker] Proxy selected — AUTO (Static)', {
         companyId,
-        taxCode:      cfg.tax_code,
+        taxCode:      botCfg.tax_code,
         proxyIp:      maskedIp,
         sessionId:    proxySessionId?.slice(0, 8) ?? '—',
         isManual:     false,
       });
+    }
+
+    // Store proxy assignment for detail.worker IP affinity (same company must use same IP)
+    if (proxyUrl) {
+      void storeProxyAssignment(_lockRedis, companyId, proxyUrl);
     }
 
     // Safety guard: never login to GDT without proxy protection.
@@ -818,14 +913,16 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     // Catches dead proxies (wrong port, server down, IP banned) before login fails mid-sync.
     // Only runs when a proxyUrl is assigned. Auto-syncs also probe but with a longer timeout.
     if (proxyUrl) {
-      const probeTimeoutMs = isManual ? 4_000 : 8_000;
+      const probeTimeoutMs = isManual
+        ? cfg.number('gdt.captcha_timeout_ms', 15_000) / 4  // ~4s probe for manual
+        : cfg.number('gdt.request_timeout_ms', 30_000) / 4; // ~8s probe for auto
       await job.updateProgress({ percent: 0, statusMessage: 'Đang kiểm tra proxy...' });
       const proxyOk = await proxyManager.probe(proxyUrl, probeTimeoutMs);
       if (!proxyOk) {
         proxyManager.markFailed(proxyUrl);
         logger.warn('[SyncWorker] Proxy health check FAILED', {
           companyId,
-          taxCode:  cfg.tax_code,
+          taxCode:  botCfg.tax_code,
           proxyIp:  _maskProxyUrl(proxyUrl),
           mode:     isManual ? 'MANUAL/static' : 'AUTO/static',
         });
@@ -838,10 +935,38 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       }
       logger.info('[SyncWorker] Proxy TCP probe OK', {
         companyId,
-        taxCode:  cfg.tax_code,
+        taxCode:  botCfg.tax_code,
         proxyIp:  _maskProxyUrl(proxyUrl),
         mode:     isManual ? 'MANUAL/static' : 'AUTO/static',
       });
+    }
+
+    // ── 3c. Per-proxy-IP concurrency gate ──────────────────────────────────────
+    // Prevents multiple companies from hammering GDT through the same proxy IP
+    // simultaneously, which triggers HTTP 429 rate-limiting.
+    // Uses Redis INCR as a lightweight counter: TTL=900s as a safety valve so
+    // a crashed job never permanently blocks the slot.
+    if (proxyUrl) {
+      _proxySlotKey = `gdt:proxy_slots:${_extractProxyHost(proxyUrl)}`;
+      const _slotCount = await _lockRedis.incr(_proxySlotKey);
+      await _lockRedis.expire(_proxySlotKey, 900);
+      if (_slotCount > MAX_CONCURRENT_PER_PROXY_IP()) {
+        // Too many concurrent sessions on this IP — back off and let another slot free up.
+        await _lockRedis.decr(_proxySlotKey);
+        _proxySlotKey = null; // don't DECR again in finally
+        logger.warn('[SyncWorker] Proxy IP slot full — throttling to prevent 429', {
+          companyId,
+          proxyHost:   _extractProxyHost(proxyUrl),
+          activeSlots: _slotCount - 1,
+          max:         MAX_CONCURRENT_PER_PROXY_IP(),
+        });
+        // COOLDOWN_SKIP: does NOT increment consecutive_failures — this is a deliberate throttle.
+        throw new Error(
+          `COOLDOWN_SKIP: Proxy IP ${_extractProxyHost(proxyUrl)} busy ` +
+          `(${_slotCount - 1}/${MAX_CONCURRENT_PER_PROXY_IP()} active) — retry after backoff`,
+        );
+      }
+      proxySlotAcquired = true;
     }
 
     // ── 4. Login via GDT Direct API ──────────────────────────────────────────────
@@ -1048,10 +1173,10 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       let fromDate: Date;
       if (jobFromDate) {
         fromDate = new Date(`${jobFromDate}T00:00:00`);
-      } else if (cfg.last_run_at) {
+      } else if (botCfg.last_run_at) {
         // Anchor to last successful run with 5-min overlap to cover boundary invoices.
         // Computed at run-time so the range is always fresh, regardless of when the job was enqueued.
-        const lastRunMs = new Date(cfg.last_run_at).getTime() - 5 * 60_000;
+        const lastRunMs = new Date(botCfg.last_run_at).getTime() - 5 * 60_000;
         // Never exceed GDT 31-day limit
         const maxBackMs = toDate.getTime() - 31 * 24 * 60 * 60_000;
         fromDate = new Date(Math.max(lastRunMs, maxBackMs));
@@ -1453,7 +1578,7 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       // Jitter ±12–30 phút (random trong range này, sign ngẫu nhiên) để tránh
       // nhiều công ty hit GDT cùng lúc và mô phỏng hành vi con người.
       // Ví dụ: 1h → next = 30–90 phút | 6h → next = 5h30–6h30 | 24h → next = 23h30–24h30
-      const freqHours = cfg.sync_frequency_hours > 0 ? cfg.sync_frequency_hours : 6;
+      const freqHours = botCfg.sync_frequency_hours > 0 ? botCfg.sync_frequency_hours : 6;
       await pool.query(
         `UPDATE gdt_bot_configs
          SET next_auto_sync_at = NOW()
@@ -1572,6 +1697,10 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       throw err;
     }
     } finally {
+    // Release proxy-IP slot FIRST so the next queued job can acquire it immediately.
+    if (proxySlotAcquired && _proxySlotKey) {
+      await _lockRedis.decr(_proxySlotKey).catch(() => {});
+    }
     clearInterval(lockHeartbeat);   // FIX-3: dừng heartbeat TRƯỚC khi giải phóng lock
     // Release both locks:
     // 1. Bot worker lock (bot:sync:lock:) — fenced release prevents cross-job unlock race
@@ -2273,6 +2402,16 @@ async function _failRun(
        WHERE company_id = $2`,
       [errorMsg.slice(0, 500), companyId]
     );
+    // Exhaust pending detail-queue rows so detail.worker stops processing them.
+    // Without this, detail.worker would keep fetching invoice details for a deactivated bot.
+    await pool.query(
+      `UPDATE invoice_detail_queue
+       SET status = 'failed', attempts = max_attempts,
+           last_error = $1
+       WHERE company_id = $2
+         AND status IN ('pending', 'processing', 'failed')`,
+      [`Bot deactivated — auth failed: ${errorMsg}`.slice(0, 500), companyId]
+    ).catch(e => logger.warn('[SyncWorker] Failed to exhaust detail queue on deactivation (non-fatal)', { e }));
     // Push to DLQ for manual triage
     await _dlqQueue.add('failed-job', {
       companyId,
@@ -2330,14 +2469,14 @@ async function handleJobFailure(job: Job<SyncJobData> | undefined, error: Error)
   if (!(error instanceof GdtStructuralError)) return; // regular errors handled inside processGdtSync
 
   const count = await _lockRedis.incr(CIRCUIT_BREAKER_ERRORS_KEY);
-  await _lockRedis.expire(CIRCUIT_BREAKER_ERRORS_KEY, CIRCUIT_BREAKER_TTL_SEC);
+  await _lockRedis.expire(CIRCUIT_BREAKER_ERRORS_KEY, CIRCUIT_BREAKER_TTL_SEC());
 
   logger.error(
-    `[CircuitBreaker] GdtStructuralError count: ${count}/${CIRCUIT_BREAKER_TRIP_COUNT}`,
+    `[CircuitBreaker] GdtStructuralError count: ${count}/${CIRCUIT_BREAKER_TRIP_COUNT()}`,
     { error: error.message, selector: error.selector, jobId: job?.id },
   );
 
-  if (count >= CIRCUIT_BREAKER_TRIP_COUNT) {
+  if (count >= CIRCUIT_BREAKER_TRIP_COUNT()) {
     await manualWorker.pause();
     await autoWorker.pause();
 
@@ -2351,7 +2490,7 @@ async function handleJobFailure(job: Job<SyncJobData> | undefined, error: Error)
 
     logger.error(
       '[CIRCUIT BREAKER TRIPPED] GDT system structure changed — ALL workers paused.',
-      { errorCount: count, threshold: CIRCUIT_BREAKER_TRIP_COUNT },
+      { errorCount: count, threshold: CIRCUIT_BREAKER_TRIP_COUNT() },
     );
 
     // Notify via sync-notifications queue (backend picks up + sends push to admin)
@@ -2461,7 +2600,11 @@ manualWorker.on('completed', (job) => {
   const userId = job.data.triggeredByUserId;
   if (!userId) return;
 
-  void promoteNextDelayedManualJobForUser(userId, String(job.id ?? ''));
+  void (async () => {
+    // Release per-user active slot so the next delayed company can be promoted
+    await _lockRedis.del(`bot:user:active:${userId}`).catch(() => null);
+    await promoteNextDelayedManualJobForUser(userId, String(job.id ?? ''));
+  })();
 });
 
 manualWorker.on('failed', (job, err) => {
@@ -2471,6 +2614,7 @@ manualWorker.on('failed', (job, err) => {
     const state = await job.getState().catch(() => null);
     if (state !== 'failed') return;
 
+    await _lockRedis.del(`bot:user:active:${job.data.triggeredByUserId!}`).catch(() => null);
     await promoteNextDelayedManualJobForUser(job.data.triggeredByUserId!, String(job.id ?? ''));
   })().catch((promoteErr) => {
     logger.warn('[SyncWorker] Failed to advance delayed manual queue after failure', {

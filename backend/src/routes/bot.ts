@@ -12,13 +12,14 @@ import { licenseService } from '../services/LicenseService';
 import { Queue } from 'bullmq';
 import IORedis from 'ioredis';
 import { env } from '../config/env';
+import { cfg } from '../config/ConfigStore';
 
 const _redis = new IORedis(env.REDIS_URL, { maxRetriesPerRequest: 3 });
 const BOT_WORKER_HEARTBEAT_KEY     = 'bot:worker:heartbeat';
-const STALE_RUN_GRACE_MS           = 15_000;
+const STALE_RUN_GRACE_MS           = () => cfg.number('bot.stale_run_grace_ms', 15_000);
 const BOT_WORKER_OFFLINE_MESSAGE   = 'BOT worker đang tắt hoặc vừa restart. Phiên treo đã được đóng, bạn có thể chạy lại khi worker sẵn sàng.';
 const BOT_MISSING_JOB_MESSAGE      = 'BOT job cũ không còn trong queue. Phiên treo đã được đóng để mở lại thao tác UI.';
-const MANUAL_USER_SERIAL_DELAY_MS  = 40 * 60 * 1000;
+const MANUAL_USER_SERIAL_DELAY_MS  = () => cfg.number('bot.manual_sync_serial_delay_ms', 40 * 60 * 1000);
 
 const router = Router();
 router.use(authenticate);
@@ -286,7 +287,7 @@ async function reconcileCompanySyncState(companyId: string): Promise<void> {
   if (!activeRun) return;
 
   const runAgeMs = Date.now() - new Date(activeRun.started_at).getTime();
-  if (runAgeMs < STALE_RUN_GRACE_MS) return;
+  if (runAgeMs < STALE_RUN_GRACE_MS()) return;
 
   const workerAlive = await isBotWorkerAlive();
   if (!workerAlive) {
@@ -591,7 +592,7 @@ router.post(
 
       const runId = uuidv4();
       const blockingManualRun = await findBlockingManualJobForUser(req.user!.userId);
-      const initialDelayMs = blockingManualRun ? MANUAL_USER_SERIAL_DELAY_MS : 0;
+      const initialDelayMs = blockingManualRun ? MANUAL_USER_SERIAL_DELAY_MS() : 0;
       const estimatedStartAt = initialDelayMs > 0 ? null : new Date();
       const queuedStatus = initialDelayMs > 0 ? 'delayed' : 'pending';
       // BOT-LICENSE-01: resolve user plan for proper rate limiting in the worker

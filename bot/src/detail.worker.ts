@@ -27,9 +27,10 @@ import { Queue }                 from 'bullmq';
 import { v4 as uuidv4 }          from 'uuid';
 import { pool }                  from './db';
 import { decryptCredentials }    from './encryption.service';
-import { proxyManager }          from './proxy-manager';
+import { proxyManager, getProxyAssignment } from './proxy-manager';
 import { GdtDirectApiService, GdtAuthError } from './gdt-direct-api.service';
 import { logger }                from './logger';
+import { cfg }                   from './config/ConfigStore';
 import { GdtSessionCache }       from './crawl-cache/GdtSessionCache';
 import { GdtDetailCache }        from './crawl-cache/GdtDetailCache';
 import { gdtRawCacheService }    from './crawl-cache/GdtRawCacheService';
@@ -42,18 +43,18 @@ const REDIS_URL = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
  * Milliseconds between PostgreSQL polls (DB only — not GDT).
  * Randomized each cycle so the poll pattern is not a fixed heartbeat.
  */
-const DB_POLL_MIN_MS = 4_000;
-const DB_POLL_MAX_MS = 8_000;
+const DB_POLL_MIN_MS = () => cfg.number('bot.detail_db_poll_min_ms', 4_000);
+const DB_POLL_MAX_MS = () => cfg.number('bot.detail_db_poll_max_ms', 8_000);
 
 /** Max parallel company workers per poll cycle. */
-const MAX_CONCURRENT_COMPANIES = 3;
+const MAX_CONCURRENT_COMPANIES = () => cfg.number('bot.max_concurrent_companies', 3);
 
 /**
  * Jitter between consecutive GDT detail-API calls within one company batch.
  * 3–15s mimics human browsing cadence and avoids fixed-interval bot detection.
  */
-const GDT_JITTER_MIN_MS = 3_000;
-const GDT_JITTER_MAX_MS = 15_000;
+const GDT_JITTER_MIN_MS = () => cfg.number('bot.detail_jitter_min_ms', 3_000);
+const GDT_JITTER_MAX_MS = () => cfg.number('bot.detail_jitter_max_ms', 15_000);
 
 /**
  * Stagger delay injected before each company's batch starts when multiple
@@ -67,8 +68,8 @@ const COMPANY_STAGGER_MAX_MS = 5_000;
  * Idle poll interval — used when no companies have pending work.
  * Longer than active interval so the worker backs off when there is nothing to do.
  */
-const DB_POLL_IDLE_MIN_MS = 15_000;
-const DB_POLL_IDLE_MAX_MS = 45_000;
+const DB_POLL_IDLE_MIN_MS = () => cfg.number('bot.detail_idle_min_ms', 15_000);
+const DB_POLL_IDLE_MAX_MS = () => cfg.number('bot.detail_idle_max_ms', 45_000);
 
 /**
  * Per-company circuit breaker: if a company accumulates CB_THRESHOLD HTTP 500
@@ -85,25 +86,25 @@ const DB_POLL_IDLE_MAX_MS = 45_000;
  *   - Reduced cooldown to 5 min: GDT recovers quickly from transient overloads; 15 min was
  *     too conservative and left companies paused long after GDT had already recovered.
  */
-const CB_THRESHOLD   = 12;
-const CB_WINDOW_MS   = 15 * 60_000;   // count errors within a 15-minute window
-const CB_COOLDOWN_MS =  5 * 60_000;   // pause for only 5 minutes after trip
+const CB_THRESHOLD   = () => cfg.number('bot.per_company_cb_threshold', 12);
+const CB_WINDOW_MS   = () => cfg.number('bot.per_company_cb_window_ms', 15 * 60_000);
+const CB_COOLDOWN_MS = () => cfg.number('bot.per_company_cb_cooldown_ms', 5 * 60_000);
 
 /** GDT JWT is valid for 30 min; refresh 5 min early = 25 min max age. */
-const JWT_MAX_AGE_MS = 25 * 60_000;
+const JWT_MAX_AGE_MS = () => cfg.number('bot.detail_jwt_max_age_ms', 25 * 60_000);
 
 /** Claim rows WHERE last_attempted_at < NOW() - STUCK_PROCESSING_MIN minutes (unstick). */
-const STUCK_PROCESSING_MIN = 10;
+const STUCK_PROCESSING_MIN = () => cfg.number('bot.detail_stuck_processing_min', 10);
 
 /**
  * Cleanup: delete completed rows older than this many days.
  * Only rows with status='done' or status='skipped' are ever deleted.
  * Rows with status='pending'/'processing'/'failed' are NEVER touched.
  */
-const CLEANUP_RETENTION_DAYS = 30;
+const CLEANUP_RETENTION_DAYS = () => cfg.number('bot.detail_cleanup_retention_days', 30);
 
 /** Run cleanup at most once every 24 hours. */
-const CLEANUP_INTERVAL_MS = 24 * 60 * 60_000;
+const CLEANUP_INTERVAL_MS = () => cfg.number('bot.detail_cleanup_interval_ms', 24 * 60 * 60_000);
 
 /**
  * Per-company hard timeout for the entire processCompany() call.
@@ -117,14 +118,14 @@ const CLEANUP_INTERVAL_MS = 24 * 60 * 60_000;
  *
  * Covers worst-case: 3 login retries × ~200 s each ≈ 10 min, plus batch ≈ 5 min.
  */
-const COMPANY_PROCESS_TIMEOUT_MS = 15 * 60_000; // 15 minutes
+const COMPANY_PROCESS_TIMEOUT_MS = () => cfg.number('bot.company_process_timeout_ms', 15 * 60_000);
 
 /**
  * Timeout specifically for the GDT login (getToken) step.
  * Shorter than COMPANY_PROCESS_TIMEOUT_MS so we can log a clear "login timed out"
  * message and skip token refresh, rather than burning the full company budget.
  */
-const GET_TOKEN_TIMEOUT_MS = 8 * 60_000; // 8 minutes
+const GET_TOKEN_TIMEOUT_MS = () => cfg.number('gdt.login_timeout_ms', 8 * 60_000);
 
 /**
  * Race a promise against a hard deadline.
@@ -158,7 +159,7 @@ function raceTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  *
  * The counter resets to 0 on any successful authentication.
  */
-const MAX_CONSECUTIVE_AUTH_FAILURES = 5;
+const MAX_CONSECUTIVE_AUTH_FAILURES = () => cfg.number('bot.max_consecutive_auth_failures', 5);
 const _authFailureCount = new Map<string, number>();
 
 function recordAuthFailure(companyId: string): number {
@@ -187,8 +188,8 @@ function resetAuthFailure(companyId: string): void {
  *   ever getting a successful login, notify the user — the entire pool may
  *   be blocked for this company.
  */
-const PROXY_TIMEOUT_THRESHOLD = 3;
-const MAX_PROXY_ROTATIONS     = 5;
+const PROXY_TIMEOUT_THRESHOLD = () => cfg.number('bot.proxy_timeout_threshold', 3);
+const MAX_PROXY_ROTATIONS     = () => cfg.number('bot.max_proxy_rotations', 5);
 
 interface ProxyFailureState {
   /** Proxy URLs that have timed out ≥ PROXY_TIMEOUT_THRESHOLD times for this company */
@@ -269,7 +270,7 @@ async function recordProxyTimeout(
   const s = getProxyFailureState(companyId); // state already in memory from ensureProxyFailureState()
   s.consecutiveTimeouts++;
 
-  if (s.consecutiveTimeouts >= PROXY_TIMEOUT_THRESHOLD) {
+  if (s.consecutiveTimeouts >= PROXY_TIMEOUT_THRESHOLD()) {
     // Exclude this proxy for future selections for this company
     s.excludedUrls.add(proxyUrl);
     s.totalRotations++;
@@ -287,7 +288,7 @@ async function recordProxyTimeout(
       });
     }
 
-    const notifyUser = s.totalRotations >= MAX_PROXY_ROTATIONS;
+    const notifyUser = s.totalRotations >= MAX_PROXY_ROTATIONS();
     if (notifyUser) {
       // All rotations exhausted — the entire pool appears blocked for this company.
       // Reset in-memory state so the company can be retried if user adds new proxies later.
@@ -486,8 +487,8 @@ function jitterMs(min: number, max: number): number {
  */
 async function jitterDelay(batchSize: number): Promise<void> {
   const highLoad = batchSize >= 5;
-  const min = highLoad ? 3_000 : GDT_JITTER_MIN_MS;
-  const max = highLoad ? 8_000 : GDT_JITTER_MAX_MS;
+  const min = highLoad ? 3_000 : GDT_JITTER_MIN_MS();
+  const max = highLoad ? 8_000 : GDT_JITTER_MAX_MS();
   const ms  = jitterMs(min, max);
   logger.debug('[DetailWorker] GDT jitter delay', { ms, highLoad });
   await new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -511,12 +512,12 @@ async function staggerDelay(companyIndex: number): Promise<void> {
 
 /** Randomized DB poll interval when there IS work (4–8s). */
 function dbPollIntervalMs(): number {
-  return jitterMs(DB_POLL_MIN_MS, DB_POLL_MAX_MS);
+  return jitterMs(DB_POLL_MIN_MS(), DB_POLL_MAX_MS());
 }
 
 /** Randomized DB poll interval when idle — backs off to avoid empty polling. */
 function dbPollIdleIntervalMs(): number {
-  return jitterMs(DB_POLL_IDLE_MIN_MS, DB_POLL_IDLE_MAX_MS);
+  return jitterMs(DB_POLL_IDLE_MIN_MS(), DB_POLL_IDLE_MAX_MS());
 }
 
 /**
@@ -549,13 +550,13 @@ function recordHttp500(companyId: string): boolean {
     _cb500.set(companyId, s);
   }
   // Reset window if last error was outside CB_WINDOW_MS
-  if (now - s.windowStart > CB_WINDOW_MS) {
+  if (now - s.windowStart > CB_WINDOW_MS()) {
     s.count = 0;
     s.windowStart = now;
     s.trippedAt = null;
   }
   s.count++;
-  if (s.count >= CB_THRESHOLD && s.trippedAt === null) {
+  if (s.count >= CB_THRESHOLD() && s.trippedAt === null) {
     s.trippedAt = now;
     return true; // just tripped
   }
@@ -569,7 +570,7 @@ function recordHttp500(companyId: string): boolean {
 function isCbOpen(companyId: string): boolean {
   const s = _cb500.get(companyId);
   if (!s || s.trippedAt === null) return false;
-  if (Date.now() - s.trippedAt >= CB_COOLDOWN_MS) {
+  if (Date.now() - s.trippedAt >= CB_COOLDOWN_MS()) {
     // Cooldown elapsed — reset breaker
     _cb500.delete(companyId);
     return false;
@@ -691,7 +692,7 @@ async function getToken(
       if (payload) {
         const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as Record<string, unknown>;
         const iat = typeof parsed['iat'] === 'number' ? parsed['iat'] : 0;
-        if (Date.now() - iat * 1000 < JWT_MAX_AGE_MS) {
+        if (Date.now() - iat * 1000 < JWT_MAX_AGE_MS()) {
           // Cache hit = this JWT was created by a successful login (from this worker or
           // sync.worker). The credentials were valid at issue time — safe to reset the
           // consecutive auth-failure counter so stale errors don't trigger deactivation.
@@ -740,11 +741,11 @@ async function getToken(
     logger.warn('[DetailWorker] GDT login failed', {
       companyId,
       consecutiveFailures: failCount,
-      maxBeforeDeactivate: MAX_CONSECUTIVE_AUTH_FAILURES,
+      maxBeforeDeactivate: MAX_CONSECUTIVE_AUTH_FAILURES(),
       err: msg,
     });
 
-    if (failCount >= MAX_CONSECUTIVE_AUTH_FAILURES) {
+    if (failCount >= MAX_CONSECUTIVE_AUTH_FAILURES()) {
       logger.error('[DetailWorker] Too many consecutive auth failures — deactivating bot to protect account', {
         companyId, failCount,
       });
@@ -957,7 +958,10 @@ async function processCompany(companyId: string, companyIndex = 0): Promise<void
   // proxySessionId still comes from gdt_bot_configs so the GdtSessionCache key
   // matches what sync.worker stored — allowing token reuse across workers.
   const proxyFailState = await ensureProxyFailureState(companyId);
-  const proxyUrl       = await proxyManager.nextForDetailWorker(companyId, proxyFailState.excludedUrls);
+  // IP affinity: prefer the proxy used by sync.worker for this company (avoids GDT flagging 2 IPs)
+  const assignedProxy  = await getProxyAssignment(_redis, companyId);
+  const useAssigned    = assignedProxy && !proxyFailState.excludedUrls.has(assignedProxy);
+  const proxyUrl       = useAssigned ? assignedProxy! : await proxyManager.nextForDetailWorker(companyId, proxyFailState.excludedUrls);
   const proxySessionId = config.proxy_session_id ?? config.company_id;
 
   // ── PROXY GUARD — CẤM TUYỆT ĐỐI crawl GDT bằng IP trực tiếp ───────────────
@@ -977,7 +981,7 @@ async function processCompany(companyId: string, companyIndex = 0): Promise<void
   try {
     token = await raceTimeout(
       getToken(companyId, proxySessionId, proxyUrl, creds.username, creds.password),
-      GET_TOKEN_TIMEOUT_MS,
+      GET_TOKEN_TIMEOUT_MS(),
       `getToken(${companyId.slice(0, 8)})`,
     );
   } catch (authErr) {
@@ -1020,7 +1024,7 @@ async function processCompany(companyId: string, companyIndex = 0): Promise<void
         // All MAX_PROXY_ROTATIONS rotations exhausted — the entire proxy pool
         // appears blocked for this company. Notify the user to add new proxies.
         logger.error('[DetailWorker] All proxies exhausted for company — notifying user to add proxies', {
-          companyId, totalRotations: MAX_PROXY_ROTATIONS,
+          companyId, totalRotations: MAX_PROXY_ROTATIONS(),
         });
         await notifyNoProxy(companyId);
       } else if (rotate) {
@@ -1030,17 +1034,20 @@ async function processCompany(companyId: string, companyIndex = 0): Promise<void
           excludedProxy:    proxyUrl,
           excludedCount:    state.excludedUrls.size,
           totalRotations:   state.totalRotations,
-          remainingBefore:  MAX_PROXY_ROTATIONS - state.totalRotations,
+          remainingBefore:  MAX_PROXY_ROTATIONS() - state.totalRotations,
         });
       } else {
         const state = getProxyFailureState(companyId);
-        logger.warn('[DetailWorker] Proxy network timeout (below rotation threshold)', {
+        // Adaptive backoff: each consecutive timeout doubles the wait (max 60s)
+        const adaptiveWaitMs = Math.min(5_000 * state.consecutiveTimeouts, 60_000);
+        logger.warn('[DetailWorker] Proxy network timeout — adaptive backoff before next cycle', {
           companyId,
           consecutiveTimeouts: state.consecutiveTimeouts,
-          threshold:           PROXY_TIMEOUT_THRESHOLD,
+          adaptiveWaitMs,
           proxy:               proxyUrl.replace(/:([^@:]+)@/, ':****@'),
           err:                 msg,
         });
+        if (adaptiveWaitMs > 0) await new Promise(r => setTimeout(r, adaptiveWaitMs));
       }
       // Do NOT count proxy timeouts as auth failures — account is still valid
       return;
@@ -1053,10 +1060,10 @@ async function processCompany(companyId: string, companyIndex = 0): Promise<void
     logger.warn('[DetailWorker] getToken auth error (non-network)', {
       companyId,
       consecutiveFailures: failCount,
-      maxBeforeDeactivate: MAX_CONSECUTIVE_AUTH_FAILURES,
+      maxBeforeDeactivate: MAX_CONSECUTIVE_AUTH_FAILURES(),
       err:                 msg,
     });
-    if (failCount >= MAX_CONSECUTIVE_AUTH_FAILURES) {
+    if (failCount >= MAX_CONSECUTIVE_AUTH_FAILURES()) {
       logger.error('[DetailWorker] Too many consecutive auth failures — deactivating bot', {
         companyId, failCount,
       });
@@ -1160,8 +1167,8 @@ async function processCompany(companyId: string, companyIndex = 0): Promise<void
         if (tripped) {
           logger.warn('[DetailWorker] Circuit breaker tripped — pausing company for 5 min', {
             companyId,
-            threshold:   CB_THRESHOLD,
-            cooldownMin: CB_COOLDOWN_MS / 60_000,
+            threshold:   CB_THRESHOLD(),
+            cooldownMin: CB_COOLDOWN_MS() / 60_000,
           });
           break;
         }
@@ -1230,7 +1237,7 @@ async function getPendingCompanyIds(manualOnly = false): Promise<string[]> {
      JOIN user_companies uc ON uc.company_id = p.company_id
      ORDER BY uc.user_id, p.oldest_pending ASC
      LIMIT $2`,
-    [STUCK_PROCESSING_MIN, MAX_CONCURRENT_COMPANIES],
+    [STUCK_PROCESSING_MIN(), MAX_CONCURRENT_COMPANIES()],
   );
   return res.rows.map(r => r.company_id);
 }
@@ -1262,16 +1269,16 @@ async function cleanupOldQueueRows(): Promise<void> {
          RETURNING id
        )
        SELECT COUNT(*) AS deleted FROM deleted`,
-      [CLEANUP_RETENTION_DAYS],
+      [CLEANUP_RETENTION_DAYS()],
     );
     const deleted = parseInt(result.rows[0]?.deleted ?? '0', 10);
     if (deleted > 0) {
       logger.info('[DetailWorker] Cleanup: removed old completed rows from invoice_detail_queue', {
         deleted,
-        retentionDays: CLEANUP_RETENTION_DAYS,
+        retentionDays: CLEANUP_RETENTION_DAYS(),
       });
     } else {
-      logger.debug('[DetailWorker] Cleanup: no expired rows found', { retentionDays: CLEANUP_RETENTION_DAYS });
+      logger.debug('[DetailWorker] Cleanup: no expired rows found', { retentionDays: CLEANUP_RETENTION_DAYS() });
     }
   } catch (err) {
     // Non-fatal — log and continue. Cleanup will retry next day.
@@ -1311,7 +1318,7 @@ async function pollLoop(): Promise<void> {
           manualCompanyIds.map((companyId, idx) =>
             raceTimeout(
               processCompany(companyId, idx),
-              COMPANY_PROCESS_TIMEOUT_MS,
+              COMPANY_PROCESS_TIMEOUT_MS(),
               `processCompany(${companyId.slice(0, 8)})`,
             ).catch(err =>
               logger.warn('[DetailWorker] processCompany error (non-fatal)', {
@@ -1354,7 +1361,7 @@ async function pollLoop(): Promise<void> {
           companyIds.map((companyId, idx) =>
             raceTimeout(
               processCompany(companyId, idx),
-              COMPANY_PROCESS_TIMEOUT_MS,
+              COMPANY_PROCESS_TIMEOUT_MS(),
               `processCompany(${companyId.slice(0, 8)})`,
             ).catch(err =>
               logger.warn('[DetailWorker] processCompany error (non-fatal)', {
@@ -1372,7 +1379,7 @@ async function pollLoop(): Promise<void> {
     }
 
     // ── Daily cleanup: remove done/skipped rows older than 30 days ──────────
-    if (Date.now() - _lastCleanupAt >= CLEANUP_INTERVAL_MS) {
+    if (Date.now() - _lastCleanupAt >= CLEANUP_INTERVAL_MS()) {
       _lastCleanupAt = Date.now();
       void cleanupOldQueueRows(); // fire-and-forget — does not block poll loop
     }

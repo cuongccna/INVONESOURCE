@@ -57,7 +57,10 @@ import { gdtRawCacheSyncWorker } from './jobs/GdtRawCacheSyncWorker';
 import { gdtRawCacheSchedulerWorker, scheduleGdtRawCacheSync } from './jobs/GdtRawCacheScheduler';
 import adminRouter from './routes/admin';
 import adminProxyRouter from './routes/admin-proxy';
+import adminSettingsRouter from './routes/admin-settings';
 import toolsRouter from './routes/tools';
+import { cfg } from './config/ConfigStore';
+import Redis from 'ioredis';
 import syncStatusRouter from './routes/syncStatus';
 import indicatorConfigsRouter from './routes/indicatorConfigs';
 
@@ -150,6 +153,7 @@ app.use('/api/hkd', hkdRouter);
 app.use('/api/hkd-reports', hkdReportsRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/admin/proxies', adminProxyRouter);
+app.use('/api/admin/system-settings', adminSettingsRouter);
 app.use('/api/tools', toolsRouter);
 app.use('/api/sync-status', syncStatusRouter);
 app.use('/api/indicator-configs', indicatorConfigsRouter);
@@ -174,6 +178,13 @@ async function start(): Promise<void> {
   // Verify DB connection
   await pool.query('SELECT 1');
   console.info('[DB] Connected to PostgreSQL');
+
+  // ── ConfigStore: load settings from Redis/DB → in-process Map ─────────────
+  const _cfgRedis = new Redis(env.REDIS_URL, { maxRetriesPerRequest: 3 });
+  const _cfgSub   = new Redis(env.REDIS_URL, { maxRetriesPerRequest: null });
+  await cfg.init(_cfgRedis, pool);
+  cfg.subscribe(_cfgSub);
+  console.info('[Config] ConfigStore ready');
 
   registerPlugins();
 

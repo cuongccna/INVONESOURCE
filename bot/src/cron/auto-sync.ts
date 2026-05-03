@@ -10,14 +10,13 @@
 import { Queue } from 'bullmq';
 import { pool } from '../db';
 import { logger } from '../logger';
+import { cfg } from '../config/ConfigStore';
 
 const REDIS_URL = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
 
 const autoSyncQueue = new Queue('gdt-sync-auto', {
   connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
 });
-
-const LIMIT = 15;
 
 export async function runAutoSyncCycle(): Promise<void> {
   try {
@@ -27,10 +26,13 @@ export async function runAutoSyncCycle(): Promise<void> {
        WHERE b.is_active = true
          AND (b.next_auto_sync_at IS NULL OR b.next_auto_sync_at <= NOW())
          AND (b.blocked_until IS NULL OR b.blocked_until < NOW())
-         AND b.consecutive_failures < 3
+         AND b.consecutive_failures < $2
        ORDER BY b.next_auto_sync_at ASC NULLS FIRST
        LIMIT $1`,
-      [LIMIT],
+      [
+        cfg.number('bot.auto_sync_companies_per_cycle', 15),
+        cfg.number('bot.auto_sync_skip_failures_threshold', 3),
+      ],
     );
 
     if (due.rows.length === 0) return;
@@ -45,8 +47,9 @@ export async function runAutoSyncCycle(): Promise<void> {
         if (state === 'waiting' || state === 'active' || state === 'delayed') continue;
       }
 
-      // Random dispatch delay 0–3 min to avoid GDT request storms
-      const dispatchDelayMs = Math.floor(Math.random() * 3 * 60_000);
+      // Spread dispatch using configurable jitter window (default 0–8 min).
+      // Admin can tune this in /admin/system-settings under the 'queue' group.
+      const dispatchDelayMs = Math.floor(Math.random() * cfg.number('bot.dispatch_jitter_max_ms', 480_000));
 
       await autoSyncQueue.add(
         'sync',
@@ -57,7 +60,7 @@ export async function runAutoSyncCycle(): Promise<void> {
     }
 
     if (queued > 0) {
-      logger.info(`[AutoSync] Queued ${queued} companies (limit=${LIMIT})`);
+      logger.info(`[AutoSync] Queued ${queued} companies (limit=${cfg.number('bot.auto_sync_companies_per_cycle', 15)})`);
     }
   } catch (err) {
     logger.error('[AutoSync] Cycle failed', { error: (err as Error).message });

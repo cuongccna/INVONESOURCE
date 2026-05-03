@@ -1,10 +1,11 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { useRouter, usePathname } from 'next/navigation';
+import { useRouter, usePathname, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import axios from 'axios';
 import apiClient, { setAccessToken } from '../../lib/apiClient';
+import { buildRouteKey, pushNavigationEntry } from '../../lib/navigationHistory';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 
@@ -16,6 +17,7 @@ const NAV_ITEMS = [
   { href: '/admin/proxies',              label: 'Proxy Pool',       icon: '🌐' },
   { href: '/admin/crawler-recipes',      label: 'Crawler Recipes',  icon: '🔧' },
   { href: '/admin/indicator-configs',    label: 'Chỉ tiêu 01/GTGT', icon: '⚙️' },
+  { href: '/admin/system-settings',      label: 'Cài đặt hệ thống', icon: '🛠️' },
 ];
 
 function SidebarContent({ pathname, onClose }: { pathname: string; onClose?: () => void }) {
@@ -66,8 +68,15 @@ function SidebarContent({ pathname, onClose }: { pathname: string; onClose?: () 
 export default function AdminLayout({ children }: { children: React.ReactNode }) {
   const router   = useRouter();
   const pathname = usePathname();
+  const searchParams = useSearchParams();
   const [checking, setChecking]     = useState(true);
   const [mobileOpen, setMobileOpen] = useState(false);
+
+  // Track navigation for back button
+  useEffect(() => {
+    const routeKey = buildRouteKey(pathname, searchParams);
+    pushNavigationEntry(routeKey);
+  }, [pathname, searchParams]);
 
   useEffect(() => {
     axios

@@ -18,6 +18,7 @@ import Redis from 'ioredis';
 
 import { pool }                   from './db';
 import { logger }                 from './logger';
+import { cfg }                    from './config/ConfigStore';
 import { decryptCredentials }     from './encryption.service';
 import { createTunnelAgent }      from './proxy-tunnel';
 import { CaptchaService }        from './captcha.service';
@@ -102,7 +103,7 @@ const notifQueue = new Queue('sync-notifications', { connection: REDIS_CONN });
 // ─── Redis Lock ──────────────────────────────────────────────────────────────
 
 const LOCK_PREFIX = 'inv:lock:';
-const LOCK_TTL    = 600; // 10 min
+const LOCK_TTL    = () => cfg.number('bot.crawl_lock_ttl_sec', 600); // 10 min
 
 const RELEASE_LOCK_LUA = `
   if redis.call('get', KEYS[1]) == ARGV[1] then
@@ -113,7 +114,7 @@ const RELEASE_LOCK_LUA = `
 async function acquireLock(tenantId: string, direction: string): Promise<string | null> {
   const token = uuidv4();
   const key   = `${LOCK_PREFIX}${tenantId}:${direction}`;
-  const ok    = await redis.set(key, token, 'EX', LOCK_TTL, 'NX');
+  const ok    = await redis.set(key, token, 'EX', LOCK_TTL(), 'NX');
   return ok === 'OK' ? token : null;
 }
 
@@ -209,7 +210,7 @@ function createGdtClient(
 
 // ─── Network Error Helpers ───────────────────────────────────────────────────
 
-const MAX_PROXY_SWAP_RETRIES = 2;
+const MAX_PROXY_SWAP_RETRIES = () => cfg.number('bot.crawl_max_proxy_swap_retries', 2);
 
 /**
  * Execute a request with automatic proxy swap on network errors.
@@ -225,14 +226,14 @@ async function requestWithProxySwap<T>(
 ): Promise<T> {
   let currentProxy = session.proxyUrl;
 
-  for (let attempt = 0; attempt <= MAX_PROXY_SWAP_RETRIES; attempt++) {
+  for (let attempt = 0; attempt <= MAX_PROXY_SWAP_RETRIES(); attempt++) {
     const client = createGdtClient(session, config, currentProxy ?? undefined);
 
     try {
       return await fn(client);
     } catch (err) {
-      if (isNetworkLevelError(err) && attempt < MAX_PROXY_SWAP_RETRIES) {
-        logger.warn(`Proxy swap retry ${attempt + 1}/${MAX_PROXY_SWAP_RETRIES} for ${label}`, {
+      if (isNetworkLevelError(err) && attempt < MAX_PROXY_SWAP_RETRIES()) {
+        logger.warn(`Proxy swap retry ${attempt + 1}/${MAX_PROXY_SWAP_RETRIES()} for ${label}`, {
           tenantId: session.tenantId,
           proxy: currentProxy ? redactProxy(currentProxy) : 'direct',
         });
@@ -253,9 +254,9 @@ async function requestWithProxySwap<T>(
 // ─── Anti-Detection Helpers ──────────────────────────────────────────────────
 
 let requestCounter = 0;
-const BREAK_EVERY_MIN = 15;
-const BREAK_EVERY_MAX = 25;
-let nextBreak = BREAK_EVERY_MIN + Math.floor(Math.random() * (BREAK_EVERY_MAX - BREAK_EVERY_MIN));
+const BREAK_EVERY_MIN = () => cfg.number('bot.crawl_break_every_min', 15);
+const BREAK_EVERY_MAX = () => cfg.number('bot.crawl_break_every_max', 25);
+let nextBreak = BREAK_EVERY_MIN() + Math.floor(Math.random() * (BREAK_EVERY_MAX() - BREAK_EVERY_MIN()));
 
 /**
  * Human-like jittered delay with ±30% variance.
@@ -284,7 +285,7 @@ async function maybeUserBreak(): Promise<void> {
     logger.debug('Simulating user break', { requests: requestCounter, pauseMs: Math.round(pauseMs) });
     await new Promise(r => setTimeout(r, pauseMs));
     requestCounter = 0;
-    nextBreak = BREAK_EVERY_MIN + Math.floor(Math.random() * (BREAK_EVERY_MAX - BREAK_EVERY_MIN));
+    nextBreak = BREAK_EVERY_MIN() + Math.floor(Math.random() * (BREAK_EVERY_MAX() - BREAK_EVERY_MIN()));
   }
 }
 
@@ -724,6 +725,16 @@ async function processSyncJob(job: Job<SyncJobData>): Promise<Record<string, unk
       // Get proxy
       const proxyUrl = proxyManager.next();
 
+      // SAFETY GATE: Direct IP crawling to GDT is FORBIDDEN.
+      // If no proxy is available, stop immediately — do NOT fall through to loginGdt with null.
+      if (!proxyUrl) {
+        logger.error('[CrawlWorker] HARD STOP: No proxy available — direct IP crawling is FORBIDDEN', { tenantId });
+        await notifQueue.add('no-proxy', { companyId: tenantId, triggeredBy }).catch(() => {});
+        await releaseLock(tenantId, lockDir, lockToken);
+        lockToken = null;
+        return { skipped: true, reason: 'no_proxy_available' };
+      }
+
       // Login
       session = await loginGdt(tenantId, username, password, config, proxyUrl);
     }
@@ -747,6 +758,12 @@ async function processSyncJob(job: Job<SyncJobData>): Promise<Record<string, unk
         });
         proxyManager.markFailed(session.proxyUrl);
         const newProxy = proxyManager.next();
+        // SAFETY GATE: If no replacement proxy exists, stop — no direct fallback allowed.
+        if (!newProxy) {
+          logger.error('[CrawlWorker] HARD STOP: No replacement proxy after health-check fail', { tenantId });
+          await notifQueue.add('no-proxy', { companyId: tenantId, triggeredBy }).catch(() => {});
+          return { skipped: true, reason: 'no_proxy_available' };
+        }
         // Re-login with new proxy
         session = await loginGdt(tenantId, username, password, config, newProxy);
       }

@@ -20,20 +20,24 @@ export default function BackButton({
 
   const handleBack = () => {
     if (typeof window !== 'undefined') {
-      const currentRoute = buildRouteKey(pathname || '/', searchParams);
-      const previousRoute = getPreviousRoute(currentRoute);
-      if (previousRoute && previousRoute !== currentRoute) {
-        router.push(previousRoute);
-        return;
-      }
-
+      // Try browser history first (most reliable)
       const referrer = document.referrer;
       const sameOrigin = referrer.startsWith(window.location.origin);
       if (sameOrigin && window.history.length > 1) {
         router.back();
         return;
       }
+
+      // Try navigation history as fallback
+      const currentRoute = buildRouteKey(pathname || '/', searchParams);
+      const previousRoute = getPreviousRoute(currentRoute);
+      if (previousRoute && previousRoute !== currentRoute) {
+        router.push(previousRoute);
+        return;
+      }
     }
+
+    // Final fallback
     router.push(fallbackHref);
   };
 

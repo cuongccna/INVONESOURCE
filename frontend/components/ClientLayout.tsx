@@ -60,6 +60,9 @@ function GlobalBackStrip() {
     || pathname === '/portfolio'
     || (pathname?.startsWith('/group/') && pathname.split('/').length === 3);
 
+  // Admin pages have their own layout with sidebar nav — never show global back strip
+  const isAdminRoute = !!pathname && pathname.startsWith('/admin');
+
   const hasLocalBackControl = !!pathname && [
     '/import',
     '/import/history',
@@ -79,7 +82,7 @@ function GlobalBackStrip() {
     || pathname.startsWith('/settings/organizations/')
   );
 
-  if (isHomeRoute || hasLocalBackControl || hasRouteSpecificBack) return null;
+  if (isHomeRoute || isAdminRoute || hasLocalBackControl || hasRouteSpecificBack) return null;
 
   return (
     <div className="max-w-2xl lg:max-w-5xl mx-auto px-4 pt-3">

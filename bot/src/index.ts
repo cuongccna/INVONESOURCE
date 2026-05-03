@@ -1,6 +1,3 @@
-/**
- * BOT-01 entry point
- */
 import 'dotenv/config';
 import Redis from 'ioredis';
 import { proxyManager } from './proxy-manager';
@@ -8,6 +5,7 @@ import { logger } from './logger';
 import { runGdtHealthCheck } from './cron/gdt-health-check';
 import { runAutoSyncCycle } from './cron/auto-sync';
 import { pool } from './db';
+import { cfg } from './config/ConfigStore';
 
 const BOT_WORKER_HEARTBEAT_KEY = 'bot:worker:heartbeat';
 const BOT_WORKER_HEARTBEAT_INTERVAL_MS = 15_000;
@@ -62,6 +60,14 @@ startBotHeartbeat();
 // Đợi ít nhất một slot proxy sẵn sàng trước khi workers được tạo/resume.
 // Tránh race condition khởi động: tất cả slot trả null trong 2–5 giây đầu
 void (async () => {
+  // ── ConfigStore: load system settings from Redis/DB into in-process Map ──────
+  // Must run before workers import so cfg.number() fallbacks are already populated.
+  const _cfgRedis = new Redis(process.env['REDIS_URL'] ?? 'redis://127.0.0.1:6379', { maxRetriesPerRequest: 3 });
+  const _cfgSub   = new Redis(process.env['REDIS_URL'] ?? 'redis://127.0.0.1:6379', { maxRetriesPerRequest: null });
+  await cfg.init(_cfgRedis, pool);
+  cfg.subscribe(_cfgSub);
+  logger.info('[Bot] ConfigStore ready — live settings loaded');
+
   await proxyManager.waitUntilReady();
 
   // Dynamic import workers AFTER proxy is ready so they won't accept jobs
@@ -101,11 +107,11 @@ void (async () => {
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
   process.on('SIGINT',  () => void shutdown('SIGINT'));
 
-  // Auto-sync scheduler — checks every 5 minutes for companies due for sync
-  const AUTO_SYNC_INTERVAL_MS = 5 * 60 * 1000; // 5 min
+  // Auto-sync scheduler — checks every N minutes for companies due for sync
+  const AUTO_SYNC_INTERVAL_MS = cfg.number('bot.auto_sync_interval_ms', 5 * 60 * 1000);
   void runAutoSyncCycle(); // Run immediately on startup
   setInterval(() => void runAutoSyncCycle(), AUTO_SYNC_INTERVAL_MS);
-  logger.info('[Bot] Auto-sync scheduler started — polling every 5 min');
+  logger.info('[Bot] Auto-sync scheduler started', { intervalMs: AUTO_SYNC_INTERVAL_MS });
 })();
 
 // Phase 7: GDT canary health check every 15 minutes

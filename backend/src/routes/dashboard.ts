@@ -6,6 +6,7 @@ import { sendSuccess } from '../utils/response';
 import { buildDashboardBucketKey, buildTrailingDashboardBuckets } from '../utils/dashboardBuckets';
 import { resolvePeriod, type PeriodType } from '../utils/period';
 import { VatReconciliationService } from '../services/VatReconciliationService';
+import { cfg } from '../config/ConfigStore';
 
 const router = Router();
 router.use(authenticate);
@@ -41,7 +42,7 @@ function _deductibleInputVatCondition(alias: string): string {
                  OR (${alias}.invoice_group IS NULL AND ${alias}.gdt_validated = true)
                )
                AND (
-                 ${alias}.total_amount <= 20000000
+                 ${alias}.total_amount <= ${cfg.number('vat.high_value_threshold_vnd', 20_000_000)}
                  OR ${alias}.payment_method IS NULL
                  OR LOWER(${alias}.payment_method) <> 'cash'
                )
@@ -189,7 +190,7 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
            COUNT(*) FILTER (WHERE direction = 'input') as input_count,
            COUNT(*) FILTER (WHERE status = 'cancelled') as invalid_count,
            COUNT(*) FILTER (WHERE gdt_validated = false AND status = 'valid') as unvalidated_count,
-           COUNT(*) FILTER (WHERE direction = 'input' AND total_amount > 20000000) as input_above_20m_count
+           COUNT(*) FILTER (WHERE direction = 'input' AND total_amount > ${cfg.number('vat.high_value_threshold_vnd', 20_000_000)}) as input_above_20m_count
          FROM invoices
          WHERE company_id = $1
            AND invoice_date BETWEEN $2 AND $3
@@ -468,7 +469,7 @@ router.get('/charts', async (req: Request, res: Response, next: NextFunction) =>
                  OR (invoice_group IS NULL AND gdt_validated = true)
                )
                AND (
-                 total_amount <= 20000000
+                 total_amount <= ${cfg.number('vat.high_value_threshold_vnd', 20_000_000)}
                  OR payment_method IS NULL
                  OR LOWER(payment_method) <> 'cash'
                )
@@ -527,7 +528,7 @@ router.get('/charts', async (req: Request, res: Response, next: NextFunction) =>
                  OR (invoice_group IS NULL AND gdt_validated = true)
                )
                AND (
-                 total_amount <= 20000000
+                 total_amount <= ${cfg.number('vat.high_value_threshold_vnd', 20_000_000)}
                  OR payment_method IS NULL
                  OR LOWER(payment_method) <> 'cash'
                )
@@ -586,7 +587,7 @@ router.get('/charts', async (req: Request, res: Response, next: NextFunction) =>
                  OR (invoice_group IS NULL AND gdt_validated = true)
                )
                AND (
-                 total_amount <= 20000000
+                 total_amount <= ${cfg.number('vat.high_value_threshold_vnd', 20_000_000)}
                  OR payment_method IS NULL
                  OR LOWER(payment_method) <> 'cash'
                )

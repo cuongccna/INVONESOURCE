@@ -3,7 +3,7 @@
     "allow": [
       "Bash(npm run *)",
       "Bash(npx tsc *)",
-      "Bash(PGPASSWORD=Cuongnv123456 psql -U user_invone -h localhost -d invone_db -c \"SELECT id, tax_code, name FROM companies WHERE tax_code = '0317342919';\")",
+      "Bash(PGPASSWORD=Cuongnv123456 psql -U user_invone -h localhost -d invone_db -c \"SELECT id, tax_code, name FROM companies WHERE tax_code = '0319303270';\")",
       "Bash(Get-ChildItem \"D:\\\\projects\\\\INVONE\\\\INVONESOURCE\\\\frontend\\\\app\\\\\\(app\\)\\\\invoices\" -Recurse)",
       "Bash(Select-Object FullName)",
       "Bash(Head -20)",

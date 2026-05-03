@@ -1,8 +1,9 @@
 import { ConnectorPlugin, CircuitBreakerState } from './types';
+import { cfg } from '../config/ConfigStore';
 
-const CIRCUIT_OPEN_THRESHOLD = 3;        // 3 consecutive failures → OPEN
-const CIRCUIT_COOLDOWN_MS    = 60_000;   // 60 seconds before HALF_OPEN (transient errors)
-const CIRCUIT_AUTH_COOLDOWN  = 24 * 60 * 60_000; // 24 hours for auth failures
+const CIRCUIT_OPEN_THRESHOLD = () => cfg.number('connector.cb_failure_threshold', 3);
+const CIRCUIT_COOLDOWN_MS    = () => cfg.number('connector.cb_cooldown_ms', 60_000);
+const CIRCUIT_AUTH_COOLDOWN  = () => cfg.number('connector.cb_auth_cooldown_ms', 24 * 60 * 60_000);
 
 /**
  * ConnectorRegistry — manages all provider plugins with per-plugin circuit breakers.
@@ -66,7 +67,7 @@ export class ConnectorRegistry {
 
     if (cb.state === 'OPEN') {
       const now = Date.now();
-      if (cb.openedAt && now - cb.openedAt.getTime() >= CIRCUIT_COOLDOWN_MS) {
+      if (cb.openedAt && now - cb.openedAt.getTime() >= CIRCUIT_COOLDOWN_MS()) {
         // Transition to HALF_OPEN — allow 1 probe request
         cb.state = 'HALF_OPEN';
         cb.halfOpenAt = new Date();
@@ -112,7 +113,7 @@ export class ConnectorRegistry {
 
     if (
       cb.state === 'CLOSED' &&
-      cb.consecutiveFailures >= CIRCUIT_OPEN_THRESHOLD
+      cb.consecutiveFailures >= CIRCUIT_OPEN_THRESHOLD()
     ) {
       cb.state = 'OPEN';
       cb.openedAt = new Date();
@@ -133,7 +134,7 @@ export class ConnectorRegistry {
     cb.consecutiveFailures += 1;
     // Set openedAt 24h in the past so canCall() requires a manual resetCircuit() call
     // (or the connector being re-enabled in DB) before retrying.
-    const farFuture = new Date(Date.now() - CIRCUIT_AUTH_COOLDOWN);
+    const farFuture = new Date(Date.now() - CIRCUIT_AUTH_COOLDOWN());
     cb.openedAt = farFuture;
   }
 

@@ -13,8 +13,9 @@
  */
 import { pool } from '../db/pool';
 import { AppError } from '../utils/AppError';
+import { cfg } from '../config/ConfigStore';
 
-export const FREE_TIER_MONTHLY_QUOTA = 100;
+export const FREE_TIER_MONTHLY_QUOTA = () => cfg.number('license.free_tier_monthly_quota', 100);
 
 // ── Error classes ─────────────────────────────────────────────────────────────
 
@@ -99,15 +100,15 @@ export class QuotaService {
     // ── No subscription → FREE tier ───────────────────────────────────────
     if (!sub) {
       const used = await this._freeUsedThisMonth(userId);
-      const remaining = FREE_TIER_MONTHLY_QUOTA - used;
-      if (used + estimated > FREE_TIER_MONTHLY_QUOTA) {
+      const remaining = FREE_TIER_MONTHLY_QUOTA() - used;
+      if (used + estimated > FREE_TIER_MONTHLY_QUOTA()) {
         throw new QuotaExceededError(
-          `Bạn đã dùng hết ${FREE_TIER_MONTHLY_QUOTA} hóa đơn miễn phí trong tháng này. ` +
+          `Bạn đã dùng hết ${FREE_TIER_MONTHLY_QUOTA()} hóa đơn miễn phí trong tháng này. ` +
           `Liên hệ admin để cấp gói license.`,
           'FREE_QUOTA_EXCEEDED',
         );
       }
-      return { allowed: true, isFree: true, remaining, quota_total: FREE_TIER_MONTHLY_QUOTA, quota_used: used, subscription: null };
+      return { allowed: true, isFree: true, remaining, quota_total: FREE_TIER_MONTHLY_QUOTA(), quota_used: used, subscription: null };
     }
 
     // ── Blocked statuses ──────────────────────────────────────────────────

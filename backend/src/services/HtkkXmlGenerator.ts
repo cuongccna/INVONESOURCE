@@ -530,6 +530,8 @@ async function _fetchPluc8InputItems(
   }
   return Array.from(map.entries())
     .map(([name, v]) => ({ name, subtotal: v.subtotal, vatAmount: v.vatAmount }))
+    // Loại mặt hàng không có giá trị tiền — cả subtotal lẫn VAT đều bằng 0
+    .filter(item => item.subtotal !== 0 || item.vatAmount !== 0)
     .sort((a, b) => b.subtotal - a.subtotal);
 }
 
@@ -608,6 +610,8 @@ async function _fetchPluc8OutputItems(
   }
   return Array.from(map.entries())
     .map(([name, subtotal]) => toOutputRow(name, subtotal))
+    // Loại mặt hàng không có giá trị tiền — subtotal = 0 thì vatReduction cũng = 0
+    .filter(item => item.subtotal !== 0)
     .sort((a, b) => b.subtotal - a.subtotal);
 }
 

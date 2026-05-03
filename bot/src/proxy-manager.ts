@@ -315,3 +315,31 @@ export function parseProxyForAxios(proxyUrl: string | null): AxiosProxyConfig | 
 }
 
 export const proxyManager = new ProxyManager();
+
+// ── Proxy assignment registry — IP affinity between sync.worker and detail.worker ──
+// When sync.worker selects a proxy for a company, it stores the URL here.
+// detail.worker reads this key and prefers the same IP to avoid GDT flagging
+// simultaneous access from two different IPs for the same account.
+const PROXY_ASSIGNMENT_PREFIX = 'gdt:proxy_assignment:';
+const PROXY_ASSIGNMENT_TTL_S  = 3600; // 1 hour
+
+export async function storeProxyAssignment(
+  redis: import('ioredis').default,
+  companyId: string,
+  proxyUrl: string,
+): Promise<void> {
+  try {
+    await redis.setex(`${PROXY_ASSIGNMENT_PREFIX}${companyId}`, PROXY_ASSIGNMENT_TTL_S, proxyUrl);
+  } catch { /* non-fatal — detail worker will fall back to hash selection */ }
+}
+
+export async function getProxyAssignment(
+  redis: import('ioredis').default,
+  companyId: string,
+): Promise<string | null> {
+  try {
+    return await redis.get(`${PROXY_ASSIGNMENT_PREFIX}${companyId}`);
+  } catch {
+    return null;
+  }
+}

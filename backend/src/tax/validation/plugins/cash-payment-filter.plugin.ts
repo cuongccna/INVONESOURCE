@@ -2,9 +2,10 @@ import type { Pool } from 'pg';
 import type { IInvoiceValidationPlugin, PluginConfig } from '../plugin.interface';
 import type { InvoiceRow, InvoiceValidationContext, InvoiceValidationResult } from '../types';
 import { ExclusionReasonCode } from '../types';
+import { cfg } from '../../../config/ConfigStore';
 
 const EFFECTIVE_DATE_DEFAULT = new Date('2025-07-01T00:00:00.000Z');
-const THRESHOLD_DEFAULT = 5_000_000;
+const THRESHOLD_DEFAULT = () => cfg.number('vat.cash_threshold_vnd', 5_000_000);
 
 /**
  * CashPaymentFilter — loại hóa đơn đầu vào thanh toán tiền mặt >= 5 triệu.
@@ -38,7 +39,7 @@ export class CashPaymentFilterPlugin implements IInvoiceValidationPlugin {
       : EFFECTIVE_DATE_DEFAULT;
     const threshold = typeof cfg['threshold'] === 'number'
       ? cfg['threshold']
-      : THRESHOLD_DEFAULT;
+      : THRESHOLD_DEFAULT();
 
     const paymentFlags = context.user_payment_flags ?? {};
 

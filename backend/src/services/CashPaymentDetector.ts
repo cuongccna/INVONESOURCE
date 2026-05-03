@@ -9,8 +9,10 @@
  */
 import { pool } from '../db/pool';
 import { v4 as uuidv4 } from 'uuid';
+import { cfg } from '../config/ConfigStore';
 
-export const CASH_THRESHOLD_VND = 5_000_000; // Điều 26 NĐ181/2025
+/** Cash threshold — configurable via /admin/system-settings (vat.cash_threshold_vnd) */
+export const CASH_THRESHOLD_VND = () => cfg.number('vat.cash_threshold_vnd', 5_000_000);
 
 export interface CashScanResult {
   riskyCount:    number;
@@ -41,7 +43,7 @@ export class CashPaymentDetector {
       `total_amount >= $2`,
       `(payment_method = 'cash' OR payment_method IS NULL)`,
     ];
-    const params: unknown[] = [companyId, CASH_THRESHOLD_VND];
+    const params: unknown[] = [companyId, CASH_THRESHOLD_VND()];
 
     if (month) { whereParts.push(`EXTRACT(MONTH FROM invoice_date) = $${params.length + 1}`); params.push(month); }
     if (year)  { whereParts.push(`EXTRACT(YEAR  FROM invoice_date) = $${params.length + 1}`); params.push(year); }
