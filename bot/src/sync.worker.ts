@@ -983,9 +983,10 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       [runId],
     );
     if ((existingRunRes.rowCount ?? 0) === 0) {
+      const workerTriggerSource = job.data.triggeredBy ?? 'scheduled_auto';
       await pool.query(
-        `INSERT INTO gdt_bot_runs (id, company_id, started_at, status) VALUES ($1, $2, NOW(), 'running')`,
-        [runId, companyId]
+        `INSERT INTO gdt_bot_runs (id, company_id, started_at, status, trigger_source) VALUES ($1, $2, NOW(), 'running', $3)`,
+        [runId, companyId, workerTriggerSource]
       );
     }
     // Mark config as running + clear previous error so the UI immediately reflects the new attempt.

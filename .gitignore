@@ -115,3 +115,7 @@ scripts/js/test-company-delete.js
 .github/instructions/bot-development.instructions.md
 .github/instructions/database-migrations.instructions.md
 .github/copilot-instructions.md
+.github/skills/invoice-filters/SKILL.md
+.github/skills/tax-declaration/SKILL.md
+.github/skills/vat-reconciliation/SKILL.md
+RISK_ENGINE_FRAMEWORK.md

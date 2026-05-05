@@ -53,7 +53,7 @@ export async function runAutoSyncCycle(): Promise<void> {
 
       await autoSyncQueue.add(
         'sync',
-        { companyId: row.company_id },
+        { companyId: row.company_id, triggeredBy: 'scheduled_auto' },
         { jobId, delay: dispatchDelayMs, priority: 5 },
       );
       queued++;

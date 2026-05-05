@@ -34,6 +34,7 @@ interface BotRun {
   input_count: number;
   duration_ms: number | null;
   error_detail: string | null;
+  trigger_source: 'user_manual' | 'user_quick_sync' | 'scheduled_auto' | 'admin_retry' | null;
 }
 
 interface BotStatus {
@@ -108,6 +109,13 @@ const STATUS_META: Record<string, { label: string; dot: string; pill: string }> 
     dot: 'bg-slate-400',
     pill: 'bg-slate-100 text-slate-700',
   },
+};
+
+const TRIGGER_META: Record<string, { label: string; pill: string }> = {
+  user_manual:    { label: 'Chạy tay',  pill: 'bg-indigo-100 text-indigo-700' },
+  user_quick_sync:{ label: 'Hôm nay',   pill: 'bg-teal-100 text-teal-700' },
+  scheduled_auto: { label: 'Tự động',   pill: 'bg-slate-100 text-slate-500' },
+  admin_retry:    { label: 'Admin',      pill: 'bg-orange-100 text-orange-700' },
 };
 
 function toLocalDateStr(date: Date): string {
@@ -803,6 +811,7 @@ export default function BotSettingsPage() {
                 <div className="mt-5 space-y-3">
                   {historyRuns.map(run => {
                     const runMeta = STATUS_META[run.status] ?? STATUS_META.idle;
+                    const triggerMeta = run.trigger_source ? TRIGGER_META[run.trigger_source] : null;
                     return (
                       <div key={run.id} className="rounded-2xl border border-slate-200 p-4">
                         <div className="flex items-start justify-between gap-4">
@@ -810,6 +819,11 @@ export default function BotSettingsPage() {
                             <div className="flex items-center gap-2">
                               <span className={`h-2.5 w-2.5 rounded-full ${runMeta.dot}`} />
                               <p className="text-sm font-semibold text-slate-900">{runMeta.label}</p>
+                              {triggerMeta && (
+                                <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.1em] ${triggerMeta.pill}`}>
+                                  {triggerMeta.label}
+                                </span>
+                              )}
                             </div>
                             <p className="mt-2 text-sm text-slate-500">{formatDateTime(run.started_at)}</p>
                           </div>

@@ -597,10 +597,11 @@ router.post(
       const queuedStatus = initialDelayMs > 0 ? 'delayed' : 'pending';
       // BOT-LICENSE-01: resolve user plan for proper rate limiting in the worker
       const userPlan = await licenseService.getPlanId(req.user!.userId);
+      const triggerSource = quick ? 'user_quick_sync' : 'user_manual';
       await pool.query(
-        `INSERT INTO gdt_bot_runs (id, company_id, started_at, status)
-         VALUES ($1, $2, NOW(), $3)`,
-        [runId, companyId, queuedStatus],
+        `INSERT INTO gdt_bot_runs (id, company_id, started_at, status, trigger_source)
+         VALUES ($1, $2, NOW(), $3, $4)`,
+        [runId, companyId, queuedStatus, triggerSource],
       );
 
       try {
@@ -739,7 +740,7 @@ router.get(
       const [countRes, dataRes] = await Promise.all([
         pool.query(`SELECT COUNT(*) FROM gdt_bot_runs WHERE company_id = $1`, [companyId]),
         pool.query(
-          `SELECT id, started_at, finished_at, status, output_count, input_count, duration_ms, error_detail
+          `SELECT id, started_at, finished_at, status, output_count, input_count, duration_ms, error_detail, trigger_source
            FROM gdt_bot_runs WHERE company_id = $1
            ORDER BY started_at DESC LIMIT $2 OFFSET $3`,
           [companyId, pageSize, offset]
