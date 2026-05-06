@@ -18,10 +18,16 @@ const autoSyncQueue = new Queue('gdt-sync-auto', {
   connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
 });
 
+// auto-sync.ts — Patch: bump next_auto_sync_at NGAY KHI enqueue
+// để tránh re-queue trong các polling cycle 5 phút tiếp theo
+
 export async function runAutoSyncCycle(): Promise<void> {
   try {
-    const due = await pool.query<{ company_id: string }>(
-      `SELECT b.company_id
+    const due = await pool.query<{
+      company_id: string;
+      sync_frequency_hours: number;
+    }>(
+      `SELECT b.company_id, b.sync_frequency_hours
        FROM gdt_bot_configs b
        WHERE b.is_active = true
          AND (b.next_auto_sync_at IS NULL OR b.next_auto_sync_at <= NOW())
@@ -39,7 +45,6 @@ export async function runAutoSyncCycle(): Promise<void> {
 
     let queued = 0;
     for (const row of due.rows) {
-      // Dedup: skip if a job is already waiting/active for this company
       const jobId = `auto-sync-${row.company_id}`;
       const existing = await autoSyncQueue.getJob(jobId);
       if (existing) {
@@ -47,10 +52,9 @@ export async function runAutoSyncCycle(): Promise<void> {
         if (state === 'waiting' || state === 'active' || state === 'delayed') continue;
       }
 
-      // Spread dispatch using configurable jitter window (default 0–8 min).
-      // Admin can tune this in /admin/system-settings under the 'queue' group.
-      const dispatchDelayMs = Math.floor(Math.random() * cfg.number('bot.dispatch_jitter_max_ms', 480_000));
-
+      const dispatchDelayMs = Math.floor(
+        Math.random() * cfg.number('bot.dispatch_jitter_max_ms', 480_000),
+      );
 
       // ── FIX: Bump next_auto_sync_at TRƯỚC KHI add vào queue ──────────────────
       // Nếu không làm điều này, polling loop 5 phút tiếp theo sẽ thấy
@@ -70,7 +74,7 @@ export async function runAutoSyncCycle(): Promise<void> {
            AND (next_auto_sync_at IS NULL OR next_auto_sync_at <= NOW())`,
         [freqHours, row.company_id],
       );
-      
+
       await autoSyncQueue.add(
         'sync',
         { companyId: row.company_id, triggeredBy: 'scheduled_auto' },
@@ -80,7 +84,9 @@ export async function runAutoSyncCycle(): Promise<void> {
     }
 
     if (queued > 0) {
-      logger.info(`[AutoSync] Queued ${queued} companies (limit=${cfg.number('bot.auto_sync_companies_per_cycle', 15)})`);
+      logger.info(
+        `[AutoSync] Queued ${queued} companies (limit=${cfg.number('bot.auto_sync_companies_per_cycle', 15)})`,
+      );
     }
   } catch (err) {
     logger.error('[AutoSync] Cycle failed', { error: (err as Error).message });
