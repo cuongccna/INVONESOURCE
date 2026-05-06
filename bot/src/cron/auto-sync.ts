@@ -68,11 +68,11 @@ export async function runAutoSyncCycle(): Promise<void> {
       await pool.query(
         `UPDATE gdt_bot_configs
          SET next_auto_sync_at = NOW()
-           + ($1 || ' hours')::INTERVAL
-           + (dispatchDelayMs/60000.0 || ' minutes')::INTERVAL
+           + make_interval(hours => $1)
+           + make_interval(secs  => $3)
          WHERE company_id = $2
            AND (next_auto_sync_at IS NULL OR next_auto_sync_at <= NOW())`,
-        [freqHours, row.company_id],
+        [freqHours, row.company_id, Math.round(dispatchDelayMs / 1000)],
       );
 
       await autoSyncQueue.add(
