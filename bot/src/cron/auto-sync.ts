@@ -51,6 +51,26 @@ export async function runAutoSyncCycle(): Promise<void> {
       // Admin can tune this in /admin/system-settings under the 'queue' group.
       const dispatchDelayMs = Math.floor(Math.random() * cfg.number('bot.dispatch_jitter_max_ms', 480_000));
 
+
+      // ── FIX: Bump next_auto_sync_at TRƯỚC KHI add vào queue ──────────────────
+      // Nếu không làm điều này, polling loop 5 phút tiếp theo sẽ thấy
+      // next_auto_sync_at vẫn <= NOW() (chưa được cập nhật vì job chưa complete)
+      // và queue lại công ty này liên tục, gây ra log "Queued N companies" mỗi 5p.
+      //
+      // sync_worker.ts sẽ ghi đè next_auto_sync_at một lần nữa sau khi complete
+      // với giá trị chính xác hơn (dựa trên thời điểm sync thực tế kết thúc).
+      // Đây là "optimistic lock" — tránh double-queue, chấp nhận drift nhỏ ~0–8 phút.
+      const freqHours = row.sync_frequency_hours > 0 ? row.sync_frequency_hours : 6;
+      await pool.query(
+        `UPDATE gdt_bot_configs
+         SET next_auto_sync_at = NOW()
+           + ($1 || ' hours')::INTERVAL
+           + (dispatchDelayMs/60000.0 || ' minutes')::INTERVAL
+         WHERE company_id = $2
+           AND (next_auto_sync_at IS NULL OR next_auto_sync_at <= NOW())`,
+        [freqHours, row.company_id],
+      );
+      
       await autoSyncQueue.add(
         'sync',
         { companyId: row.company_id, triggeredBy: 'scheduled_auto' },
