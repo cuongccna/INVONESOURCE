@@ -148,6 +148,7 @@ export default function DashboardPage() {
   const [hkdChart, setHkdChart] = useState<HkdChartData | null>(null);
   const [forecast, setForecast] = useState<VatForecast | null>(null);
   const [ghostSummary, setGhostSummary] = useState<GhostSummary | null>(null);
+  const [ghostScanning, setGhostScanning] = useState(false);
   const [loading, setLoading] = useState(true);
   const [vatViewMode, setVatViewMode] = useState<'monthly' | 'quarterly' | 'yearly'>('monthly');
   const [hkdKpi, setHkdKpi] = useState<HkdKpiData | null>(null);
@@ -255,17 +256,33 @@ export default function DashboardPage() {
     void loadEnterprise(periodMonth, periodYear, vatViewMode);
   }, [activeCompanyId, isHousehold, loadEnterprise, loadHkd, periodMonth, periodYear, vatViewMode]);
 
-  useEffect(() => {
-    if (isHousehold) {
-      setGhostSummary(null);
-      return;
-    }
-
+  const loadGhostSummary = useCallback(() => {
+    if (isHousehold) { setGhostSummary(null); return; }
     apiClient
       .get<{ data: GhostSummary }>('/audit/ghost-companies/summary')
       .then((res) => setGhostSummary(res.data.data))
       .catch(() => setGhostSummary(null));
-  }, [activeCompanyId, isHousehold]);
+  }, [isHousehold]);
+
+  const handleGhostScan = useCallback(async () => {
+    if (ghostScanning) return;
+    setGhostScanning(true);
+    try {
+      await apiClient.post('/audit/ghost-companies/scan');
+      loadGhostSummary();
+    } catch {
+      // silent
+    } finally {
+      setGhostScanning(false);
+    }
+  }, [ghostScanning, loadGhostSummary]);
+
+  useEffect(() => {
+    loadGhostSummary();
+    // Auto-refresh risk data every 5 minutes
+    const timer = setInterval(loadGhostSummary, 5 * 60 * 1_000);
+    return () => clearInterval(timer);
+  }, [activeCompanyId, loadGhostSummary]);
 
   /* ── Chart data — stored as raw VND (not pre-divided) so tooltip is exact ── */
   const vatChartData = chart?.vatTrend.map((r) => ({
@@ -390,6 +407,87 @@ export default function DashboardPage() {
           taxLabel={isHousehold ? 'Thuế khoán' : 'GTGT'}
           title={isHousehold ? 'Lịch Thuế Khoán' : 'Lịch Thuế GTGT'}
         />
+      )}
+
+      {/* ── Risk Alert Banner — Ưu tiên cao nhất, hiển thị ngay khi phát hiện rủi ro ── */}
+      {!isHousehold && ghostSummary !== null && (ghostSummary.critical > 0 || ghostSummary.high > 0 || ghostSummary.medium > 0) && (
+        <div className={`rounded-xl border px-4 py-3 ${
+          ghostSummary.critical > 0
+            ? 'bg-red-50 border-red-300'
+            : ghostSummary.high > 0
+            ? 'bg-orange-50 border-orange-300'
+            : 'bg-amber-50 border-amber-200'
+        }`}>
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div className="flex items-start gap-2.5 min-w-0">
+              <span className="text-xl mt-0.5 shrink-0">
+                {ghostSummary.critical > 0 ? '🚨' : '⚠️'}
+              </span>
+              <div className="min-w-0">
+                <p className={`text-sm font-semibold ${
+                  ghostSummary.critical > 0 ? 'text-red-800' : ghostSummary.high > 0 ? 'text-orange-800' : 'text-amber-800'
+                }`}>
+                  {ghostSummary.critical > 0
+                    ? `${ghostSummary.critical} nhà cung cấp nghiêm trọng — cần xử lý ngay`
+                    : ghostSummary.high > 0
+                    ? `${ghostSummary.high} nhà cung cấp cần kiểm tra`
+                    : `${ghostSummary.medium} nhà cung cấp cần lưu ý`
+                  }
+                </p>
+                <div className="flex items-center gap-3 mt-1 text-xs flex-wrap">
+                  {ghostSummary.critical > 0 && (
+                    <span className="text-red-700 flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 rounded-full bg-red-500 inline-block" />
+                      {ghostSummary.critical} nghiêm trọng
+                    </span>
+                  )}
+                  {ghostSummary.high > 0 && (
+                    <span className="text-orange-700 flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 rounded-full bg-orange-500 inline-block" />
+                      {ghostSummary.high} cảnh báo cao
+                    </span>
+                  )}
+                  {ghostSummary.medium > 0 && (
+                    <span className="text-amber-700 flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 rounded-full bg-amber-400 inline-block" />
+                      {ghostSummary.medium} cần lưu ý
+                    </span>
+                  )}
+                  {ghostSummary.total_vat_at_risk > 0 && (
+                    <span className="text-red-700 font-medium">
+                      VAT rủi ro: {Math.round(Number(ghostSummary.total_vat_at_risk) / 1_000_000).toLocaleString('vi-VN')}M₫
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                onClick={() => void handleGhostScan()}
+                disabled={ghostScanning}
+                className={`text-xs px-2.5 py-1.5 rounded-lg border font-medium transition-colors ${
+                  ghostSummary.critical > 0
+                    ? 'border-red-300 text-red-700 hover:bg-red-100 disabled:opacity-50'
+                    : 'border-orange-300 text-orange-700 hover:bg-orange-100 disabled:opacity-50'
+                }`}
+              >
+                {ghostScanning ? '⟳ Đang quét...' : '⟳ Quét lại'}
+              </button>
+              <Link
+                href="/audit/ghost-companies"
+                className={`text-xs font-semibold px-3 py-1.5 rounded-lg whitespace-nowrap ${
+                  ghostSummary.critical > 0
+                    ? 'bg-red-600 text-white hover:bg-red-700'
+                    : ghostSummary.high > 0
+                    ? 'bg-orange-500 text-white hover:bg-orange-600'
+                    : 'bg-amber-500 text-white hover:bg-amber-600'
+                }`}
+              >
+                Xem chi tiết →
+              </Link>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* ── Alert: input invoices >20M (DN only) ── */}
@@ -718,88 +816,25 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {/* ── Ghost Company Widget ── */}
-      {!isHousehold && ghostSummary !== null && (
-        <div className={`rounded-xl shadow-sm p-4 ${
-          ghostSummary.critical > 0
-            ? 'bg-red-50 border border-red-200'
-            : ghostSummary.high > 0
-            ? 'bg-orange-50 border border-orange-200'
-            : ghostSummary.medium > 0
-            ? 'bg-amber-50 border border-amber-200'
-            : 'bg-green-50 border border-green-200'
-        }`}>
-          <div className="flex items-center justify-between">
-            <div className="flex items-start gap-3">
-              <span className="text-2xl mt-0.5">
-                {ghostSummary.critical > 0 ? '🚨' : ghostSummary.high > 0 ? '⚠️' : ghostSummary.medium > 0 ? '⚠️' : '✅'}
-              </span>
-              <div>
-                <h2 className={`text-sm font-semibold ${
-                  ghostSummary.critical > 0 ? 'text-red-800'
-                  : ghostSummary.high > 0 ? 'text-orange-800'
-                  : ghostSummary.medium > 0 ? 'text-amber-800'
-                  : 'text-green-800'
-                }`}>
-                  {ghostSummary.critical > 0
-                    ? `Phát hiện ${ghostSummary.critical} nhà cung cấp nghiêm trọng`
-                    : ghostSummary.high > 0
-                    ? `${ghostSummary.high} nhà cung cấp cần kiểm tra`
-                    : ghostSummary.medium > 0
-                    ? `${ghostSummary.medium} nhà cung cấp cần lưu ý`
-                    : 'Không phát hiện rủi ro nhà cung cấp'}
-                </h2>
-                {ghostSummary.total_vat_at_risk > 0 && (
-                  <p className="text-xs mt-0.5 text-red-700">
-                    VAT có thể bị loại:&nbsp;
-                    <strong>{Math.round(Number(ghostSummary.total_vat_at_risk) / 1_000_000).toLocaleString('vi-VN')}M₫</strong>
-                  </p>
-                )}
-                {ghostSummary.total === 0 && (
-                  <p className="text-xs text-green-600 mt-0.5">Tất cả nhà cung cấp đều hợp lệ</p>
-                )}
-              </div>
-            </div>
-            <Link
-              href="/audit/ghost-companies"
-              className={`text-xs font-medium px-3 py-1.5 rounded-lg whitespace-nowrap ${
-                ghostSummary.critical > 0
-                  ? 'bg-red-100 text-red-700 hover:bg-red-200'
-                  : ghostSummary.high > 0
-                  ? 'bg-orange-100 text-orange-700 hover:bg-orange-200'
-                  : ghostSummary.medium > 0
-                  ? 'bg-amber-100 text-amber-700 hover:bg-amber-200'
-                  : 'bg-green-100 text-green-700 hover:bg-green-200'
-              }`}
+      {/* ── Vendor Risk Status (safe state — chỉ hiển thị khi không có rủi ro) ── */}
+      {!isHousehold && ghostSummary !== null && ghostSummary.total === 0 && (
+        <div className="flex items-center justify-between bg-green-50 border border-green-200 rounded-xl px-4 py-2.5">
+          <div className="flex items-center gap-2">
+            <span className="text-green-500">✅</span>
+            <p className="text-sm text-green-800">Không phát hiện rủi ro nhà cung cấp — tất cả hợp lệ</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => void handleGhostScan()}
+              disabled={ghostScanning}
+              className="text-xs text-green-700 hover:underline disabled:opacity-50"
             >
-              Xem chi tiết →
+              {ghostScanning ? '⟳ Đang quét...' : '⟳ Quét lại'}
+            </button>
+            <Link href="/audit/ghost-companies" className="text-xs text-green-700 hover:underline">
+              Chi tiết →
             </Link>
           </div>
-          {(ghostSummary.critical > 0 || ghostSummary.high > 0) && (
-            <div className="mt-3 flex items-center gap-4 text-xs">
-              {ghostSummary.critical > 0 && (
-                <span className="flex items-center gap-1 text-red-700">
-                  <span className="w-2 h-2 rounded-full bg-red-500 inline-block" />
-                  {ghostSummary.critical} nghiêm trọng
-                </span>
-              )}
-              {ghostSummary.high > 0 && (
-                <span className="flex items-center gap-1 text-orange-700">
-                  <span className="w-2 h-2 rounded-full bg-orange-400 inline-block" />
-                  {ghostSummary.high} cảnh báo
-                </span>
-              )}
-              {ghostSummary.medium > 0 && (
-                <span className="flex items-center gap-1 text-amber-700">
-                  <span className="w-2 h-2 rounded-full bg-amber-400 inline-block" />
-                  {ghostSummary.medium} lưu ý
-                </span>
-              )}
-              {ghostSummary.acknowledged > 0 && (
-                <span className="text-gray-400">{ghostSummary.acknowledged} đã kiểm tra</span>
-              )}
-            </div>
-          )}
         </div>
       )}
 

@@ -81,18 +81,34 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
     const [countResult, dataResult, summaryResult] = await Promise.all([
       pool.query(`SELECT COUNT(*) FROM invoices WHERE ${where}`, params),
       pool.query(
-        `SELECT id, invoice_number, serial_number, invoice_date, direction, status,
-                seller_name, seller_tax_code, buyer_name, buyer_tax_code,
-                subtotal, total_amount, vat_amount, vat_rate, gdt_validated, provider,
-                invoice_group, serial_has_cqt, has_line_items,
-                payment_method,
-                COALESCE(customer_code, NULL)::TEXT AS customer_code,
-                COALESCE(item_code, NULL)::TEXT     AS item_code,
-                COALESCE(notes, NULL)::TEXT          AS notes,
-                tc_hdon, khhd_cl_quan, so_hd_cl_quan,
-                non_deductible
-         FROM invoices WHERE ${where}
-         ORDER BY invoice_date DESC
+        // LEFT JOIN company_risk_flags to get vendor/buyer risk level inline.
+        // CTE scoped to this company's unacknowledged flags — one row per tax code.
+        // Counterparty: seller_tax_code for input invoices, buyer_tax_code for output.
+        `WITH _risk AS (
+           SELECT tax_code, risk_level, flag_types
+           FROM company_risk_flags
+           WHERE company_id = $1 AND is_acknowledged = false
+         )
+         SELECT i.id, i.invoice_number, i.serial_number, i.invoice_date, i.direction, i.status,
+                i.seller_name, i.seller_tax_code, i.buyer_name, i.buyer_tax_code,
+                i.subtotal, i.total_amount, i.vat_amount, i.vat_rate, i.gdt_validated, i.provider,
+                i.invoice_group, i.serial_has_cqt, i.has_line_items,
+                i.payment_method,
+                COALESCE(i.customer_code, NULL)::TEXT AS customer_code,
+                COALESCE(i.item_code, NULL)::TEXT     AS item_code,
+                COALESCE(i.notes, NULL)::TEXT          AS notes,
+                i.tc_hdon, i.khhd_cl_quan, i.so_hd_cl_quan,
+                i.non_deductible,
+                _r.risk_level  AS vendor_risk_level,
+                _r.flag_types  AS vendor_flag_types
+         FROM invoices i
+         LEFT JOIN _risk _r ON _r.tax_code = CASE
+           WHEN i.direction = 'input'  THEN i.seller_tax_code
+           WHEN i.direction = 'output' THEN i.buyer_tax_code
+           ELSE COALESCE(i.seller_tax_code, i.buyer_tax_code)
+         END
+         WHERE ${where}
+         ORDER BY i.invoice_date DESC
          LIMIT $${idx} OFFSET $${idx + 1}`,
         [...params, pageSize, offset]
       ),

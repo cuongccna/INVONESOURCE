@@ -35,6 +35,8 @@ export interface GridInvoice {
   khhd_cl_quan: string | null;
   so_hd_cl_quan: string | null;
   non_deductible: boolean | null;
+  vendor_risk_level: 'critical' | 'high' | 'medium' | 'low' | null;
+  vendor_flag_types: string[] | null;
 }
 
 export interface GridMeta {
@@ -82,9 +84,17 @@ function rowBg(inv: GridInvoice): string {
   if (inv.status === 'replaced_original') return 'bg-red-50/60';
   if (inv.status === 'replaced')  return 'bg-yellow-50/50';
   if (inv.status === 'adjusted')  return 'bg-blue-50/50';
+  if (inv.vendor_risk_level === 'critical') return 'bg-red-50/40';
+  if (inv.vendor_risk_level === 'high')     return 'bg-orange-50/40';
   if (!inv.payment_method && Number(inv.total_amount) >= 5_000_000 && inv.direction === 'input') return 'bg-amber-50/40';
   return '';
 }
+
+const RISK_BADGE: Record<string, { label: string; cls: string; dot: string }> = {
+  critical: { label: 'Rủi ro cao',    cls: 'bg-red-100 text-red-700',    dot: 'bg-red-500' },
+  high:     { label: 'Cần kiểm tra',  cls: 'bg-orange-100 text-orange-700', dot: 'bg-orange-500' },
+  medium:   { label: 'Lưu ý',         cls: 'bg-amber-100 text-amber-700',  dot: 'bg-amber-400' },
+};
 
 const STATUS_LEFT_BORDER: Record<string, string> = {
   cancelled:         'border-l-2 border-l-red-400',
@@ -348,6 +358,19 @@ export default function InvoiceGrid({
                       </td>
                       <td className="px-3 py-3 max-w-[180px]" onClick={() => handleRowClick(inv)}>
                         <p className="text-sm text-gray-800 truncate" title={partyName}>{partyName || '—'}</p>
+                        {inv.vendor_risk_level && RISK_BADGE[inv.vendor_risk_level] && (() => {
+                          const rb = RISK_BADGE[inv.vendor_risk_level!]!;
+                          const topFlag = inv.vendor_flag_types?.[0];
+                          return (
+                            <span
+                              className={`inline-flex items-center gap-1 mt-0.5 text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${rb.cls}`}
+                              title={topFlag ? `Cờ rủi ro: ${topFlag.replace(/_/g, ' ')}` : 'Đối tác có cờ rủi ro'}
+                            >
+                              <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${rb.dot}`} />
+                              {rb.label}
+                            </span>
+                          );
+                        })()}
                       </td>
                       <td className="px-3 py-3 text-right text-gray-700 tabular-nums text-xs hidden xl:table-cell" onClick={() => handleRowClick(inv)}>
                         {fmtVND(inv.subtotal)}
