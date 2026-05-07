@@ -18,23 +18,24 @@ const autoSyncQueue = new Queue('gdt-sync-auto', {
   connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
 });
 
-// auto-sync.ts — Patch: bump next_auto_sync_at NGAY KHI enqueue
-// để tránh re-queue trong các polling cycle 5 phút tiếp theo
-
 export async function runAutoSyncCycle(): Promise<void> {
   try {
     const due = await pool.query<{
       company_id: string;
       sync_frequency_hours: number;
+      next_auto_sync_at: Date | null;
+      consecutive_failures: number;
     }>(
-      `SELECT b.company_id, b.sync_frequency_hours
+      `SELECT b.company_id, b.sync_frequency_hours,
+              b.next_auto_sync_at, b.consecutive_failures
        FROM gdt_bot_configs b
        WHERE b.is_active = true
          AND (b.next_auto_sync_at IS NULL OR b.next_auto_sync_at <= NOW())
          AND (b.blocked_until IS NULL OR b.blocked_until < NOW())
          AND b.consecutive_failures < $2
        ORDER BY b.next_auto_sync_at ASC NULLS FIRST
-       LIMIT $1`,
+       LIMIT $1
+       FOR UPDATE SKIP LOCKED`,
       [
         cfg.number('bot.auto_sync_companies_per_cycle', 15),
         cfg.number('bot.auto_sync_skip_failures_threshold', 3),
@@ -45,40 +46,30 @@ export async function runAutoSyncCycle(): Promise<void> {
 
     let queued = 0;
     for (const row of due.rows) {
-      const jobId = `auto-sync-${row.company_id}`;
-      const existing = await autoSyncQueue.getJob(jobId);
-      if (existing) {
-        const state = await existing.getState();
-        if (state === 'waiting' || state === 'active' || state === 'delayed') continue;
-      }
+      // State-Derived ID: thay đổi khi DB state thay đổi, tự dedup khi state giữ nguyên.
+      // BullMQ idempotent trên jobId → cùng state = cùng ID = không tạo job trùng.
+      const scheduleTime = row.next_auto_sync_at
+        ? new Date(row.next_auto_sync_at).getTime()
+        : 'init';
+      const failCount = row.consecutive_failures || 0;
+      const jobId = `auto-sync-${row.company_id}-sched_${scheduleTime}-fail_${failCount}`;
 
       const dispatchDelayMs = Math.floor(
         Math.random() * cfg.number('bot.dispatch_jitter_max_ms', 480_000),
       );
 
-      // ── FIX: Bump next_auto_sync_at TRƯỚC KHI add vào queue ──────────────────
-      // Nếu không làm điều này, polling loop 5 phút tiếp theo sẽ thấy
-      // next_auto_sync_at vẫn <= NOW() (chưa được cập nhật vì job chưa complete)
-      // và queue lại công ty này liên tục, gây ra log "Queued N companies" mỗi 5p.
-      //
-      // sync_worker.ts sẽ ghi đè next_auto_sync_at một lần nữa sau khi complete
-      // với giá trị chính xác hơn (dựa trên thời điểm sync thực tế kết thúc).
-      // Đây là "optimistic lock" — tránh double-queue, chấp nhận drift nhỏ ~0–8 phút.
-      const freqHours = row.sync_frequency_hours > 0 ? row.sync_frequency_hours : 6;
-      await pool.query(
-        `UPDATE gdt_bot_configs
-         SET next_auto_sync_at = NOW()
-           + make_interval(hours => $1)
-           + make_interval(secs  => $3)
-         WHERE company_id = $2
-           AND (next_auto_sync_at IS NULL OR next_auto_sync_at <= NOW())`,
-        [freqHours, row.company_id, Math.round(dispatchDelayMs / 1000)],
-      );
-
       await autoSyncQueue.add(
         'sync',
         { companyId: row.company_id, triggeredBy: 'scheduled_auto' },
-        { jobId, delay: dispatchDelayMs, priority: 5 },
+        {
+          jobId,
+          delay: dispatchDelayMs,
+          priority: 5,
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 120_000 },
+          removeOnComplete: 100,
+          removeOnFail: 50,
+        },
       );
       queued++;
     }

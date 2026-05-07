@@ -758,6 +758,12 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
       [companyId]
     );
     if (cfgRes.rows.length === 0) {
+      if (job.queueName !== 'gdt-sync-manual') {
+        logger.info('[SyncWorker/Gatekeeper] Dropping orphaned auto job — config deleted or inactive', {
+          jobId: job.id, companyId,
+        });
+        return;
+      }
       throw new UnrecoverableError(`[SyncWorker] No active config for company ${companyId}`);
     }
     const botCfg = cfgRes.rows[0] as {
