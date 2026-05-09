@@ -2,6 +2,7 @@ import * as net from 'net';
 import { EventEmitter } from 'events';
 import { staticProxyPool } from './static-proxy-pool';
 import { logger } from './logger';
+import type { MkvnRotatingProxyProvider } from './providers/mkvn-rotating-proxy';
 
 export interface AxiosProxyConfig {
   host:     string;
@@ -16,6 +17,13 @@ export class ProxyManager extends EventEmitter {
   private index:   number;
 
   private tenantProxyMap = new Map<string, string>();
+  private _mkvnProvider: MkvnRotatingProxyProvider | null = null;
+
+  /** Attach MKVN rotating proxy provider. When set, takes priority over static pool. */
+  setMkvnProvider(p: MkvnRotatingProxyProvider): void {
+    this._mkvnProvider = p;
+    logger.info('[ProxyManager] MKVN rotating proxy provider attached');
+  }
 
   /**
    * Per-company rotation index for the detail worker pool.
@@ -140,6 +148,16 @@ export class ProxyManager extends EventEmitter {
   get failedCount(): number { return this.failed.size; }
 
   async nextForManualSync(userId: string): Promise<string | null> {
+    if (this._mkvnProvider) {
+      try {
+        return await this._mkvnProvider.getHttpProxyUrl();
+      } catch (err) {
+        logger.warn('[ProxyManager] MKVN failed for manual sync — falling back to static pool', {
+          error: (err as Error).message,
+          userId: userId.slice(0, 8),
+        });
+      }
+    }
     try {
       const result = await staticProxyPool.acquireForUser(userId);
       if (result) return result.url;
@@ -157,6 +175,16 @@ export class ProxyManager extends EventEmitter {
   }
 
   async nextForAutoSync(sessionSuffix: string): Promise<string | null> {
+    if (this._mkvnProvider) {
+      try {
+        return await this._mkvnProvider.getHttpProxyUrl();
+      } catch (err) {
+        logger.warn('[ProxyManager] MKVN failed for auto sync — falling back to static pool', {
+          error: (err as Error).message,
+          sessionSuffix: sessionSuffix.slice(0, 8),
+        });
+      }
+    }
     try {
       let dbUrls = await staticProxyPool.listActiveUrls();
 
@@ -217,6 +245,16 @@ export class ProxyManager extends EventEmitter {
     companyId: string,
     excludedUrls?: ReadonlySet<string>,
   ): Promise<string | null> {
+    if (this._mkvnProvider) {
+      try {
+        return await this._mkvnProvider.getHttpProxyUrl();
+      } catch (err) {
+        logger.warn('[ProxyManager] MKVN failed for detail worker — falling back to static pool', {
+          error: (err as Error).message,
+          companyId: companyId.slice(0, 8),
+        });
+      }
+    }
     try {
       let allUrls = await staticProxyPool.listActiveUrls();
 

@@ -6,6 +6,7 @@ import { runGdtHealthCheck } from './cron/gdt-health-check';
 import { runAutoSyncCycle, startScheduleResetListener } from './cron/auto-sync';
 import { pool } from './db';
 import { cfg } from './config/ConfigStore';
+import { createMkvnProviderFromEnv } from './providers/mkvn-rotating-proxy';
 
 const BOT_WORKER_HEARTBEAT_KEY = 'bot:worker:heartbeat';
 const BOT_WORKER_HEARTBEAT_INTERVAL_MS = 15_000;
@@ -69,6 +70,12 @@ void (async () => {
   logger.info('[Bot] ConfigStore ready — live settings loaded');
 
   await proxyManager.waitUntilReady();
+
+  // Attach MKVN rotating proxy provider if token is configured
+  const mkvnProvider = createMkvnProviderFromEnv(_cfgRedis);
+  if (mkvnProvider) {
+    proxyManager.setMkvnProvider(mkvnProvider);
+  }
 
   // Dynamic import workers AFTER proxy is ready so they won't accept jobs
   const sw = await import('./sync.worker');

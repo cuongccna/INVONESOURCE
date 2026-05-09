@@ -119,3 +119,6 @@ scripts/js/test-company-delete.js
 .github/skills/tax-declaration/SKILL.md
 .github/skills/vat-reconciliation/SKILL.md
 RISK_ENGINE_FRAMEWORK.md
+bot/test-proxy-quick.sh
+bot/test-proxy-gdt.ts
+bot/test-mkvn-gdt.ts

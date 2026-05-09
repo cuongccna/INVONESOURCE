@@ -304,6 +304,80 @@ export function createSocks5TunnelAgent(opts: ProxyOptions): http.Agent {
 }
 
 /**
+ * TLS-level probe: verify that this proxy can complete a full TLS handshake
+ * with a target host:port (typically GDT port 30000).
+ *
+ * Unlike a plain TCP probe (which only checks the proxy server is reachable),
+ * this test catches IP-based GDT blocks that happen at the TLS layer:
+ *   TCP to proxy → CONNECT to target → TLS handshake → if secureConnect fires = OK
+ *
+ * Returns true if TLS handshake completes, false otherwise.
+ * Timeout: 12s (GDT-blocked IPs fail in ~1-2s, so this gives plenty of margin).
+ *
+ * Use this before consuming captcha credits or DB lock to fail fast on blocked IPs.
+ */
+export async function probeTlsViaProxy(
+  proxyUrl: string,
+  targetHost: string,
+  targetPort: number,
+  timeoutMs = 12_000,
+): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const done = (ok: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      tlsSock?.destroy();
+      sock?.destroy();
+      resolve(ok);
+    };
+
+    let proxy: URL;
+    try { proxy = new URL(proxyUrl); } catch { resolve(false); return; }
+
+    const proxyHost = proxy.hostname;
+    const proxyPort = Number(proxy.port) || 80;
+    const proxyAuth = proxy.username
+      ? `${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`
+      : null;
+
+    const timer = setTimeout(() => done(false), timeoutMs);
+    let tlsSock: tls.TLSSocket | undefined;
+
+    const sock = net.createConnection({ host: proxyHost, port: proxyPort });
+    sock.once('error', () => done(false));
+    sock.setTimeout(timeoutMs);
+    sock.once('timeout', () => done(false));
+
+    sock.once('connect', () => {
+      const authHeader = proxyAuth
+        ? `Proxy-Authorization: Basic ${Buffer.from(proxyAuth).toString('base64')}\r\n`
+        : '';
+      sock.write(
+        `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n${authHeader}\r\n`,
+      );
+
+      let buf = Buffer.alloc(0);
+      const onData = (chunk: Buffer): void => {
+        buf = Buffer.concat([buf, chunk]);
+        if (!buf.toString('ascii').includes('\r\n\r\n')) return;
+        sock.removeListener('data', onData);
+
+        const statusLine = buf.toString('ascii').split('\r\n')[0] ?? '';
+        if (!statusLine.includes('200')) { done(false); return; }
+
+        sock.setTimeout(0);
+        tlsSock = tls.connect({ socket: sock, servername: targetHost, rejectUnauthorized: false });
+        tlsSock.once('secureConnect', () => done(true));
+        tlsSock.once('error', () => done(false));
+      };
+      sock.on('data', onData);
+    });
+  });
+}
+
+/**
  * Parse a proxy URL string and return its components.
  * Returns null if no proxy is configured.
  */
