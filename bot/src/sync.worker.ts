@@ -734,11 +734,29 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
   // FIX-3: Lock heartbeat — renews the 45-minute TTL every 10 minutes.
   // Prevents lock expiry during 100k+ invoice runs (2–30h) which would allow
   // a second job to acquire the lock and cause concurrent DB writes.
+  let _heartbeatFailCount = 0;
+  const MAX_HEARTBEAT_FAILS = 3;
   const lockHeartbeat = setInterval(async () => {
     try {
       await _lockRedis.expire(`${BOT_LOCK_PREFIX}${companyId}`, getBotLockTtl());
+      _heartbeatFailCount = 0; // reset on success
     } catch (e) {
-      logger.warn('[SyncWorker] Lock heartbeat thất bại (non-fatal)', { companyId, err: (e as Error).message });
+      _heartbeatFailCount++;
+      logger.warn('[SyncWorker] Lock heartbeat thất bại', {
+        companyId,
+        err: (e as Error).message,
+        consecutiveFails: _heartbeatFailCount,
+      });
+      // If Redis is unreachable for 30+ minutes, the lock has already expired naturally.
+      // Abort the job to prevent a zombie process holding a phantom lock.
+      if (_heartbeatFailCount >= MAX_HEARTBEAT_FAILS) {
+        logger.error('[SyncWorker] Lock heartbeat failed 3× — aborting job to prevent phantom lock', { companyId });
+        job.discard();
+        clearInterval(lockHeartbeat);
+        process.nextTick(() => {
+          throw new Error(`[SyncWorker] Lock heartbeat lost for company ${companyId} — aborted`);
+        });
+      }
     }
   }, 10 * 60 * 1000); // every 10 min
 
@@ -1060,13 +1078,23 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
         }
 
         // Non-credential failure (proxy blocked, GDT rate-limit, network error, captcha exhausted).
-        // Mark current proxy as failed and clear the sticky session —
-        // next run will pick a fresh session ID = fresh IP for this company only.
-        if (proxyUrl) proxyManager.markFailed(proxyUrl);
+        // Distinguish TLS handshake timeout (GDT-side throttle) from real proxy failure:
+        //   - "TLS handshake timeout" → proxy TCP is fine, GDT refused/throttled TLS ServerHello.
+        //     Do NOT markFailed the proxy; it's not the proxy's fault.
+        //   - Everything else → assume proxy is bad, markFailed and rotate.
+        const isTlsHandshakeHang = msgLc.includes('tls handshake timeout');
+        if (proxyUrl && !isTlsHandshakeHang) proxyManager.markFailed(proxyUrl);
+        if (isTlsHandshakeHang) {
+          logger.warn('[SyncWorker] TLS handshake timeout — GDT-side throttle suspected, proxy NOT marked failed', {
+            companyId,
+            proxyIp: proxyUrl ? _maskProxyUrl(proxyUrl) : '—',
+          });
+        }
         // Detect if the error is a pre-GDT network/proxy/TLS failure.
         // In that case GDT never received any login attempt — no need for the
         // 15-minute cooldown. BullMQ backoff + consecutive_failures block handles protection.
         const isProxyOrNetworkError =
+          isTlsHandshakeHang ||
           msgLc.includes('socket disconnected') ||
           msgLc.includes('econnreset') ||
           msgLc.includes('etimedout') ||

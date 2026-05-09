@@ -3,7 +3,7 @@ import Redis from 'ioredis';
 import { proxyManager } from './proxy-manager';
 import { logger } from './logger';
 import { runGdtHealthCheck } from './cron/gdt-health-check';
-import { runAutoSyncCycle } from './cron/auto-sync';
+import { runAutoSyncCycle, startScheduleResetListener } from './cron/auto-sync';
 import { pool } from './db';
 import { cfg } from './config/ConfigStore';
 
@@ -112,6 +112,9 @@ void (async () => {
   void runAutoSyncCycle(); // Run immediately on startup
   setInterval(() => void runAutoSyncCycle(), AUTO_SYNC_INTERVAL_MS);
   logger.info('[Bot] Auto-sync scheduler started', { intervalMs: AUTO_SYNC_INTERVAL_MS });
+
+  // Hot-reload: listen for schedule changes published by backend (no restart needed)
+  startScheduleResetListener();
 })();
 
 // Phase 7: GDT canary health check every 15 minutes

@@ -144,8 +144,15 @@ export function createTunnelAgent(opts: ProxyOptions): http.Agent {
           rejectUnauthorized,
         });
 
-        tlsSock.once('error', (err) => callback(err, null));
-        tlsSock.once('secureConnect', () => callback(null, tlsSock as unknown as net.Socket));
+        // Guard: TLS handshake can hang indefinitely if proxy accepts TCP but GDT
+        // throttles the TLS ServerHello (observed in prod: zombie locks for 4+ hours).
+        const TLS_HANDSHAKE_TIMEOUT_MS = 15_000;
+        const tlsTimer = setTimeout(() => {
+          tlsSock.destroy(new Error('TLS handshake timeout after 15s'));
+        }, TLS_HANDSHAKE_TIMEOUT_MS);
+
+        tlsSock.once('error',         (err) => { clearTimeout(tlsTimer); callback(err, null); });
+        tlsSock.once('secureConnect', ()    => { clearTimeout(tlsTimer); callback(null, tlsSock as unknown as net.Socket); });
       };
 
       sock.on('data', onData);
@@ -276,8 +283,15 @@ export function createSocks5TunnelAgent(opts: ProxyOptions): http.Agent {
           sock.setTimeout(0);
           sock.setKeepAlive(true, 5_000);  // prevent TMProxy idle-timeout during slow binary downloads
           const tlsSock = tls.connect({ socket: sock, servername, rejectUnauthorized });
-          tlsSock.once('error',         (err) => callback(err, null));
-          tlsSock.once('secureConnect', ()    => callback(null, tlsSock as unknown as net.Socket));
+
+          // Same TLS handshake timeout as HTTP CONNECT tunnel
+          const TLS_HANDSHAKE_TIMEOUT_MS = 15_000;
+          const tlsTimer = setTimeout(() => {
+            tlsSock.destroy(new Error('TLS handshake timeout after 15s'));
+          }, TLS_HANDSHAKE_TIMEOUT_MS);
+
+          tlsSock.once('error',         (err) => { clearTimeout(tlsTimer); callback(err, null); });
+          tlsSock.once('secureConnect', ()    => { clearTimeout(tlsTimer); callback(null, tlsSock as unknown as net.Socket); });
         }
       };
 

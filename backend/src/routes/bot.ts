@@ -405,9 +405,18 @@ router.post(
            otp_method           = EXCLUDED.otp_method,
            sync_frequency_hours = EXCLUDED.sync_frequency_hours,
            is_active            = true,
-           updated_at           = NOW()`,
+           updated_at           = NOW(),
+           next_auto_sync_at    = CASE
+             WHEN gdt_bot_configs.next_auto_sync_at IS NOT NULL
+             THEN NOW() + (EXCLUDED.sync_frequency_hours || ' hours')::INTERVAL
+             ELSE gdt_bot_configs.next_auto_sync_at
+           END`,
         [uuidv4(), companyId, taxCode, encryptedCreds, has_otp, otp_method, sync_frequency_hours]
       );
+
+      // Notify bot to immediately apply the new schedule (no restart required).
+      // Bot subscribes to this channel and re-checks the company on next cycle.
+      await _redis.publish('bot:schedule:reset', JSON.stringify({ companyId })).catch(() => {});
 
       // NOTE: No auto-enqueue on setup — user triggers first sync via "Lấy từ GDT" button.
       // Auto-enqueuing caused a LOCK_CONFLICT race: the first-run job (legacy queue) and the
