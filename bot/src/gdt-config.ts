@@ -77,7 +77,7 @@ export interface GdtConfig {
 
 export const DEFAULT_GDT_CONFIG: GdtConfig = {
   api: {
-    baseUrl: 'https://hoadondientu.gdt.gov.vn:30000',
+    baseUrl: 'https://hoadondientu.gdt.gov.vn/api',
     endpoints: {
       auth:        '/security-taxpayer/authenticate',
       sold:        '/query/invoices/sold',

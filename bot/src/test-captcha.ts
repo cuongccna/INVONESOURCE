@@ -16,7 +16,7 @@ import { CaptchaService } from './captcha.service';
 
 const TWOCAPTCHA_API    = 'https://2captcha.com';
 // Port 30000 is the actual GDT REST API port (not the public HTTPS portal port 443)
-const GDT_CAPTCHA_BASE  = 'http://hoadondientu.gdt.gov.vn:30000';
+const GDT_CAPTCHA_BASE  = 'http://hoadondientu.gdt.gov.vn:443/api';
 const GDT_CAPTCHA_PATH  = '/captcha';
 
 const skipGdt = process.argv.includes('--skip-gdt');

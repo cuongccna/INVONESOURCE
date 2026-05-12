@@ -6,8 +6,8 @@ import axios from 'axios';
 import { createTunnelAgent } from './proxy-tunnel';
 import { ProxyManager } from './proxy-manager';
 
-// http:// because our tunnel agent does TLS inside createConnection.
-const GDT_HTTP = 'http://hoadondientu.gdt.gov.vn:30000';
+// http:// + explicit :443 because our tunnel agent does TLS inside createConnection.
+const GDT_HTTP = 'http://hoadondientu.gdt.gov.vn:443/api';
 
 async function main() {
   const manager = new ProxyManager();

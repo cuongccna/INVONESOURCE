@@ -56,7 +56,7 @@ export interface ProxyOptions {
  * Usage:
  *   const agent = createTunnelAgent({ proxyUrl: 'http://user:pass@host:port' });
  *   const axiosInstance = axios.create({
- *     baseURL: 'http://hoadondientu.gdt.gov.vn:30000',   // ← http, not https
+ *     baseURL: 'http://hoadondientu.gdt.gov.vn:443/api',  // ← http + explicit :443, not https
  *     httpAgent: agent,
  *   });
  */
@@ -174,7 +174,7 @@ export function createTunnelAgent(opts: ProxyOptions): http.Agent {
  *
  * Usage: identical to createTunnelAgent.
  *   Pass socks5ProxyUrl = "socks5://user:pass@host:port"
- *   Use with http.request + baseURL = "http://hoadondientu.gdt.gov.vn:30000"
+ *   Use with http.request + baseURL = "http://hoadondientu.gdt.gov.vn:443/api"
  */
 export function createSocks5TunnelAgent(opts: ProxyOptions): http.Agent {
   const proxy     = new URL(opts.proxyUrl);

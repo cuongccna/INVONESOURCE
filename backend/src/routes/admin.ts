@@ -97,17 +97,23 @@ router.get('/overview', async (_req: Request, res: Response, next: NextFunction)
       ),
     ]);
 
-    const recentHistory = await pool.query(
-      `SELECT lh.*, u.full_name AS user_name, a.full_name AS admin_name,
-              op.name AS old_plan_name, np.name AS new_plan_name
-       FROM license_history lh
-       JOIN users u  ON u.id  = lh.user_id
-       JOIN users a  ON a.id  = lh.performed_by
-       LEFT JOIN license_plans op ON op.id = lh.old_plan_id
-       LEFT JOIN license_plans np ON np.id = lh.new_plan_id
-       ORDER BY lh.created_at DESC
-       LIMIT 10`,
-    );
+    const IORedis = (await import('ioredis')).default;
+    const rOverview = new IORedis(process.env['REDIS_URL'] ?? 'redis://localhost:6379', { maxRetriesPerRequest: 3 });
+    const [recentHistory, pausedFlag] = await Promise.all([
+      pool.query(
+        `SELECT lh.*, u.full_name AS user_name, a.full_name AS admin_name,
+                op.name AS old_plan_name, np.name AS new_plan_name
+         FROM license_history lh
+         JOIN users u  ON u.id  = lh.user_id
+         JOIN users a  ON a.id  = lh.performed_by
+         LEFT JOIN license_plans op ON op.id = lh.old_plan_id
+         LEFT JOIN license_plans np ON np.id = lh.new_plan_id
+         ORDER BY lh.created_at DESC
+         LIMIT 10`,
+      ),
+      rOverview.get('gdt:auto_sync:paused'),
+    ]);
+    await rOverview.quit();
 
     sendSuccess(res, {
       users: users.rows[0],
@@ -115,6 +121,7 @@ router.get('/overview', async (_req: Request, res: Response, next: NextFunction)
       invoices_synced_this_month: parseInt(quotaMonth.rows[0]?.invoices ?? '0', 10),
       expiring_soon: expiringSoon.rows,
       recent_history: recentHistory.rows,
+      bot_sync_paused: pausedFlag === '1',
     });
   } catch (err) { next(err); }
 });
@@ -801,6 +808,28 @@ router.delete('/users/:userId/rate-limit-override', async (req: Request, res: Re
     await r.quit();
     await licenseService.invalidate(userId);
     sendSuccess(res, { userId, removed: true });
+  } catch (err) { next(err); }
+});
+
+// ── BOT AUTO-SYNC GLOBAL TOGGLE ───────────────────────────────────────────────
+
+const BOT_SYNC_PAUSE_KEY = 'gdt:auto_sync:paused';
+
+// PATCH /api/admin/bot-sync-toggle
+// Flips the global pause flag — the bot's auto-sync cron checks this key each cycle.
+router.patch('/bot-sync-toggle', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const IORedis = (await import('ioredis')).default;
+    const r = new IORedis(process.env['REDIS_URL'] ?? 'redis://localhost:6379', { maxRetriesPerRequest: 3 });
+    const current = await r.get(BOT_SYNC_PAUSE_KEY);
+    const nowPaused = current !== '1'; // flip current state
+    if (nowPaused) {
+      await r.set(BOT_SYNC_PAUSE_KEY, '1');
+    } else {
+      await r.del(BOT_SYNC_PAUSE_KEY);
+    }
+    await r.quit();
+    sendSuccess(res, { paused: nowPaused });
   } catch (err) { next(err); }
 });
 

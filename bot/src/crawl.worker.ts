@@ -160,7 +160,7 @@ function createGdtClient(
     'accept-language':  'vi',
     'connection':       'keep-alive',
     'end-point':        '/tra-cuu/tra-cuu-hoa-don',
-    'host':             'hoadondientu.gdt.gov.vn:30000',
+    'host':             'hoadondientu.gdt.gov.vn',
     'origin':           'https://hoadondientu.gdt.gov.vn',
     'referer':          'https://hoadondientu.gdt.gov.vn/',
     'sec-fetch-dest':   'empty',
@@ -189,8 +189,13 @@ function createGdtClient(
   if (proxyUrl) {
     const agent = createTunnelAgent({ proxyUrl });
     axiosConfig['httpAgent'] = agent;
-    // Use http:// base to let our tunnel agent handle TLS
-    axiosConfig['baseURL'] = config.api.baseUrl.replace('https://', 'http://');
+    // Use http:// base to let our tunnel agent handle TLS.
+    // Port must be explicit (443) so the CONNECT target is correct — without it
+    // the URL parser defaults to port 80 for http://, sending CONNECT to the wrong port.
+    const _proxyBase = new URL(config.api.baseUrl);
+    _proxyBase.protocol = 'http:';
+    if (!_proxyBase.port) _proxyBase.port = '443';
+    axiosConfig['baseURL'] = _proxyBase.toString();
   }
 
   const client = axios.create(axiosConfig);

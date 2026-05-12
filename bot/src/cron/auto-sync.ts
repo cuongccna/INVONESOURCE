@@ -18,6 +18,10 @@ import { cfg } from '../config/ConfigStore';
 
 const REDIS_URL = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
 
+// Dedicated non-subscriber Redis client for flag checks.
+const pauseChecker = new IORedis(REDIS_URL, { lazyConnect: false, maxRetriesPerRequest: 1 });
+pauseChecker.on('error', (err: Error) => logger.warn('[AutoSync] pauseChecker error', { error: err.message }));
+
 const autoSyncQueue = new Queue('gdt-sync-auto', {
   connection: { url: REDIS_URL } as import('bullmq').ConnectionOptions,
 });
@@ -101,6 +105,13 @@ export function startScheduleResetListener(): void {
 
 export async function runAutoSyncCycle(): Promise<void> {
   try {
+    // Global admin pause guard — checked on every cycle, updates in <1s via Redis
+    const paused = await pauseChecker.get('gdt:auto_sync:paused');
+    if (paused === '1') {
+      logger.info('[AutoSync] Cycle skipped — global auto-sync is paused by admin');
+      return;
+    }
+
     const due = await pool.query<{
       company_id: string;
       sync_frequency_hours: number;

@@ -71,8 +71,8 @@ export function invalidateRecipeCache(name: string): void {
 export function getBuiltInDefaults(): CrawlerRecipe {
   return {
     api: {
-      baseUrl:     'https://hoadondientu.gdt.gov.vn:30000',
-      baseUrlHttp: 'http://hoadondientu.gdt.gov.vn:30000',
+      baseUrl:     'https://hoadondientu.gdt.gov.vn/api',
+      baseUrlHttp: 'http://hoadondientu.gdt.gov.vn:443/api',
       endpoints: {
         captcha:             '/captcha',
         auth:                '/security-taxpayer/authenticate',

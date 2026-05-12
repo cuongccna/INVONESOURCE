@@ -935,7 +935,7 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
     // ── 3b. Pre-sync proxy health check ────────────────────────────────────────
     // Two-level probe before consuming captcha credits or DB lock:
     //   Level 1 — TCP probe to proxy server (fast, 4-8s)
-    //   Level 2 — TLS probe to GDT:30000 via CONNECT tunnel (~1-2s for blocked IPs)
+    //   Level 2 — TLS probe to GDT:443 via CONNECT tunnel (~1-2s for blocked IPs)
     // Level 2 catches IPs that pass TCP but are blocked by GDT at the TLS layer.
     // Without this, a blocked proxy wastes 30-60s captcha + login time before failing.
     if (proxyUrl) {
@@ -959,13 +959,13 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
         throw new Error(`PROXY_DEAD: Proxy TCP probe failed (${proxyUrl.slice(0, 32)}…) — will retry`);
       }
 
-      // TLS probe: verify the proxy's exit IP can actually reach GDT:30000.
+      // TLS probe: verify the proxy's exit IP can actually reach GDT:443.
       // Blocked IPs fail TLS in ~1-2s — fast fail saves captcha credits.
       const { probeTlsViaProxy } = await import('./proxy-tunnel');
-      const tlsOk = await probeTlsViaProxy(proxyUrl, 'hoadondientu.gdt.gov.vn', 30000, 12_000);
+      const tlsOk = await probeTlsViaProxy(proxyUrl, 'hoadondientu.gdt.gov.vn', 443, 12_000);
       if (!tlsOk) {
         proxyManager.markFailed(proxyUrl);
-        logger.warn('[SyncWorker] Proxy TLS probe FAILED — IP is blocked by GDT on port 30000 (no captcha wasted)', {
+        logger.warn('[SyncWorker] Proxy TLS probe FAILED — IP is blocked by GDT on port 443 (no captcha wasted)', {
           companyId,
           taxCode:  botCfg.tax_code,
           proxyIp:  _maskProxyUrl(proxyUrl),

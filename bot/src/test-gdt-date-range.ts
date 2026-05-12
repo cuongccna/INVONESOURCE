@@ -39,7 +39,7 @@ if (!COMPANY_ID) {
   process.exit(1);
 }
 
-const GDT_BASE = 'https://hoadondientu.gdt.gov.vn:30000';
+const GDT_BASE = 'https://hoadondientu.gdt.gov.vn/api';
 const PAGE_SIZE = 20;
 
 function fmt(d: Date): string {

@@ -122,3 +122,5 @@ RISK_ENGINE_FRAMEWORK.md
 bot/test-proxy-quick.sh
 bot/test-proxy-gdt.ts
 bot/test-mkvn-gdt.ts
+bot/tmp/test-result.txt
+bot/tmp/test-tee.txt

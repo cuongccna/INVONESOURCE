@@ -2,7 +2,7 @@
  * GDT Direct API Service
  *
  * Replaces Playwright-based GdtAuthService + GdtBotRunner with direct HTTP calls
- * to hoadondientu.gdt.gov.vn:30000 REST API.
+ * to hoadondientu.gdt.gov.vn/api REST API (no custom port — standard 443).
  *
  * Flow (from DevTools inspection):
  *   1. GET  /captcha                              → { key, content: SVG string }
@@ -172,13 +172,16 @@ export class GdtAuthError extends Error {
   }
 }
 
-const GDT_API_HTTPS = 'https://hoadondientu.gdt.gov.vn:30000';
+const GDT_API_HTTPS = 'https://hoadondientu.gdt.gov.vn/api';
 // When tunnelling through a proxy we use http:// as the base URL so that axios
 // routes through http.request (which uses httpAgent). Our httpAgent's
 // createConnection performs the full TCP→CONNECT→TLS pipeline and returns a
 // TLS socket, so HTTP text is encrypted end-to-end. Using https.request would
 // double-wrap TLS and break the connection.
-const GDT_API_HTTP  = 'http://hoadondientu.gdt.gov.vn:30000';
+// Port 443 is explicit so the tunnel agent sends CONNECT hoadondientu.gdt.gov.vn:443
+// (not :80 which is the http:// default). The /api prefix shifts to baseURL so all
+// existing relative endpoint paths (/query/..., /sco-query/...) remain unchanged.
+const GDT_API_HTTP  = 'http://hoadondientu.gdt.gov.vn:443/api';
 // sco-query endpoints serve invoices sourced from POS machines (máy tính tiền — MTTTT)
 const GDT_SCO_SOLD     = '/sco-query/invoices/sold';
 const GDT_SCO_PURCHASE = '/sco-query/invoices/purchase';
