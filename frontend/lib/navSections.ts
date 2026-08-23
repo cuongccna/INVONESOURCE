@@ -121,6 +121,7 @@ export const VISIBLE_DRAWER_HREFS = VISIBLE_DRAWER_SECTIONS.flatMap((s) => s.ite
 export const HKD_REPORT_SECTION = {
   title: '🏪 Sổ Sách HKD',
   items: [
+    { href: '/reports/hkd', label: 'Bộ sổ phải ghi (theo doanh thu)' },
     { href: '/reports/hkd/s1a', label: 'S1a – Chi tiết doanh thu' },
     { href: '/reports/hkd/s2a', label: 'S2a – Doanh thu (GTGT+TNCN)' },
     { href: '/reports/hkd/s2b', label: 'S2b – Doanh thu (GTGT)' },

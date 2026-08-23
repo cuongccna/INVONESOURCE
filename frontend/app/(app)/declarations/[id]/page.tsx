@@ -14,6 +14,10 @@ interface Declaration {
   period_month: number;
   period_year: number;
   period_type: string;
+  // F8 — tờ khai bổ sung
+  declaration_type?: string;
+  amendment_no?: number;
+  khbs_reason?: string | null;
   form_type: string;
   submission_status: string;
   ct22_total_input_vat: number;
@@ -140,11 +144,65 @@ export default function DeclarationDetailPage() {
 
   useEffect(() => { void load(); }, [load]);
 
+  // F11 — cảnh báo vi phạm đẳng thức mẫu 01/GTGT do backend trả về qua header
+  const [xmlWarnings, setXmlWarnings] = useState<string[]>([]);
+
+  // F8 — tờ khai bổ sung
+  interface KhbsChange { indicator: string; before: number; after: number; delta: number }
+  const [khbs, setKhbs] = useState<{ changes: KhbsChange[]; tax_delta: number; reason: string | null } | null>(null);
+  const [amending, setAmending] = useState(false);
+  const [amendReason, setAmendReason] = useState('');
+  const [showAmendForm, setShowAmendForm] = useState(false);
+
+  const loadKhbs = useCallback(async (id: string) => {
+    try {
+      const res = await apiClient.get<{ data: { changes: KhbsChange[]; tax_delta: number; reason: string | null } }>(
+        `/declarations/${id}/khbs`);
+      setKhbs(res.data.data);
+    } catch {
+      setKhbs(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (decl?.declaration_type === 'bo_sung') void loadKhbs(decl.id);
+  }, [decl?.id, decl?.declaration_type, loadKhbs]);
+
+  const createAmendment = async () => {
+    if (!decl || amending) return;
+    if (amendReason.trim().length < 5) {
+      toast.error('Ghi rõ lý do khai bổ sung (tối thiểu 5 ký tự)');
+      return;
+    }
+    setAmending(true);
+    try {
+      const res = await apiClient.post<{ data: { message: string } }>(
+        `/declarations/${decl.id}/amend`, { reason: amendReason.trim() });
+      toast.success(res.data.data?.message ?? 'Đã lập tờ khai bổ sung');
+      setShowAmendForm(false);
+      setAmendReason('');
+      void load();
+    } catch {
+      toast.error('Không lập được tờ khai bổ sung. Vui lòng thử lại.');
+    } finally {
+      setAmending(false);
+    }
+  };
+
   const downloadXml = async () => {
     if (!decl) return;
     setDownloading(true);
     try {
       const res = await apiClient.get(`/declarations/${decl.id}/xml`, { responseType: 'blob' });
+      // F11: backend kiểm tra đẳng thức bắt buộc của mẫu 01/GTGT và cảnh báo qua header
+      const warn = res.headers['x-declaration-warnings'];
+      if (warn) {
+        const list = decodeURIComponent(String(warn)).split(' | ').filter(Boolean);
+        setXmlWarnings(list);
+        toast.error(`Tờ khai có ${list.length} chỉ tiêu chưa khớp công thức — xem cảnh báo phía trên`);
+      } else {
+        setXmlWarnings([]);
+      }
       const url = URL.createObjectURL(new Blob([res.data as BlobPart], { type: 'application/xml' }));
       const a = document.createElement('a');
       a.href = url;
@@ -331,11 +389,17 @@ export default function DeclarationDetailPage() {
       <div className="flex items-center gap-3 mb-2">
         <BackButton fallbackHref="/declarations" />
         <div className="flex-1">
-          <h1 className="text-xl font-bold text-gray-900">
+          <h1 className="text-xl font-bold text-gray-900 flex items-center gap-2 flex-wrap">
             Tờ khai {decl.form_type} —{' '}
             {decl.period_type === 'quarterly'
               ? `Quý ${decl.period_month}/${decl.period_year}`
               : `Tháng ${decl.period_month}/${decl.period_year}`}
+            {decl.declaration_type === 'bo_sung' && (
+              <span className="text-xs font-semibold bg-purple-100 text-purple-700 px-2 py-0.5 rounded-full"
+                    title="Tờ khai bổ sung — XML xuất ra có loaiTKhai = B">
+                Bổ sung lần {decl.amendment_no ?? 1}
+              </span>
+            )}
           </h1>
           <p className="text-xs text-gray-400 mt-0.5">
             Tạo: {new Date(decl.created_at).toLocaleDateString('vi-VN')}
@@ -348,6 +412,106 @@ export default function DeclarationDetailPage() {
           {statusCfg.label}
         </span>
       </div>
+
+      {/* F11 — cảnh báo đẳng thức mẫu 01/GTGT */}
+      {xmlWarnings.length > 0 && (
+        <div className="bg-red-50 border border-red-200 rounded-xl px-4 py-3 space-y-1">
+          <p className="text-sm font-semibold text-red-800">
+            ⚠ Tờ khai chưa khớp công thức của mẫu {decl.form_type}
+          </p>
+          <ul className="text-xs text-red-700 list-disc pl-5 space-y-0.5">
+            {xmlWarnings.map((w, i) => <li key={i}>{w}</li>)}
+          </ul>
+          <p className="text-xs text-red-600">
+            Nên tính lại tờ khai trước khi nộp — HTKK sẽ tự tính lại các chỉ tiêu này khi nạp file.
+          </p>
+        </div>
+      )}
+
+      {/* F8 — bản giải trình khai bổ sung */}
+      {decl.declaration_type === 'bo_sung' && khbs && (
+        <div className="bg-purple-50 border border-purple-200 rounded-xl px-4 py-3 space-y-2">
+          <p className="text-sm font-semibold text-purple-900">
+            Bản giải trình khai bổ sung — chênh lệch so với tờ khai đã nộp
+          </p>
+          {khbs.reason && <p className="text-xs text-purple-800">Lý do: {khbs.reason}</p>}
+          {khbs.changes.length === 0 ? (
+            <p className="text-xs text-purple-700">Chưa có chỉ tiêu nào thay đổi so với tờ khai gốc.</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="text-purple-700 border-b border-purple-200">
+                    <th className="text-left py-1">Chỉ tiêu</th>
+                    <th className="text-right py-1">Đã nộp</th>
+                    <th className="text-right py-1">Bổ sung</th>
+                    <th className="text-right py-1">Chênh lệch</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {khbs.changes.map((c) => (
+                    <tr key={c.indicator} className="border-b border-purple-100 last:border-0">
+                      <td className="py-1 font-mono">{c.indicator}</td>
+                      <td className="py-1 text-right tabular-nums">{c.before.toLocaleString('vi-VN')}</td>
+                      <td className="py-1 text-right tabular-nums">{c.after.toLocaleString('vi-VN')}</td>
+                      <td className={`py-1 text-right tabular-nums font-semibold ${c.delta > 0 ? 'text-red-700' : 'text-green-700'}`}>
+                        {c.delta > 0 ? '+' : ''}{c.delta.toLocaleString('vi-VN')}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <p className="text-xs text-purple-800">
+            Chênh lệch tiền thuế: <strong>{khbs.tax_delta.toLocaleString('vi-VN')}đ</strong>
+            {' · '}Căn cứ: Luật Quản lý thuế 38/2019/QH14, mẫu 01/KHBS kèm Thông tư 80/2021/TT-BTC
+          </p>
+        </div>
+      )}
+
+      {/* F8 — lập tờ khai bổ sung cho kỳ đã nộp */}
+      {decl.declaration_type !== 'bo_sung' && decl.submission_status !== 'draft' && (
+        <div className="bg-white border border-gray-200 rounded-xl px-4 py-3 space-y-2">
+          {!showAmendForm ? (
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <div>
+                <p className="text-sm text-gray-700">
+                  Phát hiện sai sót sau khi đã nộp? Lập tờ khai bổ sung cho kỳ này.
+                </p>
+                <p className="text-xs text-gray-500">
+                  Chỉ dùng khi tờ khai của kỳ này đã thực sự nộp cho cơ quan thuế.
+                </p>
+              </div>
+              <button onClick={() => setShowAmendForm(true)}
+                className="text-xs font-semibold border border-purple-300 text-purple-700 rounded-lg px-3 py-1.5 hover:bg-purple-50">
+                Lập tờ khai bổ sung
+              </button>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              <label className="block text-sm font-medium text-gray-700">
+                Lý do khai bổ sung <span className="text-red-500">*</span>
+              </label>
+              <textarea
+                value={amendReason}
+                onChange={(e) => setAmendReason(e.target.value)}
+                rows={2}
+                placeholder="VD: bổ sung hoá đơn đầu vào nhận muộn của kỳ; điều chỉnh doanh thu theo hoá đơn thay thế…"
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
+              />
+              <div className="flex gap-2 justify-end">
+                <button onClick={() => { setShowAmendForm(false); setAmendReason(''); }}
+                  className="text-xs px-3 py-1.5 text-gray-600 hover:text-gray-900">Huỷ</button>
+                <button onClick={() => void createAmendment()} disabled={amending}
+                  className="text-xs font-semibold bg-purple-600 text-white rounded-lg px-3 py-1.5 hover:bg-purple-700 disabled:opacity-50">
+                  {amending ? 'Đang lập…' : 'Xác nhận lập tờ khai bổ sung'}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* ── Warnings ── */}
       {deadlineWarning && (

@@ -44,9 +44,9 @@ INSERT INTO tax_policy_params (param_key, effective_from, effective_to, num_valu
    'Thông tư 40/2021/TT-BTC', 'Doanh thu từ 100 triệu đồng/năm trở xuống không phải nộp thuế'),
   ('hkd.revenue_exempt_threshold_year', '2025-07-01', '2025-12-31', 200000000,
    'Luật Thuế GTGT 48/2024/QH15', 'Nâng ngưỡng lên 200 triệu đồng/năm'),
-  ('hkd.revenue_exempt_threshold_year', '2026-01-01', NULL, 500000000,
-   'Thông tư 152/2025/TT-BTC (phân nhóm hộ kinh doanh theo doanh thu)',
-   'CẦN ĐỐI CHIẾU BẢN GỐC: nhóm doanh thu dưới 500 triệu đồng/năm không chịu thuế GTGT, không nộp TNCN')
+  ('hkd.revenue_exempt_threshold_year', '2026-01-01', NULL, 1000000000,
+   'Nghị quyết 198/2025/QH15',
+   'Doanh thu từ 1 tỷ đồng/năm trở xuống không chịu thuế GTGT và không phải nộp thuế TNCN, áp dụng từ 01/01/2026')
 ON CONFLICT (param_key, effective_from) DO NOTHING;
 
 -- Lệ phí môn bài của hộ kinh doanh: 1 = còn thu, 0 = đã bãi bỏ
@@ -59,8 +59,9 @@ ON CONFLICT (param_key, effective_from) DO NOTHING;
 
 -- Mốc phân nhóm hộ kinh doanh để xác định bộ sổ kế toán phải ghi (TT152/2025)
 INSERT INTO tax_policy_params (param_key, effective_from, effective_to, num_value, legal_basis, note) VALUES
-  ('hkd.book_group_small_max', '2026-01-01', NULL, 500000000,
-   'Thông tư 152/2025/TT-BTC', 'Dưới mức này: chỉ ghi sổ S1a-HKD'),
+  ('hkd.book_group_small_max', '2026-01-01', NULL, 1000000000,
+   'Nghị quyết 198/2025/QH15 và Thông tư 152/2025/TT-BTC',
+   'Hộ không thuộc diện nộp thuế (doanh thu ≤ 1 tỷ/năm) chỉ ghi sổ S1a-HKD'),
   ('hkd.book_group_medium_max', '2026-01-01', NULL, 3000000000,
    'Thông tư 152/2025/TT-BTC', 'Từ 500 triệu đến 3 tỷ: S2a-HKD (tỷ lệ %) hoặc bộ S2b–S2e (thu nhập tính thuế)')
 ON CONFLICT (param_key, effective_from) DO NOTHING;

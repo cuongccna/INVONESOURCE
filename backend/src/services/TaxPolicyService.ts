@@ -33,8 +33,8 @@ const FALLBACKS: Record<string, { value: number; legalBasis: string }> = {
     legalBasis: 'Luật Thuế GTGT 48/2024/QH15 (mặc định dự phòng)',
   },
   'hkd.revenue_exempt_threshold_year': {
-    value: 500_000_000,
-    legalBasis: 'Thông tư 152/2025/TT-BTC (mặc định dự phòng)',
+    value: 1_000_000_000,
+    legalBasis: 'Nghị quyết 198/2025/QH15 (mặc định dự phòng)',
   },
   'hkd.license_fee_applicable': {
     value: 0,

@@ -324,6 +324,99 @@ router.put('/:id', async (req: Request, res: Response, next: NextFunction) => {
 });
 
 // PATCH /api/companies/:id/onboarded — mark onboarding complete
+/**
+ * F9 — HỒ SƠ THUẾ CỦA CÔNG TY
+ *
+ * Những thông tin bắt buộc trên header tờ khai mà trước đây bỏ trống:
+ * cơ quan thuế nơi nộp, người ký, chức danh, mã ngành nghề, chế độ kế toán áp dụng.
+ * Tên cơ quan thuế được điền sẵn từ kết quả tra cứu mã số thuế; mã cơ quan thuế
+ * phải do người dùng nhập vì bản tra cứu công khai không trả về mã.
+ */
+router.get('/:id/tax-profile', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const access = await pool.query(
+      'SELECT role FROM user_companies WHERE user_id = $1 AND company_id = $2',
+      [req.user!.userId, req.params.id],
+    );
+    if (!access.rows[0]) throw new NotFoundError('Không tìm thấy công ty');
+
+    const { rows } = await pool.query(
+      `SELECT c.tax_authority_code, c.tax_authority_name, c.signer_name, c.signer_title,
+              c.business_line_code, c.accounting_regime, c.company_type,
+              v.tax_authority AS tax_authority_from_lookup, v.mst_status, v.verified_at
+         FROM companies c
+         LEFT JOIN company_verification_cache v ON v.tax_code = c.tax_code
+        WHERE c.id = $1`,
+      [req.params.id],
+    );
+    if (!rows[0]) throw new NotFoundError('Không tìm thấy công ty');
+
+    return sendSuccess(res, {
+      ...rows[0],
+      business_line_options: [
+        { code: '01', label: 'Hoạt động sản xuất kinh doanh thông thường' },
+        { code: '02', label: 'Hoạt động xổ số kiến thiết, xổ số điện toán' },
+        { code: '03', label: 'Hoạt động thăm dò khai thác dầu khí' },
+        { code: '04', label: 'Hoạt động chuyển nhượng bất động sản' },
+        { code: '05', label: 'Nhà máy sản xuất điện' },
+      ],
+      accounting_regime_options: [
+        { code: 'tt200', label: 'Thông tư 200/2014/TT-BTC — doanh nghiệp' },
+        { code: 'tt133', label: 'Thông tư 133/2016/TT-BTC — doanh nghiệp nhỏ và vừa' },
+        { code: 'tt132', label: 'Thông tư 132/2018/TT-BTC — doanh nghiệp siêu nhỏ' },
+        { code: 'hkd',   label: 'Thông tư 152/2025/TT-BTC — hộ, cá nhân kinh doanh' },
+      ],
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.put('/:id/tax-profile', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const access = await pool.query(
+      'SELECT role FROM user_companies WHERE user_id = $1 AND company_id = $2',
+      [req.user!.userId, req.params.id],
+    );
+    if (!access.rows[0]) throw new NotFoundError('Không tìm thấy công ty');
+    if (!['OWNER', 'ADMIN', 'ACCOUNTANT'].includes(access.rows[0].role as string)) {
+      throw new ForbiddenError('Không đủ quyền cập nhật hồ sơ thuế');
+    }
+
+    const parsed = z.object({
+      tax_authority_code: z.string().max(20).optional().nullable(),
+      tax_authority_name: z.string().max(255).optional().nullable(),
+      signer_name:        z.string().max(255).optional().nullable(),
+      signer_title:       z.string().max(120).optional().nullable(),
+      business_line_code: z.string().max(10).optional().nullable(),
+      accounting_regime:  z.enum(['tt133', 'tt200', 'tt132', 'hkd']).optional().nullable(),
+    }).safeParse(req.body ?? {});
+    if (!parsed.success) throw new ValidationError(parsed.error.issues[0]?.message ?? 'Dữ liệu không hợp lệ');
+
+    const d = parsed.data;
+    const { rows } = await pool.query(
+      `UPDATE companies
+          SET tax_authority_code = COALESCE($2, tax_authority_code),
+              tax_authority_name = COALESCE($3, tax_authority_name),
+              signer_name        = COALESCE($4, signer_name),
+              signer_title       = COALESCE($5, signer_title),
+              business_line_code = COALESCE($6, business_line_code),
+              accounting_regime  = COALESCE($7, accounting_regime),
+              updated_at         = NOW()
+        WHERE id = $1
+      RETURNING tax_authority_code, tax_authority_name, signer_name, signer_title,
+                business_line_code, accounting_regime`,
+      [req.params.id, d.tax_authority_code ?? null, d.tax_authority_name ?? null,
+       d.signer_name ?? null, d.signer_title ?? null,
+       d.business_line_code ?? null, d.accounting_regime ?? null],
+    );
+
+    return sendSuccess(res, rows[0], 'Đã lưu hồ sơ thuế — tờ khai xuất sau sẽ dùng thông tin này');
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.patch('/:id/onboarded', async (req: Request, res: Response, next: NextFunction) => {
   try {
     await pool.query(
