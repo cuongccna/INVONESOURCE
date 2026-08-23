@@ -5,6 +5,7 @@ import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import apiClient from '../../../../lib/apiClient';
 import { useToast } from '../../../../components/ToastProvider';
+import { useCompany } from '../../../../contexts/CompanyContext';
 import BackButton from '../../../../components/BackButton';
 import { formatVNDFull } from '../../../../utils/formatCurrency';
 
@@ -111,6 +112,7 @@ export default function DeclarationDetailPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
   const toast = useToast();
+  const { activeCompany } = useCompany();
   const [decl, setDecl] = useState<Declaration | null>(null);
   const [loading, setLoading] = useState(true);
   const [downloading, setDownloading] = useState(false);
@@ -206,7 +208,12 @@ export default function DeclarationDetailPage() {
       const url = URL.createObjectURL(new Blob([res.data as BlobPart], { type: 'application/xml' }));
       const a = document.createElement('a');
       a.href = url;
-      a.download = `01GTGT_T${String(decl.period_month).padStart(2,'0')}${decl.period_year}_${decl.id.slice(0,8)}.xml`;
+      // Tên file theo quy ước HTKK: <MST>-<mẫu>-<kỳ>-L<lần>.xml để công cụ ký/nộp nhận đúng
+      const ky = decl.period_type === 'quarterly'
+        ? `Q${decl.period_month}${decl.period_year}`
+        : `T${String(decl.period_month).padStart(2, '0')}${decl.period_year}`;
+      const lan = String(decl.amendment_no ?? 0).padStart(2, '0');
+      a.download = `${activeCompany?.tax_code ?? 'MST'}-01_GTGT_TT80-${ky}-L${lan}.xml`;
       a.click();
       URL.revokeObjectURL(url);
     } catch {

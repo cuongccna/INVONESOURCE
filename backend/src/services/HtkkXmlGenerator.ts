@@ -33,6 +33,15 @@ interface PlucOutputRow {
 /**
  * HtkkXmlGenerator — tạo XML HTKK chuẩn TT80/2021 cho tờ khai 01/GTGT (maTKhai=842).
  *
+ * YÊU CẦU ĐỂ KÝ SỐ ĐƯỢC (USB token / HSM) — đối chiếu với tờ khai thật đã ký trên eTax:
+ *   1. Có khai báo <?xml version="1.0" encoding="UTF-8"?> ở dòng đầu.
+ *   2. Node được ký mang thuộc tính id="NODETOSIGN"; chữ ký tham chiếu URI="#NODETOSIGN".
+ *   3. Thẻ <CKyDTu></CKyDTu> mở/đóng rõ ràng để công cụ ký chèn <Signature> vào trong;
+ *      KHÔNG dùng thẻ tự đóng <CKyDTu/>.
+ *   4. Tên khối phụ lục giảm thuế GTGT là tên kỹ thuật CỐ ĐỊNH của bộ chuẩn XML
+ *      (PL_NQ142_GTGT ở phiên bản 2.8.3), không đổi theo từng nghị quyết.
+ *   5. Thứ tự các chỉ tiêu phải đúng như XSD (sequence) — đã đối chiếu khớp 100%.
+ *
  * Cấu trúc XML theo đúng mẫu HTKK phiên bản 2.8.3:
  *   <HSoThueDTu xmlns="http://kekhaithue.gdt.gov.vn/TKhaiThue">
  *     <HSoKhaiThue id="NODETOSIGN">
@@ -179,7 +188,8 @@ export class HtkkXmlGenerator {
     const ngayKy  = fmtISODate(now);
 
     // ── 6. Tạo XML ────────────────────────────────────────────────────────────
-    const xml = `<HSoThueDTu xmlns="http://kekhaithue.gdt.gov.vn/TKhaiThue" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<HSoThueDTu xmlns="http://kekhaithue.gdt.gov.vn/TKhaiThue" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
     <HSoKhaiThue id="NODETOSIGN">
         <TTinChung>
             <TTinDVu>
@@ -285,7 +295,7 @@ export class HtkkXmlGenerator {
         </CTieuTKhaiChinh>
         ${_buildPlucXml(plucInputItems, plucOutputItems, plucInputSumSubtotal, plucInputSumVat, plucOutputSumSubtotal, plucOutputSumReduction, reductionPolicy)}
     </HSoKhaiThue>
-    <CKyDTu/>
+    <CKyDTu></CKyDTu>
 </HSoThueDTu>`;
 
     // F11: kiểm tra đẳng thức bắt buộc trước khi lưu — không chặn, nhưng ghi log rõ ràng

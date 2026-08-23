@@ -83,14 +83,20 @@ CREATE TABLE IF NOT EXISTS vat_reduction_policies (
 COMMENT ON TABLE vat_reduction_policies IS
   'Nghị quyết giảm thuế GTGT theo từng thời kỳ. xml_block_tag phải khớp bộ chuẩn XML của HTKK đang dùng.';
 
+-- LƯU Ý QUAN TRỌNG: xml_block_tag là TÊN KỸ THUẬT trong bộ chuẩn XML của cơ quan thuế,
+-- KHÔNG phải tên nghị quyết. Đối chiếu tờ khai thật đã ký trên eTax (kỳ Q4/2025, ký 20/01/2026,
+-- pbanTKhaiXML 2.8.3) cho thấy khối phụ lục vẫn mang tên PL_NQ142_GTGT.
+-- Đặt tên khác (vd PL_NQ204_GTGT) sẽ khiến công cụ ký số / eTax từ chối file.
+-- Cột legal_basis mới là nơi ghi nghị quyết áp dụng cho từng kỳ.
 INSERT INTO vat_reduction_policies (effective_from, effective_to, standard_rate, reduced_rate, xml_block_tag, legal_basis, note) VALUES
-  ('2022-02-01', '2022-12-31', 10, 8, 'PL_NQ43_GTGT',  'Nghị quyết 43/2022/QH15', NULL),
-  ('2023-07-01', '2023-12-31', 10, 8, 'PL_NQ101_GTGT', 'Nghị quyết 101/2023/QH15', NULL),
-  ('2024-01-01', '2024-06-30', 10, 8, 'PL_NQ110_GTGT', 'Nghị quyết 110/2023/QH15', NULL),
+  ('2022-02-01', '2022-12-31', 10, 8, 'PL_NQ142_GTGT', 'Nghị quyết 43/2022/QH15', NULL),
+  ('2023-07-01', '2023-12-31', 10, 8, 'PL_NQ142_GTGT', 'Nghị quyết 101/2023/QH15', NULL),
+  ('2024-01-01', '2024-06-30', 10, 8, 'PL_NQ142_GTGT', 'Nghị quyết 110/2023/QH15', NULL),
   ('2024-07-01', '2024-12-31', 10, 8, 'PL_NQ142_GTGT', 'Nghị quyết 142/2024/QH15', NULL),
-  ('2025-01-01', '2025-06-30', 10, 8, 'PL_NQ174_GTGT', 'Nghị quyết 174/2024/QH15', NULL),
-  ('2025-07-01', '2026-12-31', 10, 8, 'PL_NQ204_GTGT', 'Nghị quyết của Quốc hội về giảm thuế GTGT giai đoạn 7/2025–2026',
-   'CẦN ĐỐI CHIẾU tên khối phụ lục với bộ chuẩn XML của phiên bản HTKK đang dùng trước khi nộp')
+  ('2025-01-01', '2025-06-30', 10, 8, 'PL_NQ142_GTGT', 'Nghị quyết 174/2024/QH15', NULL),
+  ('2025-07-01', '2026-12-31', 10, 8, 'PL_NQ142_GTGT',
+   'Nghị quyết của Quốc hội về giảm thuế GTGT giai đoạn 7/2025–2026',
+   'Tên khối XML giữ nguyên theo bộ chuẩn 2.8.3; chỉ đổi khi cơ quan thuế nâng phiên bản XML')
 ON CONFLICT (effective_from, effective_to) DO NOTHING;
 
 -- ─── 3. Thông tin phục vụ header tờ khai (F9) ─────────────────────────────
