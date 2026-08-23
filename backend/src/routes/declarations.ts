@@ -5,7 +5,7 @@ import { pool } from '../db/pool';
 import { authenticate, requireRole } from '../middleware/auth';
 import { requireCompany } from '../middleware/company';
 import { TaxDeclarationEngine } from '../services/TaxDeclarationEngine';
-import { HtkkXmlGenerator } from '../services/HtkkXmlGenerator';
+import { HtkkXmlGenerator, validateVatDeclarationXml } from '../services/HtkkXmlGenerator';
 import { TVanSubmissionService } from '../services/TVanSubmissionService';
 import { TaxDeclarationExporter } from '../services/TaxDeclarationExporter';
 import { checkLineItemSync } from '../services/InvoiceSyncChecker';
@@ -323,6 +323,122 @@ router.get(
 );
 
 // GET /api/declarations/:id/xml — download HTKK XML
+/**
+ * F8 — TỜ KHAI BỔ SUNG (khai bổ sung hồ sơ khai thuế)
+ *
+ * Khi phát hiện sai sót của kỳ đã nộp, người nộp thuế lập tờ khai bổ sung cho chính kỳ đó
+ * kèm bản giải trình khai bổ sung. Tờ khai bổ sung có loaiTKhai = 'B' và số lần khai bổ sung.
+ *
+ * Căn cứ: Luật Quản lý thuế 38/2019/QH14 và Thông tư 80/2021/TT-BTC (mẫu 01/KHBS).
+ *
+ * POST /api/declarations/:id/amend  { reason }
+ *   → tạo tờ khai bổ sung mới, giữ nguyên tờ khai gốc để đối chiếu,
+ *     lưu ảnh chụp chỉ tiêu cũ vào khbs_snapshot.
+ */
+router.post('/:id/amend', requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'),
+  async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const body = z.object({ reason: z.string().min(5).max(1000) }).safeParse(req.body ?? {});
+    if (!body.success) throw new ValidationError('Phải ghi rõ lý do khai bổ sung (tối thiểu 5 ký tự)');
+
+    const { rows } = await pool.query(
+      `SELECT * FROM tax_declarations WHERE id = $1 AND company_id = $2`,
+      [req.params.id, companyId],
+    );
+    const origin = rows[0];
+    if (!origin) throw new NotFoundError('Không tìm thấy tờ khai');
+
+    // Số lần khai bổ sung tiếp theo của cùng kỳ
+    const { rows: cntRows } = await pool.query<{ max_no: string | null }>(
+      `SELECT MAX(amendment_no) AS max_no
+         FROM tax_declarations
+        WHERE company_id = $1 AND period_year = $2 AND period_month = $3 AND period_type = $4`,
+      [companyId, origin.period_year, origin.period_month, origin.period_type],
+    );
+    const nextNo = Number(cntRows[0]?.max_no ?? 0) + 1;
+
+    // Ảnh chụp chỉ tiêu của tờ khai đang có — dùng lập bản giải trình chênh lệch
+    const snapshot: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(origin)) {
+      if (k.startsWith('ct') && v !== null) snapshot[k] = v;
+    }
+
+    // Tính lại số liệu kỳ đó theo dữ liệu hoá đơn hiện tại
+    const engine = new TaxDeclarationEngine();
+    const recalculated = origin.period_type === 'quarterly'
+      ? await engine.calculateQuarterlyDeclaration(companyId, origin.period_month, origin.period_year)
+      : await engine.calculateDeclaration(companyId, origin.period_month, origin.period_year);
+
+    const { rows: amended } = await pool.query(
+      `UPDATE tax_declarations
+          SET declaration_type      = 'bo_sung',
+              amendment_no          = $2,
+              amends_declaration_id = $3,
+              khbs_reason           = $4,
+              khbs_snapshot         = $5::jsonb,
+              submission_status     = 'draft',
+              xml_content           = NULL,
+              xml_generated_at      = NULL,
+              updated_at            = NOW()
+        WHERE id = $1
+      RETURNING *`,
+      [recalculated.id ?? req.params.id, nextNo, origin.id, body.data.reason, JSON.stringify(snapshot)],
+    );
+
+    return sendSuccess(res, {
+      declaration: amended[0] ?? recalculated,
+      amendment_no: nextNo,
+      message: `Đã lập tờ khai bổ sung lần ${nextNo} cho kỳ ${origin.period_month}/${origin.period_year}. `
+             + 'Kiểm tra bản giải trình chênh lệch trước khi xuất XML.',
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /api/declarations/:id/khbs — bản giải trình khai bổ sung.
+ * So sánh từng chỉ tiêu giữa tờ khai đã nộp và tờ khai bổ sung, chỉ liệt kê chỉ tiêu thay đổi.
+ */
+router.get('/:id/khbs', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM tax_declarations WHERE id = $1 AND company_id = $2`,
+      [req.params.id, req.user!.companyId],
+    );
+    const decl = rows[0];
+    if (!decl) throw new NotFoundError('Không tìm thấy tờ khai');
+    if (decl.declaration_type !== 'bo_sung') {
+      throw new ValidationError('Tờ khai này không phải tờ khai bổ sung');
+    }
+
+    const snapshot = (decl.khbs_snapshot ?? {}) as Record<string, unknown>;
+    const changes: Array<{ indicator: string; before: number; after: number; delta: number }> = [];
+
+    for (const [key, before] of Object.entries(snapshot)) {
+      const after = Number(decl[key] ?? 0);
+      const prev  = Number(before ?? 0);
+      if (Math.abs(after - prev) >= 1) {
+        changes.push({ indicator: key, before: prev, after, delta: after - prev });
+      }
+    }
+    changes.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+
+    return sendSuccess(res, {
+      period: { month: decl.period_month, year: decl.period_year, type: decl.period_type },
+      amendment_no: decl.amendment_no,
+      reason: decl.khbs_reason,
+      changes,
+      // Chênh lệch tiền thuế phải nộp là con số cơ quan thuế quan tâm nhất
+      tax_delta: Number(decl.ct41_payable_vat ?? 0) - Number(snapshot['ct41_payable_vat'] ?? 0),
+      legal_basis: 'Luật Quản lý thuế 38/2019/QH14; mẫu 01/KHBS ban hành kèm Thông tư 80/2021/TT-BTC',
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.get('/:id/xml', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const result = await pool.query(
@@ -337,6 +453,12 @@ router.get('/:id/xml', async (req: Request, res: Response, next: NextFunction) =
     if (!xml || req.query['regenerate'] === 'true') {
       const generator = new HtkkXmlGenerator();
       xml = await generator.generate(decl as TaxDeclaration);
+    }
+
+    // F11: cảnh báo nếu tờ khai vi phạm đẳng thức bắt buộc của mẫu 01/GTGT
+    const equationErrors = validateVatDeclarationXml(xml);
+    if (equationErrors.length > 0) {
+      res.setHeader('X-Declaration-Warnings', encodeURIComponent(equationErrors.join(' | ')));
     }
 
     const { period_month, period_year, period_type } = decl;

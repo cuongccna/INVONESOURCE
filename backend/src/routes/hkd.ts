@@ -15,12 +15,35 @@ import { HkdHtkkXmlGenerator } from '../services/HkdHtkkXmlGenerator';
 import { HkdPdfExporter } from '../services/HkdPdfExporter';
 import { buildDashboardBucketKey, buildTrailingDashboardBuckets } from '../utils/dashboardBuckets';
 import { resolvePeriod } from '../utils/period';
+import { taxPolicyService } from '../services/TaxPolicyService';
 
 const router = Router();
 router.use(authenticate);
 router.use(requireCompany);
 
-const HKD_MONTHLY_THRESHOLD = 8_330_000; // VND — mandatory declaration if exceeded
+/**
+ * F4 — ngưỡng doanh thu và lệ phí môn bài của hộ kinh doanh tra theo KỲ TÍNH THUẾ
+ * từ bảng tax_policy_params (migration 062), không gắn cứng trong mã nguồn nữa.
+ *
+ * Bối cảnh: Nghị quyết 198/2025/QH15 bỏ thuế khoán và lệ phí môn bài với hộ kinh doanh
+ * từ 01/01/2026; ngưỡng doanh thu không chịu thuế cũng đã được nâng nhiều lần
+ * (100 triệu → 200 triệu → mức áp dụng từ 2026).
+ */
+async function hkdPolicy(year: number, month: number) {
+  const [exemptYear, licenseFee] = await Promise.all([
+    taxPolicyService.getForPeriod('hkd.revenue_exempt_threshold_year', year, month),
+    taxPolicyService.getForPeriod('hkd.license_fee_applicable', year, month),
+  ]);
+  return {
+    /** ngưỡng doanh thu năm không chịu thuế */
+    exemptYear:      exemptYear.value,
+    /** quy đổi ra mức bình quân tháng để cảnh báo sớm */
+    exemptMonth:     Math.round(exemptYear.value / 12),
+    licenseFeeApplies: licenseFee.value === 1,
+    legalBasis:      exemptYear.legalBasis,
+    licenseFeeBasis: licenseFee.legalBasis,
+  };
+}
 
 // GET /api/hkd/tax-statement?month=&year=
 router.get('/tax-statement', async (req: Request, res: Response) => {
@@ -70,7 +93,9 @@ if (!comp) throw new AppError('Company not found', 404, 'NOT_FOUND');
     ? Math.round(revenue * pitRate / 100)
     : 0;
   const totalPayable = vatPayable + pitPayable;
-  const mustDeclare = revenue > HKD_MONTHLY_THRESHOLD;
+  const policy = await hkdPolicy(year, month);
+  // So sánh doanh thu luỹ kế năm với ngưỡng năm; đồng thời cảnh báo theo mức bình quân tháng
+  const mustDeclare = revenue > policy.exemptMonth;
 
   sendSuccess(res, {
     period: { month, year },
@@ -84,7 +109,9 @@ if (!comp) throw new AppError('Company not found', 404, 'NOT_FOUND');
     pit_payable: pitPayable,
     total_payable: totalPayable,
     must_declare: mustDeclare,
-    threshold: HKD_MONTHLY_THRESHOLD,
+    threshold: policy.exemptMonth,
+    threshold_year: policy.exemptYear,
+    threshold_legal_basis: policy.legalBasis,
     saved_statement: existing.rows[0] ?? null,
   });
 });
@@ -147,13 +174,17 @@ router.get('/dashboard/kpi', async (req: Request, res: Response) => {
   const profitEst    = revenue - inputTotal;
   const profitMargin = revenue > 0 ? Math.round((profitEst / revenue) * 100) : 0;
 
-  // Mon bai tier per Decree 139/2016 (based on annualised monthly revenue)
+  // F4: lệ phí môn bài chỉ tính khi chính sách của kỳ đó còn thu.
+  // Nghị quyết 198/2025/QH15 bãi bỏ lệ phí môn bài với hộ, cá nhân kinh doanh từ 01/01/2026.
+  const kpiPolicy = await hkdPolicy(year, month);
   const annualRevEst = revenue * 12;
-  let monBai: number;
-  if (annualRevEst <= 100_000_000)      monBai = 0;
-  else if (annualRevEst <= 300_000_000) monBai = 300_000;
-  else if (annualRevEst <= 500_000_000) monBai = 500_000;
-  else                                   monBai = 1_000_000;
+  let monBai = 0;
+  if (kpiPolicy.licenseFeeApplies) {
+    if (annualRevEst <= 100_000_000)      monBai = 0;
+    else if (annualRevEst <= 300_000_000) monBai = 300_000;
+    else if (annualRevEst <= 500_000_000) monBai = 500_000;
+    else                                   monBai = 1_000_000;
+  }
 
   // Tax deadlines for HKD — monthly + quarterly
   // daysUntil uses Vietnam UTC+7 wall-clock to avoid off-by-one at night.

@@ -1,5 +1,6 @@
 import ExcelJS from 'exceljs';
 import { pool } from '../db/pool';
+import { declarableStatusSql } from '../services/TaxPolicyService';
 
 interface InvoiceRow {
   invoice_number: string;
@@ -31,7 +32,7 @@ export class VatDeclarationGenerator {
        FROM invoices
        WHERE company_id = $1
          AND direction = 'output'
-         AND status = 'valid'
+         AND ${declarableStatusSql()}
          AND deleted_at IS NULL
          AND EXTRACT(MONTH FROM invoice_date) = $2
          AND EXTRACT(YEAR FROM invoice_date) = $3
@@ -55,7 +56,10 @@ export class VatDeclarationGenerator {
     title.font = { bold: true, size: 14 };
 
     ws.mergeCells('A2:K2');
-    ws.getCell('A2').value = `Tháng ${String(month).padStart(2,'0')} năm ${year} (Mẫu số: 01-1/GTGT)`;
+    // F6: mẫu 01-1/GTGT đã bị bãi bỏ khỏi hồ sơ khai thuế GTGT (Luật 71/2014/QH13,
+    // TT119/2014/TT-BTC, TT26/2015/TT-BTC). Trong TT80/2021 ký hiệu 01-1/GTGT là phụ lục
+    // phân bổ thuế GTGT cho địa phương — nội dung khác hẳn. Đây là báo cáo nội bộ.
+    ws.getCell('A2').value = `Tháng ${String(month).padStart(2,'0')} năm ${year} — Báo cáo nội bộ phục vụ đối chiếu, không phải phụ lục của hồ sơ khai thuế`;
     ws.getCell('A2').alignment = { horizontal: 'center' };
 
     ws.addRow([]);  // blank row
@@ -147,7 +151,7 @@ export class VatDeclarationGenerator {
        FROM invoices
        WHERE company_id = $1
          AND direction = 'input'
-         AND status = 'valid'
+         AND ${declarableStatusSql()}
          AND gdt_validated = true
          AND deleted_at IS NULL
          AND EXTRACT(MONTH FROM invoice_date) = $2
@@ -171,7 +175,8 @@ export class VatDeclarationGenerator {
     title.font = { bold: true, size: 14 };
 
     ws.mergeCells('A2:K2');
-    ws.getCell('A2').value = `Tháng ${String(month).padStart(2,'0')} năm ${year} (Mẫu số: 01-2/GTGT)`;
+    // F6: xem ghi chú ở generatePL011 — bảng kê mua vào cũng không còn là phụ lục bắt buộc.
+    ws.getCell('A2').value = `Tháng ${String(month).padStart(2,'0')} năm ${year} — Báo cáo nội bộ phục vụ đối chiếu, không phải phụ lục của hồ sơ khai thuế`;
     ws.getCell('A2').alignment = { horizontal: 'center' };
 
     ws.addRow([]);
