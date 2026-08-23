@@ -1185,7 +1185,10 @@ export class GdtDirectApiService {
           const isCaptchaError =
             msgLc.includes('captcha') ||
             msgLc.includes('mã xác nhận') ||
-            msgLc.includes('mã captcha');
+            msgLc.includes('mã captcha') ||
+            msgLc.includes('mã xác thực') ||
+            msgLc.includes('xác thực') ||
+            msgLc.includes('xác nhận');
 
           if ((status === 400 || status === 401) && isCaptchaError) {
             if (lastCaptchaId) await this.captchaService.reportBad(lastCaptchaId);

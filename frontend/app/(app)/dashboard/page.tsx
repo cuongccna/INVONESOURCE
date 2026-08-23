@@ -496,7 +496,7 @@ export default function DashboardPage() {
           <div className="flex items-center gap-2 min-w-0">
             <span className="text-amber-500 text-base shrink-0">⚠</span>
             <p className="text-sm text-amber-800 truncate">
-              <strong>{kpi.invoices.input_above_20m_count}</strong> hóa đơn mua vào &gt;20Tr cần thanh toán phi tiền mặt để được khấu trừ
+              <strong>{kpi.invoices.input_above_20m_count}</strong> hóa đơn mua vào &gt;20Tr; từ 01/07/2025 cần chứng từ thanh toán không dùng tiền mặt để được khấu trừ
               {kpi.tax_deadlines?.[0]?.days_left != null && (
                 <> — hạn chốt <strong>còn {kpi.tax_deadlines[0].days_left} ngày</strong></>
               )}
@@ -593,10 +593,10 @@ export default function DashboardPage() {
               : '—'}
             sub={
               kpi.vat?.accuracy_level === 'declaration'
-                ? 'CT23 — từ tờ khai 01/GTGT đã tính'
+                ? 'CT24 kỳ này — từ tờ khai 01/GTGT đã tính'
                 : kpi.vat?.accuracy_level === 'reconciliation'
-                ? 'Theo đối chiếu VAT (chính xác hơn tạm tính)'
-                : 'Tạm tính — chưa có tờ khai kỳ này'
+                ? 'CT24 kỳ này — theo đối chiếu VAT vừa tính'
+                : 'Tạm tính CT24 kỳ này — chưa có tờ khai'
             }
             color="text-blue-600"
             badge={

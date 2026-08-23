@@ -2,6 +2,8 @@ import { pool } from '../db/pool';
 import { v4 as uuidv4 } from 'uuid';
 import { VatReconciliation, VatBreakdown } from 'shared';
 
+const HIGH_VALUE_INVOICE_THRESHOLD_VND = 20_000_000;
+
 export interface VatRateGroup {
   outputSubtotal: number;
   outputVat: number;
@@ -58,6 +60,30 @@ function _notReplacedClause(alias: string): string {
          AND TRIM(COALESCE(_r.so_hd_cl_quan, '')) = TRIM(COALESCE(${alias}.invoice_number, ''))
          AND COALESCE(_r.seller_tax_code, '') = COALESCE(${alias}.seller_tax_code, '')
      )`;
+}
+
+function _deductiblePaymentCondition(alias: string): string {
+  const nonCashPayment = `(
+             ${alias}.payment_method IS NOT NULL
+             AND LOWER(TRIM(${alias}.payment_method)) <> 'cash'
+           )`;
+  return `(
+            ${alias}.cash_risk_acknowledged = true
+            OR (
+              ${alias}.invoice_date < DATE '2025-07-01'
+              AND (
+                ${alias}.total_amount <= ${HIGH_VALUE_INVOICE_THRESHOLD_VND}
+                OR ${nonCashPayment}
+              )
+            )
+            OR (
+              ${alias}.invoice_date >= DATE '2025-07-01'
+              AND (
+                ${alias}.total_amount < 5000000
+                OR ${nonCashPayment}
+              )
+            )
+          )`;
 }
 
 /**
@@ -136,11 +162,7 @@ export class VatReconciliationService {
            -- NULL group + gdt_validated: serial format không nhận dạng được nhưng GDT đã xác nhận
            (invoice_group IS NULL AND gdt_validated = true)
          )
-         AND (
-           total_amount <= 20000000
-           OR payment_method IS NULL
-           OR (payment_method IS NOT NULL AND LOWER(payment_method) <> 'cash')
-         )
+         AND ${_deductiblePaymentCondition('invoices')}
          ${_notReplacedClause('invoices')}
          ${inputIdFilter}
        GROUP BY vat_rate`,
@@ -382,11 +404,7 @@ export class VatReconciliationService {
          AND EXTRACT(YEAR FROM invoice_date) = $2
          AND EXTRACT(MONTH FROM invoice_date) = ANY($3::int[])
          AND (non_deductible = false OR non_deductible IS NULL)
-         AND (
-           total_amount <= 20000000
-           OR payment_method IS NULL
-           OR (payment_method IS NOT NULL AND LOWER(payment_method) <> 'cash')
-         )
+         AND ${_deductiblePaymentCondition('invoices')}
          AND (
            -- Group 5: có mã CQT → phải gdt_validated; NULL group không tự động coi là group 5
            (invoice_group = 5 AND gdt_validated = true)

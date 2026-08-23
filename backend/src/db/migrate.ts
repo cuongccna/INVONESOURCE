@@ -11,6 +11,118 @@ const pool = new Pool({
   ssl: false,
 });
 
+function splitSqlStatements(sql: string): string[] {
+  const statements: string[] = [];
+  let current = '';
+  let singleQuote = false;
+  let doubleQuote = false;
+  let lineComment = false;
+  let blockComment = false;
+  let dollarQuote: string | null = null;
+
+  for (let i = 0; i < sql.length; i++) {
+    const ch = sql[i];
+    const next = sql[i + 1];
+
+    if (lineComment) {
+      current += ch;
+      if (ch === '\n') lineComment = false;
+      continue;
+    }
+
+    if (blockComment) {
+      current += ch;
+      if (ch === '*' && next === '/') {
+        current += next;
+        i++;
+        blockComment = false;
+      }
+      continue;
+    }
+
+    if (dollarQuote) {
+      current += ch;
+      if (sql.startsWith(dollarQuote, i)) {
+        current += sql.slice(i + 1, i + dollarQuote.length);
+        i += dollarQuote.length - 1;
+        dollarQuote = null;
+      }
+      continue;
+    }
+
+    if (singleQuote) {
+      current += ch;
+      if (ch === "'" && next === "'") {
+        current += next;
+        i++;
+      } else if (ch === "'") {
+        singleQuote = false;
+      }
+      continue;
+    }
+
+    if (doubleQuote) {
+      current += ch;
+      if (ch === '"' && next === '"') {
+        current += next;
+        i++;
+      } else if (ch === '"') {
+        doubleQuote = false;
+      }
+      continue;
+    }
+
+    if (ch === '-' && next === '-') {
+      current += ch + next;
+      i++;
+      lineComment = true;
+      continue;
+    }
+
+    if (ch === '/' && next === '*') {
+      current += ch + next;
+      i++;
+      blockComment = true;
+      continue;
+    }
+
+    if (ch === "'") {
+      current += ch;
+      singleQuote = true;
+      continue;
+    }
+
+    if (ch === '"') {
+      current += ch;
+      doubleQuote = true;
+      continue;
+    }
+
+    if (ch === '$') {
+      const match = sql.slice(i).match(/^\$[A-Za-z_][A-Za-z0-9_]*\$|^\$\$/);
+      if (match) {
+        dollarQuote = match[0];
+        current += dollarQuote;
+        i += dollarQuote.length - 1;
+        continue;
+      }
+    }
+
+    if (ch === ';') {
+      const stmt = current.trim();
+      if (stmt.length > 0) statements.push(stmt);
+      current = '';
+      continue;
+    }
+
+    current += ch;
+  }
+
+  const tail = current.trim();
+  if (tail.length > 0) statements.push(tail);
+  return statements;
+}
+
 async function migrate() {
   const client = await pool.connect();
   try {
@@ -46,11 +158,14 @@ async function migrate() {
       // CREATE INDEX CONCURRENTLY cannot run inside a transaction block.
       // For migrations that contain it, run each statement individually outside a transaction,
       // then record the version separately inside a small transaction.
-      const needsConcurrent = /CREATE\s+INDEX\s+CONCURRENTLY/i.test(sql);
+      const needsNoTransaction =
+        /CREATE\s+INDEX\s+CONCURRENTLY/i.test(sql) ||
+        /ALTER\s+TYPE\b[\s\S]*\bADD\s+VALUE\b/i.test(sql);
 
-      if (needsConcurrent) {
-        // Run each semicolon-separated statement individually (no wrapping transaction)
-        const stmts = sql.split(';').map(s => s.trim()).filter(s => s.length > 0);
+      if (needsNoTransaction) {
+        // Run each statement individually (no wrapping transaction).
+        // PostgreSQL dollar-quoted blocks can contain semicolons, so use a tiny splitter.
+        const stmts = splitSqlStatements(sql);
         try {
           for (const stmt of stmts) {
             await client.query(stmt);

@@ -6,6 +6,7 @@ import apiClient from '../../../lib/apiClient';
 import { useCompany } from '../../../contexts/CompanyContext';
 import { useToast } from '../../../components/ToastProvider';
 import InvoiceGrid from '../../../components/invoices/InvoiceGrid';
+import OriginalInvoiceModal from '../../../components/invoices/OriginalInvoiceModal';
 import type { GridInvoice, GridMeta } from '../../../components/invoices/InvoiceGrid';
 
 interface PaginatedResponse {
@@ -55,6 +56,14 @@ function InvoicesClient() {
   const [search, setSearch] = useState(searchParams.get('search') ?? '');
   const [debouncedSearch, setDebouncedSearch] = useState(search);
   const [pageSize, setPageSize] = useState(50);
+  // Bộ lọc nhanh từ thanh "Cần xử lý" (trạng thái NNT / bản gốc / chi tiết hàng hoá)
+  const [quickFilter, setQuickFilter] = useState<{
+    partnerStatus?: string; hasOriginal?: string; hasLineItems?: string;
+  }>({});
+  const [fetchingOriginals, setFetchingOriginals] = useState(false);
+  const [fetchingLineItems, setFetchingLineItems] = useState(false);
+  // Sau khi xếp hàng xử lý hàng loạt, tự làm mới để số liệu chạy dần trước mắt người dùng
+  const [trackProgress, setTrackProgress] = useState(0);
 
   // Count check modal state
   const [countChecking, setCountChecking] = useState(false);
@@ -121,6 +130,9 @@ function InvoicesClient() {
       if (isSco !== null) params.isSco = String(isSco);
       if (fromDate) params.fromDate = fromDate;
       if (toDate) params.toDate = toDate;
+      if (quickFilter.partnerStatus) params.partnerStatus = quickFilter.partnerStatus;
+      if (quickFilter.hasOriginal)   params.hasOriginal   = quickFilter.hasOriginal;
+      if (quickFilter.hasLineItems)  params.hasLineItems  = quickFilter.hasLineItems;
 
       const [res, trashRes] = await Promise.all([
         apiClient.get<PaginatedResponse>('/invoices', { params }),
@@ -136,18 +148,18 @@ function InvoicesClient() {
     } finally {
       setLoading(false);
     }
-  }, [activeCompanyId, direction, statusFilter, debouncedSearch, importSessionId, invoiceGroup, isSco, fromDate, toDate, pageSize]);
+  }, [activeCompanyId, direction, statusFilter, debouncedSearch, importSessionId, invoiceGroup, isSco, fromDate, toDate, pageSize, quickFilter]);
 
   const handleDelete = async () => {
     if (!deleteTarget) return;
     setDeleting(true);
     try {
       await apiClient.delete(`/invoices/${deleteTarget}`, { data: { reason: deleteReason } });
-      toast.success('Hóa đơn đã được ẩn vào thùng rác');
+      toast.success('Hóa đơn đã được loại khỏi kê khai');
       setDeleteTarget(null);
       void load(meta.page);
     } catch {
-      toast.error('Lỗi khi ẩn hóa đơn. Vui lòng thử lại.');
+      toast.error('Lỗi khi loại hóa đơn. Vui lòng thử lại.');
     } finally {
       setDeleting(false);
     }
@@ -158,7 +170,7 @@ function InvoicesClient() {
     setIgnoring(true);
     try {
       await apiClient.delete(`/invoices/${ignoreTarget}`, { data: { reason: 'permanent' } });
-      toast.success('Hóa đơn đã bị bỏ qua vĩnh viễn');
+      toast.success('Hóa đơn đã được xóa khỏi danh sách đồng bộ');
       setIgnoreTarget(null);
       void load(meta.page);
     } catch {
@@ -194,6 +206,242 @@ function InvoicesClient() {
       toast.error('Làm mới thất bại. Vui lòng thử lại.');
     } finally {
       setRefreshing(false);
+    }
+  };
+
+  // ── Trạng thái MST đối tác ────────────────────────────────────────────────
+  // Bot tra cứu bất đồng bộ tại cổng Cục Thuế (proxy + captcha) nên UI chỉ
+  // gửi yêu cầu rồi poll lại cho tới khi các MST có kết quả.
+  const [partnerStatusRefreshing, setPartnerStatusRefreshing] = useState(false);
+
+  const partnerTaxCodes = useCallback((list: GridInvoice[]): string[] => {
+    const codes = list.map(inv =>
+      inv.direction === 'input' ? inv.seller_tax_code : inv.buyer_tax_code,
+    );
+    return [...new Set(codes.filter(c => c && /^\d{10}(-\d{3})?$/.test(c)))];
+  }, []);
+
+  const applyPartnerStatuses = useCallback((statuses: Array<{
+    tax_code: string; mst_status: string; mst_status_raw: string | null;
+    registered_name: string | null; tax_authority: string | null;
+    checked_at: string; is_stale: boolean;
+  }>) => {
+    if (statuses.length === 0) return;
+    const byCode = new Map(statuses.map(s => [s.tax_code, s]));
+    setInvoices(prev => prev.map(inv => {
+      const code = inv.direction === 'input' ? inv.seller_tax_code : inv.buyer_tax_code;
+      const s = code ? byCode.get(code) : undefined;
+      if (!s) return inv;
+      return {
+        ...inv,
+        partner_mst_status:        s.mst_status as GridInvoice['partner_mst_status'],
+        partner_mst_status_raw:    s.mst_status_raw,
+        partner_registered_name:   s.registered_name,
+        partner_tax_authority:     s.tax_authority,
+        partner_status_checked_at: s.checked_at,
+        partner_status_stale:      s.is_stale,
+      };
+    }));
+  }, []);
+
+  const pollPartnerStatus = useCallback(async (codes: string[], rounds = 6) => {
+    for (let i = 0; i < rounds; i++) {
+      await new Promise(r => setTimeout(r, 10_000));
+      try {
+        const res = await apiClient.get<{ data: { statuses: Array<{
+          tax_code: string; mst_status: string; mst_status_raw: string | null;
+          registered_name: string | null; tax_authority: string | null;
+          checked_at: string; is_stale: boolean;
+        }> } }>('/invoices/partner-status', { params: { taxCodes: codes.join(',') } });
+        const statuses = res.data.data.statuses ?? [];
+        applyPartnerStatuses(statuses);
+        const done = statuses.filter(s => s.mst_status !== 'pending' && !s.is_stale).length;
+        if (done >= codes.length) return;
+      } catch {
+        return;   // lỗi mạng — dừng poll, dữ liệu sẽ có ở lần tải trang sau
+      }
+    }
+  }, [applyPartnerStatuses]);
+
+  const handleRefreshPartnerStatus = async () => {
+    if (partnerStatusRefreshing) return;
+    const codes = partnerTaxCodes(invoices);
+    if (codes.length === 0) {
+      toast.error('Không có mã số thuế đối tác hợp lệ trên trang này');
+      return;
+    }
+    setPartnerStatusRefreshing(true);
+    try {
+      const res = await apiClient.post<{ data: { queued: number; message: string } }>(
+        '/invoices/partner-status/refresh', { taxCodes: codes },
+      );
+      toast.success(res.data.data?.message ?? `Đã gửi ${codes.length} MST đi tra cứu`);
+      await pollPartnerStatus(codes);
+    } catch {
+      toast.error('Không gửi được yêu cầu tra cứu. Vui lòng thử lại.');
+    } finally {
+      setPartnerStatusRefreshing(false);
+    }
+  };
+
+  // Tự làm mới danh sách khi bot đang xử lý hàng loạt — số liệu "Cần xử lý" giảm dần
+  useEffect(() => {
+    if (trackProgress <= 0) return;
+    const t = setTimeout(() => {
+      setTrackProgress(n => n - 1);
+      void load(meta.page);
+    }, 30_000);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trackProgress]);
+
+  // Tự poll một lần sau khi tải danh sách nếu còn MST chưa có trạng thái
+  useEffect(() => {
+    if (loading || invoices.length === 0) return;
+    const missing = invoices
+      .filter(inv => !inv.partner_mst_status || inv.partner_status_stale)
+      .map(inv => (inv.direction === 'input' ? inv.seller_tax_code : inv.buyer_tax_code))
+      .filter(c => c && /^\d{10}(-\d{3})?$/.test(c));
+    if (missing.length === 0) return;
+    const codes = [...new Set(missing)];
+    const timer = setTimeout(() => { void pollPartnerStatus(codes, 3); }, 5_000);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, invoices.length]);
+
+  // Hoá đơn đang mở cửa sổ xem bản gốc
+  const [viewOriginal, setViewOriginal] = useState<GridInvoice | null>(null);
+
+  // ── Hoá đơn gốc (XML ký số) ───────────────────────────────────────────────
+  // Bản gốc phải lấy từ hệ thống GDT bằng tài khoản của chính công ty (qua bot),
+  // nên nếu chưa có sẵn thì API trả 202 và ta poll cho tới khi tải xong.
+  const downloadOriginalFile = useCallback(async (invoiceId: string): Promise<boolean> => {
+    try {
+      const res = await apiClient.get(`/invoices/${invoiceId}/original-xml`, {
+        responseType: 'blob',
+        validateStatus: s => s === 200 || s === 202 || s === 409,
+      });
+      if (res.status !== 200) return false;
+
+      const disposition = String(res.headers['content-disposition'] ?? '');
+      const match = disposition.match(/filename="?([^";]+)"?/);
+      const url = URL.createObjectURL(res.data as Blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = match?.[1] ?? `HoaDon_${invoiceId}.xml`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const handleDownloadOriginal = useCallback(async (invoiceId: string) => {
+    const inv = invoices.find(i => i.id === invoiceId);
+    if (inv?.xml_status === 'unavailable') {
+      toast.error('Hệ thống thuế không lưu XML gốc cho hoá đơn này (không mã CQT / máy tính tiền) — cần xin file từ người bán');
+      return;
+    }
+
+    if (await downloadOriginalFile(invoiceId)) {
+      toast.success('Đã tải hoá đơn gốc');
+      return;
+    }
+
+    // Chưa có bản gốc — yêu cầu bot tải về rồi poll
+    try {
+      const res = await apiClient.post<{ data: { queued: number; unavailable: number; message: string } }>(
+        '/invoices/original-xml/request', { invoiceIds: [invoiceId] },
+      );
+      const info = res.data.data;
+      if (info.queued === 0) {
+        toast.error(info.message);
+        return;
+      }
+      toast.success('Đang lấy bản gốc từ hệ thống thuế — sẽ tự tải xuống khi xong');
+      setInvoices(prev => prev.map(i => i.id === invoiceId ? { ...i, xml_status: 'queued' } : i));
+
+      for (let i = 0; i < 20; i++) {
+        await new Promise(r => setTimeout(r, 15_000));
+        const st = await apiClient.get<{ data: { statuses: Array<{ id: string; xml_status: string; has_xml: boolean }> } }>(
+          '/invoices/original-xml/status', { params: { ids: invoiceId } },
+        );
+        const row = st.data.data.statuses[0];
+        if (!row) continue;
+        if (row.has_xml) {
+          setInvoices(prev => prev.map(x => x.id === invoiceId ? { ...x, xml_status: 'available' } : x));
+          if (await downloadOriginalFile(invoiceId)) toast.success('Đã tải hoá đơn gốc');
+          return;
+        }
+        if (row.xml_status === 'unavailable' || row.xml_status === 'failed') {
+          setInvoices(prev => prev.map(x => x.id === invoiceId ? { ...x, xml_status: row.xml_status } : x));
+          toast.error(row.xml_status === 'unavailable'
+            ? 'Hệ thống thuế không lưu bản gốc cho hoá đơn này'
+            : 'Tải bản gốc thất bại — bot sẽ thử lại ở chu kỳ sau');
+          return;
+        }
+      }
+      toast.error('Bot chưa lấy được bản gốc — thử lại sau ít phút');
+    } catch {
+      toast.error('Không gửi được yêu cầu tải hoá đơn gốc');
+    }
+  }, [invoices, downloadOriginalFile, toast]);
+
+  /** Lấy bản gốc cho toàn bộ hoá đơn khớp bộ lọc hiện tại (tối đa 200 HĐ/lần) */
+  const handleFetchOriginalsForFilter = async () => {
+    if (fetchingOriginals) return;
+    setFetchingOriginals(true);
+    try {
+      const filter: Record<string, unknown> = {};
+      if (direction)            filter.direction    = direction;
+      if (statusFilter)         filter.status       = statusFilter;
+      if (debouncedSearch)      filter.search       = debouncedSearch;
+      if (invoiceGroup !== '')  filter.invoiceGroup = invoiceGroup;
+      if (isSco !== null)       filter.isSco        = String(isSco);
+      if (fromDate)             filter.fromDate     = fromDate;
+      if (toDate)               filter.toDate       = toDate;
+      if (quickFilter.partnerStatus) filter.partnerStatus = quickFilter.partnerStatus;
+
+      const res = await apiClient.post<{ data: { queued: number; message: string } }>(
+        '/invoices/original-xml/request-by-filter', { filter },
+      );
+      toast.success(res.data.data?.message ?? 'Đã xếp hàng lấy bản gốc');
+      setTrackProgress(8);   // theo dõi ~4 phút
+      void load(meta.page);
+    } catch {
+      toast.error('Không gửi được yêu cầu lấy bản gốc. Vui lòng thử lại.');
+    } finally {
+      setFetchingOriginals(false);
+    }
+  };
+
+  /** Lấy chi tiết hàng hoá cho các hoá đơn đang lọc còn thiếu dòng hàng */
+  const handleFetchLineItemsForFilter = async () => {
+    if (fetchingLineItems) return;
+    setFetchingLineItems(true);
+    try {
+      const filter: Record<string, unknown> = {};
+      if (direction)           filter.direction    = direction;
+      if (statusFilter)        filter.status       = statusFilter;
+      if (debouncedSearch)     filter.search       = debouncedSearch;
+      if (invoiceGroup !== '') filter.invoiceGroup = invoiceGroup;
+      if (isSco !== null)      filter.isSco        = String(isSco);
+      if (fromDate)            filter.fromDate     = fromDate;
+      if (toDate)              filter.toDate       = toDate;
+      if (quickFilter.partnerStatus) filter.partnerStatus = quickFilter.partnerStatus;
+
+      const res = await apiClient.post<{ data: { queued: number; message: string } }>(
+        '/invoices/line-items/fetch-by-filter', { filter },
+      );
+      toast.success(res.data.data?.message ?? 'Đã xếp hàng lấy chi tiết');
+      setTrackProgress(8);
+    } catch {
+      toast.error('Không gửi được yêu cầu lấy chi tiết hàng hoá.');
+    } finally {
+      setFetchingLineItems(false);
     }
   };
 
@@ -425,13 +673,36 @@ function InvoicesClient() {
         onPageSizeChange={(size) => setPageSize(size)}
         onExcelExport={handleExcelExport}
         onRefresh={() => void load(meta.page)}
+        onRefreshPartnerStatus={() => void handleRefreshPartnerStatus()}
+        partnerStatusRefreshing={partnerStatusRefreshing}
+        onDownloadOriginal={(id) => void handleDownloadOriginal(id)}
+        onViewOriginal={(inv) => setViewOriginal(inv)}
+        onQuickFilter={(f) => { setQuickFilter(f); setSelectedIds([]); }}
+        activeQuickFilter={quickFilter}
+        onFetchOriginalsForFilter={() => void handleFetchOriginalsForFilter()}
+        fetchingOriginals={fetchingOriginals}
+        onFetchLineItemsForFilter={() => void handleFetchLineItemsForFilter()}
+        fetchingLineItems={fetchingLineItems}
       />
+
+      {/* Xem bản thể hiện hoá đơn gốc từ hệ thống thuế */}
+      {viewOriginal && (
+        <OriginalInvoiceModal
+          invoiceId={viewOriginal.id}
+          label={`${viewOriginal.serial_number ?? ''}-${viewOriginal.invoice_number}`}
+          onClose={() => setViewOriginal(null)}
+          onStatusChange={(status) => {
+            setInvoices(prev => prev.map(i =>
+              i.id === viewOriginal.id ? { ...i, pdf_status: status } : i));
+          }}
+        />
+      )}
 
       {/* Delete confirmation modal */}
       {deleteTarget && (
         <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-4">
           <div className="bg-white rounded-2xl w-full max-w-sm p-5 shadow-xl">
-            <h3 className="text-base font-bold text-gray-900 mb-1">Ẩn hóa đơn này?</h3>
+            <h3 className="text-base font-bold text-gray-900 mb-1">Loại HĐ không kê khai?</h3>
             <p className="text-sm text-gray-500 mb-4">
               Hóa đơn sẽ vào thùng rác và không xuất hiện trong báo cáo. Có thể khôi phục sau.
             </p>
@@ -460,7 +731,7 @@ function InvoicesClient() {
                 disabled={deleting}
                 className="flex-1 py-2.5 bg-red-500 text-white rounded-xl text-sm font-medium disabled:opacity-50"
               >
-                {deleting ? 'Đang ẩn...' : 'Xác nhận ẩn'}
+                {deleting ? 'Đang xử lý...' : 'Xác nhận loại'}
               </button>
             </div>
           </div>
@@ -471,7 +742,7 @@ function InvoicesClient() {
       {ignoreTarget && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
           <div className="bg-white rounded-2xl w-full max-w-sm p-5 shadow-xl">
-            <h3 className="text-base font-bold text-gray-900 mb-1">Bỏ qua vĩnh viễn?</h3>
+            <h3 className="text-base font-bold text-gray-900 mb-1">Xóa HĐ khỏi danh sách đồng bộ?</h3>
             <p className="text-sm text-gray-500 mb-5">
               Hóa đơn này sẽ không bao giờ xuất hiện lại trong danh sách, ngay cả sau khi đồng bộ mới.
             </p>
@@ -479,7 +750,7 @@ function InvoicesClient() {
               <button onClick={() => setIgnoreTarget(null)} className="flex-1 py-2.5 border border-gray-300 rounded-xl text-sm font-medium text-gray-700">Hủy</button>
               <button onClick={() => void handlePermanentIgnore()} disabled={ignoring}
                 className="flex-1 py-2.5 bg-red-600 text-white rounded-xl text-sm font-medium disabled:opacity-50">
-                {ignoring ? 'Đang xử lý...' : 'Bỏ qua vĩnh viễn'}
+                {ignoring ? 'Đang xử lý...' : 'Xác nhận xóa'}
               </button>
             </div>
           </div>

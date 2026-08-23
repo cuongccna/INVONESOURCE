@@ -310,8 +310,21 @@ async function _fetchDeductibleInputSubtotal(
        )
        AND deleted_at IS NULL
        AND (
-         total_amount <= 20000000
-         OR (payment_method IS NOT NULL AND LOWER(payment_method) <> 'cash')
+         cash_risk_acknowledged = true
+         OR (
+           invoice_date < DATE '2025-07-01'
+           AND (
+             total_amount <= 20000000
+             OR (payment_method IS NOT NULL AND LOWER(TRIM(payment_method)) <> 'cash')
+           )
+         )
+         OR (
+           invoice_date >= DATE '2025-07-01'
+           AND (
+             total_amount < 5000000
+             OR (payment_method IS NOT NULL AND LOWER(TRIM(payment_method)) <> 'cash')
+           )
+         )
        )
        ${_notReplacedClause('invoices')}
        AND ${dateFilter}`,

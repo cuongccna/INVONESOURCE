@@ -32,6 +32,30 @@ function _validOutputVatCondition(alias: string): string {
                ${_notReplacedClause(alias)}`;
 }
 
+function _deductiblePaymentCondition(alias: string): string {
+  const nonCashPayment = `(
+                   ${alias}.payment_method IS NOT NULL
+                   AND LOWER(TRIM(${alias}.payment_method)) <> 'cash'
+                 )`;
+  return `(
+                 ${alias}.cash_risk_acknowledged = true
+                 OR (
+                   ${alias}.invoice_date < DATE '2025-07-01'
+                   AND (
+                     ${alias}.total_amount <= ${cfg.number('vat.high_value_threshold_vnd', 20_000_000)}
+                     OR ${nonCashPayment}
+                   )
+                 )
+                 OR (
+                   ${alias}.invoice_date >= DATE '2025-07-01'
+                   AND (
+                     ${alias}.total_amount < ${cfg.number('vat.cash_threshold_vnd', 5_000_000)}
+                     OR ${nonCashPayment}
+                   )
+                 )
+               )`;
+}
+
 function _deductibleInputVatCondition(alias: string): string {
   return `${alias}.direction = 'input'
                AND ${alias}.status IN ('valid', 'replaced', 'adjusted')
@@ -41,11 +65,7 @@ function _deductibleInputVatCondition(alias: string): string {
                  OR (${alias}.invoice_group IN (6, 8))
                  OR (${alias}.invoice_group IS NULL AND ${alias}.gdt_validated = true)
                )
-               AND (
-                 ${alias}.total_amount <= ${cfg.number('vat.high_value_threshold_vnd', 20_000_000)}
-                 OR ${alias}.payment_method IS NULL
-                 OR LOWER(${alias}.payment_method) <> 'cash'
-               )
+               AND ${_deductiblePaymentCondition(alias)}
                ${_notReplacedClause(alias)}`;
 }
 
@@ -179,7 +199,7 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
       throw new Error('Missing companyId in dashboard KPI route');
     }
     const resolved = resolvePeriod(req.query);
-    const [invoiceStats, vatStats, syncStats, ytdStats, riskStats, carryForwardInfo, declLookup, reconLookup] = await Promise.all([
+    const [invoiceStats, vatStats, syncStats, ytdStats, riskStats, carryForwardInfo, declLookup] = await Promise.all([
       pool.query<{
         total: string; output_count: string; input_count: string;
         invalid_count: string; unvalidated_count: string; input_above_20m_count: string;
@@ -264,22 +284,6 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
           resolved.periodType === 'yearly' ? 'monthly' : resolved.periodType, // yearly has no standard tờ khai
         ]
       ).catch(() => ({ rows: [] as { ct23_deductible_input_vat: string; ct41_payable_vat: string; ct40a_total_output_vat: string }[] })),
-      // Lookup vat_reconciliations — populated by VatReconciliationService each time TaxDeclarationEngine
-      // runs (even for preview). Used as authoritative ct23 source when no saved declaration exists.
-      pool.query<{ input_vat: string; output_vat: string }>(
-        `SELECT input_vat, output_vat
-         FROM vat_reconciliations
-         WHERE company_id = $1
-           AND period_month = $2
-           AND period_year  = $3
-         ORDER BY generated_at DESC
-         LIMIT 1`,
-        [
-          companyId,
-          resolved.periodType === 'quarterly' ? resolved.quarter : resolved.month,
-          resolved.year,
-        ]
-      ).catch(() => ({ rows: [] as { input_vat: string; output_vat: string }[] })),
     ]);
 
     // CIT estimate: YTD gross profit × 20%
@@ -347,16 +351,27 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
 
     const rawVatRow = vatStats.rows[0] ?? { output_vat: '0', input_vat: '0', deductible_vat: '0', payable_vat: '0' };
     const declRow   = declLookup.rows[0];
-    const reconRow  = reconLookup.rows[0];
 
-    // Priority for deductible VAT (ct23):
-    // 1) Saved tax declaration → ct23 from tax_declarations (most authoritative, via pipeline)
-    // 2) vat_reconciliations  → input_vat computed by VatReconciliationService (pipeline-filtered,
-    //    written on every TaxDeclarationEngine run incl. preview) — matches declaration page values
-    // 3) Raw SQL tạm tính     → _deductibleInputVatCondition without pipeline filter (approximate)
+    // Priority for deductible VAT:
+    // 1) Saved tax declaration → ct23_deductible_input_vat (current-period deductible input VAT)
+    // 2) Fresh reconciliation for this dashboard request, avoiding stale vat_reconciliations rows
+    // 3) Raw SQL estimate for yearly view, where vat_reconciliations has no yearly row shape
     //    accuracy_level: 'declaration' | 'reconciliation' | 'estimate'
     //    Frontend uses accuracy_level to show "Tạm tính" badge when raw SQL fallback is active.
-    const vatAccuracyLevel = declRow ? 'declaration' : reconRow ? 'reconciliation' : 'estimate';
+    let freshReconRow: { input_vat: string; output_vat: string } | null = null;
+    if (!declRow && resolved.periodType !== 'yearly') {
+      const reconciliationService = new VatReconciliationService();
+      const summary = resolved.periodType === 'quarterly'
+        ? await reconciliationService.calculateQuarter(companyId, resolved.quarter, resolved.year)
+        : await reconciliationService.calculatePeriod(companyId, resolved.month, resolved.year);
+
+      freshReconRow = {
+        input_vat: String(summary.ct23_deductible_input_vat),
+        output_vat: String(summary.ct40a_total_output_vat),
+      };
+    }
+
+    const vatAccuracyLevel = declRow ? 'declaration' : freshReconRow ? 'reconciliation' : 'estimate';
 
     const vatRow = declRow
       ? {
@@ -367,15 +382,15 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
           vat_from_declaration: true,
           accuracy_level:       vatAccuracyLevel,
         }
-      : reconRow
+      : freshReconRow
       ? {
           ...rawVatRow,
-          deductible_vat: reconRow.input_vat,
-          output_vat:     reconRow.output_vat,
+          deductible_vat: freshReconRow.input_vat,
+          output_vat:     freshReconRow.output_vat,
           payable_vat: String(Math.max(
             0,
-            Number(reconRow.output_vat) -
-            Number(reconRow.input_vat)  -
+            Number(freshReconRow.output_vat) -
+            Number(freshReconRow.input_vat)  -
             carryForwardInfo.amount,
           )),
           vat_from_declaration: false,
@@ -393,16 +408,6 @@ router.get('/kpi', async (req: Request, res: Response, next: NextFunction) => {
           vat_from_declaration: false,
           accuracy_level:       vatAccuracyLevel,
         };
-
-    // When tier-3 (raw SQL estimate) is active, trigger VatReconciliationService in the background.
-    // On the next dashboard load this period will hit tier-2 (more accurate) instead of raw SQL.
-    // Fire-and-forget — never block the response.
-    if (!declRow && !reconRow) {
-      const bgMonth = resolved.periodType === 'quarterly' ? resolved.quarter : resolved.month;
-      new VatReconciliationService()
-        .calculatePeriod(companyId, bgMonth, resolved.year)
-        .catch(() => { /* non-fatal — next load retries automatically */ });
-    }
 
     sendSuccess(res, {
       period: {
@@ -468,11 +473,7 @@ router.get('/charts', async (req: Request, res: Response, next: NextFunction) =>
                  OR (invoice_group IN (6, 8))
                  OR (invoice_group IS NULL AND gdt_validated = true)
                )
-               AND (
-                 total_amount <= ${cfg.number('vat.high_value_threshold_vnd', 20_000_000)}
-                 OR payment_method IS NULL
-                 OR LOWER(payment_method) <> 'cash'
-               )
+               AND ${_deductiblePaymentCondition('invoices')}
                ${_notReplacedClause('invoices')}
            ), 0) AS input_vat
          FROM invoices
@@ -527,11 +528,7 @@ router.get('/charts', async (req: Request, res: Response, next: NextFunction) =>
                  OR (invoice_group IN (6, 8))
                  OR (invoice_group IS NULL AND gdt_validated = true)
                )
-               AND (
-                 total_amount <= ${cfg.number('vat.high_value_threshold_vnd', 20_000_000)}
-                 OR payment_method IS NULL
-                 OR LOWER(payment_method) <> 'cash'
-               )
+               AND ${_deductiblePaymentCondition('invoices')}
                ${_notReplacedClause('invoices')}
            ), 0) AS input_vat
          FROM invoices
@@ -586,11 +583,7 @@ router.get('/charts', async (req: Request, res: Response, next: NextFunction) =>
                  OR (invoice_group IN (6, 8))
                  OR (invoice_group IS NULL AND gdt_validated = true)
                )
-               AND (
-                 total_amount <= ${cfg.number('vat.high_value_threshold_vnd', 20_000_000)}
-                 OR payment_method IS NULL
-                 OR LOWER(payment_method) <> 'cash'
-               )
+               AND ${_deductiblePaymentCondition('invoices')}
                ${_notReplacedClause('invoices')}
            ), 0) AS input_vat
          FROM invoices
@@ -844,4 +837,3 @@ router.get('/quick-actions', async (req: Request, res: Response, next: NextFunct
 });
 
 export default router;
-

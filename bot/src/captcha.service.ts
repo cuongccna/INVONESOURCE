@@ -25,8 +25,17 @@ export class CaptchaService {
     return this.apiKey || process.env['TWO_CAPTCHA_API_KEY'] || '';
   }
 
-  /** Submit base64 image captcha and poll for result */
-  async solve(imageBase64: string): Promise<{ text: string; captchaId: string }> {
+  /**
+   * Submit base64 image captcha and poll for result.
+   *
+   * `hints` mô tả ràng buộc của ảnh captcha (độ dài, chỉ số, phân biệt hoa thường).
+   * 2Captcha dùng thông tin này để loại bỏ đáp án sai độ dài → tăng đáng kể tỉ lệ
+   * đúng với captcha 5 ký tự của cổng tra cứu NNT.
+   */
+  async solve(
+    imageBase64: string,
+    hints?: { minLen?: number; maxLen?: number; numeric?: 0 | 1 | 2 | 3 | 4; regsense?: 0 | 1 },
+  ): Promise<{ text: string; captchaId: string }> {
     // Must send as form-encoded body — NOT as URL query params — because
     // base64 can be tens of KB which causes 414 URI Too Long in query string
     const formBody = new URLSearchParams({
@@ -34,6 +43,10 @@ export class CaptchaService {
       method: 'base64',
       body:   imageBase64,
       json:   '1',
+      ...(hints?.minLen   != null ? { min_len:  String(hints.minLen) }  : {}),
+      ...(hints?.maxLen   != null ? { max_len:  String(hints.maxLen) }  : {}),
+      ...(hints?.numeric  != null ? { numeric:  String(hints.numeric) } : {}),
+      ...(hints?.regsense != null ? { regsense: String(hints.regsense) }: {}),
     });
     const submitRes = await axios.post<string>(`${API_URL}/in.php`, formBody, {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },

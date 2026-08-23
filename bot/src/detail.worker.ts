@@ -35,6 +35,9 @@ import { GdtSessionCache }       from './crawl-cache/GdtSessionCache';
 import { GdtDetailCache }        from './crawl-cache/GdtDetailCache';
 import { gdtRawCacheService }    from './crawl-cache/GdtRawCacheService';
 import type { LineItem }         from './parsers/GdtXmlParser';
+import { GdtXmlParser }          from './parsers/GdtXmlParser';
+import { storeInvoiceDocuments, storageRoot } from './invoice-document.service';
+import { fetchProviderPdf, hasProviderAdapter } from './provider-invoice.service';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const REDIS_URL = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
@@ -640,7 +643,7 @@ async function claimBatch(companyId: string, batchSize: number): Promise<DetailQ
        id, invoice_id, company_id,
        nbmst, khhdon, shdon, is_sco,
        priority, attempts, max_attempts`,
-    [companyId, batchSize, STUCK_PROCESSING_MIN],
+    [companyId, batchSize, STUCK_PROCESSING_MIN()],
   );
   return res.rows;
 }
@@ -673,6 +676,293 @@ async function markFailed(rowId: string, error: string, attempts: number): Promi
      WHERE id = $1`,
     [rowId, error.slice(0, 500), backoffMin],
   );
+}
+
+// ── Phase 3: tải hoá đơn gốc (XML ký số) ──────────────────────────────────────
+//
+// Dùng chung token + proxy của detail worker để không mở thêm luồng đăng nhập GDT
+// (mỗi phiên đăng nhập thêm đều làm tăng rủi ro tài khoản bị GDT khoá).
+//
+// Chỉ ttxly = 5 (hoá đơn đã cấp mã CQT) mới có XML trên hệ thống GDT;
+// ttxly 6/8 trả HTTP 500 → đánh dấu 'unavailable', không thử lại.
+
+interface XmlQueueRow {
+  id:           string;
+  invoice_id:   string;
+  company_id:   string;
+  nbmst:        string;
+  khhdon:       string;
+  shdon:        string;
+  khmshdon:     number;
+  priority:          number;
+  attempts:          number;
+  max_attempts:      number;
+  want_pdf:          boolean;
+  want_provider_pdf: boolean;
+}
+
+/** Số hoá đơn gốc tải tối đa mỗi chu kỳ / công ty — file ~400KB nên đi chậm */
+const XML_BATCH_SIZE = Number(process.env['XML_BATCH_SIZE'] ?? 5);
+
+async function claimXmlBatch(companyId: string, batchSize: number): Promise<XmlQueueRow[]> {
+  const res = await pool.query<XmlQueueRow>(
+    `UPDATE invoice_xml_queue
+     SET status = 'processing', attempts = attempts + 1, last_attempted_at = NOW()
+     WHERE id IN (
+       SELECT id FROM invoice_xml_queue
+       WHERE company_id = $1
+         AND (
+           status = 'pending'
+           OR (status = 'failed' AND attempts < max_attempts)
+           OR (status = 'processing' AND last_attempted_at < NOW() - ($3 || ' minutes')::INTERVAL)
+         )
+       ORDER BY priority ASC, enqueued_at ASC
+       LIMIT $2
+       FOR UPDATE SKIP LOCKED
+     )
+     RETURNING id, invoice_id, company_id, nbmst, khhdon, shdon, khmshdon,
+               priority, attempts, max_attempts, want_pdf, want_provider_pdf`,
+    [companyId, batchSize, STUCK_PROCESSING_MIN()],
+  );
+  return res.rows;
+}
+
+/**
+ * Trích "Mã tra cứu" / "Mã số bí mật" của nhà cung cấp HĐĐT trong TTKhac của XML.
+ * Mã này là chìa khoá để lấy bản gốc theo mẫu riêng của nhà cung cấp trên cổng của họ
+ * (cổng thuế chỉ có XML ký số + bản thể hiện của cổng thuế).
+ */
+function extractProviderLookupCode(xml: string): { code: string | null; label: string | null } {
+  const m1 = /<TTruong>(Mã tra cứu|Mã số bí mật)<\/TTruong><KDLieu>[^<]*<\/KDLieu><DLieu>([^<]+)<\/DLieu>/.exec(xml);
+  if (m1) return { code: (m1[2] ?? '').trim() || null, label: m1[1] ?? null };
+  const m2 = /<DLieu>([^<]+)<\/DLieu><KDLieu>[^<]*<\/KDLieu><TTruong>(Mã tra cứu|Mã số bí mật)<\/TTruong>/.exec(xml);
+  if (m2) return { code: (m2[1] ?? '').trim() || null, label: m2[2] ?? null };
+  return { code: null, label: null };
+}
+
+async function saveOriginalXml(invoiceId: string, xml: Buffer): Promise<void> {
+  const text = xml.toString('utf-8');
+  const { code, label } = extractProviderLookupCode(text);
+  await pool.query(
+    `UPDATE invoices
+        SET raw_xml               = $2,
+            raw_xml_at            = NOW(),
+            raw_xml_size          = $3,
+            xml_status            = 'available',
+            xml_error             = NULL,
+            provider_lookup_code  = COALESCE($4, provider_lookup_code),
+            provider_lookup_label = COALESCE($5, provider_lookup_label),
+            updated_at            = NOW()
+      WHERE id = $1`,
+    [invoiceId, text, xml.byteLength, code, label],
+  );
+  if (code) {
+    logger.debug('[DetailWorker] Có mã tra cứu của nhà cung cấp', { invoiceId, label, code });
+  }
+}
+
+/** Ghi nhận vị trí gói ZIP gốc + bản thể hiện PDF đã render */
+async function saveOriginalDocs(
+  invoiceId: string,
+  docs: { zipPath: string; zipSize: number; pdfPath: string | null; pdfSize: number | null; pdfError: string | null },
+): Promise<void> {
+  await pool.query(
+    `UPDATE invoices
+        SET zip_path         = $2,
+            zip_size         = $3,
+            pdf_path         = COALESCE($4, pdf_path),
+            pdf_size         = COALESCE($5, pdf_size),
+            pdf_status       = CASE WHEN $4::text IS NOT NULL THEN 'available' ELSE 'failed' END,
+            pdf_generated_at = CASE WHEN $4::text IS NOT NULL THEN NOW() ELSE pdf_generated_at END,
+            pdf_error        = $6,
+            updated_at       = NOW()
+      WHERE id = $1`,
+    [invoiceId, docs.zipPath, docs.zipSize, docs.pdfPath, docs.pdfSize,
+     docs.pdfError ? docs.pdfError.slice(0, 300) : null],
+  );
+}
+
+async function markInvoiceXmlUnavailable(invoiceId: string, reason: string): Promise<void> {
+  await pool.query(
+    `UPDATE invoices
+        SET xml_status = 'unavailable',
+            pdf_status = 'unavailable',
+            xml_error  = $2,
+            pdf_error  = $2,
+            updated_at = NOW()
+      WHERE id = $1`,
+    [invoiceId, reason.slice(0, 300)],
+  );
+}
+
+/** Lấy PDF theo mẫu nhà cung cấp và lưu cạnh các file bản gốc khác */
+async function tryFetchProviderPdf(row: XmlQueueRow): Promise<void> {
+  const { rows } = await pool.query<{ tvan: string | null }>(
+    `SELECT gdt_tvandnkntt AS tvan FROM invoices WHERE id = $1`, [row.invoice_id]);
+  const tvan = rows[0]?.tvan ?? null;
+
+  if (!hasProviderAdapter(tvan)) {
+    await pool.query(
+      `UPDATE invoices SET provider_pdf_status='unavailable',
+              provider_pdf_error='Chưa hỗ trợ tải tự động từ nhà cung cấp này — dùng mã tra cứu trên giao diện'
+        WHERE id=$1 AND provider_pdf_status <> 'available'`, [row.invoice_id]);
+    return;
+  }
+
+  const result = await fetchProviderPdf(tvan, {
+    companyId:       row.company_id,
+    supplierTaxCode: row.nbmst,
+    serial:          row.khhdon,
+    invoiceNumber:   row.shdon,
+  });
+
+  if (!result.pdf) {
+    await pool.query(
+      `UPDATE invoices
+          SET provider_pdf_status = $2,
+              provider_pdf_error  = $3
+        WHERE id = $1 AND provider_pdf_status <> 'available'`,
+      [row.invoice_id, result.noConnector ? 'no_connector' : 'failed',
+       (result.error ?? '').slice(0, 300)],
+    );
+    return;
+  }
+
+  const fs   = await import('fs');
+  const path = await import('path');
+  const relDir = path.join(row.company_id, row.invoice_id);
+  const absDir = path.join(storageRoot(), relDir);
+  fs.mkdirSync(absDir, { recursive: true });
+  const rel = path.join(relDir, 'provider.pdf');
+  fs.writeFileSync(path.join(storageRoot(), rel), result.pdf);
+
+  await pool.query(
+    `UPDATE invoices
+        SET provider_pdf_path   = $2,
+            provider_pdf_size   = $3,
+            provider_pdf_status = 'available',
+            provider_pdf_source = $4,
+            provider_pdf_at     = NOW(),
+            provider_pdf_error  = NULL
+      WHERE id = $1`,
+    [row.invoice_id, rel.split(path.sep).join('/'), result.pdf.byteLength, result.source],
+  );
+  logger.info('[DetailWorker] Đã lưu PDF theo mẫu nhà cung cấp', {
+    invoiceId: row.invoice_id, bytes: result.pdf.byteLength, source: result.source,
+  });
+}
+
+/**
+ * Xử lý hàng đợi XML gốc cho một công ty. Chạy sau batch detail, dùng lại gdtApi
+ * đã xác thực. Trả về số lỗi mạng liên tiếp để caller quyết định xoay proxy.
+ */
+async function processXmlQueue(
+  companyId: string,
+  gdtApi:    GdtDirectApiService,
+): Promise<void> {
+  const rows = await claimXmlBatch(companyId, XML_BATCH_SIZE);
+  if (rows.length === 0) return;
+
+  logger.info('[DetailWorker] Tải hoá đơn gốc (XML)', { companyId, count: rows.length });
+  const parser = new GdtXmlParser();
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]!;
+    if (i > 0) await jitterDelay(rows.length);
+
+    try {
+      const buf = await gdtApi.exportInvoiceXml({
+        nbmst:    row.nbmst,
+        khhdon:   row.khhdon,
+        shdon:    row.shdon,
+        khmshdon: row.khmshdon ?? 1,
+      });
+
+      // Lưu nguyên gói bản gốc + render bản thể hiện PDF (Chromium headless).
+      // Lỗi render KHÔNG làm hỏng luồng XML — người dùng vẫn tải được XML ký số.
+      try {
+        const docs = await storeInvoiceDocuments(companyId, row.invoice_id, buf, {
+          renderPdf: row.want_pdf !== false,
+        });
+        await saveOriginalDocs(row.invoice_id, docs);
+      } catch (docErr) {
+        logger.warn('[DetailWorker] Lưu bản gốc / render PDF lỗi (không chặn XML)', {
+          invoiceId: row.invoice_id,
+          err: docErr instanceof Error ? docErr.message : String(docErr),
+        });
+        await pool.query(
+          `UPDATE invoices SET pdf_status='failed', pdf_error=$2 WHERE id=$1`,
+          [row.invoice_id, (docErr instanceof Error ? docErr.message : String(docErr)).slice(0, 300)],
+        ).catch(() => undefined);
+      }
+
+      const xml = parser.extractOriginalXml(buf);
+      if (!xml || xml.byteLength < 100) {
+        await markInvoiceXmlUnavailable(row.invoice_id, 'GDT trả về dữ liệu không phải XML hoá đơn');
+        await pool.query(
+          `UPDATE invoice_xml_queue SET status='skipped', done_at=NOW(),
+                  last_error='not_xml' WHERE id=$1`, [row.id]);
+        continue;
+      }
+
+      await saveOriginalXml(row.invoice_id, xml);
+
+      // Bản PDF theo MẪU RIÊNG của nhà cung cấp (khác bản thể hiện của cổng thuế) —
+      // chỉ lấy được khi công ty đã cấu hình tài khoản nhà cung cấp.
+      if (row.want_provider_pdf) {
+        await tryFetchProviderPdf(row).catch(() => undefined);
+      }
+
+      await pool.query(
+        `UPDATE invoice_xml_queue SET status='done', done_at=NOW(), last_error=NULL WHERE id=$1`,
+        [row.id],
+      );
+      logger.info('[DetailWorker] Đã lưu hoá đơn gốc', {
+        invoiceId: row.invoice_id, bytes: xml.byteLength,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+
+      // HTTP 500 ở export-xml = GDT không lưu file gốc cho hoá đơn này (ttxly 6/8).
+      // Đây là kết quả cuối cùng, KHÔNG retry.
+      if (msg.includes('500')) {
+        await markInvoiceXmlUnavailable(
+          row.invoice_id,
+          'Hệ thống GDT không lưu bản gốc cho hoá đơn này (không mã CQT / uỷ nhiệm)',
+        );
+        await pool.query(
+          `UPDATE invoice_xml_queue SET status='skipped', done_at=NOW(), last_error=$2 WHERE id=$1`,
+          [row.id, msg.slice(0, 300)],
+        );
+        continue;
+      }
+
+      // 401 → token hết hạn, dừng batch XML để chu kỳ sau đăng nhập lại
+      if (msg.includes('401') || msg.toLowerCase().includes('unauthorized')) {
+        await pool.query(
+          `UPDATE invoice_xml_queue SET status='pending', last_error=$2 WHERE id=$1`,
+          [row.id, 'token_expired'],
+        );
+        logger.info('[DetailWorker] Token hết hạn khi tải XML — dừng batch', { companyId });
+        return;
+      }
+
+      const finalFail = row.attempts >= row.max_attempts;
+      await pool.query(
+        `UPDATE invoice_xml_queue SET status='failed', last_error=$2 WHERE id=$1`,
+        [row.id, msg.slice(0, 500)],
+      );
+      if (finalFail) {
+        await pool.query(
+          `UPDATE invoices SET xml_status='failed', xml_error=$2, updated_at=NOW() WHERE id=$1`,
+          [row.invoice_id, msg.slice(0, 300)],
+        );
+      }
+      logger.warn('[DetailWorker] Tải hoá đơn gốc lỗi', {
+        invoiceId: row.invoice_id, attempts: row.attempts, err: msg,
+      });
+    }
+  }
 }
 
 // ── Get or refresh GDT token for a company ────────────────────────────────────
@@ -733,10 +1023,26 @@ async function getToken(
       throw new AuthUnrecoverableError(err.message, err.gdtErrorCode);
     }
 
-    // ── Lỗi transient (mạng, proxy, captcha timeout, 403, quota) ─────────────────
+    // ── Phân loại lỗi: Lỗi mạng/proxy timeout hay lỗi xác thực thực tế? ───────────
+    const msg = err instanceof Error ? err.message : String(err);
+    const isNetworkTimeout = (
+      msg.includes('Hard timeout')     ||  // raceTimeout fired
+      msg.includes('ETIMEDOUT')        ||  // TCP connect timed out
+      msg.includes('ECONNREFUSED')     ||  // proxy port closed
+      msg.includes('ECONNRESET')       ||  // connection reset by proxy
+      msg.includes('socket hang up')   ||  // proxy dropped TCP mid-stream
+      msg.includes('TCP')              ||  // proxy-layer TCP error
+      msg.includes('TLS')                  // TLS handshake failure (proxy MiTM issue)
+    );
+
+    if (isNetworkTimeout) {
+      // Ném lỗi ra ngoài để processCompany() bắt được và thực hiện xoay proxy
+      throw err;
+    }
+
+    // ── Lỗi transient khác (captcha timeout, 403, quota...) ─────────────────────
     // Ghi nhận vào bộ đếm. Sau MAX_CONSECUTIVE_AUTH_FAILURES lần thất bại liên
     // tiếp → deactivate bot để tránh loop vô tận làm cạn 2Captcha balance.
-    const msg = err instanceof Error ? err.message : String(err);
     const failCount = recordAuthFailure(companyId);
     logger.warn('[DetailWorker] GDT login failed', {
       companyId,
@@ -797,6 +1103,13 @@ async function processRow(
   const lineItems = GdtDirectApiService.parseLineItemsFromDetail(detail);
   if (lineItems.length > 0 && !existing?.has_items) {
     await _bulkInsertLineItems(lineItems, invoiceId, row.company_id);
+    // Cập nhật cờ has_line_items — giao diện dựa vào cờ này để báo "Thiếu CT"
+    await pool.query(
+      `UPDATE invoices SET has_line_items = true, updated_at = NOW() WHERE id = $1`,
+      [invoiceId],
+    ).catch(err => logger.warn('[DetailWorker] Không cập nhật được cờ has_line_items', {
+      invoiceId, err: err instanceof Error ? err.message : String(err),
+    }));
     logger.info('[DetailWorker] Line items inserted', { invoiceId, count: lineItems.length });
   }
 
@@ -1103,7 +1416,11 @@ async function processCompany(companyId: string, companyIndex = 0): Promise<void
 
   const batchSize = randomBatchSize();
   const rows = await claimBatch(companyId, batchSize);
-  if (rows.length === 0) return;
+  if (rows.length === 0) {
+    // Không còn detail cần lấy — vẫn phục vụ hàng đợi tải hoá đơn gốc
+    await processXmlQueue(companyId, gdtApi);
+    return;
+  }
 
   logger.info('[DetailWorker] Processing batch', { companyId, count: rows.length, proxyRotations: getProxyFailureState(companyId).totalRotations });
 
@@ -1198,6 +1515,9 @@ async function processCompany(companyId: string, companyIndex = 0): Promise<void
       await markFailed(row.id, msg, row.attempts);
     }
   }
+
+  // Phase 3 — tải hoá đơn gốc sau khi xong batch detail (cùng token, cùng proxy)
+  await processXmlQueue(companyId, gdtApi);
 }
 
 // ── Poll loop ─────────────────────────────────────────────────────────────────
@@ -1231,6 +1551,22 @@ async function getPendingCompanyIds(manualOnly = false): Promise<string[]> {
        )
        ${priorityFilter}
        GROUP BY q.company_id
+
+       UNION ALL
+
+       -- Phase 3: hàng đợi tải hoá đơn gốc (XML ký số).
+       -- Cùng process, cùng token/proxy — không mở thêm luồng đăng nhập GDT.
+       SELECT x.company_id, MIN(x.enqueued_at) AS oldest_pending
+       FROM invoice_xml_queue x
+       JOIN gdt_bot_configs g ON g.company_id = x.company_id AND g.is_active = true
+       WHERE (
+         x.status = 'pending'
+         OR (x.status = 'failed' AND x.attempts < x.max_attempts)
+         OR (x.status = 'processing'
+               AND x.last_attempted_at < NOW() - ($1 || ' minutes')::INTERVAL)
+       )
+       ${priorityFilter.replace(/q\./g, 'x.')}
+       GROUP BY x.company_id
      )
      SELECT DISTINCT ON (uc.user_id) p.company_id
      FROM pending p

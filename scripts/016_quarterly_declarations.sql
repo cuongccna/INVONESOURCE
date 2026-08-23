@@ -10,6 +10,13 @@ ALTER TABLE tax_declarations
 ALTER TABLE tax_declarations
   DROP CONSTRAINT IF EXISTS tax_declarations_company_id_period_month_period_year_form__key;
 
-ALTER TABLE tax_declarations
-  ADD CONSTRAINT tax_declarations_unique_period
-  UNIQUE (company_id, period_month, period_year, form_type, period_type);
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'tax_declarations_unique_period'
+  ) THEN
+    ALTER TABLE tax_declarations
+      ADD CONSTRAINT tax_declarations_unique_period
+      UNIQUE (company_id, period_month, period_year, form_type, period_type);
+  END IF;
+END $$;
