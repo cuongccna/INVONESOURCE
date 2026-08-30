@@ -7,15 +7,18 @@ import apiClient from '../../lib/apiClient';
  * Cửa sổ "Hoá đơn gốc".
  *
  * Phân biệt rõ 3 thứ để người dùng không nhầm:
- *   1. Bản của NHÀ CUNG CẤP (Viettel S-Invoice, MISA meInvoice, VNPT…):
+ *   1. Bản của NHÀ CUNG CẤP (Viettel, MISA, NewCA, EFY…):
  *      PDF theo mẫu riêng của họ. Cổng thuế KHÔNG lưu file này — lấy trên cổng tra cứu
  *      của nhà cung cấp bằng "Mã tra cứu"/"Mã số bí mật" in trên hoá đơn.
+ *      Hệ thống tự tra hộ: cổng nào không có mã xác thực thì chạy một nhịp, cổng nào có
+ *      thì hiện ảnh ngay tại đây cho người dùng nhập.
  *   2. Bản thể hiện của CỔNG THUẾ: PDF dựng từ gói bản gốc mà hoadondientu.gdt.gov.vn
  *      phát hành — đúng dữ liệu, mẫu của cổng thuế.
  *   3. XML ký số: bản gốc hợp pháp (chữ ký người bán + chữ ký cấp mã CQT).
  */
 
 type ViewState = 'loading' | 'ready' | 'waiting' | 'unavailable' | 'error';
+type Tab = 'provider' | 'gdt';
 
 interface ProviderInfo {
   tax_code: string;
@@ -27,10 +30,20 @@ interface ProviderInfo {
   known: boolean;
 }
 
+interface PortalCapability {
+  supported: boolean;
+  driver_id: string | null;
+  provider: string | null;
+  needs_captcha: boolean;
+  verified: boolean;
+}
+
 interface OriginalSources {
   provider: ProviderInfo | null;
   lookup_code: string | null;
   lookup_label: string | null;
+  /** Cổng tra cứu đọc từ chính file hoá đơn; thiếu thì lấy từ danh bạ nhà cung cấp */
+  lookup_url: string | null;
   seller_tax_code: string | null;
   seller_name: string | null;
   invoice_label: string;
@@ -43,6 +56,19 @@ interface OriginalSources {
     automatable: boolean;
     connected: boolean;
   };
+  portal_lookup: PortalCapability;
+}
+
+/** Phản hồi của /provider-lookup và /provider-lookup/captcha */
+interface LookupOutcome {
+  status: 'ready' | 'done' | 'captcha' | 'manual' | 'notfound' | 'error';
+  message: string;
+  size?: number | null;
+  sessionId?: string;
+  imageDataUrl?: string;
+  hint?: string;
+  attemptsLeft?: number;
+  portalUrl?: string | null;
 }
 
 interface Props {
@@ -64,8 +90,28 @@ export default function OriginalInvoiceModal({ invoiceId, label, onClose, onStat
   const [elapsed, setElapsed] = useState(0);
   const [sources, setSources] = useState<OriginalSources | null>(null);
   const [copied, setCopied]   = useState<string | null>(null);
-  const cancelled = useRef(false);
-  const objectUrl = useRef<string | null>(null);
+
+  // ── Bản gốc theo mẫu nhà cung cấp ─────────────────────────────────────────
+  const [tab, setTab]                   = useState<Tab>('gdt');
+  const [providerUrl, setProviderUrl]   = useState<string | null>(null);
+  const [lookupBusy, setLookupBusy]     = useState(false);
+  const [lookupNote, setLookupNote]     = useState<string>('');
+  const [lookupFailed, setLookupFailed] = useState(false);
+  const [captcha, setCaptcha]           = useState<LookupOutcome | null>(null);
+  const [answer, setAnswer]             = useState('');
+
+  // ── Dán link + mã tra cứu của người bán ───────────────────────────────────
+  // Hoá đơn KHÔNG MÃ cơ quan thuế (Viettel, EFY, VNPT…) không có bản gốc trên hệ thống
+  // thuế nên hệ thống không có XML để trích mã. Thứ người dùng luôn có là đoạn chữ người
+  // bán gửi kèm hoá đơn — dán vào đây là hệ thống tra hộ được như mọi hoá đơn khác.
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteText, setPasteText] = useState('');
+  const [pasteBusy, setPasteBusy] = useState(false);
+  const [pasteErr,  setPasteErr]  = useState<string | null>(null);
+
+  const cancelled  = useRef(false);
+  const objectUrl  = useRef<string | null>(null);
+  const providerObjectUrl = useRef<string | null>(null);
 
   /** Thử tải PDF bản thể hiện. true = đã có file hoặc kết luận cuối cùng */
   const fetchPdf = useCallback(async (): Promise<boolean> => {
@@ -100,12 +146,91 @@ export default function OriginalInvoiceModal({ invoiceId, label, onClose, onStat
     return false;
   }, [invoiceId, onStatusChange]);
 
+  /**
+   * Tải file PDF của nhà cung cấp về để xem ngay trong cửa sổ.
+   * Phải đi qua apiClient: token nằm trong bộ nhớ nên mở tab mới sẽ không có quyền.
+   */
+  const loadProviderPdf = useCallback(async (): Promise<boolean> => {
+    const res = await apiClient.get(`/invoices/${invoiceId}/provider-pdf`, {
+      responseType: 'blob',
+      validateStatus: s => s === 200 || s === 409 || s === 404,
+    });
+    if (res.status !== 200) return false;
+    if (providerObjectUrl.current) URL.revokeObjectURL(providerObjectUrl.current);
+    const url = URL.createObjectURL(res.data as Blob);
+    providerObjectUrl.current = url;
+    setProviderUrl(url);
+    setTab('provider');
+    return true;
+  }, [invoiceId]);
+
+  /** Xử lý chung cho cả bước mở phiên lẫn bước gửi mã xác thực */
+  const applyOutcome = useCallback(async (out: LookupOutcome) => {
+    setLookupNote(out.message ?? '');
+    if (out.status === 'captcha') {
+      setCaptcha(out);
+      setAnswer('');
+      setLookupFailed(false);
+      return;
+    }
+    setCaptcha(null);
+    if (out.status === 'done' || out.status === 'ready') {
+      setLookupFailed(false);
+      const ok = await loadProviderPdf();
+      if (!ok) {
+        setLookupFailed(true);
+        setLookupNote('Đã tải được bản gốc nhưng chưa mở được file — thử lại sau ít phút.');
+      }
+      return;
+    }
+    setLookupFailed(true);
+  }, [loadProviderPdf]);
+
+  const runLookup = useCallback(async (force = false) => {
+    setLookupBusy(true);
+    setLookupFailed(false);
+    setLookupNote('Đang kết nối cổng tra cứu của nhà cung cấp…');
+    try {
+      const res = await apiClient.post<{ data: LookupOutcome }>(
+        `/invoices/${invoiceId}/provider-lookup`, { force },
+      );
+      await applyOutcome(res.data.data);
+    } catch {
+      setLookupFailed(true);
+      setLookupNote('Không kết nối được máy chủ. Vui lòng thử lại.');
+    } finally {
+      setLookupBusy(false);
+    }
+  }, [invoiceId, applyOutcome]);
+
+  const sendCaptcha = useCallback(async () => {
+    if (!captcha?.sessionId || !answer.trim()) return;
+    setLookupBusy(true);
+    setLookupNote('Đang gửi mã xác thực…');
+    try {
+      const res = await apiClient.post<{ data: LookupOutcome }>(
+        '/invoices/provider-lookup/captcha',
+        { sessionId: captcha.sessionId, answer: answer.trim() },
+      );
+      await applyOutcome(res.data.data);
+    } catch {
+      setLookupFailed(true);
+      setLookupNote('Không gửi được mã xác thực. Vui lòng thử lại.');
+    } finally {
+      setLookupBusy(false);
+    }
+  }, [captcha, answer, applyOutcome]);
+
   // Nguồn bản gốc của nhà cung cấp — hiển thị ngay, không phụ thuộc việc render PDF
   useEffect(() => {
     apiClient.get<{ data: OriginalSources }>(`/invoices/${invoiceId}/original-sources`)
-      .then(r => setSources(r.data.data))
+      .then(r => {
+        setSources(r.data.data);
+        // Đã có sẵn file của nhà cung cấp thì mở luôn — đó là thứ người dùng muốn xem
+        if (r.data.data.provider_pdf?.has_pdf) void loadProviderPdf();
+      })
       .catch(() => undefined);
-  }, [invoiceId]);
+  }, [invoiceId, loadProviderPdf]);
 
   useEffect(() => {
     cancelled.current = false;
@@ -153,6 +278,7 @@ export default function OriginalInvoiceModal({ invoiceId, label, onClose, onStat
     return () => {
       cancelled.current = true;
       if (objectUrl.current) URL.revokeObjectURL(objectUrl.current);
+      if (providerObjectUrl.current) URL.revokeObjectURL(providerObjectUrl.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [invoiceId]);
@@ -165,29 +291,52 @@ export default function OriginalInvoiceModal({ invoiceId, label, onClose, onStat
     } catch { /* trình duyệt chặn clipboard — người dùng bôi đen copy tay */ }
   };
 
-  const download = (kind: 'pdf' | 'xml') => {
-    const a = document.createElement('a');
-    if (kind === 'pdf' && pdfUrl) {
-      a.href = pdfUrl;
-      a.download = `BanTheHien_${label ?? invoiceId}.pdf`;
-    } else {
-      const base = apiClient.defaults.baseURL ?? '';
-      a.href = `${base}/invoices/${invoiceId}/original-${kind}`;
-      a.target = '_blank';
+  /** Lưu đoạn "link + mã tra cứu" người dùng dán, rồi tra luôn nếu hệ thống hỗ trợ cổng đó */
+  const savePastedLookup = useCallback(async () => {
+    const text = pasteText.trim();
+    if (!text || pasteBusy) return;
+    setPasteBusy(true);
+    setPasteErr(null);
+    try {
+      const res = await apiClient.patch<{ data: OriginalSources }>(
+        `/invoices/${invoiceId}/lookup-info`, { text },
+      );
+      setSources(res.data.data);
+      setPasteOpen(false);
+      setPasteText('');
+      if (res.data.data.portal_lookup?.supported) await runLookup(false);
+      else setLookupNote('Đã lưu thông tin tra cứu — bấm "Mở cổng tra cứu" để lấy bản gốc.');
+    } catch (err) {
+      const msg = (err as { response?: { data?: { error?: { message?: string } } } })
+        ?.response?.data?.error?.message;
+      setPasteErr(msg ?? 'Không lưu được thông tin tra cứu. Kiểm tra lại nội dung vừa dán.');
+    } finally {
+      setPasteBusy(false);
     }
+  }, [pasteText, pasteBusy, invoiceId, runLookup]);
+
+  const downloadBlob = (url: string, filename: string) => {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     a.remove();
   };
 
+  const downloadXml = async () => {
+    const res = await apiClient.get(`/invoices/${invoiceId}/original-xml`, { responseType: 'blob' });
+    const url = URL.createObjectURL(res.data as Blob);
+    downloadBlob(url, `HoaDon_${label ?? invoiceId}.xml`);
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  };
+
   const provider = sources?.provider ?? null;
   const providerLabel = provider?.short_name ?? provider?.name ?? null;
-  const hasProviderPdf = sources?.provider_pdf?.has_pdf === true;
-  const apiBase = apiClient.defaults.baseURL ?? '';
-
-  const openProviderPdf = () => {
-    window.open(`${apiBase}/invoices/${invoiceId}/provider-pdf`, '_blank', 'noopener');
-  };
+  // Link in trong chính hoá đơn là nguồn chuẩn nhất; danh bạ chỉ là dự phòng
+  const lookupUrl = sources?.lookup_url ?? provider?.portal_url ?? null;
+  const canLookup = sources?.portal_lookup?.supported === true;
+  const hasProviderPdf = !!providerUrl || sources?.provider_pdf?.has_pdf === true;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-2 sm:p-6"
@@ -208,19 +357,23 @@ export default function OriginalInvoiceModal({ invoiceId, label, onClose, onStat
             </p>
           </div>
           <div className="flex-1" />
-          {state === 'ready' && (
-            <>
-              <button onClick={() => download('pdf')}
-                className="text-xs font-medium border border-gray-300 text-gray-700 rounded-lg px-3 py-1.5 hover:bg-gray-50">
-                ⬇ Tải bản thể hiện
-              </button>
-              <button onClick={() => download('xml')}
-                title="File XML đã ký số — bản gốc hợp pháp để đối chiếu/nộp cơ quan thuế"
-                className="text-xs font-medium border border-gray-300 text-gray-700 rounded-lg px-3 py-1.5 hover:bg-gray-50">
-                ⬇ XML ký số
-              </button>
-            </>
+          {tab === 'provider' && providerUrl && (
+            <button onClick={() => downloadBlob(providerUrl, `HoaDonGoc_${label ?? invoiceId}.pdf`)}
+              className="text-xs font-medium border border-gray-300 text-gray-700 rounded-lg px-3 py-1.5 hover:bg-gray-50">
+              ⬇ Tải bản nhà cung cấp
+            </button>
           )}
+          {tab === 'gdt' && state === 'ready' && pdfUrl && (
+            <button onClick={() => downloadBlob(pdfUrl, `BanTheHien_${label ?? invoiceId}.pdf`)}
+              className="text-xs font-medium border border-gray-300 text-gray-700 rounded-lg px-3 py-1.5 hover:bg-gray-50">
+              ⬇ Tải bản thể hiện
+            </button>
+          )}
+          <button onClick={() => void downloadXml()}
+            title="File XML đã ký số — bản gốc hợp pháp để đối chiếu/nộp cơ quan thuế"
+            className="text-xs font-medium border border-gray-300 text-gray-700 rounded-lg px-3 py-1.5 hover:bg-gray-50">
+            ⬇ XML ký số
+          </button>
           <button onClick={onClose}
             className="text-gray-400 hover:text-gray-700 rounded-lg px-2 py-1 text-xl leading-none">×</button>
         </div>
@@ -232,10 +385,18 @@ export default function OriginalInvoiceModal({ invoiceId, label, onClose, onStat
               📑 Bản gốc theo mẫu nhà cung cấp{providerLabel ? ` (${providerLabel})` : ''}
             </span>
 
+            {/* Nút tra cứu tự động — chỉ hiện khi hệ thống thật sự tra được cổng đó */}
+            {canLookup && !hasProviderPdf && !captcha && (
+              <button onClick={() => void runLookup(false)} disabled={lookupBusy}
+                className="inline-flex items-center gap-1 bg-emerald-600 text-white font-semibold rounded-lg px-3 py-1.5 hover:bg-emerald-700 disabled:opacity-60">
+                {lookupBusy ? 'Đang tra cứu…' : '⤓ Lấy bản gốc từ nhà cung cấp'}
+              </button>
+            )}
+
             {hasProviderPdf && (
-              <button onClick={openProviderPdf}
+              <button onClick={() => setTab('provider')}
                 className="inline-flex items-center gap-1 bg-emerald-600 text-white font-semibold rounded-lg px-3 py-1.5 hover:bg-emerald-700">
-                ⬇ Tải PDF bản nhà cung cấp
+                ✓ Xem bản nhà cung cấp
                 {sources?.provider_pdf?.size ? ` (${Math.round(sources.provider_pdf.size / 1024)} KB)` : ''}
               </button>
             )}
@@ -259,6 +420,13 @@ export default function OriginalInvoiceModal({ invoiceId, label, onClose, onStat
               </span>
             )}
 
+            {!hasProviderPdf && (
+              <button onClick={() => { setPasteOpen(o => !o); setPasteErr(null); }}
+                className="text-amber-800 underline hover:text-amber-900">
+                {sources?.lookup_code ? 'sửa link/mã tra cứu' : '+ dán link tra cứu của người bán'}
+              </button>
+            )}
+
             {sources?.seller_tax_code && (
               <>
                 <span className="text-amber-900">
@@ -274,44 +442,158 @@ export default function OriginalInvoiceModal({ invoiceId, label, onClose, onStat
               </>
             )}
 
-            {provider?.portal_url && (
-              <a href={provider.portal_url} target="_blank" rel="noopener noreferrer"
+            {lookupUrl && (
+              <a href={lookupUrl} target="_blank" rel="noopener noreferrer"
                  className="ml-auto inline-flex items-center gap-1 bg-amber-600 text-white font-semibold rounded-lg px-3 py-1.5 hover:bg-amber-700">
-                Mở cổng tra cứu {provider.short_name ?? ''} ↗
+                Mở cổng tra cứu {provider?.short_name ?? ''} ↗
               </a>
             )}
           </div>
+
+          {/* Dán đoạn tra cứu người bán gửi kèm hoá đơn — đường duy nhất cho hoá đơn
+              không mã cơ quan thuế, và cho các cổng cấp riêng theo từng tài khoản */}
+          {pasteOpen && (
+            <div className="mt-3 bg-white border border-amber-300 rounded-lg p-3">
+              <p className="text-[11px] text-gray-600 mb-2">
+                Dán nguyên đoạn tra cứu trong thư/hoá đơn người bán gửi — hệ thống tự tách
+                link và mã. Ví dụ:{' '}
+                <span className="font-mono text-gray-500">
+                  …truy cập: https://…-tt78.vnpt-invoice.com.vn — Mã tra cứu hóa đơn: N2026V…
+                </span>
+              </p>
+              <textarea
+                value={pasteText}
+                onChange={e => setPasteText(e.target.value)}
+                rows={3}
+                autoFocus
+                placeholder="Dán link tra cứu và mã tra cứu vào đây"
+                className="w-full text-xs font-mono border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-amber-400"
+              />
+              <div className="mt-2 flex items-center gap-3">
+                <button onClick={() => void savePastedLookup()} disabled={pasteBusy || !pasteText.trim()}
+                  className="text-xs font-semibold bg-emerald-600 text-white rounded-lg px-3 py-2 hover:bg-emerald-700 disabled:opacity-60">
+                  {pasteBusy ? 'Đang lưu…' : 'Lưu và tra cứu'}
+                </button>
+                <button onClick={() => { setPasteOpen(false); setPasteErr(null); }}
+                  className="text-xs text-gray-500 underline hover:text-gray-700">
+                  huỷ
+                </button>
+                {pasteErr && <span className="text-[11px] text-red-700">⚠ {pasteErr}</span>}
+              </div>
+            </div>
+          )}
+
+          {/* Ô nhập mã xác thực — cổng nào bắt captcha thì khách nhập ngay tại đây */}
+          {captcha?.imageDataUrl && (
+            <div className="mt-3 flex flex-wrap items-center gap-3 bg-white border border-amber-300 rounded-lg p-3">
+              <div className="text-xs text-amber-900 font-semibold w-full sm:w-auto">
+                Cổng {sources?.portal_lookup?.provider ?? 'nhà cung cấp'} yêu cầu mã xác thực:
+              </div>
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={captcha.imageDataUrl} alt="Mã xác thực của cổng tra cứu"
+                   className="h-12 rounded border border-gray-300 bg-white" />
+              <input
+                value={answer}
+                onChange={e => setAnswer(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') void sendCaptcha(); }}
+                autoFocus
+                placeholder="Nhập mã trong ảnh"
+                className="w-40 text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-amber-400"
+              />
+              <button onClick={() => void sendCaptcha()} disabled={lookupBusy || !answer.trim()}
+                className="text-xs font-semibold bg-emerald-600 text-white rounded-lg px-3 py-2 hover:bg-emerald-700 disabled:opacity-60">
+                {lookupBusy ? 'Đang tra…' : 'Tra cứu'}
+              </button>
+              <button onClick={() => void runLookup(true)} disabled={lookupBusy}
+                className="text-xs text-amber-800 underline hover:text-amber-900 disabled:opacity-60">
+                đổi mã khác
+              </button>
+              <button onClick={() => { setCaptcha(null); setLookupNote(''); }}
+                className="text-xs text-gray-500 underline hover:text-gray-700">
+                bỏ qua
+              </button>
+              {captcha.hint && (
+                <span className="text-[11px] text-gray-500 w-full">{captcha.hint}</span>
+              )}
+            </div>
+          )}
+
+          {lookupNote && (
+            <p className={`mt-1 text-[11px] ${lookupFailed ? 'text-red-700' : 'text-amber-800'}`}>
+              {lookupFailed ? '⚠ ' : ''}{lookupNote}
+            </p>
+          )}
+
+          {lookupUrl && sources?.lookup_url === lookupUrl && (
+            <p className="mt-1 text-[11px] text-amber-800">
+              Cổng tra cứu lấy từ chính file hoá đơn: <span className="font-mono">{lookupUrl}</span>
+            </p>
+          )}
           {provider?.note && (
             <p className="mt-1 text-[11px] text-amber-800">{provider.note}</p>
           )}
-          {sources?.provider_pdf?.automatable && !sources.provider_pdf.connected && !hasProviderPdf && (
+          {!canLookup && !hasProviderPdf && sources?.lookup_code && (
             <p className="mt-1 text-[11px] text-amber-800">
-              💡 Hệ thống có thể tự tải bản PDF của {providerLabel ?? 'nhà cung cấp'} về đây —
-              chỉ cần thêm tài khoản {providerLabel ?? ''} tại{' '}
-              <a href="/settings/connectors" className="underline font-semibold">Cài đặt → Kết nối hoá đơn</a>.
+              Hệ thống chưa tự tra được cổng của nhà cung cấp này — bấm “Mở cổng tra cứu”
+              rồi dán mã ở trên để tải bản PDF theo đúng mẫu của họ.
             </p>
           )}
-          {!provider?.portal_url && provider && (
+          {!lookupUrl && provider && (
             <p className="mt-1 text-[11px] text-amber-800">
-              Nhà cung cấp: {provider.name} (MST {provider.tax_code}) — tra cứu trên website của đơn vị này
-              bằng mã ở trên để tải PDF theo đúng mẫu của họ.
+              Nhà cung cấp: {provider.name}{provider.tax_code ? ` (MST ${provider.tax_code})` : ''} —
+              hoá đơn không ghi kèm link tra cứu, tìm cổng tra cứu trên website của đơn vị này
+              rồi nhập mã ở trên để tải PDF theo đúng mẫu của họ.
             </p>
           )}
         </div>
 
-        {/* Bản thể hiện từ cổng thuế */}
-        <div className="px-4 py-1.5 bg-gray-50 border-b border-gray-200 text-[11px] text-gray-600">
-          Dưới đây là <strong>bản thể hiện do cổng thuế phát hành</strong> (dữ liệu giống hệt hoá đơn gốc,
-          mẫu trình bày của cổng thuế). Bản có dấu hiệu nhận diện thương hiệu của nhà cung cấp phải tải ở cổng phía trên.
+        {/* Chọn bản đang xem */}
+        <div className="flex items-center gap-1 px-4 py-1.5 bg-gray-50 border-b border-gray-200">
+          <button onClick={() => setTab('provider')} disabled={!providerUrl}
+            className={`text-[11px] font-medium rounded-md px-2.5 py-1 ${
+              tab === 'provider'
+                ? 'bg-white border border-gray-300 text-gray-900 shadow-sm'
+                : 'text-gray-500 hover:text-gray-800 disabled:opacity-40 disabled:hover:text-gray-500'}`}>
+            Bản nhà cung cấp{providerUrl ? '' : ' (chưa có)'}
+          </button>
+          <button onClick={() => setTab('gdt')}
+            className={`text-[11px] font-medium rounded-md px-2.5 py-1 ${
+              tab === 'gdt'
+                ? 'bg-white border border-gray-300 text-gray-900 shadow-sm'
+                : 'text-gray-500 hover:text-gray-800'}`}>
+            Bản thể hiện cổng thuế
+          </button>
+          <span className="text-[11px] text-gray-500 ml-2">
+            {tab === 'provider'
+              ? 'PDF theo đúng mẫu và logo của nhà cung cấp phát hành hoá đơn.'
+              : 'Dữ liệu giống hệt hoá đơn gốc, trình bày theo mẫu của cổng thuế.'}
+          </span>
         </div>
 
         {/* Nội dung */}
         <div className="flex-1 bg-gray-100">
-          {state === 'ready' && pdfUrl && (
+          {tab === 'provider' && providerUrl && (
+            <iframe src={providerUrl} title="Bản gốc theo mẫu nhà cung cấp"
+                    className="w-full h-full border-0" />
+          )}
+
+          {tab === 'provider' && !providerUrl && (
+            <div className="h-full flex flex-col items-center justify-center gap-3 px-8 text-center">
+              <span className="text-4xl">📑</span>
+              <p className="text-sm font-semibold text-gray-800">Chưa có bản của nhà cung cấp</p>
+              <p className="text-xs text-gray-600 max-w-md">
+                {canLookup
+                  ? 'Bấm “Lấy bản gốc từ nhà cung cấp” ở trên — hệ thống tự điền mã tra cứu và MST người bán, cổng nào cần mã xác thực sẽ hiện ảnh ngay tại đây.'
+                  : 'Cổng thuế không lưu bản theo mẫu nhà cung cấp. Dùng mã tra cứu ở trên để tải trên cổng của họ.'}
+              </p>
+            </div>
+          )}
+
+          {tab === 'gdt' && state === 'ready' && pdfUrl && (
             <iframe src={pdfUrl} title="Bản thể hiện hoá đơn" className="w-full h-full border-0" />
           )}
 
-          {(state === 'loading' || state === 'waiting') && (
+          {tab === 'gdt' && (state === 'loading' || state === 'waiting') && (
             <div className="h-full flex flex-col items-center justify-center gap-3 px-6 text-center">
               <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-primary-600" />
               <p className="text-sm font-medium text-gray-700">
@@ -324,20 +606,20 @@ export default function OriginalInvoiceModal({ invoiceId, label, onClose, onStat
             </div>
           )}
 
-          {state === 'unavailable' && (
+          {tab === 'gdt' && state === 'unavailable' && (
             <div className="h-full flex flex-col items-center justify-center gap-3 px-8 text-center">
               <span className="text-4xl">🚫</span>
               <p className="text-sm font-semibold text-gray-800">Cổng thuế không lưu bản thể hiện</p>
               <p className="text-xs text-gray-600 max-w-md">{message}</p>
               <p className="text-xs text-gray-500 max-w-md">
                 Hoá đơn không mã cơ quan thuế (nhóm 6) và hoá đơn máy tính tiền/uỷ nhiệm (nhóm 8)
-                không được lưu file trên cổng tra cứu. Hãy dùng mã tra cứu ở trên để lấy bản của
-                nhà cung cấp, hoặc xin file từ người bán.
+                không được lưu file trên cổng tra cứu. Hãy lấy bản của nhà cung cấp ở trên,
+                hoặc xin file từ người bán.
               </p>
             </div>
           )}
 
-          {state === 'error' && (
+          {tab === 'gdt' && state === 'error' && (
             <div className="h-full flex flex-col items-center justify-center gap-3 px-8 text-center">
               <span className="text-4xl">⏳</span>
               <p className="text-sm font-semibold text-gray-800">Chưa lấy được bản thể hiện</p>

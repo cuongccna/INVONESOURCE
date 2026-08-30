@@ -201,7 +201,7 @@ export default function DeclarationDetailPage() {
       if (warn) {
         const list = decodeURIComponent(String(warn)).split(' | ').filter(Boolean);
         setXmlWarnings(list);
-        toast.error(`Tờ khai có ${list.length} chỉ tiêu chưa khớp công thức — xem cảnh báo phía trên`);
+        toast.error(`Tờ khai có ${list.length} điểm cần kiểm tra trước khi ký/nộp — xem cảnh báo phía trên`);
       } else {
         setXmlWarnings([]);
       }

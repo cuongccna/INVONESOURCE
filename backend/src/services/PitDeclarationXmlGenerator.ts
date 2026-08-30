@@ -169,6 +169,7 @@ export class PitDeclarationXmlGenerator {
       <ct32>${n(declaration.ct32)}</ct32>
     </CTieuTKhaiChinh>
   </HSoKhaiThue>
+  <CKyDTu></CKyDTu>
 </HSoThueDTu>`;
   }
 }

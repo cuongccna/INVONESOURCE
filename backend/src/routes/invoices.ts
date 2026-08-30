@@ -13,7 +13,8 @@ import { missingInvoiceFinder } from '../services/MissingInvoiceFinder';
 import {
   companyVerificationService, MST_STATUS_LABEL, MST_STATUS_RISK, MstStatus,
 } from '../services/CompanyVerificationService';
-import { einvoiceProviderService } from '../services/EInvoiceProviderService';
+import { einvoiceProviderService, parsePastedLookupInfo } from '../services/EInvoiceProviderService';
+import { providerPortalService } from '../services/providerPortal';
 
 // Hợp lệ lý do ẩn hóa đơn
 const DELETE_REASONS = ['duplicate', 'invalid', 'test_data', 'other'] as const;
@@ -167,7 +168,8 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
                 i.gdt_tvandnkntt       AS provider_tax_code,
                 i.provider_lookup_code AS provider_lookup_code,
                 COALESCE(_p.short_name, _p.name, _pc.company_name) AS provider_name,
-                _p.portal_url          AS provider_portal_url,
+                -- Link tra cứu in trong chính hoá đơn đúng hơn danh bạ (cổng riêng theo tỉnh)
+                COALESCE(i.provider_lookup_url, _p.portal_url) AS provider_portal_url,
                 _r.risk_level  AS vendor_risk_level,
                 _r.flag_types  AS vendor_flag_types,
                 -- Trạng thái MST đối tác (tra từ cổng Cục Thuế, cache có TTL theo trạng thái)
@@ -402,6 +404,43 @@ router.get('/export', async (req: Request, res: Response, next: NextFunction) =>
   }
 });
 
+/**
+ * raw_xml có đúng là XML hoá đơn không.
+ *
+ * Vì sao cần kiểm: gói mà cổng thuế trả về là ZIP (invoice.xml + invoice.html + ảnh).
+ * Một đường ghi dữ liệu cũ (bot/src/backfill-xml.ts) từng đổ nguyên buffer ZIP vào cột
+ * raw_xml dưới dạng chuỗi, nên có hoá đơn tải file .xml về là mở lên báo lỗi. Chặn ở đây
+ * để KHÔNG bao giờ giao cho người dùng một file .xml không mở được: hoá đơn hỏng bị coi
+ * như chưa có bản gốc và được xếp hàng tải lại.
+ *
+ * Chấp nhận BOM và khoảng trắng đầu file; gốc phải là <?xml hoặc thẻ hoá đơn.
+ */
+function looksLikeXml(raw: string | null | undefined): boolean {
+  if (!raw) return false;
+  const head = raw.slice(0, 400).replace(/^﻿/, '').trimStart();
+  if (!head.startsWith('<')) return false;                       // ZIP ("PK…"), base64, JSON…
+  if (/^<(!doctype\s+html|html\b)/i.test(head)) return false;    // trang lỗi của cổng, không phải hoá đơn
+  return /^<(\?xml|[A-Za-z_][\w.:-]*)/.test(head);
+}
+
+/**
+ * Xoá bản gốc hỏng khỏi hoá đơn để lần sau hệ thống tải lại từ cổng thuế.
+ * Lỗi ở đây không được làm hỏng việc tải file của người dùng nên nuốt lỗi có chủ đích.
+ */
+async function quarantineCorruptXml(ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  await pool.query(
+    `UPDATE invoices
+        SET raw_xml      = NULL,
+            raw_xml_size = NULL,
+            xml_status   = 'queued',
+            xml_error    = 'Bản gốc lưu trước đây không phải XML hợp lệ — đã xoá để tải lại',
+            updated_at   = NOW()
+      WHERE id = ANY($1::uuid[])`,
+    [ids],
+  ).catch(() => undefined);
+}
+
 // GET /api/invoices/download-xml — tải ZIP chứa XML của các hóa đơn được chọn
 router.get('/download-xml', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -415,10 +454,16 @@ router.get('/download-xml', async (req: Request, res: Response, next: NextFuncti
     if (validIds.length === 0) return res.status(400).json({ success: false, error: { code: 'INVALID_IDS', message: 'No valid UUIDs provided' } });
 
     const placeholders = validIds.map((_, i) => `$${i + 2}`).join(',');
-    const { rows } = await pool.query(
-      `SELECT invoice_number, seller_tax_code, buyer_tax_code, direction, raw_xml FROM invoices WHERE company_id = $1 AND id IN (${placeholders}) AND raw_xml IS NOT NULL AND deleted_at IS NULL`,
+    const { rows: allRows } = await pool.query(
+      `SELECT id, invoice_number, seller_tax_code, buyer_tax_code, direction, raw_xml FROM invoices WHERE company_id = $1 AND id IN (${placeholders}) AND raw_xml IS NOT NULL AND deleted_at IS NULL`,
       [companyId, ...validIds]
     );
+
+    // Bản gốc hỏng (không phải XML) thì dọn đi và xếp hàng tải lại, thay vì đóng gói
+    // một file .xml mở lên báo lỗi cho người dùng.
+    const rows    = allRows.filter(r => looksLikeXml(r.raw_xml as string | null));
+    const corrupt = allRows.filter(r => !looksLikeXml(r.raw_xml as string | null));
+    if (corrupt.length > 0) await quarantineCorruptXml(corrupt.map(r => r.id as string));
 
     if (rows.length === 0) {
       // Check if invoices actually exist but just have no raw_xml stored
@@ -844,11 +889,12 @@ router.get('/:id/provider-pdf', async (req: Request, res: Response, next: NextFu
       provider_pdf_path: string | null; provider_pdf_status: string; provider_pdf_error: string | null;
       invoice_number: string; serial_number: string | null;
       seller_tax_code: string | null; buyer_tax_code: string | null; direction: string;
-      provider_lookup_code: string | null; gdt_tvandnkntt: string | null;
+      provider_lookup_code: string | null; provider_lookup_url: string | null;
+      gdt_tvandnkntt: string | null;
     }>(
       `SELECT provider_pdf_path, COALESCE(provider_pdf_status,'unknown') AS provider_pdf_status,
               provider_pdf_error, invoice_number, serial_number, seller_tax_code, buyer_tax_code,
-              direction, provider_lookup_code, gdt_tvandnkntt
+              direction, provider_lookup_code, provider_lookup_url, gdt_tvandnkntt
          FROM invoices
         WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
       [id, companyId],
@@ -867,8 +913,10 @@ router.get('/:id/provider-pdf', async (req: Request, res: Response, next: NextFu
       }
     }
 
-    // Chưa có: hướng dẫn đúng cách lấy thay vì báo lỗi cụt
-    const provider = await einvoiceProviderService.resolve(inv.gdt_tvandnkntt);
+    // Chưa có: hướng dẫn đúng cách lấy thay vì báo lỗi cụt.
+    // Không có MST đơn vị cung cấp giải pháp thì suy nguồn từ link tra cứu in trong hoá đơn.
+    const provider = (await einvoiceProviderService.resolve(inv.gdt_tvandnkntt))
+      ?? (await einvoiceProviderService.resolveByUrl(inv.provider_lookup_url));
     return res.status(409).json({
       success: false,
       error: {
@@ -882,10 +930,128 @@ router.get('/:id/provider-pdf', async (req: Request, res: Response, next: NextFu
       data: {
         provider,
         lookup_code: inv.provider_lookup_code,
+        lookup_url:  inv.provider_lookup_url ?? provider?.portal_url ?? null,
         seller_tax_code: inv.seller_tax_code,
         provider_pdf_status: inv.provider_pdf_status,
       },
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/invoices/:id/provider-lookup
+ *
+ * Tra cứu bản gốc THEO MẪU NHÀ CUNG CẤP trên cổng công khai của họ, ngay lúc người dùng
+ * bấm — không phải chờ bot chạy nền.
+ *
+ * Hai kiểu cổng:
+ *   - Không có mã xác thực (M-Invoice/NCInvoice, Viet-Invoice, EFY, Viettel): chạy một
+ *     nhịp, hệ thống tự điền MST người bán + mã tra cứu đã có sẵn trong hoá đơn.
+ *   - Có mã xác thực (NewCA, CyberBill, EasyInvoice): trả về ảnh captcha để người dùng
+ *     nhập, rồi gọi tiếp /provider-lookup/captcha.
+ *
+ * Body: { force?: boolean }  — force = tải lại kể cả khi đã có file.
+ */
+router.post('/:id/provider-lookup', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const force = req.body?.force === true;
+    const outcome = await providerPortalService.start(companyId, req.params.id!, req.user!.userId, force);
+    return sendSuccess(res, outcome, outcome.message);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * PATCH /api/invoices/:id/lookup-info
+ *
+ * Ghi LINK + MÃ TRA CỨU của nhà cung cấp vào hoá đơn, do người dùng dán vào.
+ *
+ * VÌ SAO CẦN: hoá đơn KHÔNG MÃ của cơ quan thuế (Viettel, EFY, VNPT…) không có bản gốc
+ * trên hệ thống GDT — hệ thống không có XML nên không tự trích được mã tra cứu, và người
+ * dùng gặp ngõ cụt "không lấy được bản gốc". Thứ họ luôn có trong tay là đoạn chữ người
+ * bán gửi kèm hoá đơn. Dán nguyên đoạn đó vào là hệ thống nhận ra cổng (kể cả cổng cấp
+ * riêng theo từng tài khoản như VNPT) và tra hộ như mọi hoá đơn khác.
+ *
+ * Body: { text } — dán nguyên đoạn, HOẶC { lookup_url, lookup_code } khi nhập tách sẵn.
+ * Trả về nguồn bản gốc đã cập nhật để giao diện vẽ lại ngay trong một vòng gọi.
+ */
+router.patch('/:id/lookup-info', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const { id } = req.params;
+
+    const body = z.object({
+      text:        z.string().max(4000).optional(),
+      lookup_url:  z.string().max(500).optional(),
+      lookup_code: z.string().max(64).optional(),
+    }).safeParse(req.body ?? {});
+    if (!body.success) throw new ValidationError('Dữ liệu tra cứu không hợp lệ');
+
+    // Nhập tách sẵn thì ưu tiên; còn lại đọc từ đoạn chữ dán vào
+    const parsed = body.data.text ? parsePastedLookupInfo(body.data.text) : { url: null, code: null };
+    const url  = (body.data.lookup_url  ?? parsed.url  ?? '').trim() || null;
+    const code = (body.data.lookup_code ?? parsed.code ?? '').trim() || null;
+
+    if (!url && !code) {
+      throw new ValidationError(
+        'Không đọc được link hoặc mã tra cứu trong nội dung vừa dán. ' +
+        'Dán cả dòng "truy cập địa chỉ…" và dòng "Mã tra cứu hóa đơn: …".',
+      );
+    }
+    if (url && !/^https?:\/\/[a-z0-9-]+(\.[a-z0-9-]+)+(\/|$|[?#])/i.test(url)) {
+      throw new ValidationError('Link tra cứu không hợp lệ — phải là địa chỉ http(s) đầy đủ');
+    }
+    if (code && !/^[A-Za-z0-9._-]{6,64}$/.test(code)) {
+      throw new ValidationError('Mã tra cứu chỉ gồm chữ, số và các dấu . _ - (6–64 ký tự)');
+    }
+
+    const { rowCount } = await pool.query(
+      `UPDATE invoices
+          SET provider_lookup_url   = COALESCE($3, provider_lookup_url),
+              provider_lookup_code  = COALESCE($4, provider_lookup_code),
+              provider_lookup_label = CASE WHEN $4::text IS NULL THEN provider_lookup_label
+                                           ELSE COALESCE(provider_lookup_label, 'Mã tra cứu') END,
+              updated_at            = NOW()
+        WHERE id = $1 AND company_id = $2 AND deleted_at IS NULL`,
+      [id, companyId, url, code],
+    );
+    if (rowCount === 0) throw new NotFoundError('Không tìm thấy hoá đơn');
+
+    await writeAuditLog(companyId, req.user!.userId, 'invoice.lookup_info_set', id!, {
+      lookup_url: url, has_code: !!code,
+    });
+
+    const sources = await einvoiceProviderService.getOriginalSources(companyId, id!);
+    return sendSuccess(res, sources, 'Đã lưu thông tin tra cứu của nhà cung cấp');
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/invoices/provider-lookup/captcha
+ * Body: { sessionId: string, answer: string }
+ *
+ * Gửi mã xác thực người dùng vừa nhập. Nhập sai thì trả về ảnh mới kèm số lần còn lại,
+ * không bắt bắt đầu lại từ đầu.
+ */
+router.post('/provider-lookup/captcha', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const companyId = req.user!.companyId!;
+    const body = z.object({
+      sessionId: z.string().uuid(),
+      answer:    z.string().trim().min(1).max(20),
+    }).safeParse(req.body ?? {});
+    if (!body.success) throw new ValidationError('Thiếu mã xác thực hoặc phiên tra cứu');
+
+    const outcome = await providerPortalService.submitCaptcha(
+      companyId, body.data.sessionId, body.data.answer,
+    );
+    return sendSuccess(res, outcome, outcome.message);
   } catch (err) {
     next(err);
   }
@@ -976,15 +1142,22 @@ router.get('/:id/original-xml', async (req: Request, res: Response, next: NextFu
     const inv = rows[0];
     if (!inv) throw new NotFoundError('Không tìm thấy hoá đơn');
 
-    if (inv.raw_xml) {
+    if (looksLikeXml(inv.raw_xml)) {
       const prefix = inv.direction === 'output' ? 'BR' : 'MV';
       const taxCode = inv.direction === 'output' ? inv.seller_tax_code : inv.buyer_tax_code;
       const filename = `${prefix}_${taxCode ?? 'NA'}_${inv.serial_number ?? ''}_${inv.invoice_number}.xml`
         .replace(/[/\\?%*:|"<>]/g, '_');
+      // Gửi dạng Buffer UTF-8 kèm BOM-free: một số công cụ đọc XML của cơ quan thuế
+      // không chịu được BOM, còn trình duyệt thì không cần.
+      const body = Buffer.from(String(inv.raw_xml).replace(/^﻿/, ''), 'utf8');
       res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+      res.setHeader('Content-Length', String(body.byteLength));
       res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-      return res.send(inv.raw_xml);
+      return res.send(body);
     }
+
+    // Có dữ liệu nhưng không phải XML (bản ghi hỏng từ đường nhập cũ) → dọn và tải lại
+    if (inv.raw_xml) await quarantineCorruptXml([id!]);
 
     if (inv.gdt_ttxly === 6 || inv.gdt_ttxly === 8 || inv.xml_status === 'unavailable') {
       return res.status(409).json({

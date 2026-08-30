@@ -40,6 +40,9 @@ interface PlucOutputRow {
  *      KHÔNG dùng thẻ tự đóng <CKyDTu/>.
  *   4. Tên khối phụ lục giảm thuế GTGT là tên kỹ thuật CỐ ĐỊNH của bộ chuẩn XML
  *      (PL_NQ142_GTGT ở phiên bản 2.8.3), không đổi theo từng nghị quyết.
+ *      Tên này được HARD-CODE tại PLUC_VAT_REDUCTION_TAG bên dưới, KHÔNG đọc từ DB:
+ *      một dòng dữ liệu sai trong vat_reduction_policies từng làm công cụ ký treo
+ *      (khối được ghi thành PL_NQ204_GTGT — tên nghị quyết, không có trong bộ chuẩn).
  *   5. Thứ tự các chỉ tiêu phải đúng như XSD (sequence) — đã đối chiếu khớp 100%.
  *
  * Cấu trúc XML theo đúng mẫu HTKK phiên bản 2.8.3:
@@ -56,7 +59,7 @@ interface PlucOutputRow {
  *   ct24_carried_over_vat      → ct22  (kết chuyển kỳ trước)
  *   ct23_input_subtotal        → GiaTriVaThueGTGTHHDVMuaVao/ct23  (giá trị mua vào chưa VAT)
  *   ct23_deductible_input_vat  → GiaTriVaThueGTGTHHDVMuaVao/ct24  (thuế mua vào khấu trừ)
- *   ct25_total_deductible      → ct25
+ *   ct23_deductible_input_vat  → ct25  ([25] = [24]; [22] KHÔNG cộng vào đây)
  *   ct30_exempt_revenue        → ct26  (HHDV không chịu thuế GTGT)
  *   ct29 = 0                   (xuất khẩu 0% — chưa phân biệt riêng)
  *   ct32_revenue_5pct + ct33   → HHDVBRaChiuTSuat5/ct30, ct31
@@ -65,11 +68,21 @@ interface PlucOutputRow {
  *   ct40a_total_output_vat     → ct35  (trước NQ142)
  *   ct35 - ct25                → ct36  (Thuế GTGT phát sinh trong kỳ = net VAT)
  *   plucOutputSumReduction     → ct38  (Điều chỉnh giảm — giảm NQ142/NQ204 2% × DT 8%)
- *   MAX(0, ct36+ct22-ct38)     → ct40a, ct40  (phải nộp — 0 khi đầu vào > đầu ra)
- *   MAX(0, -(ct36+ct22-ct38))  → ct41, ct43   (kết chuyển — 0 khi đầu ra > đầu vào)
+ *   MAX(0, ct36-ct22+ct37-ct38)    → ct40a, ct40  (phải nộp — 0 khi đầu vào > đầu ra)
+ *   MAX(0, -(ct36-ct22+ct37-ct38)) → ct41, ct43   (kết chuyển — 0 khi đầu ra > đầu vào)
  *   ct41_payable_vat           → ct41
  *   ct43_carry_forward_vat     → ct43
  */
+/**
+ * Tên khối phụ lục giảm thuế GTGT trong bộ chuẩn XML 2.8.3 của cơ quan thuế.
+ *
+ * Đây là TÊN KỸ THUẬT của schema, KHÔNG phải tên nghị quyết đang áp dụng. Hai tờ khai
+ * tham chiếu trong repo đều dùng tên này: bản HTKK 5.7.1 và bản đã nộp thành công qua
+ * eTax (kỳ Q4/2025). Ghi tên khác (vd PL_NQ204_GTGT) làm công cụ ký / eTax không nhận file.
+ * Nghị quyết áp dụng cho từng kỳ nằm ở cột legal_basis của vat_reduction_policies.
+ */
+const PLUC_VAT_REDUCTION_TAG = 'PL_NQ142_GTGT';
+
 export class HtkkXmlGenerator {
   async generate(declaration: TaxDeclaration): Promise<string> {
     // ── 1. Thông tin công ty ─────────────────────────────────────────────────
@@ -137,18 +150,27 @@ export class HtkkXmlGenerator {
     const plucOutputSumSubtotal  = Math.round(n(d.ct34_revenue_8pct));
     const plucOutputSumReduction = Math.round(plucOutputSumSubtotal * reductionRate);
 
-    // ── FIX: [25] trong XML = CHỈ thuế đầu vào kỳ này (ct23_deductible_input_vat = form [24])
-    // KHÔNG bao gồm [22] kết chuyển kỳ trước. ct25_total_deductible=[24]+[22] chỉ dùng nội bộ.
-    const xml_ct25 = Math.round(n(d.ct23_deductible_input_vat));
-    // [22] = kết chuyển từ kỳ trước
-    const xml_ct22 = Math.round(n(d.ct24_carried_over_vat));
+    // ── Chỉ tiêu khấu trừ theo đúng mẫu 01/GTGT (TT80/2021) ─────────────────
+    //
+    // [24] Thuế GTGT của HHDV mua vào             = thuế đầu vào phát sinh trong kỳ
+    // [25] Tổng số thuế GTGT được khấu trừ KỲ NÀY = [24] (chưa gồm [22])
+    // [22] Thuế GTGT còn được khấu trừ KỲ TRƯỚC chuyển sang — KHÔNG cộng vào [25],
+    //      mà được trừ ở bước [40a]/[41].
+    //
+    // Đối chiếu tờ khai HTKK 5.7.1 thật (Q2/2026, MST 0319303270):
+    //   [22]=1.823.054  [24]=8.005.715  [25]=8.005.715  ⇒ [25] = [24], không cộng [22]
+    //   [35]=6.293.492  [36]=-1.712.223 = [35] - [25]
+    //   [41]= 3.535.277 = -([36] - [22])                ⇒ [22] trừ ở [40a]/[41]
+    //
+    // Cách cũ (gộp [22] vào [25]) cho ra [41] bằng nhau nhưng ghi sai [25] và [36];
+    // khi eTax/HTKK tự tính lại thì [22] bị trừ HAI LẦN, số kết chuyển kỳ sau sai lệch
+    // đúng bằng [22].
+    const xml_ct24 = Math.round(n(d.ct23_deductible_input_vat));   // [24]
+    const xml_ct25 = xml_ct24;                                     // [25] = [24]
+    const xml_ct22 = Math.round(n(d.ct24_carried_over_vat));       // [22]
 
-    // [36] = [35] - [25], trong đó [25] = [22] + [24] (mẫu 01/GTGT, TT80/2021).
-    // F1-FIX: trước đây tính [36] = [35] - [24], tức bỏ sót [22]. Số [40a]/[41] cuối cùng
-    // vẫn đúng vì [22] được trừ ở bước sau, nhưng giá trị [36] ghi trong XML sai lệch đúng
-    // bằng [22] — HTKK tự tính lại sẽ ra số khác, dễ bị hiểu thành "phải nộp".
-    const xml_ct25_total = xml_ct25 + xml_ct22;          // = [25] trên tờ khai
-    const xml_ct36 = xml_ct35_total - xml_ct25_total;
+    // [36] = [35] - [25]
+    const xml_ct36 = xml_ct35_total - xml_ct25;
 
     // [37] = prior-period adjustments that increase output VAT + manual override
     const xml_ct37 = Math.round(n(d.ct37_auto_decrease ?? 0) + n(d.ct37_adjustment_decrease ?? 0));
@@ -158,8 +180,8 @@ export class HtkkXmlGenerator {
     // Do NOT include plucOutputSumReduction here: that would be a double-reduction.
     const xml_ct38 = Math.round(n(d.ct38_auto_increase ?? 0) + n(d.ct38_adjustment_increase ?? 0));
 
-    // [40a] = MAX(0, [36] + [37] - [38]) — [22] đã nằm trong [25] nên KHÔNG trừ lại lần nữa
-    const xml_ct40a_raw = xml_ct36 + xml_ct37 - xml_ct38;
+    // [40a] = MAX(0, [36] - [22] + [37] - [38] - [39a]) — [39a] hiện luôn = 0
+    const xml_ct40a_raw = xml_ct36 - xml_ct22 + xml_ct37 - xml_ct38;
     // ct40a/ct40: phải nộp — chỉ > 0 khi đầu ra > đầu vào
     const xml_ct40a = Math.max(0, xml_ct40a_raw);
     // ct40b = bù trừ dự án đầu tư (nhập tay)
@@ -256,13 +278,13 @@ export class HtkkXmlGenerator {
             <ct22>${xml_ct22}</ct22>
             <GiaTriVaThueGTGTHHDVMuaVao>
                 <ct23>${n(inputSubtotal)}</ct23>
-                <ct24>${xml_ct25}</ct24>
+                <ct24>${xml_ct24}</ct24>
             </GiaTriVaThueGTGTHHDVMuaVao>
             <HangHoaDichVuNhapKhau>
                 <ct23a>0</ct23a>
                 <ct24a>0</ct24a>
             </HangHoaDichVuNhapKhau>
-            <ct25>${xml_ct25_total}</ct25>
+            <ct25>${xml_ct25}</ct25>
             <ct26>${xml_ct26}</ct26>
             <HHDVBRaChiuThueGTGT>
                 <ct27>${xml_ct27_taxable}</ct27>
@@ -329,6 +351,29 @@ export class HtkkXmlGenerator {
  *
  * Trả về danh sách vi phạm (rỗng = hợp lệ).
  */
+/**
+ * Kiểm tra các trường bắt buộc để eTax NHẬN được file (khác với đẳng thức số học).
+ *
+ * Thiếu mã cơ quan thuế nơi nộp là lỗi hay gặp nhất: file vẫn ký số được nhưng khi nộp
+ * thì eTax không biết định tuyến hồ sơ về đâu, màn hình nộp đứng im. Tờ khai tham chiếu
+ * đã nộp thành công đều có maCQTNoiNop (70111 / 70101).
+ */
+export function validateDeclarationHeader(xml: string): string[] {
+  const text = (tag: string): string => {
+    const m = new RegExp(`<${tag}>([^<]*)</${tag}>`).exec(xml);
+    return (m?.[1] ?? '').trim();
+  };
+
+  const errors: string[] = [];
+  if (!text('maCQTNoiNop')) {
+    errors.push('Thiếu mã cơ quan thuế nơi nộp — khai tại Cài đặt → Hồ sơ thuế trước khi nộp');
+  }
+  if (!text('mst')) {
+    errors.push('Thiếu mã số thuế người nộp thuế');
+  }
+  return errors;
+}
+
 export function validateVatDeclarationXml(xml: string): string[] {
   const num = (tag: string): number => {
     const m = new RegExp(`<${tag}>([^<]*)</${tag}>`).exec(xml);
@@ -350,13 +395,17 @@ export function validateVatDeclarationXml(xml: string): string[] {
   const check = (ok: boolean, msg: string): void => { if (!ok) errors.push(msg); };
   const eq = (a: number, b: number): boolean => Math.abs(a - b) <= 1;   // sai số làm tròn 1đ
 
-  check(eq(ct.c25, ct.c22 + ct.c24), `[25] phải = [22] + [24] (đang là ${ct.c25} ≠ ${ct.c22 + ct.c24})`);
+  // [25] là "tổng thuế được khấu trừ KỲ NÀY" = [24]; [22] của kỳ trước được trừ ở [40a]/[41].
+  check(eq(ct.c25, ct.c24), `[25] phải = [24] (đang là ${ct.c25} ≠ ${ct.c24})`);
   check(eq(ct.c28, ct.c31 + ct.c33), `[28] phải = [31] + [33] (đang là ${ct.c28} ≠ ${ct.c31 + ct.c33})`);
   check(eq(ct.c27, ct.c29 + ct.c30 + ct.c32), `[27] phải = [29] + [30] + [32]`);
   check(eq(ct.c34, ct.c26 + ct.c27 + ct.c32a), `[34] phải = [26] + [27] + [32a]`);
   check(eq(ct.c35, ct.c28), `[35] phải = [28]`);
   check(eq(ct.c36, ct.c35 - ct.c25), `[36] phải = [35] - [25] (đang là ${ct.c36} ≠ ${ct.c35 - ct.c25})`);
-  check(eq(ct.c40a, Math.max(0, ct.c36 + ct.c37 - ct.c38)), `[40a] phải = max(0, [36] + [37] - [38])`);
+  check(eq(ct.c40a, Math.max(0, ct.c36 - ct.c22 + ct.c37 - ct.c38)),
+        `[40a] phải = max(0, [36] - [22] + [37] - [38])`);
+  check(eq(ct.c41, Math.max(0, -(ct.c36 - ct.c22 + ct.c37 - ct.c38)) + Math.max(0, ct.c40b - ct.c40a)),
+        `[41] phải = max(0, -([36] - [22] + [37] - [38])) (đang là ${ct.c41})`);
   check(eq(ct.c40, Math.max(0, ct.c40a - ct.c40b)), `[40] phải = [40a] - [40b]`);
   check(eq(ct.c43, ct.c41 - ct.c42), `[43] phải = [41] - [42]`);
   check(!(ct.c40 > 0 && ct.c41 > 0), `[40] và [41] không thể cùng dương (vừa phải nộp vừa còn khấu trừ)`);
@@ -767,8 +816,16 @@ function _buildPlucXml(
     `                    <tongCongThueGTGTDuocGiam>${outputSumReduction}</tongCongThueGTGTDuocGiam>`,
   ];
 
+  // Cảnh báo nếu dữ liệu chính sách trong DB ghi tên khối khác bộ chuẩn — vẫn xuất theo
+  // bộ chuẩn để file ký/nộp được, nhưng để lại dấu vết cho người vận hành sửa dữ liệu.
+  if (policy.xmlBlockTag && policy.xmlBlockTag !== PLUC_VAT_REDUCTION_TAG) {
+    console.warn('[HtkkXml] vat_reduction_policies.xml_block_tag sai bộ chuẩn — đã bỏ qua', {
+      inDb: policy.xmlBlockTag, dung: PLUC_VAT_REDUCTION_TAG, hieuLucTu: policy.from,
+    });
+  }
+
   return `<PLuc>
-            <${policy.xmlBlockTag}>
+            <${PLUC_VAT_REDUCTION_TAG}>
                 <HH_DV_MuaVaoTrongKy>
 ${inputLines.join('\n')}
                 </HH_DV_MuaVaoTrongKy>
@@ -778,7 +835,7 @@ ${outputLines.join('\n')}
                 <ChenhLech>
                     <ct9>${ct9}</ct9>
                 </ChenhLech>
-            </${policy.xmlBlockTag}>
+            </${PLUC_VAT_REDUCTION_TAG}>
         </PLuc>`;
 }
 

@@ -38,6 +38,7 @@ import type { LineItem }         from './parsers/GdtXmlParser';
 import { GdtXmlParser }          from './parsers/GdtXmlParser';
 import { storeInvoiceDocuments, storageRoot } from './invoice-document.service';
 import { fetchProviderPdf, hasProviderAdapter } from './provider-invoice.service';
+import { fetchPdfFromPublicPortal } from './providers/lookup/runner';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const REDIS_URL = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
@@ -733,31 +734,120 @@ async function claimXmlBatch(companyId: string, batchSize: number): Promise<XmlQ
  * (cổng thuế chỉ có XML ký số + bản thể hiện của cổng thuế).
  */
 function extractProviderLookupCode(xml: string): { code: string | null; label: string | null } {
-  const m1 = /<TTruong>(Mã tra cứu|Mã số bí mật)<\/TTruong><KDLieu>[^<]*<\/KDLieu><DLieu>([^<]+)<\/DLieu>/.exec(xml);
-  if (m1) return { code: (m1[2] ?? '').trim() || null, label: m1[1] ?? null };
-  const m2 = /<DLieu>([^<]+)<\/DLieu><KDLieu>[^<]*<\/KDLieu><TTruong>(Mã tra cứu|Mã số bí mật)<\/TTruong>/.exec(xml);
-  if (m2) return { code: (m2[1] ?? '').trim() || null, label: m2[2] ?? null };
+  for (const { field, value } of ttKhacEntries(xml)) {
+    const label = LOOKUP_CODE_FIELDS[normalizeFieldName(field)];
+    if (label && !/^https?:\/\//i.test(value)) return { code: value, label };
+  }
   return { code: null, label: null };
+}
+
+/**
+ * Đọc các cặp (tên trường, giá trị) trong <TTKhac>. Thứ tự thẻ con không cố định giữa
+ * các nhà cung cấp nên phải bóc theo từng khối <TTin>, không khớp cả chuỗi theo thứ tự.
+ */
+function ttKhacEntries(xml: string): Array<{ field: string; value: string }> {
+  const out: Array<{ field: string; value: string }> = [];
+  const blockRe = /<TTin>([\s\S]*?)<\/TTin>/g;
+  let m: RegExpExecArray | null;
+  while ((m = blockRe.exec(xml)) !== null) {
+    const block = m[1] ?? '';
+    const field = /<TTruong>([^<]*)<\/TTruong>/.exec(block)?.[1]?.trim() ?? '';
+    const value = /<DLieu>([^<]*)<\/DLieu>/.exec(block)?.[1]?.trim() ?? '';
+    if (field && value) out.push({ field, value });
+  }
+  return out;
+}
+
+/** Bỏ dấu tiếng Việt + ký tự ngăn cách để so tên trường bất kể cách viết */
+function normalizeFieldName(s: string): string {
+  return s
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/đ/g, 'd').replace(/Đ/g, 'D')
+    .toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/**
+ * MST tổ chức cung cấp giải pháp HĐĐT (<MSTTCGP>) — đơn vị có cổng tra cứu.
+ * KHÁC với tvandnkntt (tổ chức T-VAN truyền dữ liệu tới cơ quan thuế): vd hoá đơn của
+ * ICORP/Viet-Invoice có MSTTCGP 0106870211 nhưng tvandnkntt là 0312303803 (Win Tech).
+ */
+function extractSolutionProviderTaxCode(xml: string): string | null {
+  const m = /<MSTTCGP>\s*([0-9-]{10,15})\s*<\/MSTTCGP>/.exec(xml);
+  return m?.[1]?.trim() || null;
+}
+
+/** Giữ đồng bộ với backend/src/services/EInvoiceProviderService.ts */
+const LOOKUP_CODE_FIELDS: Record<string, string> = {
+  matracuu:   'Mã tra cứu',
+  masobimat:  'Mã số bí mật',
+  masobaomat: 'Mã số bảo mật',
+  mabaomat:   'Mã bảo mật',
+  fkey:       'Mã tra cứu',
+  lookupcode: 'Mã tra cứu',
+  searchcode: 'Mã tra cứu',
+  secretcode: 'Mã số bí mật',
+};
+
+const LOOKUP_URL_FIELDS = new Set([
+  'portallink', 'portalurl', 'linktracuu', 'linktracuunguoiban',
+  'websitetracuu', 'diachitracuu', 'duongdantracuu', 'tracuutai', 'website',
+]);
+
+/**
+ * Trích ĐƯỜNG LINK tra cứu đi kèm trong hoá đơn (TTKhac).
+ *
+ * Có mã mà không biết cổng nào thì mã vô dụng — đa số hoá đơn ghi sẵn link cạnh mã,
+ * và link trong hoá đơn chính xác hơn danh bạ vì nhiều nhà cung cấp chạy cổng riêng
+ * theo tỉnh. Giữ đồng bộ với extractLookupUrl() ở backend/src/services/EInvoiceProviderService.ts.
+ */
+function extractProviderLookupUrl(xml: string): string | null {
+  const clean = (raw: string): string | null => {
+    const v = raw.trim().replace(/[.,;)]+$/, '');
+    if (/^https?:\/\/\S+$/i.test(v)) return v;
+    if (/^[a-z0-9-]+(\.[a-z0-9-]+)+(\/\S*)?$/i.test(v)) return `https://${v}`;
+    return null;
+  };
+
+  const entries = ttKhacEntries(xml);
+  for (const { field, value } of entries) {
+    if (LOOKUP_URL_FIELDS.has(normalizeFieldName(field))) {
+      const u = clean(value);
+      if (u) return u;
+    }
+  }
+  for (const { value } of entries) {
+    if (/^https?:\/\//i.test(value)) {
+      const u = clean(value);
+      if (u) return u;
+    }
+  }
+  return null;
 }
 
 async function saveOriginalXml(invoiceId: string, xml: Buffer): Promise<void> {
   const text = xml.toString('utf-8');
   const { code, label } = extractProviderLookupCode(text);
+  const lookupUrl   = extractProviderLookupUrl(text);
+  const mstGiaiPhap = extractSolutionProviderTaxCode(text);
   await pool.query(
     `UPDATE invoices
-        SET raw_xml               = $2,
-            raw_xml_at            = NOW(),
-            raw_xml_size          = $3,
-            xml_status            = 'available',
-            xml_error             = NULL,
-            provider_lookup_code  = COALESCE($4, provider_lookup_code),
-            provider_lookup_label = COALESCE($5, provider_lookup_label),
-            updated_at            = NOW()
+        SET raw_xml                    = $2,
+            raw_xml_at                 = NOW(),
+            raw_xml_size               = $3,
+            xml_status                 = 'available',
+            xml_error                  = NULL,
+            provider_lookup_code       = COALESCE($4, provider_lookup_code),
+            provider_lookup_label      = COALESCE($5, provider_lookup_label),
+            provider_lookup_url        = COALESCE($6, provider_lookup_url),
+            provider_solution_tax_code = COALESCE($7, provider_solution_tax_code),
+            updated_at                 = NOW()
       WHERE id = $1`,
-    [invoiceId, text, xml.byteLength, code, label],
+    [invoiceId, text, xml.byteLength, code, label, lookupUrl, mstGiaiPhap],
   );
-  if (code) {
-    logger.debug('[DetailWorker] Có mã tra cứu của nhà cung cấp', { invoiceId, label, code });
+  if (code || lookupUrl || mstGiaiPhap) {
+    logger.debug('[DetailWorker] Có thông tin tra cứu của nhà cung cấp', {
+      invoiceId, label, code, lookupUrl, mstGiaiPhap,
+    });
   }
 }
 
@@ -795,26 +885,67 @@ async function markInvoiceXmlUnavailable(invoiceId: string, reason: string): Pro
   );
 }
 
-/** Lấy PDF theo mẫu nhà cung cấp và lưu cạnh các file bản gốc khác */
+/**
+ * Lấy PDF theo mẫu nhà cung cấp và lưu cạnh các file bản gốc khác.
+ *
+ * Hai đường, thử lần lượt:
+ *   1. API nhà cung cấp bằng TÀI KHOẢN của công ty — chỉ chạy được với hoá đơn đầu ra
+ *      và khi công ty đã cấu hình kết nối. Giữ nguyên như cũ.
+ *   2. CỔNG TRA CỨU CÔNG KHAI bằng mã tra cứu in trên hoá đơn (plugin ở
+ *      providers/lookup) — chạy được cả hoá đơn đầu vào, không cần tài khoản.
+ *      Toàn bộ đường này được bọc kín: không ném lỗi, không treo, tắt được từ trang admin.
+ */
 async function tryFetchProviderPdf(row: XmlQueueRow): Promise<void> {
-  const { rows } = await pool.query<{ tvan: string | null }>(
-    `SELECT gdt_tvandnkntt AS tvan FROM invoices WHERE id = $1`, [row.invoice_id]);
-  const tvan = rows[0]?.tvan ?? null;
+  const { rows } = await pool.query<{
+    tvan: string | null; msttcgp: string | null;
+    lookup_code: string | null; lookup_url: string | null; seller: string | null;
+  }>(
+    `SELECT gdt_tvandnkntt AS tvan, provider_solution_tax_code AS msttcgp,
+            provider_lookup_code AS lookup_code, provider_lookup_url AS lookup_url,
+            seller_tax_code AS seller
+       FROM invoices WHERE id = $1`, [row.invoice_id]);
+  const inv     = rows[0];
+  const tvan    = inv?.tvan ?? null;
+  const msttcgp = inv?.msttcgp ?? null;
 
-  if (!hasProviderAdapter(tvan)) {
-    await pool.query(
-      `UPDATE invoices SET provider_pdf_status='unavailable',
-              provider_pdf_error='Chưa hỗ trợ tải tự động từ nhà cung cấp này — dùng mã tra cứu trên giao diện'
-        WHERE id=$1 AND provider_pdf_status <> 'available'`, [row.invoice_id]);
-    return;
+  let result: { pdf: Buffer | null; source: string | null; error: string | null; noConnector?: boolean };
+
+  if (hasProviderAdapter(tvan)) {
+    result = await fetchProviderPdf(tvan, {
+      companyId:       row.company_id,
+      supplierTaxCode: row.nbmst,
+      serial:          row.khhdon,
+      invoiceNumber:   row.shdon,
+    });
+  } else {
+    result = { pdf: null, source: null, error: null, noConnector: false };
   }
 
-  const result = await fetchProviderPdf(tvan, {
-    companyId:       row.company_id,
-    supplierTaxCode: row.nbmst,
-    serial:          row.khhdon,
-    invoiceNumber:   row.shdon,
-  });
+  // ── Đường 2: cổng tra cứu công khai ─────────────────────────────────────────
+  // Bọc thêm một lớp catch nữa ngoài lớp của runner: dù có chuyện gì xảy ra bên trong
+  // plugin, hàng đợi XML vẫn chạy tiếp bình thường.
+  if (!result.pdf) {
+    const viaPortal = await fetchPdfFromPublicPortal({
+      invoiceId:       row.invoice_id,
+      companyId:       row.company_id,
+      providerTaxCode: msttcgp ?? tvan,
+      sellerTaxCode:   inv?.seller ?? row.nbmst,
+      lookupCode:      inv?.lookup_code ?? null,
+      lookupUrl:       inv?.lookup_url ?? null,
+      serial:          row.khhdon,
+      invoiceNumber:   row.shdon,
+    }).catch((err: unknown) => ({
+      pdf: null as Buffer | null, source: null, final: false,
+      error: `Lỗi plugin tra cứu: ${err instanceof Error ? err.message : String(err)}`,
+    }));
+
+    if (viaPortal.pdf) {
+      result = { pdf: viaPortal.pdf, source: viaPortal.source, error: null };
+    } else if (!result.error) {
+      // Chưa có thông điệp nào từ đường 1 thì lấy thông điệp của đường 2 để hiển thị
+      result = { pdf: null, source: null, error: viaPortal.error, noConnector: result.noConnector };
+    }
+  }
 
   if (!result.pdf) {
     await pool.query(
@@ -910,7 +1041,13 @@ async function processXmlQueue(
       // Bản PDF theo MẪU RIÊNG của nhà cung cấp (khác bản thể hiện của cổng thuế) —
       // chỉ lấy được khi công ty đã cấu hình tài khoản nhà cung cấp.
       if (row.want_provider_pdf) {
-        await tryFetchProviderPdf(row).catch(() => undefined);
+        // Chặn cứng thời gian: bản PDF nhà cung cấp là thứ "có thì tốt", không được phép
+        // giữ hàng đợi XML lại vì một cổng bên thứ ba phản hồi chậm.
+        await raceTimeout(
+          tryFetchProviderPdf(row),
+          cfg.number('provider_lookup.total_budget_ms', 90_000),
+          `provider PDF ${row.khhdon}-${row.shdon}`,
+        ).catch(() => undefined);
       }
 
       await pool.query(

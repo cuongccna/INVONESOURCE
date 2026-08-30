@@ -34,7 +34,7 @@ export class InvoiceNormalizer {
       currency: InvoiceNormalizer.str(raw['currencyCode']) || 'VND',
       status: InvoiceNormalizer.misaStatus(InvoiceNormalizer.str(raw['invoiceStatus'] ?? raw['status'])),
       direction,
-      rawXml: typeof raw['xmlContent'] === 'string' ? raw['xmlContent'] : undefined,
+      rawXml: InvoiceNormalizer.xmlContent(raw['xmlContent']),
       source: 'misa',
     });
   }
@@ -93,6 +93,24 @@ export class InvoiceNormalizer {
   // ============================================================
   // Private helpers
   // ============================================================
+
+  /**
+   * XML hoá đơn do nhà cung cấp trả về.
+   *
+   * MISA/Viettel thường trả trường xmlContent dưới dạng BASE64 chứ không phải XML thô.
+   * Lưu thẳng chuỗi base64 vào invoices.raw_xml thì người dùng tải file .xml về mở lên
+   * báo lỗi — nên giải mã tại đây, và chỉ nhận khi kết quả thật sự là XML.
+   */
+  static xmlContent(val: unknown): string | undefined {
+    if (typeof val !== 'string') return undefined;
+    const s = val.trim();
+    if (!s) return undefined;
+    if (s.replace(/^﻿/, '').trimStart().startsWith('<')) return s;   // đã là XML
+
+    if (!/^[A-Za-z0-9+/\r\n]+={0,2}$/.test(s) || s.length < 40) return undefined;
+    const decoded = Buffer.from(s, 'base64').toString('utf8');
+    return decoded.replace(/^﻿/, '').trimStart().startsWith('<') ? decoded : undefined;
+  }
 
   static str(val: unknown): string {
     if (typeof val === 'string') return val.trim();

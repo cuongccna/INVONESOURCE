@@ -152,16 +152,33 @@ export default function DeclarationsPage() {
     } catch { /* header không phải JSON hợp lệ, bỏ qua */ }
   };
 
-  const downloadXml = async (id: string, month: number, year: number) => {
+  const downloadXml = async (decl: Declaration) => {
     try {
-      const res = await apiClient.get(`/declarations/${id}/xml`, { responseType: 'blob' });
+      const res = await apiClient.get(`/declarations/${decl.id}/xml`, { responseType: 'blob' });
       const url = URL.createObjectURL(new Blob([res.data as BlobPart], { type: 'application/xml' }));
       const a = document.createElement('a');
       a.href = url;
-      a.download = `01GTGT_${year}_${String(month).padStart(2, '0')}.xml`;
+      // Kỳ quý phải ghi Q<quý>, không phải số tháng — trước đây Q2/2026 tải về thành
+      // "01GTGT_2026_02.xml" nên dễ nhầm là tờ khai tháng 2.
+      const ky = decl.period_type === 'quarterly'
+        ? `Q${decl.period_month}${decl.period_year}`
+        : `T${String(decl.period_month).padStart(2, '0')}${decl.period_year}`;
+      a.download = `01_GTGT_TT80-${ky}.xml`;
       a.click();
       URL.revokeObjectURL(url);
       showSyncWarningFromHeader(res.headers as Record<string, string>);
+
+      // Cảnh báo chỉ tiêu / trường bắt buộc — cùng nguồn với màn hình chi tiết tờ khai
+      const warn = (res.headers as Record<string, string>)['x-declaration-warnings'];
+      if (warn) {
+        const list = decodeURIComponent(String(warn)).split(' | ').filter(Boolean);
+        toast.show({
+          tone: 'warning',
+          title: `⚠️ Tờ khai có ${list.length} điểm cần kiểm tra trước khi nộp`,
+          message: list.join(' · '),
+          duration: 12000,
+        });
+      }
     } catch {
       toast.error('Lỗi tải XML. Vui lòng thử lại.');
     }
@@ -305,7 +322,7 @@ export default function DeclarationsPage() {
 
                 <div className="flex rounded-lg border border-gray-300 overflow-hidden text-xs text-gray-700 font-medium divide-x divide-gray-300">
                   <button
-                    onClick={(e) => { e.stopPropagation(); void downloadXml(decl.id, decl.period_month, decl.period_year); }}
+                    onClick={(e) => { e.stopPropagation(); void downloadXml(decl); }}
                     className="flex-1 py-2 hover:bg-gray-50"
                   >
                     📄 XML

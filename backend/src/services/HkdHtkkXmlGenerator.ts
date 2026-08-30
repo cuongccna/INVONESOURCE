@@ -342,6 +342,7 @@ export class HkdHtkkXmlGenerator {
       </PLuc_01_2_BK_HDKD>
     </PLuc>
   </HSoKhaiThue>
+  <CKyDTu></CKyDTu>
 </HSoThueDTu>`;
 
     // Lưu XML vào DB

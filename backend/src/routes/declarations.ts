@@ -5,7 +5,9 @@ import { pool } from '../db/pool';
 import { authenticate, requireRole } from '../middleware/auth';
 import { requireCompany } from '../middleware/company';
 import { TaxDeclarationEngine } from '../services/TaxDeclarationEngine';
-import { HtkkXmlGenerator, validateVatDeclarationXml } from '../services/HtkkXmlGenerator';
+import {
+  HtkkXmlGenerator, validateVatDeclarationXml, validateDeclarationHeader,
+} from '../services/HtkkXmlGenerator';
 import { TVanSubmissionService } from '../services/TVanSubmissionService';
 import { TaxDeclarationExporter } from '../services/TaxDeclarationExporter';
 import { checkLineItemSync } from '../services/InvoiceSyncChecker';
@@ -448,18 +450,25 @@ router.get('/:id/xml', async (req: Request, res: Response, next: NextFunction) =
     const decl = result.rows[0];
     if (!decl) throw new NotFoundError('Declaration not found');
 
-    // Generate XML nếu chưa có hoặc client yêu cầu regenerate (?regenerate=true)
+    // Tờ khai ĐÃ NỘP: giữ nguyên bản XML đã gửi cơ quan thuế để còn đối chiếu.
+    // Tờ khai chưa nộp: LUÔN sinh lại. Bản lưu trong xml_content có thể là sản phẩm của
+    // phiên bản sinh XML cũ (đã từng ghi sai tên khối phụ lục / thiếu khai báo <?xml?>),
+    // tải về sẽ không ký số được — trước đây chỉ sinh lại khi client gửi ?regenerate=true
+    // nên người dùng cứ tải trúng bản hỏng đã cache.
+    const isSubmitted = ['submitted', 'accepted'].includes(decl.submission_status as string);
     let xml: string = decl.xml_content as string;
-    if (!xml || req.query['regenerate'] === 'true') {
+    if (!xml || !isSubmitted || req.query['regenerate'] === 'true') {
       const generator = new HtkkXmlGenerator();
       xml = await generator.generate(decl as TaxDeclaration);
     }
 
-    // F11: cảnh báo nếu tờ khai vi phạm đẳng thức bắt buộc của mẫu 01/GTGT
-    const equationErrors = validateVatDeclarationXml(xml);
-    if (equationErrors.length > 0) {
-      res.setHeader('X-Declaration-Warnings', encodeURIComponent(equationErrors.join(' | ')));
+    // F11: cảnh báo nếu tờ khai vi phạm đẳng thức bắt buộc của mẫu 01/GTGT,
+    // hoặc thiếu trường bắt buộc khiến eTax không nhận file khi nộp.
+    const warnings = [...validateDeclarationHeader(xml), ...validateVatDeclarationXml(xml)];
+    if (warnings.length > 0) {
+      res.setHeader('X-Declaration-Warnings', encodeURIComponent(warnings.join(' | ')));
     }
+    res.setHeader('Access-Control-Expose-Headers', 'X-Declaration-Warnings, X-Sync-Warning');
 
     const { period_month, period_year, period_type } = decl;
     const isQuarterly = period_type === 'quarterly';
@@ -470,7 +479,6 @@ router.get('/:id/xml', async (req: Request, res: Response, next: NextFunction) =
     ).catch(() => null);
     if (syncWarning) {
       res.setHeader('X-Sync-Warning', encodeURIComponent(JSON.stringify(syncWarning)));
-      res.setHeader('Access-Control-Expose-Headers', 'X-Sync-Warning');
     }
 
     const filename = isQuarterly
@@ -501,12 +509,10 @@ router.post(
         throw new ValidationError(`Không thể nộp tờ khai ở trạng thái "${decl.submission_status as string}"`);
       }
 
-      // Generate XML
-      let xml: string = decl.xml_content as string;
-      if (!xml) {
-        const generator = new HtkkXmlGenerator();
-        xml = await generator.generate(decl as TaxDeclaration);
-      }
+      // Luôn sinh lại trước khi nộp: tờ khai ở trạng thái draft/ready có thể đang giữ bản
+      // XML cache của phiên bản sinh XML cũ, nộp lên sẽ bị cơ quan thuế từ chối.
+      const generator = new HtkkXmlGenerator();
+      const xml = await generator.generate(decl as TaxDeclaration);
 
       const tvan = new TVanSubmissionService();
       const submitResult = await tvan.submit(req.params.id, xml);
