@@ -324,11 +324,39 @@ export default function OriginalInvoiceModal({ invoiceId, label, onClose, onStat
     a.remove();
   };
 
+  /**
+   * Tải XML ký số.
+   *
+   * Phần lớn hoá đơn trong hệ thống là hoá đơn KHÔNG MÃ / uỷ nhiệm — cơ quan thuế không
+   * lưu bản gốc, nên endpoint trả 409 (không có) hoặc 202 (đang xếp hàng tải). Trước đây
+   * chỗ này không xử lý hai mã đó: axios ném lỗi, người dùng bấm nút thì không có gì xảy
+   * ra mà cũng không biết vì sao. Nay nói rõ tình trạng.
+   */
   const downloadXml = async () => {
-    const res = await apiClient.get(`/invoices/${invoiceId}/original-xml`, { responseType: 'blob' });
-    const url = URL.createObjectURL(res.data as Blob);
-    downloadBlob(url, `HoaDon_${label ?? invoiceId}.xml`);
-    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    try {
+      const res = await apiClient.get(`/invoices/${invoiceId}/original-xml`, {
+        responseType: 'blob',
+        validateStatus: s => s === 200 || s === 202 || s === 409,
+      });
+      if (res.status === 200) {
+        const url = URL.createObjectURL(res.data as Blob);
+        downloadBlob(url, `HoaDon_${label ?? invoiceId}.xml`);
+        setTimeout(() => URL.revokeObjectURL(url), 10_000);
+        return;
+      }
+      const text = await (res.data as Blob).text();
+      const parsed = JSON.parse(text) as { error?: { message?: string }; message?: string };
+      setLookupFailed(res.status === 409);
+      setLookupNote(
+        parsed.error?.message ?? parsed.message ??
+        (res.status === 202
+          ? 'Đang tải bản gốc từ hệ thống thuế — thử lại sau ít phút.'
+          : 'Hoá đơn này không có XML gốc trên hệ thống thuế.'),
+      );
+    } catch {
+      setLookupFailed(true);
+      setLookupNote('Không tải được XML ký số. Vui lòng thử lại.');
+    }
   };
 
   const provider = sources?.provider ?? null;

@@ -424,6 +424,26 @@ function looksLikeXml(raw: string | null | undefined): boolean {
 }
 
 /**
+ * Bổ sung dòng khai báo XML khi file gốc thiếu.
+ *
+ * ĐÃ KIỂM TRÊN DỮ LIỆU THẬT: invoice.xml trong gói ZIP mà cổng thuế phát hành KHÔNG có
+ * dòng <?xml version="1.0" encoding="UTF-8"?> — 122/122 hoá đơn đều bắt đầu thẳng bằng
+ * <HDon>. File vẫn đúng chuẩn XML (trình duyệt và bộ phân tích đều đọc được), nhưng nhiều
+ * công cụ đọc hoá đơn của Việt Nam (iTaxViewer, HTKK, một số trình xem của nhà cung cấp)
+ * đòi có dòng khai báo mới chịu mở — đó là lý do người dùng tải XML về mở lên báo lỗi.
+ *
+ * Thêm dòng này KHÔNG ảnh hưởng chữ ký số: chữ ký XML-DSig tham chiếu tới node <DLHDon>
+ * theo Id, phần khai báo nằm ngoài mọi node được ký nên không thuộc dữ liệu đã băm.
+ * Nội dung hoá đơn giữ nguyên từng byte.
+ */
+function withXmlDeclaration(raw: string): string {
+  const body = raw.replace(/^﻿/, '');
+  return body.trimStart().startsWith('<?xml')
+    ? body
+    : `<?xml version="1.0" encoding="UTF-8"?>\n${body}`;
+}
+
+/**
  * Xoá bản gốc hỏng khỏi hoá đơn để lần sau hệ thống tải lại từ cổng thuế.
  * Lỗi ở đây không được làm hỏng việc tải file của người dùng nên nuốt lỗi có chủ đích.
  */
@@ -497,7 +517,7 @@ router.get('/download-xml', async (req: Request, res: Response, next: NextFuncti
       const prefix = row.direction === 'output' ? 'BR' : 'MV';
       const taxCode = row.direction === 'output' ? row.seller_tax_code : row.buyer_tax_code;
       const filename = `${prefix}_${taxCode}_${row.invoice_number || 'unknown'}.xml`.replace(/[/\\?%*:|"<>]/g, '_');
-      archive.append(row.raw_xml, { name: filename });
+      archive.append(withXmlDeclaration(String(row.raw_xml)), { name: filename });
     }
 
     await archive.finalize();
@@ -1147,9 +1167,9 @@ router.get('/:id/original-xml', async (req: Request, res: Response, next: NextFu
       const taxCode = inv.direction === 'output' ? inv.seller_tax_code : inv.buyer_tax_code;
       const filename = `${prefix}_${taxCode ?? 'NA'}_${inv.serial_number ?? ''}_${inv.invoice_number}.xml`
         .replace(/[/\\?%*:|"<>]/g, '_');
-      // Gửi dạng Buffer UTF-8 kèm BOM-free: một số công cụ đọc XML của cơ quan thuế
-      // không chịu được BOM, còn trình duyệt thì không cần.
-      const body = Buffer.from(String(inv.raw_xml).replace(/^﻿/, ''), 'utf8');
+      // Buffer UTF-8, bỏ BOM và thêm dòng khai báo XML nếu file gốc thiếu — đó là điều
+      // kiện để các công cụ đọc hoá đơn của Việt Nam mở được file (xem withXmlDeclaration).
+      const body = Buffer.from(withXmlDeclaration(String(inv.raw_xml)), 'utf8');
       res.setHeader('Content-Type', 'application/xml; charset=utf-8');
       res.setHeader('Content-Length', String(body.byteLength));
       res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
