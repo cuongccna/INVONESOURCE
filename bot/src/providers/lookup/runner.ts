@@ -16,7 +16,7 @@ import { cfg } from '../../config/ConfigStore';
 import { logger } from '../../logger';
 import { createLookupHttp } from './http';
 import { buildAdapter, loadLookupConfigs } from './registry';
-import { renderHtmlToPdf } from '../../invoice-document.service';
+import { ensureUtf8Document, renderHtmlToPdf } from '../../invoice-document.service';
 import { LookupDocument, LookupInputError, LookupNotFoundError, LookupRequest } from './types';
 
 export interface LookupOutcome {
@@ -183,7 +183,7 @@ async function toPdf(doc: LookupDocument, providerName: string): Promise<Buffer>
   const dir  = fs.mkdtempSync(path.join(os.tmpdir(), 'lookup-'));
   const file = path.join(dir, 'invoice.html');
   try {
-    fs.writeFileSync(file, doc.html, 'utf-8');
+    fs.writeFileSync(file, ensureUtf8Document(doc.html), 'utf-8');
     const pdf = await renderHtmlToPdf(file);
     if (pdf.subarray(0, 5).toString('latin1') !== '%PDF-') {
       throw new Error(`Render bản thể hiện của ${providerName} không ra PDF hợp lệ`);

@@ -14,6 +14,31 @@ const RENDER_TIMEOUT_MS = Number(process.env['PDF_RENDER_TIMEOUT_MS'] ?? 60_000)
 
 let shared: Browser | null = null;
 
+/**
+ * Bảo đảm HTML khai báo UTF-8 trước khi đưa vào Chromium.
+ *
+ * Cổng nhà cung cấp trả về MẢNH HTML: không <head>, không khai báo bộ mã. Chromium phải
+ * tự đoán, và với hoá đơn ít dấu tiếng Việt nó đoán ra windows-1252 — cả tờ hoá đơn biến
+ * thành "HÃ³a Ä'Æ¡n GiÃ¡ Trá»‹ Gia TÄƒng". Khai thẳng UTF-8 thì không còn chỗ cho phỏng đoán.
+ *
+ * HTML nào đã tự khai bộ mã (bản thể hiện đầy đủ của cổng thuế, mảnh VNPT đã bọc sẵn) thì
+ * giữ nguyên — không ghi đè khai báo của nhà cung cấp.
+ */
+export function ensureUtf8Document(html: string): string {
+  if (/<meta[^>]+charset/i.test(html)) return html;
+
+  const meta = '<meta charset="utf-8">';
+  const head = /<head[^>]*>/i.exec(html);
+  if (head) {
+    const at = head.index + head[0].length;
+    return html.slice(0, at) + meta + html.slice(at);
+  }
+  if (/<html[\s>]/i.test(html)) {
+    return html.replace(/<html([^>]*)>/i, `<html$1><head>${meta}</head>`);
+  }
+  return `<!doctype html><html><head>${meta}</head><body>${html}</body></html>`;
+}
+
 async function browser(): Promise<Browser> {
   if (shared) {
     try {
@@ -48,7 +73,7 @@ export async function renderHtmlToPdf(html: string): Promise<Buffer> {
   try {
     await page.setJavaScriptEnabled(false);
     await page.setViewport({ width: 1240, height: 1754 });
-    await page.setContent(html, { waitUntil: 'load', timeout: RENDER_TIMEOUT_MS });
+    await page.setContent(ensureUtf8Document(html), { waitUntil: 'load', timeout: RENDER_TIMEOUT_MS });
     const pdf = await page.pdf({
       format: 'A4',
       printBackground: true,
