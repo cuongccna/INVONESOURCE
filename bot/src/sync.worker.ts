@@ -1103,7 +1103,9 @@ async function processGdtSync(job: Job<SyncJobData>): Promise<void> {
         //     Do NOT markFailed the proxy; it's not the proxy's fault.
         //   - Everything else → assume proxy is bad, markFailed and rotate.
         const isTlsHandshakeHang = msgLc.includes('tls handshake timeout');
-        if (proxyUrl && !isTlsHandshakeHang) proxyManager.markFailed(proxyUrl);
+        // GDT_WAF_BLOCK: GDT đã nhận và trả lời request (403 chống bot) → proxy vẫn tốt.
+        const isGdtWafBlock = msg.startsWith('GDT_WAF_BLOCK');
+        if (proxyUrl && !isTlsHandshakeHang && !isGdtWafBlock) proxyManager.markFailed(proxyUrl);
         if (isTlsHandshakeHang) {
           logger.warn('[SyncWorker] TLS handshake timeout — GDT-side throttle suspected, proxy NOT marked failed', {
             companyId,

@@ -81,6 +81,14 @@ void (async () => {
   const sw = await import('./sync.worker');
   const { worker, manualWorker, autoWorker, flushStaleLocks } = sw;
 
+  // Chẩn đoán GDT do admin kích hoạt (queue gdt-diagnose)
+  const { diagnoseWorker } = await import('./gdt-diagnose.worker');
+
+  // Chẩn đoán tự động mỗi ngày trong giờ hành chính → dashboard báo khi mất kết nối GDT
+  const { runDailyGdtDiagnoseTick } = await import('./cron/daily-gdt-diagnose');
+  void runDailyGdtDiagnoseTick();
+  setInterval(() => void runDailyGdtDiagnoseTick(), 10 * 60 * 1000);
+
   // Flush locks cũ chỉ sau khi proxy xác nhận sẵn sàng
   void flushStaleLocks();
 
@@ -106,6 +114,7 @@ void (async () => {
       worker.close(),
       manualWorker.close(),
       autoWorker.close(),
+      diagnoseWorker.close(),
       stopBotHeartbeat(),
     ]);
     process.exit(0);

@@ -21,6 +21,7 @@ import { logger }                 from './logger';
 import { cfg }                    from './config/ConfigStore';
 import { decryptCredentials }     from './encryption.service';
 import { createTunnelAgent }      from './proxy-tunnel';
+import { attachGdtBrowserHeaders, gdtBrowserHeaders } from './gdt-request-headers';
 import { CaptchaService }        from './captcha.service';
 
 import {
@@ -199,6 +200,7 @@ function createGdtClient(
   }
 
   const client = axios.create(axiosConfig);
+  attachGdtBrowserHeaders(client);
 
   // Request interceptor: per-endpoint timeout (with peak period multiplier)
   client.interceptors.request.use((reqConfig) => {
@@ -450,6 +452,7 @@ async function loginGdt(
 
     const captchaRes = await axios.get(captchaEndpoint, {
       ...axiosConfig,
+      headers: { ...headers, ...gdtBrowserHeaders(captchaEndpoint) },
       responseType: 'arraybuffer',
     });
 
@@ -475,6 +478,7 @@ async function loginGdt(
         ...axiosConfig,
         headers: {
           ...headers,
+          ...gdtBrowserHeaders(authEndpoint),
           'content-type': 'application/json',
           'accept': 'application/json, text/plain, */*',
         },

@@ -9,6 +9,7 @@ import Link from 'next/link';
 import apiClient from '../../../lib/apiClient';
 import { useCompany } from '../../../contexts/CompanyContext';
 import { ProfessionalTaxCalendar } from '../../../components/dashboard/TaxCalendar';
+import { GdtConnectionNotice } from '../../../components/dashboard/GdtConnectionNotice';
 
 /* ─── Types ───────────────────────────────────────────────────────────────── */
 interface TaxDeadline {
@@ -397,6 +398,9 @@ export default function DashboardPage() {
           ↻ Làm mới
         </button>
       </div>
+
+      {/* ── Kết nối GDT — chỉ hiện khi chẩn đoán hằng ngày phát hiện lỗi ── */}
+      <GdtConnectionNotice />
 
       {/* ── Professional Tax Calendar — đầu trang ── */}
       {calendarDeadlines.length > 0 && (

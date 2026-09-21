@@ -98,6 +98,17 @@ export default function AdminPage() {
         </button>
       </div>
 
+      <Link
+        href="/admin/gdt-diagnose"
+        className="flex items-center justify-between gap-3 rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3 hover:bg-indigo-100"
+      >
+        <div>
+          <p className="text-sm font-semibold text-indigo-800">🩺 Chẩn đoán GDT</p>
+          <p className="text-xs text-indigo-700">Bot không kéo được hoá đơn? Kiểm tra từng mốc proxy → captcha → đăng nhập → kéo hoá đơn và sửa ngay.</p>
+        </div>
+        <span className="text-sm font-medium text-indigo-700 shrink-0">Mở →</span>
+      </Link>
+
       {/* KPIs */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4">
         <KCard label="Tổng người dùng" value={data.users.total} sub={`${data.users.active} đang hoạt động`} />

@@ -15,6 +15,7 @@ const NAV_ITEMS = [
   { href: '/admin/plans',                label: 'Gói dịch vụ',      icon: '💼' },
   { href: '/admin/analytics',            label: 'Phân tích',        icon: '📈' },
   { href: '/admin/proxies',              label: 'Proxy Pool',       icon: '🌐' },
+  { href: '/admin/gdt-diagnose',         label: 'Chẩn đoán GDT',    icon: '🩺' },
   { href: '/admin/crawler-recipes',      label: 'Crawler Recipes',  icon: '🔧' },
   { href: '/admin/indicator-configs',    label: 'Chỉ tiêu 01/GTGT', icon: '⚙️' },
   { href: '/admin/system-settings',      label: 'Cài đặt hệ thống', icon: '🛠️' },
