@@ -21,6 +21,7 @@ import { logger }                 from './logger';
 import { cfg }                    from './config/ConfigStore';
 import { decryptCredentials }     from './encryption.service';
 import { createTunnelAgent }      from './proxy-tunnel';
+import { attachGdtBrowserHeaders, gdtBrowserHeaders } from './gdt-request-headers';
 import { CaptchaService }        from './captcha.service';
 
 import {
@@ -199,6 +200,7 @@ function createGdtClient(
   }
 
   const client = axios.create(axiosConfig);
+  attachGdtBrowserHeaders(client);
 
   // Request interceptor: per-endpoint timeout (with peak period multiplier)
   client.interceptors.request.use((reqConfig) => {
@@ -450,6 +452,7 @@ async function loginGdt(
 
     const captchaRes = await axios.get(captchaEndpoint, {
       ...axiosConfig,
+      headers: { ...headers, ...gdtBrowserHeaders(captchaEndpoint) },
       responseType: 'arraybuffer',
     });
 
@@ -475,6 +478,7 @@ async function loginGdt(
         ...axiosConfig,
         headers: {
           ...headers,
+          ...gdtBrowserHeaders(authEndpoint),
           'content-type': 'application/json',
           'accept': 'application/json, text/plain, */*',
         },
@@ -514,8 +518,17 @@ async function loginGdt(
       const data = (err as { response?: { data?: unknown } }).response?.data;
       const dataStr = typeof data === 'string' ? data : JSON.stringify(data ?? '');
 
+      const dataStrLc = dataStr.toLowerCase();
+
       // Wrong captcha → retry
-      if (dataStr.includes('captcha') || dataStr.includes('Mã xác nhận không đúng')) {
+      if (
+        dataStrLc.includes('captcha') ||
+        dataStrLc.includes('mã xác nhận') ||
+        dataStrLc.includes('mã captcha') ||
+        dataStrLc.includes('mã xác thực') ||
+        dataStrLc.includes('xác thực') ||
+        dataStrLc.includes('xác nhận')
+      ) {
         logger.warn('Wrong captcha, retrying', { attempt: attempt + 1 });
         continue;
       }
@@ -924,7 +937,7 @@ async function processSyncJob(job: Job<SyncJobData>): Promise<Record<string, unk
     if (err instanceof UnrecoverableError) {
       // Deactivate bot credentials
       await pool.query(
-        `UPDATE company_gdt_credentials SET is_active = false, updated_at = NOW() WHERE company_id = $1`,
+        `UPDATE gdt_bot_configs SET is_active = false, updated_at = NOW() WHERE company_id = $1`,
         [tenantId],
       ).catch(() => {});
     }

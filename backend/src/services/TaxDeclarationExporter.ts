@@ -1018,13 +1018,33 @@ ${pluc8Input.length > 0 ? `
 </body>
 </html>`;
 
+    const browser = await TaxDeclarationExporter.getBrowser();
+    const page = await browser.newPage();
+    try {
+      await page.setContent(html, { waitUntil: 'domcontentloaded' });
+      const pdf = await page.pdf({ format: 'A4', printBackground: true, margin: { top: '15mm', bottom: '15mm', left: '12mm', right: '12mm' } });
+      return Buffer.from(pdf);
+    } finally {
+      await page.close();
+    }
+  }
+
+  private static sharedBrowser: any = null;
+
+  private static async getBrowser() {
+    if (this.sharedBrowser) {
+      try {
+        if (this.sharedBrowser.connected) {
+          return this.sharedBrowser;
+        }
+      } catch {
+        this.sharedBrowser = null;
+      }
+    }
     const { default: puppeteer } = await import('puppeteer');
-    // On Linux VPS: set CHROMIUM_PATH=/usr/bin/chromium-browser (or chromium / google-chrome)
-    // to use the system-installed browser instead of puppeteer's bundled one.
-    // If CHROMIUM_PATH is not set, puppeteer uses its own bundled Chrome (needs system libs).
     const executablePath = process.env['CHROMIUM_PATH'] || undefined;
     const isLinux = process.platform === 'linux';
-    const browser = await puppeteer.launch({
+    this.sharedBrowser = await puppeteer.launch({
       headless: true,
       executablePath,
       args: [
@@ -1034,13 +1054,6 @@ ${pluc8Input.length > 0 ? `
         '--disable-gpu',
       ],
     });
-    try {
-      const page = await browser.newPage();
-      await page.setContent(html, { waitUntil: 'domcontentloaded' });
-      const pdf = await page.pdf({ format: 'A4', printBackground: true, margin: { top: '15mm', bottom: '15mm', left: '12mm', right: '12mm' } });
-      return Buffer.from(pdf);
-    } finally {
-      await browser.close();
-    }
+    return this.sharedBrowser;
   }
 }

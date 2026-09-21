@@ -21,6 +21,7 @@
 import axios, { AxiosInstance } from 'axios';
 import { createTunnelAgent, createSocks5TunnelAgent } from './proxy-tunnel';
 import { CaptchaService } from './captcha.service';
+import { attachGdtBrowserHeaders, isGdtWafBlock } from './gdt-request-headers';
 import { logger } from './logger';
 import { cfg } from './config/ConfigStore';
 import type { RawInvoice } from './parsers/GdtXmlParser';
@@ -954,6 +955,7 @@ export class GdtDirectApiService {
       ...(httpAgent ? { httpAgent } : {}),
     });
     this._addTimeoutInterceptor(this.http);
+    attachGdtBrowserHeaders(this.http);
     // SOCKS5 client for binary downloads (XML ZIP / XLSX).
     // Pure TCP relay → no content filtering by proxy → binary always works.
     // When socks5ProxyUrl is null: binaryHttp stays null → _getBinaryWithRetry uses this.http.
@@ -966,6 +968,7 @@ export class GdtDirectApiService {
         paramsSerializer: serializeParams,  // BUG-1: raw FIQL values, encoded keys only
         httpAgent:        socks5Agent,
       });
+      attachGdtBrowserHeaders(this.binaryHttp);
     }
   }
 
@@ -1030,6 +1033,7 @@ export class GdtDirectApiService {
       httpAgent,
     });
     this._addTimeoutInterceptor(this.http);
+    attachGdtBrowserHeaders(this.http);
     logger.info('[GdtDirect] Proxy swapped — new axios instance created', {
       newProxy: newProxyUrl.replace(/:([^@:]+)@/, ':****@').slice(0, 50),
     });
@@ -1185,7 +1189,10 @@ export class GdtDirectApiService {
           const isCaptchaError =
             msgLc.includes('captcha') ||
             msgLc.includes('mã xác nhận') ||
-            msgLc.includes('mã captcha');
+            msgLc.includes('mã captcha') ||
+            msgLc.includes('mã xác thực') ||
+            msgLc.includes('xác thực') ||
+            msgLc.includes('xác nhận');
 
           if ((status === 400 || status === 401) && isCaptchaError) {
             if (lastCaptchaId) await this.captchaService.reportBad(lastCaptchaId);
@@ -1194,6 +1201,14 @@ export class GdtDirectApiService {
             lastCaptchaId = null;
             await sleep(retryDelayMs);
             continue;
+          }
+
+          // 403 "Hệ thống phát hiện hành vi không hợp lệ" = lớp chống bot của GDT từ chối
+          // request (thiếu header trình duyệt, IP bị gắn cờ...). Không phải lỗi tài khoản,
+          // cũng không phải lỗi proxy — ném lỗi có tiền tố để worker không đánh dấu proxy hỏng.
+          if (isGdtWafBlock(status, rawBody)) {
+            logger.error('[GdtDirect] GDT chặn request đăng nhập (403 chống bot)', { msg });
+            throw new Error(`GDT_WAF_BLOCK: ${msg || 'HTTP 403'}`);
           }
 
           // Wrong credentials / account locked → throw GdtAuthError immediately.

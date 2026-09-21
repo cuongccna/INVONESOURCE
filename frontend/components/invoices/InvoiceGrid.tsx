@@ -37,7 +37,40 @@ export interface GridInvoice {
   non_deductible: boolean | null;
   vendor_risk_level: 'critical' | 'high' | 'medium' | 'low' | null;
   vendor_flag_types: string[] | null;
+  // Trạng thái MST đối tác — tra từ cổng Cục Thuế (tracuunnt.gdt.gov.vn)
+  partner_mst_status: MstStatus | null;
+  partner_mst_status_raw: string | null;
+  partner_registered_name: string | null;
+  partner_tax_authority: string | null;
+  partner_status_checked_at: string | null;
+  partner_status_stale: boolean | null;
+  // Hoá đơn gốc (XML ký số) — 'available' | 'queued' | 'unavailable' | 'failed' | 'unknown'
+  xml_status: string | null;
+  // Bản thể hiện PDF do cổng thuế phát hành — cùng tập trạng thái với xml_status
+  pdf_status: string | null;
+  // Nhà cung cấp HĐĐT (Viettel/MISA/VNPT…) và mã tra cứu bản gốc theo mẫu của họ
+  provider_name: string | null;
+  provider_tax_code: string | null;
+  provider_lookup_code: string | null;
+  provider_portal_url: string | null;
 }
+
+export type MstStatus =
+  | 'active' | 'suspended' | 'inactive_at_address' | 'pending_dissolution'
+  | 'dissolved' | 'moved' | 'not_found' | 'error' | 'pending';
+
+/** Nhãn + màu cho cột "Trạng thái NNT" */
+export const MST_STATUS_BADGE: Record<MstStatus, { label: string; short: string; cls: string; dot: string }> = {
+  active:              { label: 'Đang hoạt động',                    short: 'Hoạt động',   cls: 'bg-green-100 text-green-700',   dot: 'bg-green-500' },
+  suspended:           { label: 'Tạm ngừng kinh doanh',              short: 'Tạm ngừng',   cls: 'bg-orange-100 text-orange-700', dot: 'bg-orange-500' },
+  inactive_at_address: { label: 'Không hoạt động tại địa chỉ đăng ký', short: 'Bỏ địa chỉ', cls: 'bg-red-100 text-red-700',       dot: 'bg-red-500' },
+  pending_dissolution: { label: 'Đang làm thủ tục đóng MST',         short: 'Đóng MST',    cls: 'bg-orange-100 text-orange-700', dot: 'bg-orange-500' },
+  dissolved:           { label: 'Đã đóng MST / giải thể',            short: 'Đã đóng MST', cls: 'bg-red-100 text-red-700',       dot: 'bg-red-500' },
+  moved:               { label: 'Chuyển địa điểm',                   short: 'Chuyển ĐĐ',   cls: 'bg-blue-100 text-blue-700',     dot: 'bg-blue-500' },
+  not_found:           { label: 'Không tìm thấy MST trên hệ thống thuế', short: 'Không thấy', cls: 'bg-red-100 text-red-700',    dot: 'bg-red-500' },
+  error:               { label: 'Chưa tra cứu được — sẽ thử lại',    short: 'Lỗi tra',     cls: 'bg-gray-100 text-gray-600',     dot: 'bg-gray-400' },
+  pending:             { label: 'Đang tra cứu tại cổng thuế…',       short: 'Đang tra…',   cls: 'bg-gray-100 text-gray-500',     dot: 'bg-gray-300' },
+};
 
 export interface GridMeta {
   total: number;
@@ -49,6 +82,16 @@ export interface GridMeta {
     subtotal: number;
     vat: number;
     by_status?: Record<string, { count: number; subtotal: number; vat: number }>;
+    /** Chỉ số sức khoẻ hồ sơ thuế của đúng tập hoá đơn đang lọc */
+    tax_health?: {
+      risky_partner_count: number;
+      risky_vat: number;
+      with_original_count: number;
+      missing_original_count: number;
+      no_original_count: number;
+      missing_items_count: number;
+      unchecked_partner_count: number;
+    };
   };
 }
 
@@ -66,6 +109,23 @@ interface Props {
   onPageSizeChange: (size: number) => void;
   onExcelExport?: () => void;
   onRefresh: () => void;
+  /** Ép tra lại trạng thái MST của các đối tác đang hiển thị */
+  onRefreshPartnerStatus?: () => void;
+  partnerStatusRefreshing?: boolean;
+  /** Tải (hoặc yêu cầu tải) hoá đơn gốc XML của một hoá đơn */
+  onDownloadOriginal?: (id: string) => void;
+  /** Mở cửa sổ xem bản thể hiện PDF của hoá đơn gốc */
+  onViewOriginal?: (inv: GridInvoice) => void;
+  /** Bấm vào chỉ số trên thanh cảnh báo thuế để lọc nhanh */
+  onQuickFilter?: (filter: { partnerStatus?: string; hasOriginal?: string; hasLineItems?: string }) => void;
+  /** Bộ lọc nhanh đang bật (để tô sáng chip) */
+  activeQuickFilter?: { partnerStatus?: string; hasOriginal?: string; hasLineItems?: string };
+  /** Lấy bản gốc cho toàn bộ hoá đơn đang lọc */
+  onFetchOriginalsForFilter?: () => void;
+  fetchingOriginals?: boolean;
+  /** Lấy chi tiết hàng hoá cho toàn bộ hoá đơn đang lọc còn thiếu */
+  onFetchLineItemsForFilter?: () => void;
+  fetchingLineItems?: boolean;
 }
 
 const STATUS_LABELS: Record<string, { label: string; color: string }> = {
@@ -85,6 +145,11 @@ function rowBg(inv: GridInvoice): string {
   if (inv.status === 'replaced')  return 'bg-yellow-50/50';
   if (inv.status === 'adjusted')  return 'bg-blue-50/50';
   if (inv.vendor_risk_level === 'critical') return 'bg-red-50/40';
+  // MST đối tác không hoạt động tại địa chỉ / đã đóng — VAT đầu vào có nguy cơ bị loại
+  if (inv.direction === 'input' &&
+      (inv.partner_mst_status === 'inactive_at_address' ||
+       inv.partner_mst_status === 'dissolved' ||
+       inv.partner_mst_status === 'not_found')) return 'bg-red-50/40';
   if (inv.vendor_risk_level === 'high')     return 'bg-orange-50/40';
   if (!inv.payment_method && Number(inv.total_amount) >= 5_000_000 && inv.direction === 'input') return 'bg-amber-50/40';
   return '';
@@ -117,6 +182,9 @@ export default function InvoiceGrid({
   onDelete, onPermanentIgnore, onToggleNonDeductible,
   onPageChange, onPageSizeChange,
   onExcelExport, onRefresh,
+  onRefreshPartnerStatus, partnerStatusRefreshing, onDownloadOriginal, onViewOriginal,
+  onQuickFilter, activeQuickFilter, onFetchOriginalsForFilter, fetchingOriginals,
+  onFetchLineItemsForFilter, fetchingLineItems,
 }: Props) {
   const router = useRouter();
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -198,12 +266,37 @@ export default function InvoiceGrid({
                   )}
                 </span>
               </div>
-              {onExcelExport && (
-                <button onClick={onExcelExport}
-                  className="text-xs border border-gray-300 rounded-lg px-3 py-1.5 text-gray-600 hover:bg-gray-100 flex items-center gap-1 shrink-0">
-                  📊 Xuất Excel
-                </button>
-              )}
+              <div className="flex items-center gap-2 shrink-0">
+                {/* Cảnh báo nhanh: đối tác có trạng thái MST ảnh hưởng quyền khấu trừ */}
+                {(() => {
+                  const risky = invoices.filter(i =>
+                    i.partner_mst_status === 'inactive_at_address' ||
+                    i.partner_mst_status === 'dissolved' ||
+                    i.partner_mst_status === 'not_found' ||
+                    i.partner_mst_status === 'suspended' ||
+                    i.partner_mst_status === 'pending_dissolution');
+                  if (risky.length === 0) return null;
+                  return (
+                    <span className="text-xs bg-red-50 text-red-700 border border-red-200 rounded-lg px-2 py-1"
+                      title="Số hoá đơn trên trang này có đối tác đang ở trạng thái MST rủi ro">
+                      ⚠ {risky.length} HĐ có NNT bất thường
+                    </span>
+                  );
+                })()}
+                {onRefreshPartnerStatus && (
+                  <button onClick={onRefreshPartnerStatus} disabled={partnerStatusRefreshing}
+                    title="Tra lại trạng thái MST của các đối tác trên trang này tại cổng Cục Thuế"
+                    className="text-xs border border-gray-300 rounded-lg px-3 py-1.5 text-gray-600 hover:bg-gray-100 flex items-center gap-1 disabled:opacity-50">
+                    {partnerStatusRefreshing ? '⏳ Đang tra…' : '🔍 Cập nhật trạng thái NNT'}
+                  </button>
+                )}
+                {onExcelExport && (
+                  <button onClick={onExcelExport}
+                    className="text-xs border border-gray-300 rounded-lg px-3 py-1.5 text-gray-600 hover:bg-gray-100 flex items-center gap-1">
+                    📊 Xuất Excel
+                  </button>
+                )}
+              </div>
             </div>
             {/* Dòng 2: Breakdown — hiển thị khi có hóa đơn đặc biệt hoặc không hợp lệ */}
             {(notValidCount > 0 || hasExtraInfo) && (
@@ -236,6 +329,101 @@ export default function InvoiceGrid({
                   </span>
                 )}
               </div>
+            )}
+          </div>
+        );
+      })()}
+
+      {/* ── Thanh sức khoẻ hồ sơ thuế — bấm vào từng chỉ số để lọc ── */}
+      {sum?.tax_health && (() => {
+        const th = sum.tax_health!;
+        const af = activeQuickFilter ?? {};
+        const chip = (
+          key: string,
+          active: boolean,
+          cls: string,
+          onClick: () => void,
+          content: React.ReactNode,
+          tip: string,
+        ) => (
+          <button key={key} onClick={onClick} title={tip}
+            className={`text-xs rounded-lg px-2.5 py-1.5 border transition-colors ${cls} ${
+              active ? 'ring-2 ring-offset-1 ring-gray-900/30 font-semibold' : ''}`}>
+            {content}
+          </button>
+        );
+
+        const items: React.ReactNode[] = [];
+
+        if (th.risky_partner_count > 0) {
+          items.push(chip('risky', af.partnerStatus === 'risky',
+            'bg-red-50 text-red-700 border-red-200 hover:bg-red-100',
+            () => onQuickFilter?.({ partnerStatus: af.partnerStatus === 'risky' ? undefined : 'risky' }),
+            <>⚠ <strong>{th.risky_partner_count}</strong> HĐ có NNT bất thường
+              {th.risky_vat > 0 && <> · VAT nguy cơ <strong>{fmtVND(th.risky_vat)}đ</strong></>}</>,
+            'Đối tác đang tạm ngừng / bỏ địa chỉ / đóng MST — VAT đầu vào có nguy cơ bị loại khấu trừ'));
+        }
+
+        if (th.unchecked_partner_count > 0) {
+          items.push(chip('unchecked', af.partnerStatus === 'unknown',
+            'bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100',
+            () => onQuickFilter?.({ partnerStatus: af.partnerStatus === 'unknown' ? undefined : 'unknown' }),
+            <>🔍 <strong>{th.unchecked_partner_count}</strong> HĐ chưa tra NNT</>,
+            'Chưa tra được trạng thái mã số thuế đối tác tại cổng Cục Thuế'));
+        }
+
+        if (th.missing_original_count > 0) {
+          items.push(chip('noorig', af.hasOriginal === 'no',
+            'bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100',
+            () => onQuickFilter?.({ hasOriginal: af.hasOriginal === 'no' ? undefined : 'no' }),
+            <>📄 <strong>{th.missing_original_count}</strong> HĐ chưa có bản gốc</>,
+            'Chưa tải bản gốc từ cổng thuế — bấm để lọc rồi lấy hàng loạt'));
+        }
+
+        if (th.with_original_count > 0) {
+          items.push(chip('hasorig', af.hasOriginal === 'yes',
+            'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100',
+            () => onQuickFilter?.({ hasOriginal: af.hasOriginal === 'yes' ? undefined : 'yes' }),
+            <>✅ <strong>{th.with_original_count}</strong> HĐ đã có bản gốc</>,
+            'Đã tải bản gốc (XML ký số + bản thể hiện) về hệ thống'));
+        }
+
+        if (th.missing_items_count > 0) {
+          items.push(chip('noitems', af.hasLineItems === 'no',
+            'bg-orange-50 text-orange-700 border-orange-200 hover:bg-orange-100',
+            () => onQuickFilter?.({ hasLineItems: af.hasLineItems === 'no' ? undefined : 'no' }),
+            <>🧾 <strong>{th.missing_items_count}</strong> HĐ thiếu chi tiết hàng hoá</>,
+            'Chưa có dòng hàng hoá/dịch vụ — ảnh hưởng bảng kê và sổ sách'));
+        }
+
+        if (items.length === 0) return null;
+
+        const showFetchOriginals = th.missing_original_count > 0 && !!onFetchOriginalsForFilter
+          && af.hasLineItems !== 'no';
+        const showFetchItems = th.missing_items_count > 0 && !!onFetchLineItemsForFilter
+          && af.hasLineItems === 'no';
+
+        return (
+          <div className="bg-white border border-gray-200 rounded-xl px-3 py-2.5 flex items-center gap-2 flex-wrap shadow-sm">
+            <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Cần xử lý</span>
+            {items}
+            {(af.partnerStatus || af.hasOriginal || af.hasLineItems) && (
+              <button onClick={() => onQuickFilter?.({})}
+                className="text-xs text-gray-500 underline hover:text-gray-800">bỏ lọc nhanh</button>
+            )}
+            {showFetchItems && (
+              <button onClick={onFetchLineItemsForFilter} disabled={fetchingLineItems}
+                title="Lấy dòng hàng hoá/dịch vụ từ cổng thuế cho các hoá đơn đang lọc (tối đa 500 HĐ/lần)"
+                className="ml-auto text-xs font-semibold bg-orange-600 text-white rounded-lg px-3 py-1.5 hover:bg-orange-700 disabled:opacity-50">
+                {fetchingLineItems ? '⏳ Đang xếp hàng…' : '🧾 Lấy chi tiết hàng hoá cho HĐ đang lọc'}
+              </button>
+            )}
+            {showFetchOriginals && (
+              <button onClick={onFetchOriginalsForFilter} disabled={fetchingOriginals}
+                title="Xếp hàng lấy bản gốc cho toàn bộ hoá đơn đang lọc (tối đa 200 HĐ/lần)"
+                className="ml-auto text-xs font-semibold bg-primary-600 text-white rounded-lg px-3 py-1.5 hover:bg-primary-700 disabled:opacity-50">
+                {fetchingOriginals ? '⏳ Đang xếp hàng…' : '⬇ Lấy bản gốc cho HĐ đang lọc'}
+              </button>
             )}
           </div>
         );
@@ -279,6 +467,9 @@ export default function InvoiceGrid({
                 <th className="px-3 py-3 text-left text-xs font-semibold text-gray-500">Số HĐ</th>
                 <th className="px-3 py-3 text-left text-xs font-semibold text-gray-500 hidden sm:table-cell">Ngày lập</th>
                 <th className="px-3 py-3 text-left text-xs font-semibold text-gray-500">Tên {partyLabel}</th>
+                <th className="px-3 py-3 text-left text-xs font-semibold text-gray-500 hidden md:table-cell" title="Trạng thái mã số thuế tra từ cổng Cục Thuế">
+                  Trạng thái NNT
+                </th>
                 <th className="px-3 py-3 text-right text-xs font-semibold text-gray-500 hidden xl:table-cell">Tiền hàng</th>
                 <th className="px-3 py-3 text-right text-xs font-semibold text-gray-500 hidden sm:table-cell">Tổng tiền</th>
                 <th className="px-3 py-3 text-right text-xs font-semibold text-gray-500">Thuế VAT</th>
@@ -299,7 +490,7 @@ export default function InvoiceGrid({
                 return (
                   <React.Fragment key={inv.id}>
                     <tr
-                      className={`border-b border-gray-100 cursor-pointer hover:bg-blue-50/30 transition-colors ${bg} ${leftBorder} ${isSelected ? 'bg-primary-50/40' : ''} ${isExpanded ? 'bg-blue-50/40' : ''}`}
+                      className={`group border-b border-gray-100 cursor-pointer hover:bg-blue-50/30 transition-colors ${bg} ${leftBorder} ${isSelected ? 'bg-primary-50/40' : ''} ${isExpanded ? 'bg-blue-50/40' : ''}`}
                     >
                       <td className="px-3 py-3" onClick={e => { e.stopPropagation(); toggleOne(inv.id); }}>
                         <input
@@ -328,6 +519,16 @@ export default function InvoiceGrid({
                       <td className="px-3 py-3" onClick={() => handleRowClick(inv)}>
                         <div>
                           <span className="font-medium text-gray-900">{inv.invoice_number}</span>
+                          {onViewOriginal && inv.pdf_status === 'available' && (
+                            <button
+                              onClick={e => { e.stopPropagation(); onViewOriginal(inv); }}
+                              title={`Xem bản thể hiện từ cổng thuế + lấy bản gốc theo mẫu nhà cung cấp${inv.provider_name ? ' (' + inv.provider_name + ')' : ''}`}
+                              className="ml-1 text-xs bg-primary-50 text-primary-700 border border-primary-200 px-1 rounded hover:bg-primary-100"
+                            >📄 Bản gốc</button>
+                          )}
+                          {inv.pdf_status === 'queued' && (
+                            <span className="ml-1 text-xs bg-gray-100 text-gray-500 px-1 rounded" title="Đang tải bản gốc từ hệ thống thuế">⏳ Bản gốc</span>
+                          )}
                           {inv.has_line_items === false && (
                             <span className="ml-1 text-xs bg-gray-100 text-gray-500 px-1 rounded">Thiếu CT</span>
                           )}
@@ -372,6 +573,33 @@ export default function InvoiceGrid({
                           );
                         })()}
                       </td>
+                      {/* Trạng thái MST đối tác — tra từ tracuunnt.gdt.gov.vn */}
+                      <td className="px-3 py-3 hidden md:table-cell" onClick={() => handleRowClick(inv)}>
+                        {(() => {
+                          const st = (inv.partner_mst_status ?? 'pending') as MstStatus;
+                          const badge = MST_STATUS_BADGE[st] ?? MST_STATUS_BADGE.pending;
+                          const checked = inv.partner_status_checked_at
+                            ? format(new Date(inv.partner_status_checked_at), 'dd/MM/yyyy HH:mm', { locale: vi })
+                            : null;
+                          const tip = [
+                            badge.label,
+                            inv.partner_mst_status_raw ? `Nguyên văn: ${inv.partner_mst_status_raw}` : null,
+                            inv.partner_registered_name ? `Tên đăng ký thuế: ${inv.partner_registered_name}` : null,
+                            inv.partner_tax_authority ? `CQT quản lý: ${inv.partner_tax_authority}` : null,
+                            checked ? `Tra lúc: ${checked}` : 'Chưa tra cứu',
+                            inv.partner_status_stale ? '(dữ liệu đã cũ — đang tra lại)' : null,
+                          ].filter(Boolean).join('\n');
+                          return (
+                            <span
+                              className={`inline-flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded-full whitespace-nowrap ${badge.cls}`}
+                              title={tip}
+                            >
+                              <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${badge.dot}`} />
+                              {badge.short}
+                            </span>
+                          );
+                        })()}
+                      </td>
                       <td className="px-3 py-3 text-right text-gray-700 tabular-nums text-xs hidden xl:table-cell" onClick={() => handleRowClick(inv)}>
                         {fmtVND(inv.subtotal)}
                       </td>
@@ -382,10 +610,11 @@ export default function InvoiceGrid({
                         {fmtVND(inv.vat_amount)}
                       </td>
                       {/* Status badge cell hidden — status conveyed by row color + left border */}
-                      <td className="px-2 py-3 relative" ref={openMenuId === inv.id ? menuRef : undefined}>
+                      <td className={`px-2 py-3 relative sticky right-0 z-10 ${isSelected ? 'bg-primary-50' : bg || 'bg-white'} group-hover:bg-blue-50`} ref={openMenuId === inv.id ? menuRef : undefined}>
                         <button
                           onClick={e => { e.stopPropagation(); setOpenMenuId(openMenuId === inv.id ? null : inv.id); }}
-                          className="p-1 rounded-lg text-gray-400 hover:bg-gray-100"
+                          className={`p-1 rounded-lg text-gray-400 hover:bg-gray-100 transition-opacity ${isSelected || openMenuId === inv.id ? 'opacity-100' : 'opacity-70 group-hover:opacity-100'}`}
+                          title="Thao tác"
                         >
                           <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
                             <circle cx="10" cy="4" r="1.5" /><circle cx="10" cy="10" r="1.5" /><circle cx="10" cy="16" r="1.5" />
@@ -399,11 +628,37 @@ export default function InvoiceGrid({
                                 onClick={e => { e.stopPropagation(); setOpenMenuId(null); onToggleNonDeductible(inv.id, !inv.non_deductible); }}
                                 className="w-full text-left px-4 py-2 text-sm text-orange-600 hover:bg-orange-50"
                               >
-                                {inv.non_deductible ? '✓ Đưa lại vào khấu trừ' : '⊘ Loại khỏi khấu trừ [25]'}
+                                {inv.non_deductible ? '✓ Đưa lại vào khấu trừ' : '⊘ Loại HĐ không hợp lệ'}
                               </button>
                             )}
-                            <button onClick={e => { e.stopPropagation(); setOpenMenuId(null); onDelete(inv.id); }} className="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50">Ẩn hóa đơn</button>
-                            <button onClick={e => { e.stopPropagation(); setOpenMenuId(null); onPermanentIgnore(inv.id); }} className="w-full text-left px-4 py-2 text-sm text-red-700 hover:bg-red-50">Bỏ qua vĩnh viễn</button>
+                            {onViewOriginal && (
+                              <button
+                                onClick={e => { e.stopPropagation(); setOpenMenuId(null); onViewOriginal(inv); }}
+                                title={inv.pdf_status === 'unavailable'
+                                  ? 'Cổng thuế không lưu bản thể hiện của hoá đơn không mã CQT / máy tính tiền — vẫn xem được mã tra cứu của nhà cung cấp'
+                                  : 'Xem bản thể hiện từ cổng thuế và lấy bản gốc theo mẫu nhà cung cấp'}
+                                className="w-full text-left px-4 py-2 text-sm font-medium text-primary-700 hover:bg-primary-50 disabled:text-gray-300 disabled:hover:bg-white"
+                              >
+                                👁 Xem hoá đơn gốc
+                              </button>
+                            )}
+                            {onDownloadOriginal && (
+                              <button
+                                onClick={e => { e.stopPropagation(); setOpenMenuId(null); onDownloadOriginal(inv.id); }}
+                                disabled={inv.xml_status === 'unavailable'}
+                                title={inv.xml_status === 'unavailable'
+                                  ? 'Hệ thống GDT không lưu XML gốc cho hoá đơn không mã CQT / máy tính tiền'
+                                  : 'Tải file XML gốc có chữ ký số từ hệ thống thuế'}
+                                className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:text-gray-300 disabled:hover:bg-white"
+                              >
+                                {inv.xml_status === 'available' ? '⬇ Tải XML ký số'
+                                  : inv.xml_status === 'queued' ? '⏳ Đang tải XML…'
+                                  : inv.xml_status === 'unavailable' ? '✕ Không có XML gốc'
+                                  : '⬇ Tải XML ký số'}
+                              </button>
+                            )}
+                            <button onClick={e => { e.stopPropagation(); setOpenMenuId(null); onDelete(inv.id); }} className="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50">Loại HĐ không kê khai</button>
+                            <button onClick={e => { e.stopPropagation(); setOpenMenuId(null); onPermanentIgnore(inv.id); }} className="w-full text-left px-4 py-2 text-sm text-red-700 hover:bg-red-50">Xóa HĐ khỏi danh sách đồng bộ</button>
                           </div>
                         )}
                       </td>
@@ -470,8 +725,7 @@ export default function InvoiceGrid({
   );
 }
 
-// ── Bulk Action Bar (shown when selectedIds.length >= 2) ─────────────────────
-import { BulkItemCodeModal, BulkCustomerCodeModal, BulkPaymentModal } from './BulkActionModals';
+// ── Bulk Action Bar (shown when selectedIds.length > 0) ─────────────────────
 
 function BulkActionBar({
   selectedIds,
@@ -482,10 +736,11 @@ function BulkActionBar({
   onClear: () => void;
   onRefresh: () => void;
 }) {
-  const [modal, setModal] = useState<'item' | 'customer' | 'payment' | null>(null);
   const [confirmHide, setConfirmHide] = useState(false);
   const [hideReason, setHideReason] = useState<'duplicate' | 'invalid' | 'other'>('invalid');
   const [hiding, setHiding] = useState(false);
+  const [downloadingXml, setDownloadingXml] = useState(false);
+  const [downloadingPdf, setDownloadingPdf] = useState(false);
   const n = selectedIds.length;
   const toast = useToast();
 
@@ -494,14 +749,93 @@ function BulkActionBar({
     try {
       const { default: apiClient } = await import('../../lib/apiClient');
       await apiClient.delete('/invoices/bulk-delete', { data: { ids: selectedIds, reason: hideReason } });
-      toast.success(`Đã ẩn ${n} hóa đơn. Các hóa đơn này sẽ không tính vào tờ khai.`);
+      toast.success(`Đã loại ${n} hóa đơn khỏi kê khai.`);
       setConfirmHide(false);
       onClear();
       onRefresh();
     } catch {
-      toast.error('Ẩn hóa đơn thất bại. Vui lòng thử lại.');
+      toast.error('Loại hóa đơn thất bại. Vui lòng thử lại.');
     } finally {
       setHiding(false);
+    }
+  }
+
+  /** Tải hàng loạt bản thể hiện PDF (ZIP). 202 = bot đang tạo, báo user chờ. */
+  async function handleBulkOriginalPdf() {
+    setDownloadingPdf(true);
+    try {
+      const { default: apiClient } = await import('../../lib/apiClient');
+      const res = await apiClient.get('/invoices/download-pdf', {
+        params: { ids: selectedIds.join(',') },
+        responseType: 'blob',
+        validateStatus: st => st === 200 || st === 202 || st === 409,
+      });
+
+      if (res.status === 200) {
+        const url = URL.createObjectURL(res.data as Blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `HoaDonGoc_PDF_${new Date().toISOString().slice(0, 10)}.zip`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        toast.success('Đã tải bản gốc PDF');
+        return;
+      }
+
+      const text = await (res.data as Blob).text();
+      const parsed = JSON.parse(text) as { error?: { message?: string } };
+      const msg = parsed.error?.message ?? 'Chưa có bản gốc cho các hoá đơn này';
+      if (res.status === 202) { toast.success(msg); onRefresh(); } else { toast.error(msg); }
+    } catch {
+      toast.error('Tải bản gốc PDF thất bại. Vui lòng thử lại.');
+    } finally {
+      setDownloadingPdf(false);
+    }
+  }
+
+  /**
+   * Tải hàng loạt hoá đơn gốc: gọi /download-xml (ZIP).
+   * Nếu chưa có bản gốc, backend tự đưa vào hàng đợi và trả 202 — báo user chờ bot tải.
+   */
+  async function handleBulkOriginalXml() {
+    setDownloadingXml(true);
+    try {
+      const { default: apiClient } = await import('../../lib/apiClient');
+      const res = await apiClient.get('/invoices/download-xml', {
+        params: { ids: selectedIds.join(',') },
+        responseType: 'blob',
+        validateStatus: st => st === 200 || st === 202 || st === 404 || st === 409,
+      });
+
+      if (res.status === 200) {
+        const url = URL.createObjectURL(res.data as Blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `HoaDon_XML_${new Date().toISOString().slice(0, 10)}.zip`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        toast.success(`Đã tải bản gốc của ${n} hoá đơn`);
+        return;
+      }
+
+      // Body là blob → đọc JSON lỗi/hướng dẫn ra
+      const text = await (res.data as Blob).text();
+      const parsed = JSON.parse(text) as { error?: { message?: string } };
+      const msg = parsed.error?.message ?? 'Chưa có bản gốc cho các hoá đơn này';
+      if (res.status === 202) {
+        toast.success(msg);
+        onRefresh();
+      } else {
+        toast.error(msg);
+      }
+    } catch {
+      toast.error('Tải hoá đơn gốc thất bại. Vui lòng thử lại.');
+    } finally {
+      setDownloadingXml(false);
     }
   }
 
@@ -509,19 +843,28 @@ function BulkActionBar({
     <>
       <div className="flex items-center gap-2 bg-primary-50 border border-primary-200 rounded-xl px-4 py-2.5 flex-wrap">
         <span className="text-sm font-medium text-primary-700">Đã chọn {n} hóa đơn —</span>
-        <button onClick={() => setModal('item')}     className="text-xs border border-primary-300 bg-white rounded-lg px-3 py-1.5 text-primary-700 hover:bg-primary-50">Gán mã hàng</button>
-        <button onClick={() => setModal('customer')} className="text-xs border border-primary-300 bg-white rounded-lg px-3 py-1.5 text-primary-700 hover:bg-primary-50">Gán mã KH/NCC</button>
-        <button onClick={() => setModal('payment')}  className="text-xs border border-primary-300 bg-white rounded-lg px-3 py-1.5 text-primary-700 hover:bg-primary-50">Khai báo TT</button>
+        <button
+          onClick={() => void handleBulkOriginalPdf()}
+          disabled={downloadingPdf}
+          title="Tải bản thể hiện PDF (mẫu cổng thuế) của các hoá đơn đã chọn — gói ZIP"
+          className="text-xs border border-primary-300 bg-white rounded-lg px-3 py-1.5 text-primary-700 hover:bg-primary-100 disabled:opacity-50"
+        >{downloadingPdf ? 'Đang tạo bản thể hiện…' : '📄 Tải bản thể hiện (PDF)'}</button>
+        <button
+          onClick={() => void handleBulkOriginalXml()}
+          disabled={downloadingXml}
+          title="Tải file XML gốc (có chữ ký số) của các hoá đơn đã chọn"
+          className="text-xs border border-primary-300 bg-white rounded-lg px-3 py-1.5 text-primary-700 hover:bg-primary-100 disabled:opacity-50"
+        >{downloadingXml ? 'Đang lấy bản gốc…' : '⬇ Tải hoá đơn gốc (XML)'}</button>
         <button
           onClick={() => setConfirmHide(true)}
           className="text-xs border border-orange-300 bg-white rounded-lg px-3 py-1.5 text-orange-700 hover:bg-orange-50"
-        >Ẩn hóa đơn</button>
+        >Loại HĐ không kê khai</button>
         <button onClick={onClear} className="ml-auto text-xs text-gray-400 hover:text-gray-700">Hủy chọn</button>
       </div>
 
       {confirmHide && (
         <div className="flex items-center gap-3 bg-orange-50 border border-orange-200 rounded-xl px-4 py-3 flex-wrap text-sm">
-          <span className="text-orange-800 font-medium">Ẩn {n} hóa đơn khỏi tờ khai?</span>
+          <span className="text-orange-800 font-medium">Loại {n} hóa đơn khỏi kê khai?</span>
           <select
             value={hideReason}
             onChange={e => setHideReason(e.target.value as typeof hideReason)}
@@ -535,14 +878,10 @@ function BulkActionBar({
             onClick={handleBulkHide}
             disabled={hiding}
             className="text-xs bg-orange-600 text-white rounded-lg px-3 py-1.5 hover:bg-orange-700 disabled:opacity-50"
-          >{hiding ? 'Đang ẩn...' : 'Xác nhận ẩn'}</button>
+          >{hiding ? 'Đang xử lý...' : 'Xác nhận loại'}</button>
           <button onClick={() => setConfirmHide(false)} className="text-xs text-gray-500 hover:text-gray-700">Hủy</button>
         </div>
       )}
-
-      {modal === 'item'     && <BulkItemCodeModal     ids={selectedIds} onClose={() => { setModal(null); onClear(); onRefresh(); }} />}
-      {modal === 'customer' && <BulkCustomerCodeModal ids={selectedIds} onClose={() => { setModal(null); onClear(); onRefresh(); }} />}
-      {modal === 'payment'  && <BulkPaymentModal      ids={selectedIds} onClose={() => { setModal(null); onClear(); onRefresh(); }} />}
     </>
   );
 }

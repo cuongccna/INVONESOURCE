@@ -5,6 +5,7 @@ import { useParams, useRouter } from 'next/navigation';
 import { format } from 'date-fns';
 import { vi } from 'date-fns/locale';
 import apiClient from '../../../../lib/apiClient';
+import OriginalInvoiceModal from '../../../../components/invoices/OriginalInvoiceModal';
 
 interface LineItem {
   id: string;
@@ -50,7 +51,49 @@ interface Invoice {
   invoice_group: number | null;
   has_line_items: boolean | null;
   raw_data: Record<string, unknown> | null;
+  xml_status: string | null;
+  pdf_status: string | null;
+  gdt_ttxly: number | null;
+  gdt_tvandnkntt: string | null;
+  provider_lookup_code: string | null;
+  provider_lookup_label: string | null;
+  gdt_mtdtchieu: string | null;
+  gdt_nky: string | null;
+  gdt_cqt: string | null;
+  gdt_cqtcks: string | null;
 }
+
+/** Trang thai MST doi tac, lay tu API tra cuu cong thue */
+interface PartnerStatus {
+  tax_code: string;
+  mst_status: string;
+  label: string;
+  risk: string;
+  registered_name: string | null;
+  address: string | null;
+  tax_authority: string | null;
+  checked_at: string;
+  is_stale: boolean;
+}
+
+const MST_BADGE: Record<string, string> = {
+  active:              'bg-green-100 text-green-700',
+  suspended:           'bg-orange-100 text-orange-700',
+  inactive_at_address: 'bg-red-100 text-red-700',
+  pending_dissolution: 'bg-orange-100 text-orange-700',
+  dissolved:           'bg-red-100 text-red-700',
+  moved:               'bg-blue-100 text-blue-700',
+  not_found:           'bg-red-100 text-red-700',
+  error:               'bg-gray-100 text-gray-600',
+  pending:             'bg-gray-100 text-gray-500',
+};
+
+/** ttxly cua cong thue -> nghia tieng Viet */
+const TTXLY_LABEL: Record<number, string> = {
+  5: 'Đã cấp mã cơ quan thuế',
+  6: 'Không mã, gửi đủ bảng kê',
+  8: 'Khởi tạo từ máy tính tiền / uỷ nhiệm',
+};
 
 const STATUS_LABELS: Record<string, { label: string; color: string }> = {
   valid: { label: 'Hợp lệ', color: 'bg-green-100 text-green-700' },
@@ -102,6 +145,79 @@ export default function InvoiceDetailPage() {
   const [deleting, setDeleting] = useState(false);
   const [formMsg, setFormMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
+  // ── Hoá đơn gốc (XML ký số từ hệ thống GDT) ─────────────────────────────
+  const [showOriginal, setShowOriginal] = useState(false);
+  const [partner, setPartner] = useState<PartnerStatus | null>(null);
+  const [xmlBusy, setXmlBusy] = useState(false);
+  const [xmlMsg, setXmlMsg]   = useState<string | null>(null);
+
+  const tryDownloadXml = useCallback(async (): Promise<boolean> => {
+    if (!id) return false;
+    try {
+      const res = await apiClient.get(`/invoices/${id}/original-xml`, {
+        responseType: 'blob',
+        validateStatus: st => st === 200 || st === 202 || st === 409,
+      });
+      if (res.status !== 200) return false;
+      const disposition = String(res.headers['content-disposition'] ?? '');
+      const match = disposition.match(/filename="?([^";]+)"?/);
+      const url = URL.createObjectURL(res.data as Blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = match?.[1] ?? `HoaDon_${id}.xml`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      return true;
+    } catch {
+      return false;
+    }
+  }, [id]);
+
+  const handleDownloadOriginal = useCallback(async () => {
+    if (!id || xmlBusy) return;
+    setXmlBusy(true);
+    setXmlMsg(null);
+    try {
+      if (await tryDownloadXml()) { setXmlMsg('Đã tải hoá đơn gốc'); return; }
+
+      const res = await apiClient.post<{ data: { queued: number; message: string } }>(
+        '/invoices/original-xml/request', { invoiceIds: [id] },
+      );
+      const info = res.data.data;
+      if (info.queued === 0) { setXmlMsg(info.message); return; }
+      setXmlMsg('Đang lấy bản gốc từ hệ thống thuế — sẽ tự tải xuống khi xong…');
+
+      for (let i = 0; i < 20; i++) {
+        await new Promise(r => setTimeout(r, 15_000));
+        const st = await apiClient.get<{ data: { statuses: Array<{ xml_status: string; has_xml: boolean }> } }>(
+          '/invoices/original-xml/status', { params: { ids: id } },
+        );
+        const row = st.data.data.statuses[0];
+        if (!row) continue;
+        if (row.has_xml) {
+          await tryDownloadXml();
+          setXmlMsg('Đã tải hoá đơn gốc');
+          reload();
+          return;
+        }
+        if (row.xml_status === 'unavailable' || row.xml_status === 'failed') {
+          setXmlMsg(row.xml_status === 'unavailable'
+            ? 'Hệ thống thuế không lưu bản gốc cho hoá đơn này — cần xin file từ người bán'
+            : 'Tải bản gốc thất bại — bot sẽ thử lại ở chu kỳ sau');
+          reload();
+          return;
+        }
+      }
+      setXmlMsg('Bot chưa lấy được bản gốc — thử lại sau ít phút');
+    } catch {
+      setXmlMsg('Không gửi được yêu cầu tải hoá đơn gốc');
+    } finally {
+      setXmlBusy(false);
+    }
+  }, [id, xmlBusy, tryDownloadXml]);
+
   const reload = useCallback(() => {
     if (!id) return;
     apiClient.get<Invoice>(`/invoices/${id}`)
@@ -117,6 +233,19 @@ export default function InvoiceDetailPage() {
   }, [id]);
 
   useEffect(() => { reload(); }, [reload]);
+
+  // Trang thai ma so thue cua doi tac (nguoi ban voi HD mua vao, nguoi mua voi HD ban ra)
+  useEffect(() => {
+    if (!invoice) return;
+    const code = invoice.direction === 'input' ? invoice.seller_tax_code : invoice.buyer_tax_code;
+    if (!code || !/^[0-9]{10}(-[0-9]{3})?$/.test(code)) return;
+    apiClient.get<{ data: { statuses: PartnerStatus[] } }>('/invoices/partner-status', {
+      params: { taxCodes: code },
+    })
+      .then(r => setPartner(r.data.data.statuses[0] ?? null))
+      .catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [invoice?.id]);
 
   const handleSaveItemName = async () => {
     if (!itemName.trim() || !id) return;
@@ -198,11 +327,44 @@ export default function InvoiceDetailPage() {
           Quay lại
         </button>
         <div className="flex-1" />
+        <button
+          onClick={() => setShowOriginal(true)}
+          title="Xem bản thể hiện từ cổng thuế và lấy bản gốc theo mẫu nhà cung cấp"
+          className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-primary-600 text-white hover:bg-primary-700 disabled:opacity-40"
+        >
+          👁 Xem hoá đơn gốc
+        </button>
+        <button
+          onClick={() => void handleDownloadOriginal()}
+          disabled={xmlBusy || invoice.xml_status === 'unavailable'}
+          title={invoice.xml_status === 'unavailable'
+            ? 'Hệ thống GDT không lưu XML gốc cho hoá đơn không mã CQT / máy tính tiền'
+            : 'Tải file XML gốc có chữ ký số của người bán và cơ quan thuế'}
+          className="px-3 py-1.5 rounded-lg text-xs font-medium border border-primary-300 text-primary-700 bg-white hover:bg-primary-50 disabled:opacity-50"
+        >
+          {xmlBusy ? '⏳ Đang lấy bản gốc…'
+            : '⬇ Tải XML ký số'}
+        </button>
         <span className={`px-2.5 py-1 rounded-full text-xs font-semibold ${statusInfo.color}`}>{statusInfo.label}</span>
         <span className={`px-2.5 py-1 rounded-full text-xs font-semibold ${isOutput ? 'bg-blue-100 text-blue-700' : 'bg-emerald-100 text-emerald-700'}`}>
           {isOutput ? '↑ Bán ra' : '↓ Mua vào'}
         </span>
       </div>
+
+      {showOriginal && (
+        <OriginalInvoiceModal
+          invoiceId={invoice.id}
+          label={`${invoice.serial_number ?? ''}-${invoice.invoice_number}`}
+          onClose={() => setShowOriginal(false)}
+          onStatusChange={() => reload()}
+        />
+      )}
+
+      {xmlMsg && (
+        <div className="mb-4 bg-blue-50 border border-blue-200 rounded-xl px-4 py-2.5 text-sm text-blue-800">
+          {xmlMsg}
+        </div>
+      )}
 
       {/* ── Replacement note banner ── */}
       {noteItems.length > 0 && (
@@ -231,9 +393,98 @@ export default function InvoiceDetailPage() {
             </div>
             <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm text-gray-500 border-t border-gray-50 pt-3">
               <span>Nguồn: <strong className="text-gray-700">{PROVIDER_LABELS[invoice.provider] ?? invoice.provider}</strong></span>
+              {invoice.provider_lookup_code && (
+                <span title="Mã do nhà cung cấp HĐĐT cấp — dùng để tải bản gốc theo mẫu của họ">
+                  {invoice.provider_lookup_label ?? 'Mã tra cứu'}:{' '}
+                  <strong className="text-gray-700 font-mono">{invoice.provider_lookup_code}</strong>
+                </span>
+              )}
               {invoice.currency && invoice.currency !== 'VND' && <span>Tiền tệ: <strong className="text-gray-700">{invoice.currency}</strong></span>}
             </div>
           </div>
+
+          {/* Thong tin tu co quan thue */}
+          <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5">
+            <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-4">
+              Thông tin từ cơ quan thuế
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-3 text-sm">
+              <div>
+                <p className="text-xs text-gray-400 font-medium">Kết quả kiểm tra (ttxly)</p>
+                <p className="text-gray-800">
+                  {invoice.gdt_ttxly != null
+                    ? `${invoice.gdt_ttxly} · ${TTXLY_LABEL[invoice.gdt_ttxly] ?? 'Khác'}`
+                    : '—'}
+                </p>
+              </div>
+              <div>
+                <p className="text-xs text-gray-400 font-medium">Chữ ký cấp mã của CQT</p>
+                <p className={invoice.gdt_cqtcks ? 'text-green-700 font-medium' : 'text-gray-500'}>
+                  {invoice.gdt_cqtcks ? '✓ Có chữ ký CQT' : 'Không có (hoá đơn không mã)'}
+                </p>
+              </div>
+              <div className="sm:col-span-2">
+                <p className="text-xs text-gray-400 font-medium">Mã tra cứu điện tử (cổng thuế)</p>
+                <p className="text-gray-800 font-mono text-xs break-all">{invoice.gdt_mtdtchieu || '—'}</p>
+              </div>
+              <div>
+                <p className="text-xs text-gray-400 font-medium">Bản gốc đã tải về</p>
+                <p className="text-gray-800">
+                  {invoice.xml_status === 'available' ? '✓ XML ký số' : '— chưa có XML'}
+                  {' · '}
+                  {invoice.pdf_status === 'available'
+                    ? 'bản thể hiện PDF'
+                    : invoice.pdf_status === 'unavailable' ? 'cổng thuế không lưu PDF' : 'chưa có PDF'}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Trang thai nguoi nop thue cua doi tac */}
+          {partner && (
+            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5">
+              <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-3">
+                Tình trạng {isOutput ? 'người mua' : 'người bán'} tại cơ quan thuế
+              </p>
+              <div className="flex flex-wrap items-center gap-3 mb-3">
+                <span className={`text-xs font-semibold px-2.5 py-1 rounded-full ${MST_BADGE[partner.mst_status] ?? 'bg-gray-100 text-gray-600'}`}>
+                  {partner.label}
+                </span>
+                <span className="text-xs text-gray-500 font-mono">{partner.tax_code}</span>
+                {partner.checked_at && (
+                  <span className="text-xs text-gray-400">
+                    tra lúc {fmtDate(partner.checked_at)}{partner.is_stale ? ' (đang tra lại)' : ''}
+                  </span>
+                )}
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2 text-sm">
+                {partner.registered_name && (
+                  <div className="sm:col-span-2">
+                    <p className="text-xs text-gray-400 font-medium">Tên đăng ký thuế</p>
+                    <p className="text-gray-800">{partner.registered_name}</p>
+                  </div>
+                )}
+                {partner.tax_authority && (
+                  <div>
+                    <p className="text-xs text-gray-400 font-medium">Cơ quan thuế quản lý</p>
+                    <p className="text-gray-800">{partner.tax_authority}</p>
+                  </div>
+                )}
+                {partner.address && (
+                  <div className="sm:col-span-2">
+                    <p className="text-xs text-gray-400 font-medium">Địa chỉ đăng ký</p>
+                    <p className="text-gray-700 text-xs">{partner.address}</p>
+                  </div>
+                )}
+              </div>
+              {partner.risk === 'critical' && !isOutput && (
+                <p className="mt-3 text-xs bg-red-50 border border-red-200 text-red-700 rounded-lg px-3 py-2">
+                  ⚠ Nhà cung cấp đang ở trạng thái rủi ro cao — VAT đầu vào của hoá đơn này có nguy cơ bị loại khấu trừ.
+                  Nên rà soát hồ sơ giao dịch (hợp đồng, chứng từ thanh toán, biên bản giao nhận).
+                </p>
+              )}
+            </div>
+          )}
 
           {/* Parties card */}
           <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5">

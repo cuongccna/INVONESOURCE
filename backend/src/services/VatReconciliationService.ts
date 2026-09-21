@@ -1,6 +1,18 @@
 import { pool } from '../db/pool';
 import { v4 as uuidv4 } from 'uuid';
 import { VatReconciliation, VatBreakdown } from 'shared';
+import { taxPolicyService } from './TaxPolicyService';
+
+/**
+ * F3 — ngưỡng bắt buộc chứng từ thanh toán không dùng tiền mặt.
+ *
+ * Không gắn cứng con số trong code nữa: tra bảng tax_policy_params theo ngày hoá đơn.
+ * Giá trị dưới đây chỉ là dự phòng khi chưa chạy migration 062:
+ *   - đến 30/6/2025: 20 triệu (Luật Thuế GTGT cũ)
+ *   - từ 01/7/2025 : 5 triệu (Luật Thuế GTGT 48/2024/QH15 và nghị định hướng dẫn)
+ */
+const POLICY_CUTOVER_DATE = '2025-07-01';
+interface NonCashThresholds { legacy: number; current: number; }
 
 export interface VatRateGroup {
   outputSubtotal: number;
@@ -60,6 +72,39 @@ function _notReplacedClause(alias: string): string {
      )`;
 }
 
+/** Tra ngưỡng theo hai thời kỳ, dùng chung cho mọi truy vấn khấu trừ */
+async function _loadNonCashThresholds(): Promise<NonCashThresholds> {
+  const [legacy, current] = await Promise.all([
+    taxPolicyService.get('vat.non_cash_payment_threshold', '2024-01-01'),
+    taxPolicyService.get('vat.non_cash_payment_threshold', POLICY_CUTOVER_DATE),
+  ]);
+  return { legacy: legacy.value || 20_000_000, current: current.value || 5_000_000 };
+}
+
+function _deductiblePaymentCondition(alias: string, th: NonCashThresholds): string {
+  const nonCashPayment = `(
+             ${alias}.payment_method IS NOT NULL
+             AND LOWER(TRIM(${alias}.payment_method)) <> 'cash'
+           )`;
+  return `(
+            ${alias}.cash_risk_acknowledged = true
+            OR (
+              ${alias}.invoice_date < DATE '${POLICY_CUTOVER_DATE}'
+              AND (
+                ${alias}.total_amount <= ${th.legacy}
+                OR ${nonCashPayment}
+              )
+            )
+            OR (
+              ${alias}.invoice_date >= DATE '${POLICY_CUTOVER_DATE}'
+              AND (
+                ${alias}.total_amount < ${th.current}
+                OR ${nonCashPayment}
+              )
+            )
+          )`;
+}
+
 /**
  * VatReconciliationService — calculates and persists VAT reconciliation data
  * for a company in a given period following Vietnam Tax Law.
@@ -73,6 +118,9 @@ export class VatReconciliationService {
     year: number,
     validIds?: { inputIds?: string[]; outputIds?: string[] }
   ): Promise<VatSummary> {
+    // F3: ngưỡng chứng từ thanh toán không dùng tiền mặt tra từ bảng tham số pháp lý
+    const nonCashTh = await _loadNonCashThresholds();
+
     // Apply direction-specific ID filters independently.
     // If validIds is provided (even with empty array), always apply the filter —
     // empty array = no valid invoices → result is 0, not "all invoices".
@@ -136,11 +184,7 @@ export class VatReconciliationService {
            -- NULL group + gdt_validated: serial format không nhận dạng được nhưng GDT đã xác nhận
            (invoice_group IS NULL AND gdt_validated = true)
          )
-         AND (
-           total_amount <= 20000000
-           OR payment_method IS NULL
-           OR (payment_method IS NOT NULL AND LOWER(payment_method) <> 'cash')
-         )
+         AND ${_deductiblePaymentCondition('invoices', nonCashTh)}
          ${_notReplacedClause('invoices')}
          ${inputIdFilter}
        GROUP BY vat_rate`,
@@ -342,6 +386,9 @@ export class VatReconciliationService {
     year: number,
     validIds?: { inputIds?: string[]; outputIds?: string[] }
   ): Promise<VatSummary> {
+    // F3: ngưỡng chứng từ thanh toán không dùng tiền mặt tra từ bảng tham số pháp lý
+    const nonCashTh = await _loadNonCashThresholds();
+
     const m1 = (quarter - 1) * 3 + 1;
     const m2 = m1 + 1;
     const m3 = m1 + 2;
@@ -382,11 +429,7 @@ export class VatReconciliationService {
          AND EXTRACT(YEAR FROM invoice_date) = $2
          AND EXTRACT(MONTH FROM invoice_date) = ANY($3::int[])
          AND (non_deductible = false OR non_deductible IS NULL)
-         AND (
-           total_amount <= 20000000
-           OR payment_method IS NULL
-           OR (payment_method IS NOT NULL AND LOWER(payment_method) <> 'cash')
-         )
+         AND ${_deductiblePaymentCondition('invoices', nonCashTh)}
          AND (
            -- Group 5: có mã CQT → phải gdt_validated; NULL group không tự động coi là group 5
            (invoice_group = 5 AND gdt_validated = true)

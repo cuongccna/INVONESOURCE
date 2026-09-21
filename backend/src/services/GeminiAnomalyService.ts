@@ -122,17 +122,20 @@ export class GeminiAnomalyService {
       });
     }
 
-    // 1c. Cash payment > 20M (not deductible)
+    // 1c. Cash payment > limit (not deductible)
     const { rows: cashOverLimit } = await pool.query<{
-      id: string; invoice_number: string; total_amount: string; seller_name: string;
+      id: string; invoice_number: string; total_amount: string; seller_name: string; invoice_date: Date;
     }>(
-      `SELECT id, invoice_number, total_amount, seller_name
+      `SELECT id, invoice_number, total_amount, seller_name, invoice_date
        FROM invoices
        WHERE company_id = $1
          AND direction = 'input'
          AND status = 'valid'
          AND payment_method = 'cash'
-         AND total_amount > 20000000
+         AND (
+           (invoice_date < DATE '2025-07-01' AND total_amount > 20000000)
+           OR (invoice_date >= DATE '2025-07-01' AND total_amount >= 5000000)
+         )
          AND deleted_at IS NULL
          AND EXTRACT(MONTH FROM invoice_date) = $2
          AND EXTRACT(YEAR FROM invoice_date) = $3
@@ -141,12 +144,14 @@ export class GeminiAnomalyService {
     );
 
     for (const row of cashOverLimit) {
+      const isPostJuly2025 = new Date(row.invoice_date) >= new Date('2025-07-01');
+      const limitText = isPostJuly2025 ? '5 triệu' : '20 triệu';
       anomalies.push({
         id: `cash-${row.id}`,
         invoiceId: row.id,
         invoiceNumber: row.invoice_number,
         type: 'CASH_OVER_LIMIT',
-        description: `Thanh toán tiền mặt > 20 triệu (${formatMoney(parseFloat(row.total_amount))}đ) — không được khấu trừ`,
+        description: `Thanh toán tiền mặt >= ${limitText} (${formatMoney(parseFloat(row.total_amount))}đ) — không được khấu trừ`,
         amount: parseFloat(row.total_amount),
         sellerName: row.seller_name,
       });

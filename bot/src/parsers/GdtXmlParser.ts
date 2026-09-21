@@ -373,6 +373,24 @@ export class GdtXmlParser {
     }).filter(item => item.item_name != null);
   }
 
+  /**
+   * Trả về XML hoá đơn gốc (đã ký số) từ response của /query/invoices/export-xml.
+   *
+   * GDT trả về ZIP chứa invoice.xml + invoice.html + ảnh. Hàm này bóc invoice.xml.
+   * Nếu buffer đã là XML thuần (một số T-VAN trả thẳng) thì trả nguyên buffer.
+   * Trả null nếu không phải XML hợp lệ.
+   */
+  extractOriginalXml(buffer: Buffer): Buffer | null {
+    const fromZip = this._extractXmlFromZip(buffer);
+    if (fromZip) return fromZip;
+
+    const head = buffer.subarray(0, 200).toString('utf-8').trimStart();
+    if (head.startsWith('<?xml') || head.startsWith('<HDon') || head.startsWith('<DLHDon')) {
+      return buffer;
+    }
+    return null;
+  }
+
   // ── ZIP extraction helper ────────────────────────────────────────────────────
 
   /**

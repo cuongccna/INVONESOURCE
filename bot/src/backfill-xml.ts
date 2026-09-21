@@ -131,13 +131,27 @@ async function main() {
       });
       fetched++;
 
-      // Save raw XML to the invoices table so download-xml works for gdt_bot invoices
-      const rawXmlStr = xmlBuf.toString('utf8');
+      // Save raw XML to the invoices table so download-xml works for gdt_bot invoices.
+      //
+      // QUAN TRỌNG: exportInvoiceXml() trả về GÓI ZIP (invoice.xml + invoice.html + ảnh),
+      // KHÔNG phải XML. Trước đây chỗ này ghi thẳng buffer ZIP vào raw_xml dưới dạng chuỗi
+      // UTF-8 — người dùng tải file .xml về thì nội dung là ZIP hỏng nên mở lên báo lỗi.
+      // Phải bóc invoice.xml ra đúng như detail.worker vẫn làm.
+      const xmlOnly = xmlParser.extractOriginalXml(xmlBuf);
+      if (!xmlOnly || xmlOnly.byteLength < 100) {
+        logger.warn('[Backfill] Gói tải về không chứa invoice.xml — bỏ qua, KHÔNG ghi raw_xml', {
+          invoiceId: inv.id, bytes: xmlBuf.byteLength,
+        });
+        skipped++;
+        continue;
+      }
       await pool.query(
-        `UPDATE invoices SET raw_xml = $1, updated_at = NOW() WHERE id = $2`,
-        [rawXmlStr, inv.id],
+        `UPDATE invoices SET raw_xml = $1, raw_xml_size = $2, raw_xml_at = NOW(),
+                xml_status = 'available', xml_error = NULL, updated_at = NOW()
+          WHERE id = $3`,
+        [xmlOnly.toString('utf8'), xmlOnly.byteLength, inv.id],
       );
-      logger.info('[Backfill] raw_xml saved', { invoiceId: inv.id, bytes: xmlBuf.byteLength });
+      logger.info('[Backfill] raw_xml saved', { invoiceId: inv.id, bytes: xmlOnly.byteLength });
 
       const lineItems = xmlParser.parseLineItems(xmlBuf);
       if (lineItems.length === 0) {

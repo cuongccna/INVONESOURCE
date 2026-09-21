@@ -20,6 +20,8 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
         TZ: 'Asia/Ho_Chi_Minh',
+        // Thư mục chứa bản gốc hoá đơn (ZIP + PDF) — dùng chung với detail worker
+        INVOICE_STORAGE_DIR: '/opt/INVONESOURCE/storage/invoices',
       },
       error_file: '/opt/INVONESOURCE/logs/backend-error.log',
       out_file: '/opt/INVONESOURCE/logs/backend-out.log',
@@ -30,8 +32,8 @@ module.exports = {
     {
       name: 'invone-frontend',
       cwd: '/opt/INVONESOURCE/frontend',
-      script: 'node',
-      args: 'start',//'node_modules/.bin/next start -p 3000',
+      script: '../node_modules/next/dist/bin/next',
+      args: 'start',
       instances: 1,
       exec_mode: 'fork',
       autorestart: true,
@@ -87,9 +89,35 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
         TZ: 'Asia/Ho_Chi_Minh',
+        // Nơi lưu gói bản gốc từ GDT + bản thể hiện PDF đã render
+        INVOICE_STORAGE_DIR: '/opt/INVONESOURCE/storage/invoices',
       },
       error_file: '/opt/INVONESOURCE/logs/detail-worker-error.log',
       out_file: '/opt/INVONESOURCE/logs/detail-worker-out.log',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+    },
+
+    // ─── MST Verification Worker (tra cứu trạng thái NNT tại cổng Cục Thuế) ──
+    // Queue 'company-verification' + vòng quét định kỳ MST hết hạn cache.
+    // Tách riêng process: lỗi tra cứu MST không bao giờ ảnh hưởng sync hoá đơn.
+    // Bắt buộc proxy + 2Captcha — không tra bằng IP server.
+    {
+      name: 'invone-verify-worker',
+      cwd: '/opt/INVONESOURCE/bot',
+      script: 'node',
+      args: '-r dotenv/config dist/verification.worker.js',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      watch: false,
+      max_memory_restart: '384M',
+      kill_timeout: 10000,
+      env: {
+        NODE_ENV: 'production',
+        TZ: 'Asia/Ho_Chi_Minh',
+      },
+      error_file: '/opt/INVONESOURCE/logs/verify-worker-error.log',
+      out_file: '/opt/INVONESOURCE/logs/verify-worker-out.log',
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
     },
   ],

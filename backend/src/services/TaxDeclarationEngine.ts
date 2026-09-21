@@ -35,7 +35,8 @@ export class TaxDeclarationEngine {
               total_amount, vat_amount, payment_method, gdt_validated,
               invoice_group, serial_has_cqt, has_line_items,
               mccqt, tc_hdon, lhd_cl_quan, khhd_cl_quan, so_hd_cl_quan,
-              invoice_relation_type, cross_period_flag
+              invoice_relation_type, cross_period_flag,
+              non_deductible, cash_risk_acknowledged
        FROM invoices
        WHERE company_id = $1
          AND deleted_at IS NULL
@@ -105,12 +106,33 @@ export class TaxDeclarationEngine {
       this.getCompanyMst(companyId),
     ]);
 
+    const userPaymentFlags: Record<string, boolean> = {};
+    const userNonBusinessFlags: Record<string, boolean> = {};
+
+    for (const inv of invoices) {
+      if (inv.payment_method === 'cash') {
+        userPaymentFlags[inv.id] = true;
+      } else if (inv.payment_method !== null && inv.payment_method !== undefined) {
+        userPaymentFlags[inv.id] = false;
+      } else if (inv.cash_risk_acknowledged === true) {
+        userPaymentFlags[inv.id] = false;
+      }
+
+      if (inv.non_deductible === true) {
+        userNonBusinessFlags[inv.id] = true;
+      } else if (inv.non_deductible === false) {
+        userNonBusinessFlags[inv.id] = false;
+      }
+    }
+
     const periodStr = `${year}-${String(month).padStart(2, '0')}`;
     const validationOutput = await this.pipeline.validate(invoices, {
       mst,
       declaration_period: periodStr,
       declaration_type: 'monthly',
       direction: 'both',
+      user_payment_flags: userPaymentFlags,
+      user_non_business_flags: userNonBusinessFlags,
     });
 
     const validInvoiceIds = validationOutput.valid_invoices;
@@ -301,11 +323,32 @@ export class TaxDeclarationEngine {
       this.getCompanyMst(companyId),
     ]);
 
+    const userPaymentFlags: Record<string, boolean> = {};
+    const userNonBusinessFlags: Record<string, boolean> = {};
+
+    for (const inv of invoices) {
+      if (inv.payment_method === 'cash') {
+        userPaymentFlags[inv.id] = true;
+      } else if (inv.payment_method !== null && inv.payment_method !== undefined) {
+        userPaymentFlags[inv.id] = false;
+      } else if (inv.cash_risk_acknowledged === true) {
+        userPaymentFlags[inv.id] = false;
+      }
+
+      if (inv.non_deductible === true) {
+        userNonBusinessFlags[inv.id] = true;
+      } else if (inv.non_deductible === false) {
+        userNonBusinessFlags[inv.id] = false;
+      }
+    }
+
     const validationOutput = await this.pipeline.validate(invoices, {
       mst,
       declaration_period: `${year}-Q${quarter}`,
       declaration_type: 'quarterly',
       direction: 'both',
+      user_payment_flags: userPaymentFlags,
+      user_non_business_flags: userNonBusinessFlags,
     });
 
     const validInvoiceIds = validationOutput.valid_invoices;

@@ -9,15 +9,15 @@ const REPORT_GROUPS = [
       { href: '/reports/invoices', icon: '📄', title: 'Báo cáo hóa đơn', desc: 'Lọc và xuất danh sách hóa đơn theo kỳ, loại, trạng thái', color: 'bg-blue-50 text-blue-700 border-blue-100' },
       { href: `/reports/monthly/${new Date().getFullYear()}/${new Date().getMonth() + 1}`, icon: '📊', title: 'Báo cáo tháng', desc: 'Tóm tắt doanh thu, thuế GTGT, top đối tác — in được (A4)', color: 'bg-green-50 text-green-700 border-green-100' },
       { href: '/reports/revenue-expense', icon: '💹', title: 'Doanh thu & Chi phí', desc: 'Phân tích theo thuế suất, top khách hàng & nhà cung cấp', color: 'bg-teal-50 text-teal-700 border-teal-100' },
-      { href: '/reports/profit-loss', icon: '📈', title: 'Kết quả HĐKD (B02-DN)', desc: 'Lợi nhuận gộp, chi phí bán hàng, QLDN, lợi nhuận sau thuế', color: 'bg-emerald-50 text-emerald-700 border-emerald-100' },
+      { href: '/reports/profit-loss', icon: '📈', title: 'Lãi lỗ ước tính từ hoá đơn', desc: 'Báo cáo quản trị — không thay thế Báo cáo kết quả hoạt động kinh doanh theo chế độ kế toán', color: 'bg-emerald-50 text-emerald-700 border-emerald-100' },
     ],
   },
   {
     title: '📒 Kế toán chi tiết',
     items: [
-      { href: '/reports/sales-journal', icon: '📑', title: 'Bảng kê bán ra / mua vào', desc: 'Bảng kê theo thuế suất 0%/5%/8%/10% tương thích HTKK', color: 'bg-indigo-50 text-indigo-700 border-indigo-100' },
-      { href: '/reports/inventory', icon: '📦', title: 'Xuất Nhập Tồn (XNT)', desc: 'Tồn kho từ hóa đơn — không cần phần mềm kho riêng', color: 'bg-amber-50 text-amber-700 border-amber-100' },
-      { href: '/reports/cash-book', icon: '💵', title: 'Sổ Quỹ Tiền', desc: 'Phiếu thu chi, số dư luỹ kế, tự đồng bộ từ hóa đơn', color: 'bg-yellow-50 text-yellow-700 border-yellow-100' },
+      { href: '/reports/sales-journal', icon: '📑', title: 'Bảng kê bán ra / mua vào', desc: 'Bảng kê nội bộ theo thuế suất 0%/5%/8%/10% để đối chiếu với tờ khai', color: 'bg-indigo-50 text-indigo-700 border-indigo-100' },
+      { href: '/reports/inventory', icon: '📦', title: 'Xuất Nhập Tồn (XNT)', desc: 'Báo cáo quản trị dựng từ hoá đơn — không thay thẻ kho theo chế độ kế toán', color: 'bg-amber-50 text-amber-700 border-amber-100' },
+      { href: '/reports/cash-book', icon: '💵', title: 'Sổ Quỹ Tiền', desc: 'Báo cáo quản trị: phiếu thu chi, số dư luỹ kế — không thay sổ kế toán theo chế độ áp dụng', color: 'bg-yellow-50 text-yellow-700 border-yellow-100' },
     ],
   },
   {

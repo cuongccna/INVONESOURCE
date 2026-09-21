@@ -113,10 +113,18 @@ export default function ProfitLossPage() {
 
   return (
     <div className="p-4 max-w-3xl mx-auto space-y-4">
+      {/* Nói rõ phạm vi số liệu để không bị nhầm với báo cáo tài chính theo chế độ kế toán */}
+      <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 text-xs text-amber-900">
+        <strong>Đây là báo cáo quản trị</strong>, dựng từ hoá đơn điện tử và sổ quỹ tiền mặt.
+        Chưa bao gồm chi phí lương và các khoản trích theo lương, khấu hao tài sản cố định,
+        chi phí tài chính, thu nhập khác và chi phí thuế TNDN — nên
+        <strong> không thay thế Báo cáo kết quả hoạt động kinh doanh</strong> theo chế độ kế toán
+        doanh nghiệp (mẫu B02-DN của Thông tư 200/2014/TT-BTC hoặc B02-DNN của Thông tư 133/2016/TT-BTC).
+      </div>
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">Kết Quả Hoạt Động Kinh Doanh</h1>
-          <p className="text-sm text-gray-500">{periodLabel(period)} · Mẫu B02-DN</p>
+          <h1 className="text-2xl font-bold text-gray-900">Lãi Lỗ Ước Tính Từ Hoá Đơn</h1>
+          <p className="text-sm text-gray-500">{periodLabel(period)} · Báo cáo quản trị</p>
         </div>
         <div className="flex gap-2 flex-wrap items-center">
           <PeriodSelector value={period} onChange={setPeriod} />

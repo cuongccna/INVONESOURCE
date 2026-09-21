@@ -128,6 +128,83 @@ router.get('/users/me/sync-status', async (req: Request, res: Response, next: Ne
 });
 
 /**
+ * GET /api/bot/users/me/gdt-connection
+ * Tình trạng kết nối GDT của các công ty người dùng có quyền — dashboard hiện thông báo
+ * khi có lỗi. Nguồn: kết quả chẩn đoán gần nhất (gdt_connection_checks, bot chạy mỗi ngày
+ * trong giờ hành chính) + trạng thái bot (gdt_bot_configs).
+ *
+ *   status = 'ok' | 'error' | 'unknown'
+ *   fixBy  = 'user'   → người dùng cần làm gì đó (đổi mật khẩu GDT...)
+ *            'system' → sự cố phía hệ thống/GDT, người dùng không cần thao tác
+ */
+const USER_FIX_CODES = new Set(['CREDENTIALS_REJECTED', 'DECRYPT_FAIL']);
+
+function gdtConnectionMessage(code: string): string {
+  switch (code) {
+    case 'CREDENTIALS_REJECTED':
+      return 'Cổng thuế GDT từ chối tài khoản đăng nhập — có thể mật khẩu đã đổi. Vui lòng cập nhật lại trong Cài đặt → GDT Bot.';
+    case 'DECRYPT_FAIL':
+      return 'Không đọc được tài khoản GDT đã lưu. Vui lòng nhập lại tài khoản trong Cài đặt → GDT Bot.';
+    case 'GDT_SERVER_ERROR':
+      return 'Cổng thuế GDT đang quá tải hoặc bảo trì. Hoá đơn sẽ tự đồng bộ khi GDT hoạt động lại.';
+    default:
+      return 'Hệ thống đang gặp sự cố khi kết nối tới cổng thuế GDT. Bạn không cần thao tác gì — hoá đơn mới có thể về chậm hơn bình thường.';
+  }
+}
+
+router.get('/users/me/gdt-connection', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const rows = await pool.query<{
+      company_id: string; name: string; tax_code: string | null;
+      is_active: boolean; last_run_status: string | null; last_run_at: string | null; last_error: string | null;
+      checked_at: string | null; ok: boolean | null; verdict_code: string | null;
+    }>(
+      `SELECT c.id AS company_id, c.name, c.tax_code,
+              b.is_active, b.last_run_status, b.last_run_at, b.last_error,
+              g.checked_at, g.ok, g.verdict_code
+       FROM user_companies uc
+       JOIN companies c       ON c.id = uc.company_id AND c.deleted_at IS NULL
+       JOIN gdt_bot_configs b ON b.company_id = c.id
+       LEFT JOIN gdt_connection_checks g ON g.company_id = c.id
+       WHERE uc.user_id = $1`,
+      [req.user!.userId],
+    );
+
+    const companies = rows.rows.map(r => {
+      const base = { companyId: r.company_id, companyName: r.name, taxCode: r.tax_code, checkedAt: r.checked_at };
+      // Bot bị hệ thống tự tắt sau lỗi — bot không tự thử lại nên phải báo người dùng.
+      // Bot tắt mà không có lỗi = người dùng tự tắt → không báo.
+      if (!r.is_active) {
+        if (!r.last_error) return { ...base, status: 'ok' as const, fixBy: null, code: null, message: null };
+        const systemSide = /proxy|407|captcha|timeout|econn|socket|tls|mạng|network|5\d\d/i.test(r.last_error);
+        return {
+          ...base, status: 'error' as const, code: 'BOT_INACTIVE',
+          fixBy: systemSide ? 'system' as const : 'user' as const,
+          message: systemSide
+            ? 'Bot đồng bộ hoá đơn đã tạm dừng do sự cố kết nối phía hệ thống. Quản trị viên cần xử lý và bật lại — hoá đơn mới tạm thời chưa về.'
+            : 'Bot đồng bộ hoá đơn đã dừng vì cổng thuế GDT từ chối đăng nhập. Vui lòng kiểm tra lại tài khoản GDT trong Cài đặt → GDT Bot.',
+        };
+      }
+      if (r.ok === null) return { ...base, status: 'unknown' as const, fixBy: null, code: null, message: null };
+      // Có phiên đồng bộ thành công SAU lần chẩn đoán lỗi → kết nối đã hồi phục.
+      const recoveredBySync = r.last_run_status === 'success' && r.last_run_at && r.checked_at
+        && new Date(r.last_run_at) > new Date(r.checked_at);
+      if (r.ok || recoveredBySync) return { ...base, status: 'ok' as const, fixBy: null, code: null, message: null };
+      const code = r.verdict_code ?? 'UNKNOWN';
+      return {
+        ...base, status: 'error' as const,
+        fixBy: USER_FIX_CODES.has(code) ? 'user' as const : 'system' as const,
+        code, message: gdtConnectionMessage(code),
+      };
+    });
+
+    sendSuccess(res, { companies });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
  * POST /api/bot/users/me/sync-status/retry
  * Resets all failed detail-queue rows (for user's companies) back to pending
  * so detail.worker will retry them.

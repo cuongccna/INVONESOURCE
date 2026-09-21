@@ -8,6 +8,7 @@ const SETTINGS_SECTIONS = [
     items: [
       { href: '/settings/companies', label: 'Danh sách công ty', desc: 'Quản lý các công ty của bạn', icon: '🏢' },
       { href: '/settings/organizations', label: 'Tập đoàn / Nhóm', desc: 'Cấu trúc công ty đa cấp', icon: '🏛️' },
+      { href: '/settings/tax-profile', label: 'Hồ sơ thuế', desc: 'Cơ quan thuế nơi nộp, người ký tờ khai, chế độ kế toán áp dụng', icon: '🧾' },
     ],
   },
   {

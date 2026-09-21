@@ -19,10 +19,106 @@ import { pool } from '../db/pool';
 import { AppError } from '../utils/AppError';
 import ExcelJS from 'exceljs';
 import { INDUSTRY_GROUP_RATES } from '../services/HkdDeclarationEngine';
+import { taxPolicyService } from '../services/TaxPolicyService';
 
 const router = Router();
 router.use(authenticate);
 router.use(requireCompany);
+
+// ── F10: bộ sổ bắt buộc theo nhóm doanh thu (Thông tư 152/2025/TT-BTC) ─────
+//
+// Thông tư phân hoá sổ sách theo quy mô và cách nộp thuế TNCN, không phải hộ nào
+// cũng ghi cả 7 sổ:
+//   • Doanh thu dưới ngưỡng nhóm nhỏ      → chỉ S1a-HKD
+//   • Nộp thuế theo tỷ lệ % trên doanh thu → S2a-HKD
+//   • Nộp thuế trên thu nhập tính thuế và
+//     hộ doanh thu lớn                     → S2b, S2c, S2d, S2e
+//   • Có nghĩa vụ thuế khác (XK, TTĐB,
+//     tài nguyên, BVMT, sử dụng đất)       → thêm S3a-HKD
+
+export interface BookRequirement {
+  code:     string;
+  name:     string;
+  required: boolean;
+  reason:   string;
+}
+
+async function resolveRequiredBooks(
+  annualRevenue: number,
+  pitMethod: 'percent' | 'income',
+  hasOtherTaxes: boolean,
+  year: number,
+): Promise<{ group: string; groupLabel: string; books: BookRequirement[]; legalBasis: string }> {
+  const [smallMax, mediumMax] = await Promise.all([
+    taxPolicyService.getForPeriod('hkd.book_group_small_max', year, 1),
+    taxPolicyService.getForPeriod('hkd.book_group_medium_max', year, 1),
+  ]);
+
+  const isSmall  = annualRevenue < smallMax.value;
+  const isMedium = !isSmall && annualRevenue < mediumMax.value;
+  const usesIncomeMethod = pitMethod === 'income' || (!isSmall && !isMedium);
+
+  const group =
+    isSmall  ? 'small'  :
+    isMedium ? (usesIncomeMethod ? 'medium_income' : 'medium_percent') : 'large';
+
+  const groupLabel =
+    isSmall  ? `Doanh thu dưới ${(smallMax.value / 1e6).toLocaleString('vi-VN')} triệu đồng/năm`
+    : isMedium ? `Doanh thu từ ${(smallMax.value / 1e6).toLocaleString('vi-VN')} triệu đến ${(mediumMax.value / 1e9).toLocaleString('vi-VN')} tỷ đồng/năm`
+    : `Doanh thu trên ${(mediumMax.value / 1e9).toLocaleString('vi-VN')} tỷ đồng/năm`;
+
+  const mk = (code: string, name: string, required: boolean, reason: string): BookRequirement =>
+    ({ code, name, required, reason });
+
+  const s2Set = !isSmall && usesIncomeMethod;
+
+  const books: BookRequirement[] = [
+    mk('s1a', 'Sổ chi tiết doanh thu bán hàng hoá, dịch vụ', isSmall,
+       isSmall ? 'Hộ doanh thu thấp chỉ phải ghi sổ này' : 'Không bắt buộc với nhóm doanh thu của bạn'),
+    mk('s2a', 'Sổ doanh thu bán hàng hoá, dịch vụ (GTGT + TNCN theo tỷ lệ)', !isSmall && !usesIncomeMethod,
+       (!isSmall && !usesIncomeMethod) ? 'Nộp thuế TNCN theo tỷ lệ % trên doanh thu' : 'Chỉ dùng khi nộp thuế theo tỷ lệ % trên doanh thu'),
+    mk('s2b', 'Sổ doanh thu bán hàng hoá, dịch vụ (GTGT)', s2Set,
+       s2Set ? 'Nộp thuế TNCN trên thu nhập tính thuế hoặc doanh thu lớn' : 'Chỉ dùng khi tính thuế trên thu nhập'),
+    mk('s2c', 'Sổ chi tiết doanh thu, chi phí', s2Set,
+       s2Set ? 'Cần theo dõi chi phí để xác định thu nhập tính thuế' : 'Chỉ dùng khi tính thuế trên thu nhập'),
+    mk('s2d', 'Sổ chi tiết vật liệu, dụng cụ, sản phẩm, hàng hoá', s2Set,
+       s2Set ? 'Bắt buộc với hộ tính thuế trên thu nhập' : 'Chỉ dùng khi tính thuế trên thu nhập'),
+    mk('s2e', 'Sổ chi tiết tiền', s2Set,
+       s2Set ? 'Bắt buộc với hộ tính thuế trên thu nhập' : 'Chỉ dùng khi tính thuế trên thu nhập'),
+    mk('s3a', 'Sổ theo dõi nghĩa vụ thuế khác', hasOtherTaxes,
+       hasOtherTaxes ? 'Có phát sinh thuế xuất khẩu / TTĐB / tài nguyên / BVMT / sử dụng đất'
+                     : 'Chỉ ghi khi có nghĩa vụ thuế khác ngoài GTGT và TNCN'),
+  ];
+
+  return { group, groupLabel, books, legalBasis: smallMax.legalBasis };
+}
+
+/**
+ * GET /api/hkd-reports/required-books — bộ sổ hộ kinh doanh phải ghi.
+ * Dựa trên doanh thu 12 tháng gần nhất và cách nộp thuế TNCN đã khai báo.
+ */
+router.get('/required-books', requireRole('OWNER', 'ADMIN', 'ACCOUNTANT', 'VIEWER'), async (req: Request, res: Response) => {
+  const companyId = req.user!.companyId!;
+  const year = Number(req.query.year) || new Date().getFullYear();
+
+  const { rows } = await pool.query<{ revenue: string }>(
+    `SELECT COALESCE(SUM(subtotal), 0) AS revenue
+       FROM invoices
+      WHERE company_id = $1 AND direction = 'output' AND deleted_at IS NULL
+        AND status IN ('valid','replaced','adjusted')
+        AND invoice_date >= $2::date AND invoice_date < ($2::date + INTERVAL '1 year')`,
+    [companyId, `${year}-01-01`],
+  );
+  const annualRevenue = Number(rows[0]?.revenue ?? 0);
+
+  const { rows: compRows } = await pool.query<{ hkd_pit_method: string | null }>(
+    `SELECT NULL::text AS hkd_pit_method FROM companies WHERE id = $1`, [companyId],
+  );
+  const pitMethod = (compRows[0]?.hkd_pit_method === 'income' ? 'income' : 'percent') as 'percent' | 'income';
+
+  const result = await resolveRequiredBooks(annualRevenue, pitMethod, false, year);
+  res.json({ success: true, data: { year, annual_revenue: annualRevenue, ...result } });
+});
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
 

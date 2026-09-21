@@ -77,7 +77,8 @@ router.post(
                invoice_date, seller_tax_code, seller_name, buyer_tax_code, buyer_name,
                total_amount, vat_amount, payment_method, gdt_validated,
                invoice_group, serial_has_cqt, has_line_items,
-               mccqt, tc_hdon, lhd_cl_quan, khhd_cl_quan, so_hd_cl_quan
+               mccqt, tc_hdon, lhd_cl_quan, khhd_cl_quan, so_hd_cl_quan,
+               non_deductible, cash_risk_acknowledged
         FROM invoices
         WHERE company_id = $1
           AND deleted_at IS NULL
@@ -98,14 +99,36 @@ router.post(
 
       const { rows: invoices } = await pool.query<InvoiceRow>(invoiceQuery, params);
 
+      const dbPaymentFlags: Record<string, boolean> = {};
+      const dbNonBusinessFlags: Record<string, boolean> = {};
+
+      for (const inv of invoices) {
+        if (inv.payment_method === 'cash') {
+          dbPaymentFlags[inv.id] = true;
+        } else if (inv.payment_method !== null && inv.payment_method !== undefined) {
+          dbPaymentFlags[inv.id] = false;
+        } else if (inv.cash_risk_acknowledged === true) {
+          dbPaymentFlags[inv.id] = false;
+        }
+
+        if (inv.non_deductible === true) {
+          dbNonBusinessFlags[inv.id] = true;
+        } else if (inv.non_deductible === false) {
+          dbNonBusinessFlags[inv.id] = false;
+        }
+      }
+
+      const finalPaymentFlags = { ...dbPaymentFlags, ...user_payment_flags };
+      const finalNonBusinessFlags = { ...dbNonBusinessFlags, ...user_non_business_flags };
+
       const pipeline = new InvoiceValidationPipeline();
       const output = await pipeline.validate(invoices, {
         mst,
         declaration_period: period,
         declaration_type,
         direction,
-        user_payment_flags,
-        user_non_business_flags,
+        user_payment_flags: finalPaymentFlags,
+        user_non_business_flags: finalNonBusinessFlags,
       });
 
       sendSuccess(res, output);

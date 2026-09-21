@@ -32,7 +32,7 @@ export class GhostCompanyDetector {
   ): Promise<RiskFlag[]> {
     const flags: RiskFlag[] = [];
 
-    const info = await companyVerificationService.verify(partnerTaxCode);
+    const info = await companyVerificationService.verify(partnerTaxCode, false, companyId);
 
     // Cross-check with DKKD (Bộ KH&ĐT business registry) — non-blocking
     const dkkdStatus = await companyVerificationService.lookupFromDkkd(partnerTaxCode);
@@ -86,6 +86,29 @@ export class GhostCompanyDetector {
         level: 'high',
         message: `${info.company_name ?? partnerTaxCode} đang tạm ngừng hoạt động — HĐ có thể không hợp lệ để khấu trừ`,
         vat_at_risk: totalVatAtRisk,
+      });
+    }
+
+    // FLAG 3b: MST không hoạt động tại địa chỉ đã đăng ký — rủi ro khấu trừ cao nhất.
+    // Cơ quan thuế thường loại toàn bộ VAT đầu vào của HĐ phát sinh sau thời điểm này.
+    if (info.mst_status === 'inactive_at_address') {
+      flags.push({
+        code: 'MST_INACTIVE_AT_ADDRESS',
+        level: 'critical',
+        message: `${info.company_name ?? partnerTaxCode} KHÔNG hoạt động tại địa chỉ đã đăng ký — HĐ đầu vào có nguy cơ bị loại khấu trừ`,
+        vat_at_risk: totalVatAtRisk,
+        details: { mst_status_raw: info.mst_status_raw },
+      });
+    }
+
+    // FLAG 3c: Đang làm thủ tục chấm dứt hiệu lực MST
+    if (info.mst_status === 'pending_dissolution') {
+      flags.push({
+        code: 'MST_PENDING_DISSOLUTION',
+        level: 'high',
+        message: `${info.company_name ?? partnerTaxCode} đang làm thủ tục đóng MST — cần kiểm tra hiệu lực hoá đơn`,
+        vat_at_risk: totalVatAtRisk,
+        details: { mst_status_raw: info.mst_status_raw },
       });
     }
 

@@ -57,6 +57,8 @@ export interface InvoiceRow {
   so_hd_cl_quan: string | null;
   invoice_relation_type: string | null;
   cross_period_flag: boolean;
+  non_deductible?: boolean | null;
+  cash_risk_acknowledged?: boolean | null;
 }
 
 // ─── Context passed into every pipeline run ───────────────────────────────────
